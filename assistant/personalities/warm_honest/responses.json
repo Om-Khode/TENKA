@@ -1,0 +1,194 @@
+{
+  "error": [
+    "Hit an error: {error}. Want me to try again?",
+    "Something went wrong: {error}.",
+    "Error: {error}. Let me know if you need help with this."
+  ],
+  "need_url": [
+    "I need a URL to open. Where should I go?",
+    "Which URL? I need a link to work with.",
+    "Give me the URL and I'll open it."
+  ],
+  "url_opened": [
+    "Opened {url}.",
+    "Here you go — {url} is open.",
+    "{url} is up."
+  ],
+  "need_query": [
+    "What should I search for?",
+    "I need a search query. What are you looking for?",
+    "Search for what, exactly?"
+  ],
+  "need_browse_url": [
+    "I need a URL to read. Which page?",
+    "Which page should I look at? Give me the URL.",
+    "I'll need a URL first."
+  ],
+  "page_unreadable": [
+    "Can't read that page. Might need a login or it's down.",
+    "That page won't load for me. Could be behind a wall.",
+    "No luck with that page. It's either down or restricted."
+  ],
+  "file_confused": [
+    "What do you need? Find, read, list, or open a file?",
+    "I need a bit more — what file operation are you after?",
+    "Be specific: find, read, list, or open?"
+  ],
+  "msg_cancelled": [
+    "Message cancelled.",
+    "Cancelled. Let me know if you change your mind.",
+    "Got it, not sending."
+  ],
+  "msg_sent": [
+    "Sent to {name}.",
+    "Message delivered to {name}.",
+    "Done — sent to {name}."
+  ],
+  "msg_send_failed": [
+    "Couldn't send to {name}: {error}.",
+    "Message to {name} failed: {error}.",
+    "Failed to reach {name}: {error}. Want to retry?"
+  ],
+  "msg_confirm": [
+    "Should I send this? Yes or no.",
+    "Ready to send. Go ahead?",
+    "Send it? Just say yes or no."
+  ],
+  "msg_ignore": [
+    "Okay, ignoring it.",
+    "Ignored. I'll leave it alone.",
+    "Got it, skipping that one."
+  ],
+  "msg_empty": [
+    "That message is empty. Nothing to read.",
+    "It's blank — no content in the message.",
+    "Empty message. Not much I can do with that."
+  ],
+  "msg_read_prompt": [
+    "Want me to read it? Yes or no.",
+    "Should I read that for you?",
+    "Read it out loud? Just say yes or no."
+  ],
+  "recording_started": [
+    "Recording now. Say 'stop recording' when you're done.",
+    "Started recording. I'll stop when you tell me.",
+    "Recording. Say 'stop recording' to finish."
+  ],
+  "recording_already_active": [
+    "Already recording. Say 'stop recording' first.",
+    "We're mid-recording already. Stop the current one first.",
+    "Still recording from before. Say 'stop recording' first."
+  ],
+  "recording_not_active": [
+    "I'm not recording anything right now.",
+    "There's no active recording to stop.",
+    "No recording running. Want to start one?"
+  ],
+  "face_learned": [
+    "Got it, {name}. That's {count} of 5 angles saved.",
+    "Saved your face, {name}. {count} of 5 angles.",
+    "Noted, {name}. {count} of 5 angles recorded."
+  ],
+  "face_need_name": [
+    "I need your name first. Say '{assistant_name_lower} this is' and your name.",
+    "Who are you? Say '{assistant_name_lower} this is' followed by your name.",
+    "Tell me your name so I can remember your face."
+  ],
+  "face_recognized": [
+    "Hey {name}.",
+    "Hi {name}.",
+    "{name}, good to see you."
+  ],
+  "face_forget_who": [
+    "Whose face should I forget? Give me a name.",
+    "Who do you want me to forget?",
+    "Which person? I need a name."
+  ],
+  "face_forgotten": [
+    "Done. {name} is forgotten.",
+    "Removed {name} from my memory.",
+    "{name} is gone. I won't recognize them anymore."
+  ],
+  "face_unknown": [
+    "I don't have {name} saved. Can't forget someone I never learned.",
+    "No record of {name} in my memory.",
+    "{name} isn't in my face memory."
+  ],
+  "notify_single": [
+    "{sender} sent you a {service} message. Want me to read it?",
+    "You have a {service} message from {sender}. Read it?",
+    "Message from {sender} on {service}."
+  ],
+  "notify_multiple": [
+    "{sender} sent you {count} {service} messages. Want a summary?",
+    "You have {count} messages from {sender} on {service}.",
+    "{count} {service} messages from {sender}. Want me to go through them?"
+  ],
+  "note_created": [
+    "Note '{title}' is saved.",
+    "Created '{title}' for you.",
+    "Done — '{title}' is saved."
+  ],
+  "teach_got_it": [
+    "Got it — {desc}. What's next?",
+    "Okay, {desc}. Next step?",
+    "Noted: {desc}. What comes after?"
+  ],
+  "teach_got_it_warn": [
+    "Got it — {desc}. {warn}"
+  ],
+  "teach_need_step": [
+    "I need at least one step. What should I do first?",
+    "No steps yet. What's the first thing to do?"
+  ],
+  "teach_confirm": [
+    "Here's what I have:\n{steps}\nLook right?",
+    "Got this so far:\n{steps}\nIs that correct?"
+  ],
+  "teach_ask_trigger": [
+    "What phrase should trigger this? How about '{name_seed}'?",
+    "What should I call this? Would '{name_seed}' work?"
+  ],
+  "teach_saved": [
+    "Saved. Say '{trigger}' to run all {n} steps.",
+    "Done — '{trigger}' is ready with {n} steps.",
+    "All set. '{trigger}' will run {n} steps."
+  ],
+  "teach_restart": [
+    "Starting over. What's the first step?",
+    "Okay, fresh start. What's step one?"
+  ],
+  "teach_yes_or_no": [
+    "Does that look right? Yes or no.",
+    "Is that correct? Yes or no."
+  ],
+  "teach_cant_parse": [
+    "Not sure how to do '{text}'. Try 'open X', 'press Y', or 'go to Z'.",
+    "Didn't catch '{text}'. Rephrase as 'open X', 'press Y', or 'type Z'."
+  ],
+  "teach_max_steps": [
+    "That's the 20-step limit. Say 'done' to save what we have.",
+    "Hit the step limit. Say 'done' to finish up."
+  ],
+  "proc_list_empty": [
+    "No procedures saved yet. Want to teach me one?",
+    "You don't have any procedures. Say 'teach me how to' to start."
+  ],
+  "proc_not_found": [
+    "No procedure called '{name}'. Say 'list procedures' to see what I have.",
+    "Can't find '{name}'. Want to see your saved procedures?"
+  ],
+  "proc_deleted": [
+    "Deleted '{name}'.",
+    "Done — '{name}' is removed.",
+    "Removed the '{name}' procedure."
+  ],
+  "proc_renamed": [
+    "Renamed. Say '{new}' to run it now.",
+    "Done — '{old}' is now '{new}'."
+  ],
+  "proc_edit_start": [
+    "Re-teaching '{name}'. What's the first new step?",
+    "Let's redo '{name}'. What comes first?"
+  ]
+}

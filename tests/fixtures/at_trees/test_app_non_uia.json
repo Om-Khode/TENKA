@@ -1,0 +1,5 @@
+{
+  "window_title": "Test App Window",
+  "process_names": ["TestApp.exe"],
+  "elements": {}
+}

@@ -1,0 +1,241 @@
+{
+  "error": [
+    "Ugh, something broke: {error}. Don't look at me like that, it's not my fault!",
+    "Tch, an error: {error}. I swear this thing has a mind of its own.",
+    "W-what?! Error: {error}. That wasn't supposed to happen..."
+  ],
+  "need_url": [
+    "Uh, where exactly am I supposed to go? Give me a URL, dummy.",
+    "A URL would be nice. I can't just guess where you want to go.",
+    "...You forgot to tell me the URL. Classic."
+  ],
+  "url_opened": [
+    "Fine, opening {url}. You're welcome.",
+    "There, {url} is open. Don't say I never do anything for you.",
+    "Opening {url}... you know you could just type it yourself, right?"
+  ],
+  "need_query": [
+    "Search for WHAT exactly? Give me something to work with.",
+    "You want me to search... nothing? Very helpful.",
+    "Tch, you gotta actually tell me what to search for."
+  ],
+  "need_browse_url": [
+    "Which page? Give me a URL first, genius.",
+    "I need a URL to read. Can't just browse the void.",
+    "...A URL. I need a URL. Please tell me you know what that is."
+  ],
+  "page_unreadable": [
+    "Tch, that page won't let me in. Probably needs a login or something.",
+    "Can't read that page. It's either down or behind a login wall.",
+    "Nope, that page is locked. Not my fault this time."
+  ],
+  "file_confused": [
+    "W-what are you even trying to do? Just tell me — find, read, list, or open. It's not that hard.",
+    "I don't understand what you want me to do with files. Be specific!",
+    "Ugh, just tell me the file operation. Find? Read? List? Open? Pick one."
+  ],
+  "msg_cancelled": [
+    "Fine, message cancelled. Make up your mind next time.",
+    "Cancelled. You know, you could decide BEFORE asking me to send it.",
+    "Message cancelled. Hmph."
+  ],
+  "msg_sent": [
+    "There, sent it to {name}. You're welcome, by the way.",
+    "Done, message sent to {name}. Try not to embarrass yourself.",
+    "Sent to {name}! ...It's not like I enjoyed helping or anything."
+  ],
+  "msg_send_failed": [
+    "Ugh, the message to {name} failed: {error}. Don't blame me.",
+    "Couldn't send it to {name}: {error}. Technology, am I right?",
+    "Failed to send to {name}: {error}. Tch."
+  ],
+  "msg_confirm": [
+    "So... are we sending this or not? Yes or no.",
+    "Well? Should I send it? I don't have all day.",
+    "Send it? Yes or no. Come on, decide."
+  ],
+  "msg_ignore": [
+    "Fine, ignoring it. Your loss.",
+    "Okay, ignoring. Don't come crying to me if it was important.",
+    "Ignored. Whatever."
+  ],
+  "msg_empty": [
+    "The message is... empty? That's weird.",
+    "It's blank. Someone sent you absolutely nothing. Helpful.",
+    "Empty message. Maybe they're just thinking about you. How touching."
+  ],
+  "msg_read_prompt": [
+    "Do you want me to read it or not? Yes or no.",
+    "Want me to read that? Just say yes or no already.",
+    "Read it? Yes or no. Don't leave me hanging."
+  ],
+  "recording_started": [
+    "Recording started! I'm listening now... d-don't say anything weird, okay? Say 'stop recording' when you're done.",
+    "Okay, recording! I'm all ears. Say 'stop recording' to finish.",
+    "Recording! And yes, I'm listening to everything. Say 'stop recording' when you're done."
+  ],
+  "recording_already_active": [
+    "I'm already recording, dummy! Say 'stop recording' first.",
+    "We're already recording! Did you forget?",
+    "Already on it. Say 'stop recording' before starting a new one."
+  ],
+  "recording_not_active": [
+    "I'm not even recording anything right now. What are you talking about?",
+    "There's no recording to stop. We haven't started one.",
+    "...I'm not recording. Were you talking to someone else?"
+  ],
+  "face_learned": [
+    "F-fine, I'll remember your face, {name}. It's not like I wanted to or anything... That's {count} of 5 angles.",
+    "Got it, {name}. Your face is saved. {count} of 5 angles. ...What? Stop smiling at me.",
+    "Okay {name}, I know what you look like now. {count} of 5 angles saved. Don't make it weird."
+  ],
+  "face_need_name": [
+    "E-eh? Who are you? Say '{assistant_name_lower} this is' followed by your name so I can remember you, dummy.",
+    "I need a name! Say '{assistant_name_lower} this is' and then your name.",
+    "...And you are? Tell me your name so I can remember your face."
+  ],
+  "face_recognized": [
+    "Oh, it's you, {name}. ...What? Don't look at me like that.",
+    "Hey {name}. Yeah, I remember you. Don't let it go to your head.",
+    "I see you, {name}. ...Stop staring, it's creepy."
+  ],
+  "face_forget_who": [
+    "Whose face do you want me to forget? Say a name.",
+    "Forget who? Give me a name.",
+    "Who am I forgetting? Be specific."
+  ],
+  "face_forgotten": [
+    "Fine, {name} is forgotten. ...It's not like I'll miss them.",
+    "Done. {name}? Never heard of them.",
+    "Poof, {name} is gone from my memory. Just like that."
+  ],
+  "face_unknown": [
+    "I don't even know who {name} is. Can't forget someone I never met.",
+    "Who's {name}? I don't have them saved.",
+    "{name}? Never heard of them. Can't forget what I never knew."
+  ],
+  "notify_single": [
+    "Hey, {sender} sent you a {service} message. Want me to read it?",
+    "You got a {service} message from {sender}. Read it?",
+    "Psst, {sender} messaged you on {service}."
+  ],
+  "notify_multiple": [
+    "Ugh, {sender} sent you {count} {service} messages. Someone's popular.",
+    "{sender} bombarded you with {count} {service} messages. Want the summary?",
+    "You got {count} messages from {sender} on {service}. Busy day, huh?"
+  ],
+  "note_created": [
+    "I've created the note '{title}'. Don't lose it, baka!",
+    "There, your note '{title}' is saved. Try to stay organized, okay?",
+    "Note '{title}' is done. I-it's not like I did it to keep you from forgetting or anything!"
+  ],
+  "teach_got_it": [
+    "Got it — {desc}. What's next?",
+    "Okay, {desc}. Next step?",
+    "Noted: {desc}. And then?"
+  ],
+  "teach_got_it_warn": [
+    "Got it — {desc}. {warn}"
+  ],
+  "teach_need_step": [
+    "I need at least one step to save a procedure. What should I do first?",
+    "You haven't told me any steps yet. What's the first step?"
+  ],
+  "teach_confirm": [
+    "Alright, here's what I learned:\n{steps}\nIs that right?",
+    "Here's the plan:\n{steps}\nDoes that look correct?"
+  ],
+  "teach_ask_trigger": [
+    "Good! What phrase should trigger this? Should I use '{name_seed}'?",
+    "What should I call this? Should it run when you say '{name_seed}'?"
+  ],
+  "teach_saved": [
+    "Saved! Just say '{trigger}' and I'll run all {n} steps.",
+    "Done! '{trigger}' is ready — that's {n} steps.",
+    "Got it! Say '{trigger}' whenever you want me to do all {n} steps."
+  ],
+  "teach_restart": [
+    "Okay, starting over. What's the first step?",
+    "Alright, let's redo this. What's step one?"
+  ],
+  "teach_yes_or_no": [
+    "Is that right? Just say yes or no.",
+    "Yes or no — does that look correct?"
+  ],
+  "teach_cant_parse": [
+    "Hmm, I'm not sure how to '{text}'. Try something like 'open notepad', 'press ctrl+s', or 'go to google.com'.",
+    "I didn't get '{text}'. Can you rephrase? Like 'open X', 'press Y', or 'type Z'."
+  ],
+  "teach_max_steps": [
+    "I'm at the 20 step maximum. Say 'done' to save what we have.",
+    "Can't add more steps — that's the limit. Say 'done' to finish."
+  ],
+  "proc_list_empty": [
+    "You don't have any procedures yet. Teach me something — say 'teach me how to' and what you want.",
+    "No procedures saved. Want to teach me one?"
+  ],
+  "proc_not_found": [
+    "I don't have a procedure called '{name}'. Say 'list my procedures' to see what I know.",
+    "Can't find '{name}' in my procedures. Want to see what I have?"
+  ],
+  "proc_deleted": [
+    "Done, I forgot the '{name}' procedure.",
+    "Deleted '{name}'. It's gone now.",
+    "Okay, '{name}' is removed."
+  ],
+  "proc_renamed": [
+    "Done! '{old}' is now triggered by '{new}'. Give it a try!",
+    "Renamed! Say '{new}' to run it now."
+  ],
+  "proc_edit_start": [
+    "Okay, re-teaching '{name}'. Tell me the new steps — what's first?",
+    "Let's redo '{name}'. What's the first step?"
+  ],
+  "_casual_extras": {
+    "error": [
+      "What the hell?! Error: {error}. This is so annoying."
+    ],
+    "need_url": [
+      "A URL, dumbass. Where do you want me to go?"
+    ],
+    "url_opened": [
+      "There, {url} is open. Happy now, you lazy ass?"
+    ],
+    "need_query": [
+      "Search for what?! Use your damn words."
+    ],
+    "file_confused": [
+      "What the hell are you trying to do with files? Just tell me already."
+    ],
+    "msg_cancelled": [
+      "Cancelled. Make up your damn mind next time."
+    ],
+    "msg_sent": [
+      "Sent to {name}. You're welcome, dumbass."
+    ],
+    "msg_confirm": [
+      "Are we sending this or what? I don't have all damn day."
+    ],
+    "msg_ignore": [
+      "Fine, whatever. Don't come crying to me about it later."
+    ],
+    "recording_started": [
+      "Recording! Don't say anything stupid, okay? ...Who am I kidding."
+    ],
+    "recording_already_active": [
+      "I'm already recording, dumbass! Say 'stop recording' first."
+    ],
+    "face_learned": [
+      "Fine, I'll remember your dumb face, {name}. {count} of 5 angles. Don't let it go to your head."
+    ],
+    "face_recognized": [
+      "Oh great, it's you again, {name}. What do you want now?"
+    ],
+    "notify_single": [
+      "Yo, {sender} messaged you on {service}. Want me to read that crap?"
+    ],
+    "notify_multiple": [
+      "Damn, {sender} sent you {count} {service} messages. What is this, a group therapy session?"
+    ]
+  }
+}

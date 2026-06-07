@@ -1,0 +1,95 @@
+{
+  "schema_version": 1,
+  "services": {
+    "spotify": {
+      "auth_type": "oauth",
+      "packages": ["spotipy"],
+      "min_scopes": [
+        "playlist-read-private",
+        "playlist-read-collaborative",
+        "user-library-read",
+        "user-read-playback-state",
+        "user-modify-playback-state"
+      ],
+      "auth_extras": {},
+      "banned_auth_classes": [
+        "SpotifyOAuth",
+        "SpotifyClientCredentials",
+        "SpotifyPKCE"
+      ],
+      "constructor_names": ["Spotify"],
+      "blocked_actions": [],
+      "env_aliases": {
+        "spotipy": {
+          "SPOTIPY_CLIENT_ID": "$SPOTIFY_CLIENT_ID",
+          "SPOTIPY_CLIENT_SECRET": "$SPOTIFY_CLIENT_SECRET",
+          "SPOTIPY_REDIRECT_URI": "http://localhost:8888/callback",
+          "SPOTIPY_ACCESS_TOKEN": "$SPOTIFY_ACCESS_TOKEN"
+        }
+      },
+      "developer_url": "https://developer.spotify.com/dashboard",
+      "router_hint": "Music playback/control -> spotipy."
+    },
+    "gmail": {
+      "auth_type": "oauth",
+      "packages": [
+        "google-api-python-client",
+        "google-auth-oauthlib"
+      ],
+      "min_scopes": [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.compose"
+      ],
+      "auth_extras": {
+        "access_type": "offline",
+        "prompt": "consent"
+      },
+      "banned_auth_classes": [
+        "InstalledAppFlow",
+        "Flow"
+      ],
+      "constructor_names": ["build", "Credentials"],
+      "blocked_actions": [
+        ["messages().send", "Sending emails is blocked. Use drafts().create() to save as draft instead."],
+        ["messages/send", "Sending emails is blocked. Use drafts().create() to save as draft instead."],
+        ["messages().delete", "Deleting emails is blocked."],
+        ["messages().batchDelete", "Batch deleting emails is blocked."],
+        ["messages/delete", "Deleting emails is blocked."],
+        ["messages/batchDelete", "Batch deleting emails is blocked."],
+        ["messages().trash", "Trashing emails is blocked."],
+        ["messages/trash", "Trashing emails is blocked."],
+        ["messages().batchModify", "Batch modifying emails is blocked."],
+        ["messages/batchModify", "Batch modifying emails is blocked."],
+        ["settings().filters().create", "Creating email filters is blocked."],
+        ["settings/filters", "Modifying email filters is blocked."],
+        ["settings().forwardingAddresses", "Modifying email forwarding is blocked."],
+        ["settings/forwardingAddresses", "Modifying email forwarding is blocked."],
+        ["settings().updateAutoForwarding", "Modifying auto-forwarding is blocked."],
+        ["updateAutoForwarding", "Modifying auto-forwarding is blocked."],
+        ["settings().updateVacation", "Modifying vacation responder is blocked."]
+      ],
+      "env_aliases": {},
+      "developer_url": "https://console.cloud.google.com/apis/credentials",
+      "router_hint": "Email (read/send/draft) -> google-api-python-client + google-auth-oauthlib.\n    NEVER use smtplib, imaplib, or email.mime -- always use the Google API.\n    \"Send email\" -> template_slug should be a DRAFT (user sends manually)."
+    },
+    "whatsapp": {
+      "auth_type": "device",
+      "packages": ["neonize"],
+      "min_scopes": [],
+      "auth_extras": {},
+      "banned_auth_classes": [],
+      "constructor_names": [],
+      "blocked_actions": [],
+      "env_aliases": {},
+      "developer_url": null,
+      "router_hint": "WhatsApp messages -> neonize. Uses messaging bridge HTTP API."
+    }
+  },
+  "generic_constructor_names": ["Client"],
+  "generic_router_hints": [
+    "System audio (volume/mute) -> pycaw.",
+    "Weather/generic HTTP -> requests.",
+    "Telegram messages -> telethon. Uses messaging bridge HTTP API.",
+    "Image processing, color detection, pixel analysis, grid sampling, contour detection, HSV classification -> opencv-python + numpy. NEVER use Pillow/PIL for image analysis -- always use opencv-python."
+  ]
+}

@@ -1,0 +1,54 @@
+[tool.importlinter]
+root_packages = ["assistant"]
+
+[[tool.importlinter.contracts]]
+name = "IO never imports actions"
+type = "forbidden"
+source_modules = ["assistant.io"]
+forbidden_modules = ["assistant.actions"]
+
+[[tool.importlinter.contracts]]
+name = "IO never imports main"
+type = "forbidden"
+source_modules = ["assistant.io"]
+forbidden_modules = ["assistant.main"]
+
+[[tool.importlinter.contracts]]
+name = "Config never imports storage"
+type = "forbidden"
+source_modules = ["assistant.config"]
+forbidden_modules = ["assistant.storage"]
+# Known transitive tech-debt: config.py itself never imports storage directly.
+# The violations are all in domain modules reached transitively via lazy
+# function-level imports (config re-exports llm/prompts.py builders for compat).
+#
+# Root causes to fix (tracked):
+#   1. core/runtime_config.py uses function-level lazy storage imports
+#      → fix: relocate runtime_config out of core/
+#   2. Domain facades (personality, preferences, memory, etc.) import storage at
+#      module top-level and are lazy-imported by llm/prompts.py which config re-exports
+#      → fix: make domain facades use deferred DB access
+ignore_imports = [
+    "assistant.core.runtime_config -> assistant.storage.db",
+    "assistant.core.runtime_config -> assistant.storage.repos.settings",
+    "assistant.personality -> assistant.storage.db",
+    "assistant.personality -> assistant.storage.repos.personality",
+    "assistant.preferences -> assistant.storage.db",
+    "assistant.preferences -> assistant.storage.repos.preference",
+    "assistant.memory -> assistant.storage.db",
+    "assistant.memory -> assistant.storage.repos.memory",
+    "assistant.reminders -> assistant.storage.db",
+    "assistant.shortcuts -> assistant.storage.db",
+    "assistant.shortcuts -> assistant.storage.repos.shortcut",
+    "assistant.settings -> assistant.storage.db",
+    "assistant.settings -> assistant.storage.repos.settings",
+    "assistant.procedures -> assistant.storage.db",
+    "assistant.procedures -> assistant.storage.repos.procedure",
+    "assistant.proactive -> assistant.storage.db",
+]
+
+[[tool.importlinter.contracts]]
+name = "Overlay never imports actions or automation"
+type = "forbidden"
+source_modules = ["assistant.io.overlay"]
+forbidden_modules = ["assistant.actions", "assistant.automation"]

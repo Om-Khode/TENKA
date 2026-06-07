@@ -1,0 +1,33 @@
+TENKA — Transformative Evolving Neural Kinetic Agent
+Copyright 2026 Om Khode
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full text.
+
+Created and maintained by Om Khode.
+
+If you fork, modify, or redistribute this software, you are required by the
+Apache License (§4) to retain this NOTICE file in your distribution. Crediting
+the original author in user-facing documentation is appreciated but not
+legally required beyond what the License demands.
+
+────────────────────────────────────────────────────────────────────────────
+
+Third-party software bundled or required by TENKA at runtime — each retains
+its own license. This list is non-exhaustive; refer to each project's site
+for canonical license terms.
+
+  faster-whisper       MIT       https://github.com/SYSTRAN/faster-whisper
+  Kokoro TTS           Apache-2  https://github.com/hexgrad/kokoro
+  openWakeWord         Apache-2  https://github.com/dscripka/openWakeWord
+  SpeechBrain          Apache-2  https://github.com/speechbrain/speechbrain
+  Playwright           Apache-2  https://github.com/microsoft/playwright-python
+  Terminator           MIT       https://github.com/mediar-ai/terminator
+  FAISS                MIT       https://github.com/facebookresearch/faiss
+  sentence-transformers Apache-2 https://github.com/UKPLab/sentence-transformers
+  pyautogui            BSD-3     https://github.com/asweigart/pyautogui
+  pygetwindow          BSD-3     https://github.com/asweigart/pygetwindow
+
+LLM providers (Gemini, Groq, Cerebras, Tavily, Jina, Hugging Face, Ollama)
+are accessed as services via their public APIs; no provider code is bundled
+into TENKA. Each provider's terms of service apply to your use of their API.

@@ -1,0 +1,95 @@
+# TENKA — Voice Assistant (Python)
+# Install with: pip install -r requirements.txt
+# Or run the setup wizard: python scripts/setup.py
+
+# STT (Speech-to-Text) — choose one or both:
+faster-whisper       # CTranslate2-based Whisper (downloads own model)
+# Note: whisper_cpp backend uses HTTP calls, no extra pip package needed
+
+# TTS (Text-to-Speech)  
+kokoro>=0.9          # Local Kokoro TTS (no Docker needed)
+pysbd               # Sentence boundary detection (streaming TTS)
+
+# Terminal UX
+prompt_toolkit>=3.0  # Chat input autocomplete + history (RC-1)
+
+# Audio I/O
+sounddevice          # Microphone recording and audio playback
+soundfile            # WAV file reading/writing (required by sounddevice)
+numpy                # Audio data manipulation
+
+# LLM
+google-genai         # Google Gemini (primary — unified text + vision multimodal)
+groq                 # Groq cloud API (fallback)
+cerebras-cloud-sdk   # Cerebras Inference API (fallback)
+requests             # HTTP calls (Ollama fallback, whisper.cpp server, Tavily web search)
+pydantic>=2.0        # Schema validation (LLM JSON responses, app manifests)
+
+# Screen reading & OCR
+mss                  # Fast cross-platform screenshots
+easyocr              # OCR engine (downloads model on first run, ~100 MB)
+pygetwindow          # Window title detection (Windows)
+winrt-Windows.Foundation # SMTC media playback verification (Windows)
+comtypes             # Windows UI Automation (Reading browser tabs)
+Pillow               # Image manipulation
+
+# Computer agent (mouse/keyboard automation)
+pyautogui            # Mouse & keyboard automation
+pyperclip            # Clipboard read/write
+
+# Browser automation (three-tier dispatch tier 1)
+playwright           # Browser driver. After install: playwright install chromium
+
+# Native Windows automation (three-tier dispatch tier 2)
+terminator           # Terminator Rust SDK Python bindings (PyO3) — primary
+pywinauto            # Win32/UIA automation — fallback
+
+# Manifest + config parsing
+PyYAML               # per-app manifests, generic config
+
+# Credentials
+cryptography         # AES-GCM at-rest encryption for OAuth tokens
+
+# Wake word detection (open-source, no API key needed)
+openwakeword         # openWakeWord engine (https://github.com/dscripka/openWakeWord)
+                     # Uses sounddevice (already listed above) for mic access
+
+# Keyboard input (for standalone testing without Unity)
+pynput               # Global keyboard listener
+
+# System info
+psutil               # Battery, CPU, RAM, disk, uptime queries
+nest_asyncio         # Asyncio event loop management
+tzlocal              # Map Windows registry TZ → IANA name (setup wizard region/TZ)
+
+# Vector Database (Memory RAG)
+sentence-transformers>=3.0.0
+faiss-cpu>=1.7.4
+spacy>=3.7.0
+huggingface_hub      # Model snapshot download (SpeechBrain, Kokoro)
+
+# Audio DSP
+scipy                # Resampling + bandpass filter for TTS streaming
+
+# OS Operations
+send2trash
+opencv-python
+dlib
+face_recognition
+
+# Speaker Verification
+speechbrain
+torch                # Required by speechbrain + torchaudio (declared explicitly)
+torchaudio
+
+# Scheduling
+croniter              # Cron expression parsing for scheduler (scheduled conditional tasks)
+
+# Event monitoring
+winsdk
+
+# Messaging adapters (optional features — guarded by try/except in code)
+neonize              # WhatsApp Web client (only needed if using WA-2 messaging)
+
+# Import boundary enforcement
+import-linter>=2.1

@@ -1,0 +1,29 @@
+# ─── TENKA commit template ───────────────────────────────────────────
+# Format:
+#   <type>: <imperative summary, <= 72 chars>
+#
+#   <optional body — what & why, wrap at 72>
+#
+#   TENKA ~ "<tsundere one-liner reacting to THIS specific change>"
+#
+# Types: feat | fix | refactor | chore | docs | test | perf
+#
+# The TENKA line is mandatory on every commit. It must:
+#   • be in-character (tsundere — reluctant, prickly, secretly pleased)
+#   • react to what THIS commit actually changes (not generic)
+#   • stay in double quotes after `TENKA ~ `
+#   • be a single line
+#
+# Examples (do NOT reuse verbatim — write fresh per commit):
+#   feat: mute other windows while TTS is speaking
+#
+#   TENKA ~ "Ohhh so now I can shut up the noisy windows when I speak? How convenient. Not like I needed quiet or anything."
+#
+#   fix: stop browser planner from reusing stale page handle
+#
+#   TENKA ~ "Hmph, fine, I'll remember which tab I was on. Don't get used to me being this thoughtful."
+#
+#   refactor: collapse three pending-state handlers into one dispatcher
+#
+#   TENKA ~ "There. Cleaner. Not because you asked — it was bothering me."
+# ─────────────────────────────────────────────────────────────────────

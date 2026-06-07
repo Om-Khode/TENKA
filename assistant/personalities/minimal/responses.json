@@ -1,0 +1,125 @@
+{
+  "error": [
+    "Error: {error}."
+  ],
+  "need_url": [
+    "Need a URL."
+  ],
+  "url_opened": [
+    "Opened {url}."
+  ],
+  "need_query": [
+    "What should I search for?"
+  ],
+  "need_browse_url": [
+    "Need a URL to read."
+  ],
+  "page_unreadable": [
+    "Can't read that page."
+  ],
+  "file_confused": [
+    "Specify the file operation: find, read, list, or open."
+  ],
+  "msg_cancelled": [
+    "Message cancelled."
+  ],
+  "msg_sent": [
+    "Sent to {name}."
+  ],
+  "msg_send_failed": [
+    "Failed to send to {name}: {error}."
+  ],
+  "msg_confirm": [
+    "Send it? Yes or no."
+  ],
+  "msg_ignore": [
+    "Ignored."
+  ],
+  "msg_empty": [
+    "Empty message."
+  ],
+  "msg_read_prompt": [
+    "Read it? Yes or no."
+  ],
+  "recording_started": [
+    "Recording. Say 'stop recording' to finish."
+  ],
+  "recording_already_active": [
+    "Already recording."
+  ],
+  "recording_not_active": [
+    "Not recording."
+  ],
+  "face_learned": [
+    "{name} saved. {count} of 5 angles."
+  ],
+  "face_need_name": [
+    "Say '{assistant_name_lower} this is' and your name."
+  ],
+  "face_recognized": [
+    "{name} recognized."
+  ],
+  "face_forget_who": [
+    "Forget who? Give me a name."
+  ],
+  "face_forgotten": [
+    "{name} forgotten."
+  ],
+  "face_unknown": [
+    "No record of {name}."
+  ],
+  "notify_single": [
+    "{service} message from {sender}. Read it?"
+  ],
+  "notify_multiple": [
+    "{count} {service} messages from {sender}."
+  ],
+  "note_created": [
+    "Note '{title}' saved."
+  ],
+  "teach_got_it": [
+    "{desc}. Next?"
+  ],
+  "teach_got_it_warn": [
+    "{desc}. {warn}"
+  ],
+  "teach_need_step": [
+    "Need at least one step."
+  ],
+  "teach_confirm": [
+    "Steps:\n{steps}\nCorrect?"
+  ],
+  "teach_ask_trigger": [
+    "Trigger phrase? Use '{name_seed}'?"
+  ],
+  "teach_saved": [
+    "Saved. Say '{trigger}' to run {n} steps."
+  ],
+  "teach_restart": [
+    "Starting over. First step?"
+  ],
+  "teach_yes_or_no": [
+    "Correct? Yes or no."
+  ],
+  "teach_cant_parse": [
+    "Can't parse '{text}'. Try 'open X' or 'press Y'."
+  ],
+  "teach_max_steps": [
+    "Step limit reached. Say 'done'."
+  ],
+  "proc_list_empty": [
+    "No procedures saved."
+  ],
+  "proc_not_found": [
+    "No procedure '{name}' found."
+  ],
+  "proc_deleted": [
+    "Deleted '{name}'."
+  ],
+  "proc_renamed": [
+    "Renamed to '{new}'."
+  ],
+  "proc_edit_start": [
+    "Re-teaching '{name}'. First step?"
+  ]
+}

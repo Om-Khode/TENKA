@@ -1,0 +1,20 @@
+{
+  "window_title": "Test App Window",
+  "process_names": ["TestApp.exe"],
+  "elements": {
+    "play_btn_v2": {
+      "automation_id": "play_btn_v2",
+      "control_type": "Button",
+      "name": "Play",
+      "parent_chain": ["Window[Name~'TestApp']", "Pane[ClassName~'Chrome_WidgetWin']"],
+      "sibling_count": 5
+    },
+    "next-track-button": {
+      "automation_id": "next-track-button",
+      "control_type": "Button",
+      "name": "Next",
+      "parent_chain": ["Window[Name~'TestApp']", "Pane[ClassName~'Chrome_WidgetWin']"],
+      "sibling_count": 5
+    }
+  }
+}

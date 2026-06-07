@@ -1,0 +1,79 @@
+# ─── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+.pytest_cache/
+.import_linter_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ─── Virtual environments ────────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ─── Secrets / local config ──────────────────────────────
+.env
+.env.local
+*.pem
+*.key
+credentials/
+
+# ─── User data (defense-in-depth; SANDBOX_DIR lives outside repo) ──
+# These should never end up in the repo, but ignore anyway in case
+# someone runs TENKA from inside the working tree during development.
+*.db
+*.db-journal
+*.npz
+*.npy
+*.faiss
+
+# ─── Setup wizard runtime marker (per-machine, schema v1) ─
+.tenka_setup.json
+
+# ─── Runtime artifacts ───────────────────────────────────
+debug.log
+*.log
+assistant/debug.log
+
+# ─── Downloaded / cached models ──────────────────────────
+# Root-level models/ holds downloaded SpeechBrain / etc. weights.
+# Wake-word models in assistant/models/ are ignored by default — only the
+# bundled tenka.onnx/tenka.tflite are tracked (negation rules below).
+# Custom-trained models you drop in there stay local.
+/models/
+*.ckpt
+*.gguf
+*.onnx
+*.tflite
+!assistant/models/tenka.onnx
+!assistant/models/tenka.tflite
+
+# ─── IDE / OS ────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Claude Code session state ───────────────────────────
+.claude/worktrees/
+.superpowers/
+
+# ─── Private / internal docs (not for public repo) ───────
+CLAUDE.md
+ARCHITECTURE.md
+docs/
+
+# ─── Claude Code project-local config ────────────────────
+.claude/
