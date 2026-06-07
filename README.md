@@ -6,7 +6,7 @@ The name is the thesis: **TENKA evolves without dependency**. Adding support for
 
 Created by **Om Khode**. Licensed under [Apache 2.0](./LICENSE).
 
-> Status: pre-release. Targeting v1.0 end of June 2026. Expect rough edges.
+> Status: v1.0.0 released 2026-06-07. Active development continues — expect rough edges. Bug reports and PRs welcome.
 
 ---
 
