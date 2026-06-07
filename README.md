@@ -1,6 +1,6 @@
 # TENKA
 
-**Transformative Evolving Neural Kinetic Agent** — a standalone Python voice agent for Windows. She listens, thinks, remembers, and acts on the desktop.
+**Transformative Evolving Neural Kinetic Agent** — a local-first Python voice agent for Windows. She listens, thinks, remembers, and acts on the desktop.
 
 The name is the thesis: **TENKA evolves without dependency**. Adding support for a new app, service, or domain must not require code changes. Apps are discovered at runtime, learned from your behavior, and stored as data.
 
@@ -100,7 +100,7 @@ TENKA is a single Python process with a few long-lived domains:
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │  io/  (audio in/out, overlay, screen, status broadcaster)      │
-│  ─────────────────────────────────────────────────────────────  │
+├────────────────────────────────────────────────────────────────┤
 │  llm/        — provider chain + task-shaped contracts          │
 │  storage/    — single SQLite DB + FAISS indexes                │
 │  automation/ — three-tier desktop control + manifest learning  │

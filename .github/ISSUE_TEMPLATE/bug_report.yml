@@ -11,7 +11,7 @@ body:
         Describe the issue in detail.
 
         ⚠️ Please report only **one** bug per issue. Submitting multiple bugs will make the report invalid and it may be ignored or deleted.
-      placeholder: "It crashed when I clicked X..."
+      placeholder: "It crashed when I said the wake word..."
     validations:
       required: true
 
@@ -24,30 +24,53 @@ body:
     validations:
       required: true
 
-  - type: dropdown
-    id: version
+  - type: input
+    id: commit
     attributes:
-      label: App Version
-      description: Which version were you using when the bug occurred?
-      options:
-        - "2.1.4"
-        - "2.1.2"
-        - "2.1.0"
-        - "1.9.8"
-        - "1.9.5"
+      label: Commit / version
+      description: |
+        TENKA has no released versions yet — please paste the commit SHA you're running.
+        Get it with: `git rev-parse --short HEAD`
+      placeholder: "e.g. 31b54a8 (or 'latest main')"
     validations:
       required: true
 
   - type: dropdown
-    id: store-edition
+    id: python
     attributes:
-      label: Store Edition
-      description: Where did you get this version of the app?
+      label: Python version
+      description: Output of `python --version`. TENKA is tested on 3.11.x.
       options:
-        - "GitHub Edition"
-        - "Steam Edition"
+        - "3.11.x"
+        - "3.12.x"
+        - "3.10.x"
+        - "Other (please mention in 'What happened?')"
     validations:
       required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      description: TENKA is Windows-only.
+      options:
+        - "Windows 11"
+        - "Windows 10"
+        - "Other (please mention in 'What happened?')"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        Paste the relevant lines from `assistant/debug.log` (around the time the bug happened).
+        Trim aggressively — only what's needed to understand the failure.
+      placeholder: "Paste log excerpt here..."
+      render: shell
+    validations:
+      required: false
 
   - type: checkboxes
     id: read_note
