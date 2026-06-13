@@ -456,8 +456,18 @@ class TestFormIntentExpandedKeywords(unittest.TestCase):
 
 
 def _run(coro):
-    """Run a coroutine in a new event loop and return its result."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    """Run a coroutine in a new event loop and return its result.
+
+    Uses `asyncio.new_event_loop()` directly — `get_event_loop()` is
+    deprecated since 3.10 and raises RuntimeError when no loop is set
+    in the current thread (which is the case under pytest's default
+    test isolation).
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # ─── _execute_dom_task: form-intent routing to run_dom_form_fill ─────────
@@ -466,31 +476,34 @@ def _run(coro):
 class TestDomFormFillRouting(unittest.TestCase):
     """Verify _execute_dom_task calls run_dom_form_fill for form-intent goals."""
 
-    @patch("assistant.automation.router.browser_dom_orchestrator.run_dom_form_fill", new_callable=AsyncMock)
-    @patch("assistant.automation.router.browser_dom_orchestrator.run_dom_task", new_callable=AsyncMock)
+    # _execute_dom_task imports browser_cdp / browser_dom_orchestrator
+    # LOCALLY (lazy import at line ~1565 of router.py), so patches must
+    # target the source modules, not `router.<name>` which never exists.
+    @patch("assistant.automation.browser.dom_orchestrator.run_dom_form_fill", new_callable=AsyncMock)
+    @patch("assistant.automation.browser.dom_orchestrator.run_dom_task", new_callable=AsyncMock)
     @patch("assistant.automation.router._pick_active_page", new_callable=AsyncMock)
-    @patch("assistant.automation.router.browser_cdp.get_or_attach_browser", new_callable=AsyncMock)
+    @patch("assistant.automation.browser.cdp.get_or_attach_browser", new_callable=AsyncMock)
     def test_form_intent_uses_form_fill(self, mock_cdp, mock_pick, mock_old, mock_new):
-        mock_cdp.return_value = MagicMock()
+        mock_cdp.return_value = MagicMock(kind="cdp", attachment=MagicMock())
         mock_pick.return_value = MagicMock()
         mock_new.return_value = MagicMock(
             success=True, final_summary="Form submitted.", reason="completed",
         )
-        result = _run(da._execute_dom_task("Fill the registration form with test data"))
+        _run(da._execute_dom_task("Fill the registration form with test data"))
         mock_new.assert_called_once()
         mock_old.assert_not_called()
 
-    @patch("assistant.automation.router.browser_dom_orchestrator.run_dom_form_fill", new_callable=AsyncMock)
-    @patch("assistant.automation.router.browser_dom_orchestrator.run_dom_task", new_callable=AsyncMock)
+    @patch("assistant.automation.browser.dom_orchestrator.run_dom_form_fill", new_callable=AsyncMock)
+    @patch("assistant.automation.browser.dom_orchestrator.run_dom_task", new_callable=AsyncMock)
     @patch("assistant.automation.router._pick_active_page", new_callable=AsyncMock)
-    @patch("assistant.automation.router.browser_cdp.get_or_attach_browser", new_callable=AsyncMock)
+    @patch("assistant.automation.browser.cdp.get_or_attach_browser", new_callable=AsyncMock)
     def test_non_form_uses_old_loop(self, mock_cdp, mock_pick, mock_old, mock_new):
-        mock_cdp.return_value = MagicMock()
+        mock_cdp.return_value = MagicMock(kind="cdp", attachment=MagicMock())
         mock_pick.return_value = MagicMock()
         mock_old.return_value = MagicMock(
             success=True, final_summary="Done.", reason="completed",
         )
-        result = _run(da._execute_dom_task("Click the search button"))
+        _run(da._execute_dom_task("Click the search button"))
         mock_old.assert_called_once()
         mock_new.assert_not_called()
 

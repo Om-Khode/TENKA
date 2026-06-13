@@ -45,8 +45,7 @@ def reg_setup(tmp_path):
 
 
 def test_regex_router_dispatches_to_manifest_intent_when_active_app_matches(reg_setup):
-    # Use "press play" — "play music" collides with _PLAY_RE further down
-    # the router; "press play" matches no other pre-route pattern, so the
+    # Use "press play" — it matches no other pre-route pattern, so the
     # negative test below can assert `result is None` cleanly.
     with patch("assistant.automation.router.detect_active_app",
                return_value={"process_names": ["TestApp.exe"],

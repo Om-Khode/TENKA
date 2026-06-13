@@ -181,13 +181,16 @@ def test_open_app_case_insensitive():
 
 # ─── code_executor (music) ───────────────────────────────────────────────────
 
-def test_play_music():
-    r = matches("play my liked songs on spotify", "code_executor")
-    assert r.params["goal"] == "play my liked songs on spotify"
-
-    matches("play some music", "code_executor")
-    matches("play Bohemian Rhapsody", "code_executor")
-    matches("start playing music", "code_executor")
+def test_play_falls_through_to_llm():
+    # "play {X}" is intentionally NOT shortcut-routed. The LLM + intent.Guard 3
+    # are needed to distinguish "play X on spotify" (code_executor) from
+    # "play X on browser" / "play X on youtube" (computer_task → browser).
+    no_match("play my liked songs on spotify")
+    no_match("play some music")
+    no_match("play Bohemian Rhapsody")
+    no_match("start playing music")
+    no_match("play cat video on youtube")
+    no_match("play something on browser")
 
 
 def test_music_controls():
@@ -202,7 +205,9 @@ def test_music_controls():
 
 
 def test_music_case_insensitive():
-    matches("PLAY some music", "code_executor")
+    # "PLAY some music" falls through to the LLM (no _PLAY_RE shortcut).
+    # Music transport controls remain case-insensitive on the fast path.
+    no_match("PLAY some music")
     matches("Next Song", "code_executor")
 
 
@@ -526,7 +531,9 @@ def test_compound_requests_still_match_first_intent():
     # doesn't need to detect compound requests itself.
     matches("search for keyboards and then open amazon", "web_search")
     matches("open settings and change the volume", "computer_task")
-    matches("play music and remind me in 10 minutes", "code_executor")
+    # "play music and remind me in 10 minutes" no longer has a regex shortcut —
+    # falls through to the LLM (planner). Asserted as no_match here.
+    no_match("play music and remind me in 10 minutes")
 
 
 def test_ambiguous_fall_through():

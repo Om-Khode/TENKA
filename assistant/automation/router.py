@@ -414,6 +414,62 @@ _DETECT_STOP_WORDS = frozenset({
     "pause", "stop", "next", "back", "forward", "new", "tab", "window",
 })
 
+# ─── Generic category nouns / content verbs (not specific app names) ────────
+#
+# Linguistic categories that look syntactically like app names in patterns
+# such as "open X" or "X on Y" but never are. Without these, the router
+# captures "browser" / "music" / "video" as app names, then tries to launch
+# them via Win-key search — which (e.g.) opened the "browser-cache" folder
+# in File Explorer when the user said "play X on browser".
+#
+# Kept generic — never a specific brand. THE-rule: routing decisions over
+# real apps (Spotify, Chrome, Notepad) come from `known_apps` / preferences,
+# not regex shortcuts.
+_GENERIC_CATEGORY_WORDS = frozenset({
+    "browser", "music", "video", "videos", "movie", "movies",
+    "song", "songs", "playlist", "site", "website", "app", "apps",
+    "player", "stream", "audio",
+})
+
+# Content verbs that the `launch_keyword` regex (`open|launch|start|run` + word)
+# wrongly captures as app names — e.g. "open play cat videos" → app="play".
+# Falling through to the LLM planner is correct here.
+_LAUNCH_VERB_STOPLIST = frozenset({
+    "play", "watch", "listen", "stream", "search", "find", "show",
+    "get", "make", "send", "tell", "ask",
+})
+
+# Matches goals that are LITERALLY just "open the browser" with no payload —
+# the only case where routing to native-focus on a running browser is what
+# the user actually wants. Anything richer (content verbs, site names,
+# form-fill) is browser-content work and must not be silently converted to
+# "focus the browser window".
+_BROWSER_ONLY_GOAL_RE = re.compile(
+    rf'^(?:open|launch|start|run|focus|switch\s+to)\s+'
+    rf'(?:my\s+|the\s+)?(?:{_BROWSER_ALT}|browser)\s*$',
+    re.IGNORECASE,
+)
+
+# Trailing "on/in browser" / "on music" / etc. — generic category suffix that
+# gives the router no app signal. Stripped before the LLM planner sees the
+# goal so it isn't tempted to navigate to "browser.com" or similar.
+_GENERIC_SUFFIX_RE = re.compile(
+    rf'\s+(?:on|in|with|using)\s+(?:the\s+|my\s+)?'
+    rf'(?:{"|".join(re.escape(w) for w in _GENERIC_CATEGORY_WORDS)})\s*$',
+    re.IGNORECASE,
+)
+
+
+def _strip_generic_category_suffix(goal: str) -> str:
+    """Drop a trailing "...on browser" / "...in music" generic suffix.
+
+    These suffixes carry no specific app routing signal — the router has
+    already used them to pick a backend, and leaving them in the goal sent
+    to the LLM planner can mislead it (e.g. navigating to "browser.com").
+    No-op when the suffix doesn't match.
+    """
+    return _GENERIC_SUFFIX_RE.sub("", goal).rstrip() if goal else goal
+
 
 def _detect_running_app(goal: str) -> Optional[str]:
     """
@@ -596,22 +652,41 @@ def detect_backend(goal: str) -> Tuple[str, Dict[str, Any]]:
     # Priority 3: Running OS process
     running_window = _detect_running_app(goal)
     if running_window:
-        # Same browser-content guard for goals that don't trip
-        # _BROWSER_INTENT_PATTERNS but still target an open browser.
-        # `open|launch|start|run <browser>` normally wants native focus —
-        # but if the goal ALSO has form-intent ("open chrome and fill the
-        # form"), the form-fill is the actual task and we should route to
-        # browser-content despite the "open browser" prefix.
-        if _BROWSER_NAMES.search(running_window) and (
-            not run_app_match or _FORM_INTENT_RE.search(goal)
-        ):
-            return _route_browser_content(goal, running_window)
+        # Browser-window special case. `_detect_running_app` matches goal
+        # words against the app-name portion of the window title, so any
+        # goal mentioning "youtube" / "twitter" / etc. matches a browser
+        # window currently on that site — but the user wants the *content*,
+        # not to focus a stale tab. Three sub-cases:
+        if _BROWSER_NAMES.search(running_window):
+            # 3a. Pure focus goal ("open chrome", "switch to firefox") —
+            #     intentional focus on the browser app. Native is right.
+            if _BROWSER_ONLY_GOAL_RE.match(goal.strip()):
+                return "native", {"reason": "running_app_detected", "app": running_window}
+            # 3b. Form-shape goal — DOM mode wins when CDP is up; falls
+            #     to vision-loop in `_route_browser_content` otherwise.
+            #     Preserves the "open chrome and fill form" carve-out.
+            if _FORM_INTENT_RE.search(goal):
+                return _route_browser_content(goal, running_window)
+            # 3c. Content-shape goal ("play X on youtube", "search Y") —
+            #     route to Playwright bundled, NOT _route_browser_content.
+            #     With CDP down (default), _route_browser_content collapses
+            #     to vision-loop (3-10 vision calls). The bundled-browser
+            #     path opens Chromium and navigates — zero vision calls,
+            #     which is the README-promised behavior.
+            return "browser", {
+                "reason": "browser_content_via_running_browser",
+                "running": running_window,
+            }
         return "native", {"reason": "running_app_detected", "app": running_window}
-    
+
     # Priority 4: App launch regex
     if run_app_match:
-        app_name = run_app_match.group(2)
-        return "native", {"reason": "launch_keyword", "app": app_name}
+        app_name = run_app_match.group(2).lower()
+        # Reject content verbs ("open play X" captures "play" as the app).
+        # Falling through to priorities 5+ / "unknown" is correct — the
+        # LLM planner will figure out the actual goal.
+        if app_name not in _LAUNCH_VERB_STOPLIST:
+            return "native", {"reason": "launch_keyword", "app": app_name}
 
     # Priority 5: "... on/in/with/using [app_name]" pattern
     # e.g., "multiply 3 and 4 on calculator", "play music on spotify"
@@ -627,7 +702,18 @@ def detect_backend(goal: str) -> Tuple[str, Dict[str, Any]]:
         skip = prep in ("with", "using") and _FORM_INTENT_RE.search(goal)
         if not skip:
             app_name = app_context_match.group(2).lower()
-            if len(app_name) > 2 and app_name not in ("it", "that", "this", "now", "here", "them", "all", "mode"):
+            # "X on browser" → use the user's default browser via
+            # _execute_browser_task, NOT open_application("browser").
+            # The latter once Win-key-searched and opened the local
+            # `browser-cache` Playwright folder in File Explorer.
+            if app_name == "browser":
+                return "browser", {"reason": "browser_category"}
+            # Other generic categories ("music", "video", …) don't name
+            # a specific app — fall through to "unknown" so the LLM
+            # planner can route from richer context.
+            if (len(app_name) > 2
+                    and app_name not in ("it", "that", "this", "now", "here", "them", "all", "mode")
+                    and app_name not in _GENERIC_CATEGORY_WORDS):
                 return "native", {"reason": "app_context_pattern", "app": app_name}
 
     # Priority 6 (fallback): browser-content via form-shape goal.
@@ -883,6 +969,13 @@ async def _execute_browser_task(goal: str, llm_func, *, _from_planner: bool = Fa
                                 _planner_goal: str = "") -> str:
     from .browser import automation as browser_automation
 
+    # Strip a trailing generic-category suffix ("on browser", "in music"…).
+    # `detect_backend` has already used that suffix to pick this backend;
+    # leaving it in the goal can mislead the LLM planner into navigating
+    # to "browser.com" or similar. Specific brands ("on youtube") are
+    # untouched.
+    goal = _strip_generic_category_suffix(goal)
+
     # Shortcut: "open <browser> [and] [go to] <url>" — honor the explicit
     # browser name. Playwright Chromium is wrong here (sandboxed, no user
     # data, closed by run_browser_steps' finally block).
@@ -1137,12 +1230,19 @@ def _extract_target_app(goal: str) -> tuple[Optional[str], str]:
     Used by _execute_native_task to honour an explicit target instead of
     silently falling back to the active window — which previously caused
     Ctrl+N to fire inside the user's IDE when they said `type X in notepad`.
+
+    Also rejects generic category words ("browser", "music", "video", …)
+    via `_GENERIC_CATEGORY_WORDS`. Without that guard, "play X on browser"
+    used to drive `_resolve_target_window("browser")` → Win-key search →
+    the `browser-cache` Playwright folder opened in File Explorer.
     """
     m = _APP_TARGET_SUFFIX_RE.search(goal)
     if not m:
         return None, goal
     candidate = m.group(1).lower()
-    if len(candidate) <= 2 or candidate in _APP_TARGET_STOP_WORDS:
+    if (len(candidate) <= 2
+            or candidate in _APP_TARGET_STOP_WORDS
+            or candidate in _GENERIC_CATEGORY_WORDS):
         return None, goal
     return candidate, goal[:m.start()].rstrip()
 

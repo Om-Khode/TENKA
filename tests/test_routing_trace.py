@@ -58,22 +58,28 @@ GENERIC_CASES = [
 ]
 
 
-all_failures = []
-print("=== Firefox open + browser-content goals ===")
-all_failures += trace(FIREFOX_OPEN, FIREFOX_CASES)
-print()
-print("=== Chrome open + launch goals ===")
-all_failures += trace(CHROME_OPEN, LAUNCH_CASES_CHROME)
-print()
-print("=== No browser open + generic goals ===")
-all_failures += trace(NO_BROWSER, GENERIC_CASES)
+def _main() -> int:
+    all_failures = []
+    print("=== Firefox open + browser-content goals ===")
+    all_failures += trace(FIREFOX_OPEN, FIREFOX_CASES)
+    print()
+    print("=== Chrome open + launch goals ===")
+    all_failures += trace(CHROME_OPEN, LAUNCH_CASES_CHROME)
+    print()
+    print("=== No browser open + generic goals ===")
+    all_failures += trace(NO_BROWSER, GENERIC_CASES)
 
-print()
-if all_failures:
-    print(f"{len(all_failures)} FAILED:")
-    for g, e, a in all_failures:
-        print(f"  - {g!r}  expected={e}  got={a}")
-    raise SystemExit(1)
+    print()
+    if all_failures:
+        print(f"{len(all_failures)} FAILED:")
+        for g, e, a in all_failures:
+            print(f"  - {g!r}  expected={e}  got={a}")
+        return 1
 
-total = len(FIREFOX_CASES) + len(LAUNCH_CASES_CHROME) + len(GENERIC_CASES)
-print(f"All {total} routing cases passed.")
+    total = len(FIREFOX_CASES) + len(LAUNCH_CASES_CHROME) + len(GENERIC_CASES)
+    print(f"All {total} routing cases passed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

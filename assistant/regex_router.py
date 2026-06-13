@@ -50,6 +50,10 @@ _NON_APP_WORDS = frozenset({
     "file", "document", "folder", "link", "url",
     "page", "website", "site",
     "recording", "record",
+    # Media verbs — "start playing X" / "start streaming X" must fall through
+    # to the LLM (code_executor / browser routing), not be treated as an app
+    # launch. "open music" is still fine (music isn't a media verb here).
+    "playing", "streaming", "watching", "listening",
 })
 
 # ─── Compiled Patterns ───────────────────────────────────────────────────────
@@ -77,10 +81,12 @@ _COMPOUND_ACTION_RE = re.compile(
 # "open / launch / start {app}"
 _OPEN_APP_RE = re.compile(r"^(?:open|launch|start)\s+(.+)$", re.I)
 
-# Music play: "play {X}" or "start playing {X}"
-_PLAY_RE = re.compile(r"^(?:play|start\s+playing)\s+(.+)$", re.I)
-
-# Music transport controls (no argument needed)
+# Music transport controls (no argument needed).
+# Note: there is intentionally no "play {X}" regex shortcut. "play" is too
+# ambiguous to deterministically route here — "play X on browser" or
+# "play X on youtube" needed the LLM + intent.Guard 3 (browser post-correction)
+# to land on the right backend. Let the LLM classify; INTENT_SYSTEM_PROMPT
+# Rule 1 already pins music/media to code_executor.
 _MUSIC_CTRL_RE = re.compile(
     r"^(?:pause|resume|unpause"
     r"|next\s*(?:song|track)?"
@@ -435,10 +441,10 @@ def pre_route(text: str) -> IntentResult | None:
     if len(t.split()) <= 3 and _URL_RE.match(t):
         return IntentResult(intent="open_browser", response=t, params={"url": t})
 
-    # ── Music playback — before open-app check ("start playing" uses "start") ─
-    if _PLAY_RE.match(t):
-        return IntentResult(intent="code_executor", response=t, params={"goal": t})
-
+    # ── Music transport controls only ──────────────────────────────────────
+    # "play {X}" is intentionally NOT shortcut-routed here — see the note on
+    # _MUSIC_CTRL_RE above. Bare transport verbs ("pause", "next song", …)
+    # have no browser-context ambiguity and stay on the fast path.
     if _MUSIC_CTRL_RE.match(t):
         return IntentResult(intent="code_executor", response=t, params={"goal": t})
 
