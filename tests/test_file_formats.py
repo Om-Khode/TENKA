@@ -23,7 +23,7 @@ import assistant.file_manager as fm
 
 def test_rich_extensions_cover_popular_formats():
     """The popular office/document formats are registered."""
-    for ext in (".docx", ".pdf", ".xlsx", ".pptx", ".doc"):
+    for ext in (".docx", ".pdf", ".xlsx", ".pptx"):
         assert ext in fm.RICH_DOC_EXTENSIONS
         assert ext in fm._DOC_EXTRACTORS
 

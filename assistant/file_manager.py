@@ -257,26 +257,6 @@ def _extract_pptx(path: Path) -> str:
     return "\n".join(out)
 
 
-def _extract_doc(path: Path) -> str:
-    # Legacy binary .doc — best-effort via Word COM automation (needs Word + pywin32).
-    try:
-        import win32com.client as win32  # pywin32
-    except ImportError:
-        raise ImportError("pywin32")
-    import pythoncom
-    pythoncom.CoInitialize()
-    word = win32.Dispatch("Word.Application")
-    word.Visible = False
-    try:
-        doc = word.Documents.Open(str(path), ReadOnly=True)
-        text = doc.Content.Text
-        doc.Close(False)
-        return text
-    finally:
-        word.Quit()
-        pythoncom.CoUninitialize()
-
-
 # extension → (pip package, extractor)
 _DOC_EXTRACTORS = {
     ".docx": ("python-docx", _extract_docx),
@@ -284,7 +264,6 @@ _DOC_EXTRACTORS = {
     ".xlsx": ("openpyxl", _extract_xlsx),
     ".xlsm": ("openpyxl", _extract_xlsx),
     ".pptx": ("python-pptx", _extract_pptx),
-    ".doc":  ("pywin32", _extract_doc),
 }
 RICH_DOC_EXTENSIONS = frozenset(_DOC_EXTRACTORS)
 
@@ -331,7 +310,7 @@ def read_file(path: Path) -> str:
         return (
             f"I can't read {path.suffix} files yet — I support text formats "
             f"(.txt, .md, .py, .json, .csv …) and documents "
-            f"(.docx, .pdf, .xlsx, .pptx, .doc)."
+            f"(.docx, .pdf, .xlsx, .pptx)."
         )
     for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
         try:

@@ -49,7 +49,6 @@ python-docx          # .docx  (Word)
 pypdf                # .pdf
 openpyxl             # .xlsx / .xlsm (Excel)
 python-pptx          # .pptx  (PowerPoint)
-# .doc (legacy binary) is read best-effort via Word COM if pywin32 is installed.
 
 # Manifest + config parsing
 PyYAML               # per-app manifests, generic config
