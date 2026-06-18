@@ -103,6 +103,59 @@ def test_resolve_file_path_returns_none():
             assert result is None
 
 
+# ─── 2b. _extract_explicit_path ──────────────────────────────────────────────
+
+def test_extract_explicit_path_quoted(tmp_path):
+    """A quoted absolute path inside a goal string is honored verbatim."""
+    from assistant.actions.file_ops import _extract_explicit_path
+
+    target = tmp_path / "World Building - Final.txt"
+    target.write_text("hi", encoding="utf-8")
+    goal = f"read this file '{target}'"
+    assert _extract_explicit_path(goal) == target
+
+
+def test_extract_explicit_path_unquoted_with_spaces(tmp_path):
+    """An unquoted absolute path containing spaces is recovered (exists guard)."""
+    from assistant.actions.file_ops import _extract_explicit_path
+
+    target = tmp_path / "MC Character Profile.docx"
+    target.write_text("x", encoding="utf-8")
+    goal = f"read file {target}"
+    assert _extract_explicit_path(goal) == target
+
+
+def test_extract_explicit_path_forward_slashes(tmp_path):
+    """Forward-slash paths (as the STT/LLM often emit) resolve too."""
+    from assistant.actions.file_ops import _extract_explicit_path
+
+    target = tmp_path / "notes.txt"
+    target.write_text("x", encoding="utf-8")
+    goal = f"& '{str(target).replace(chr(92), '/')}' can you read this file?"
+    assert _extract_explicit_path(goal) == target
+
+
+def test_extract_explicit_path_nonexistent_returns_none():
+    """A path that doesn't exist must not be returned (no false positives)."""
+    from assistant.actions.file_ops import _extract_explicit_path
+
+    assert _extract_explicit_path("read 'Z:/nope/missing.txt'") is None
+    assert _extract_explicit_path("just some words, no path") is None
+
+
+def test_resolve_file_path_cwd_match(tmp_path, monkeypatch):
+    """A bare filename present in the current working dir resolves via cwd."""
+    from assistant.actions.file_ops import _resolve_file_path
+
+    target = tmp_path / "report.csv"
+    target.write_text("a,b", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    with patch("assistant.file_manager.find_files", return_value=[]), \
+         patch("assistant.config.SANDBOX_DIR", tmp_path / "sandbox"):
+        result = _resolve_file_path("report.csv")
+        assert result == target
+
+
 # ─── 3. _resolve_dest_folder ─────────────────────────────────────────────────
 
 def test_resolve_dest_folder_known():

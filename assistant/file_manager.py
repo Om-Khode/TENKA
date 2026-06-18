@@ -204,16 +204,134 @@ def find_files(
     return matches
 
 
+# ─── Rich document extraction ────────────────────────────────────────────────
+# Each entry maps an extension to (pip package name, lazy extractor). Adding a
+# new format is a one-row change — read_file dispatches generically (THE rule).
+
+def _extract_docx(path: Path) -> str:
+    import docx  # python-docx
+    doc = docx.Document(str(path))
+    parts = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [c.text.strip() for c in row.cells if c.text and c.text.strip()]
+            if cells:
+                parts.append(" | ".join(cells))
+    return "\n".join(parts)
+
+
+def _extract_pdf(path: Path) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(str(path))
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception:
+            pass
+    return "\n".join((page.extract_text() or "") for page in reader.pages)
+
+
+def _extract_xlsx(path: Path) -> str:
+    from openpyxl import load_workbook
+    wb = load_workbook(str(path), read_only=True, data_only=True)
+    out = []
+    for ws in wb.worksheets:
+        out.append(f"# Sheet: {ws.title}")
+        for row in ws.iter_rows(values_only=True):
+            cells = [str(c) for c in row if c is not None]
+            if cells:
+                out.append(", ".join(cells))
+    wb.close()
+    return "\n".join(out)
+
+
+def _extract_pptx(path: Path) -> str:
+    from pptx import Presentation  # python-pptx
+    prs = Presentation(str(path))
+    out = []
+    for i, slide in enumerate(prs.slides, 1):
+        out.append(f"# Slide {i}")
+        for shape in slide.shapes:
+            if shape.has_text_frame and shape.text_frame.text.strip():
+                out.append(shape.text_frame.text.strip())
+    return "\n".join(out)
+
+
+def _extract_doc(path: Path) -> str:
+    # Legacy binary .doc — best-effort via Word COM automation (needs Word + pywin32).
+    try:
+        import win32com.client as win32  # pywin32
+    except ImportError:
+        raise ImportError("pywin32")
+    import pythoncom
+    pythoncom.CoInitialize()
+    word = win32.Dispatch("Word.Application")
+    word.Visible = False
+    try:
+        doc = word.Documents.Open(str(path), ReadOnly=True)
+        text = doc.Content.Text
+        doc.Close(False)
+        return text
+    finally:
+        word.Quit()
+        pythoncom.CoUninitialize()
+
+
+# extension → (pip package, extractor)
+_DOC_EXTRACTORS = {
+    ".docx": ("python-docx", _extract_docx),
+    ".pdf":  ("pypdf", _extract_pdf),
+    ".xlsx": ("openpyxl", _extract_xlsx),
+    ".xlsm": ("openpyxl", _extract_xlsx),
+    ".pptx": ("python-pptx", _extract_pptx),
+    ".doc":  ("pywin32", _extract_doc),
+}
+RICH_DOC_EXTENSIONS = frozenset(_DOC_EXTRACTORS)
+
+
+def _extract_document_text(path: Path) -> str:
+    """Extract plain text from a rich document format. Returns a user-facing
+    message (never raises) on missing dependency or extraction failure."""
+    pkg, extractor = _DOC_EXTRACTORS[path.suffix.lower()]
+    try:
+        text = extractor(path)
+    except ImportError:
+        return (
+            f"I need the '{pkg}' library to read {path.suffix} files. "
+            f"Install it with: pip install {pkg}"
+        )
+    except Exception as e:
+        logger.warning(f"[FILE] Failed to extract {path.suffix} from {path.name}: {e}")
+        return (
+            f"I couldn't read that {path.suffix} file — it may be corrupted, "
+            f"empty, or password-protected."
+        )
+    text = (text or "").strip()
+    if not text:
+        return f"That {path.suffix} file opened, but I found no readable text in it."
+    return text
+
+
 def read_file(path: Path) -> str:
-    """Read a text file and return its contents."""
+    """Read a file and return its text contents (plain-text or rich documents)."""
     if not path.exists():
         return f"File not found: {path}"
     if not path.is_file():
         return f"That path is a folder, not a file."
-    if path.suffix.lower() not in READABLE_EXTENSIONS:
+
+    suffix = path.suffix.lower()
+
+    if suffix in RICH_DOC_EXTENSIONS:
+        content = _extract_document_text(path)
+        if len(content) > MAX_READ_CHARS:
+            content = content[:MAX_READ_CHARS] + "\n... (truncated)"
+        return content
+
+    if suffix not in READABLE_EXTENSIONS:
         return (
-            f"I can't read {path.suffix} files — only text formats like "
-            f".txt, .md, .py, .json, .csv, .log and similar."
+            f"I can't read {path.suffix} files yet — I support text formats "
+            f"(.txt, .md, .py, .json, .csv …) and documents "
+            f"(.docx, .pdf, .xlsx, .pptx, .doc)."
         )
     for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
         try:
