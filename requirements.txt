@@ -44,6 +44,12 @@ playwright           # Browser driver. After install: playwright install chromiu
 terminator           # Terminator Rust SDK Python bindings (PyO3) — primary
 pywinauto            # Win32/UIA automation — fallback
 
+# Document reading (rich file formats for file_task — guarded by lazy import)
+python-docx          # .docx  (Word)
+pypdf                # .pdf
+openpyxl             # .xlsx / .xlsm (Excel)
+python-pptx          # .pptx  (PowerPoint)
+
 # Manifest + config parsing
 PyYAML               # per-app manifests, generic config
 

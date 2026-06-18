@@ -14,12 +14,46 @@ def _set_pending_destructive(op: str, path: Path, extra: dict):
     _act.pending_destructive.set({"op": op, "path": path, **extra})
 
 
+def _extract_explicit_path(text: str) -> Path | None:
+    """
+    If the user typed an absolute Windows path, return it verbatim — an
+    explicit path is a hard constraint and must never be silently discarded
+    (the op-extraction LLM tends to strip directories to a basename).
+
+    Handles surrounding quotes, a leading PowerShell '&', forward or back
+    slashes, and paths containing spaces. Returns None if no existing
+    absolute path is found.
+    """
+    import re
+
+    if not text:
+        return None
+
+    candidates: list[str] = []
+    # Quoted absolute path: 'X:\...' or "X:\..." (most reliable — spaces safe)
+    m = re.search(r"""['"]([A-Za-z]:[\\/][^'"]+)['"]""", text)
+    if m:
+        candidates.append(m.group(1))
+    # Unquoted: drive letter through to the last non-space char (paths may
+    # contain spaces). The exists() check below guards against overshoot.
+    m2 = re.search(r"([A-Za-z]:[\\/].*\S)", text)
+    if m2:
+        candidates.append(m2.group(1))
+
+    for raw in candidates:
+        p = Path(raw.strip().strip("'\""))
+        if p.is_absolute() and p.exists():
+            return p
+    return None
+
+
 def _resolve_file_path(name: str) -> Path | None:
     """
     Resolve a filename to a Path. Search order:
     1. Absolute path (if given and exists)
     2. SANDBOX_DIR exact match
-    3. Tier-1 find_files with EXACT name matching only
+    3. Current working directory exact match
+    4. Tier-1 find_files with EXACT name matching only
        (stem match or full name match — never substring)
     """
     from .. import file_manager
@@ -34,6 +68,10 @@ def _resolve_file_path(name: str) -> Path | None:
     sandbox_candidate = _config.SANDBOX_DIR / name
     if sandbox_candidate.exists():
         return sandbox_candidate
+
+    cwd_candidate = Path.cwd() / name
+    if cwd_candidate.exists():
+        return cwd_candidate
 
     matches = file_manager.find_files(name, tier=1)
     name_lower = name.lower()
@@ -247,12 +285,9 @@ async def handle_file_task(params: dict, llm_response: str, bridge=None) -> str:
 
     elif op == "read":
         name = op_data.get("name", "")
-        path_obj = Path(name) if Path(name).is_absolute() and Path(name).exists() else None
+        path_obj = _extract_explicit_path(goal) or _resolve_file_path(name)
         if path_obj is None:
-            matches = file_manager.find_files(name, tier=1)
-            if not matches:
-                return f"I couldn't find a file called '{name}' to read."
-            path_obj = matches[0]
+            return f"I couldn't find a file called '{name}' to read."
         content = file_manager.read_file(path_obj)
         result_text = f"FILE: {path_obj.name}\nCONTENT:\n{content}"
 
@@ -285,25 +320,16 @@ async def handle_file_task(params: dict, llm_response: str, bridge=None) -> str:
         name_lower = name.lower().replace("my ", "").strip()
         if name_lower in known_folders:
             return file_manager.open_path(known_folders[name_lower])
-        path_obj = Path(name) if Path(name).is_absolute() else None
-        if path_obj is None or not path_obj.exists():
-            matches = file_manager.find_files(name, tier=1)
-            if not matches:
-                return f"I couldn't find '{name}' to open."
-            path_obj = matches[0]
-
-        if path_obj.is_dir():
-            return file_manager.open_path(path_obj)
+        path_obj = _extract_explicit_path(goal) or _resolve_file_path(name)
+        if path_obj is None:
+            return f"I couldn't find '{name}' to open."
         return file_manager.open_path(path_obj)
 
     elif op == "info":
         name = op_data.get("name", "")
-        path_obj = Path(name) if Path(name).is_absolute() and Path(name).exists() else None
+        path_obj = _extract_explicit_path(goal) or _resolve_file_path(name)
         if path_obj is None:
-            matches = file_manager.find_files(name, tier=1)
-            if not matches:
-                return f"I couldn't find a file called '{name}'."
-            path_obj = matches[0]
+            return f"I couldn't find a file called '{name}'."
         info = file_manager.get_file_info(path_obj)
         if not info:
             return "Couldn't get info for that file."

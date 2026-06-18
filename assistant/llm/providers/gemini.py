@@ -109,11 +109,30 @@ class GeminiProvider:
             else:
                 contents = user_message
 
-            response = client.models.generate_content(
-                model=target_model,
-                contents=contents,
-                config=types.GenerateContentConfig(**gen_config_kwargs),
-            )
+            # 503 UNAVAILABLE ("high demand") is a transient server-side
+            # capacity error — not a quota/rate limit. Retry briefly before
+            # falling through to the next provider; these usually clear in ~1s.
+            import time
+            response = None
+            for attempt in range(3):
+                try:
+                    response = client.models.generate_content(
+                        model=target_model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(**gen_config_kwargs),
+                    )
+                    break
+                except Exception as e:
+                    es = str(e).lower()
+                    transient = "503" in es or "unavailable" in es or "overloaded" in es
+                    if transient and attempt < 2:
+                        logger.warning(
+                            f"[LLM] Gemini {target_model} transient 503 "
+                            f"(attempt {attempt + 1}/3) — retrying..."
+                        )
+                        time.sleep(0.6 * (attempt + 1))
+                        continue
+                    raise
 
             text = (response.text or "").strip()
             if text.startswith("<think>"):
@@ -138,6 +157,8 @@ class GeminiProvider:
             error_str = str(e).lower()
             if "429" in error_str or "rate" in error_str or "quota" in error_str or "resource_exhausted" in error_str:
                 logger.warning(f"[LLM] Gemini rate-limited: {e}")
+            elif "503" in error_str or "unavailable" in error_str or "overloaded" in error_str:
+                logger.warning(f"[LLM] Gemini transiently unavailable (503), falling back: {e}")
             else:
                 logger.error(f"[LLM] Gemini error: {e}")
             return None
