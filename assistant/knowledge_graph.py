@@ -282,6 +282,17 @@ async def ingest_turn(
     except Exception as e:
         logger.debug(f"[KG] extraction failed (non-critical): {e}")
         return
+    # Visibility for the silent-gap case: the pre-filter found entity signal,
+    # yet extraction returned nothing — often a degraded provider fallback
+    # (e.g. Gemini 503 → empty Cerebras response) rather than a genuinely
+    # entity-free turn. Logged at INFO so these are auditable, not invisible.
+    if not isinstance(payload, dict) or not any(
+        payload.get(k) for k in ("entities", "facts", "relationships", "commitments")
+    ):
+        logger.info(
+            f"[KG] extraction returned nothing despite entity signal "
+            f"(source={source}, text={resolved_text[:60]!r})"
+        )
     # original_text=text (raw, pre-resolution) on purpose: the date-grounding
     # check in _strip_unfounded_event_at must verify against what the user
     # literally typed, not the pronoun-substituted form.
@@ -324,6 +335,32 @@ def _is_pronoun(name: str) -> bool:
 def _canonicalize_for_filter(name: str) -> str:
     return " ".join(str(name).lower().strip().split())
 
+
+# Defense against the extractor emitting a file path or URL as an entity
+# (live-test: a full path was stored as a "tool" entity). Generic — matches a
+# drive-letter path, UNC share, or scheme:// / www. URL, no app specifics.
+_PATH_OR_URL_RE = re.compile(
+    r"""^(?:
+        [A-Za-z]:[\\/]          |   # C:\ or D:/ drive path
+        \\\\                    |   # \\server UNC share
+        [a-z][a-z0-9+.\-]*://   |   # scheme://...
+        www\.                       # www.example.com
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _looks_like_path_or_url(name: str) -> bool:
+    return bool(_PATH_OR_URL_RE.match(str(name).strip()))
+
+
+# Standalone entities below this confidence are dropped — transient, low-signal
+# mentions (momentary moods, vague one-off concepts) that pollute recall. Real
+# named entities from clear statements arrive at 0.8-1.0. Applies to the
+# entity list only; facts/relationships and their structural subject upserts
+# are unaffected.
+_MIN_ENTITY_CONFIDENCE = 0.6
+
 # Defense-in-depth against template-echo noise: facts the assistant asserts
 # about itself (replying with our own templated key:value confirmations) get
 # down-weighted so user_msg evidence wins on dedup/cleanup. Generic --
@@ -361,7 +398,13 @@ def _persist_extraction(
         if _is_pronoun(ename):
             logger.debug(f"[KG] dropping pronoun entity {ename!r}")
             continue
+        if _looks_like_path_or_url(ename):
+            logger.debug(f"[KG] dropping path/URL entity {ename!r}")
+            continue
         conf = _adjust_confidence(ent.get("confidence"), source)
+        if conf < _MIN_ENTITY_CONFIDENCE:
+            logger.debug(f"[KG] dropping low-confidence entity {ename!r} (conf={conf:.2f})")
+            continue
         eid, _ = repo.upsert_entity(
             entity_type=etype, name=ename, source=source, confidence=conf,
             source_turn_id=source_turn_id,
@@ -379,6 +422,9 @@ def _persist_extraction(
             continue
         if _is_pronoun(subj):
             logger.debug(f"[KG] dropping fact with pronoun subject {subj!r}")
+            continue
+        if _looks_like_path_or_url(subj):
+            logger.debug(f"[KG] dropping fact with path/URL subject {subj!r}")
             continue
         # knowledge-graph Session 4 livetest defense: drop nonsense self-referent
         # facts where the LLM emitted (X, predicate, X). Flash-Lite
@@ -419,6 +465,9 @@ def _persist_extraction(
             continue
         if _is_pronoun(a) or _is_pronoun(b):
             logger.debug(f"[KG] dropping relationship with pronoun endpoint: {a!r} -> {b!r}")
+            continue
+        if _looks_like_path_or_url(a) or _looks_like_path_or_url(b):
+            logger.debug(f"[KG] dropping relationship with path/URL endpoint: {a!r} -> {b!r}")
             continue
         fid = name_to_id.get(a.lower()) or repo.upsert_entity(
             entity_type="concept", name=a, source=source,
