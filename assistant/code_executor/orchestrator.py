@@ -771,7 +771,10 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
 
         synth = await llm_func(
             f'User asked: "{goal}"\nResult:\n{result}\n\nConcise spoken response (1-3 sentences). '
-            f'Only describe what is in the Result.', task_type="synthesis", max_tokens=400)
+            f'Only describe what is in the Result. '
+            f'IMPORTANT: State the key output values (numbers, names, results) from the Result. '
+            f'The user cannot see the raw output — you are their only way to learn it, so do not '
+            f'just say the task is done.', task_type="synthesis", max_tokens=400)
         final = synth if synth != "__LLM_UNAVAILABLE__" else result
 
         return final
@@ -844,6 +847,9 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
             task_type="synthesis", max_tokens=200)
     else:
         synth = await llm_func(
-            f'User asked: "{goal}"\nResult:\n{result}\n\nConcise spoken response.',
+            f'User asked: "{goal}"\nResult:\n{result}\n\nConcise spoken response. '
+            f'IMPORTANT: State the key output values (numbers, names, results) from the Result. '
+            f'The user cannot see the raw output — you are their only way to learn it, so do not '
+            f'just say the task is done.',
             task_type="synthesis", max_tokens=400)
     return synth if synth != "__LLM_UNAVAILABLE__" else result

@@ -4,10 +4,11 @@ Minor issues discovered during testing. Not blocking — features work, but subo
 
 ---
 
-## KI-1: get_text timeout on app automation search tasks
+## KI-1: ~~get_text timeout on app automation search tasks~~ FIXED
 
 **Priority:** Low
 **Effort:** Medium (deterministic step-plan fix in router.py + multi-scenario retest)
+**Fixed:** 2026-06-19 — added `"search"` to `_TYPE_WORDS` in `router.py` Fix A, so search goals (no result-reading words) strip hallucinated `get_text` steps just like type/write goals do. Test: `tests/test_known_issues_fixes.py::TestKI1SearchGetTextStrip`.
 **Discovered:** 2026-05-07, during D1+D9 live-test
 
 **Symptom:** When computer_task native automation runs a search task (e.g. "search weather in Berlin on Chrome"), the LLM planner adds a `get_text` step with a hallucinated selector (`name:Weather in Berlin` on window `Berlin Weather - Google Chrome`). The selector doesn't resolve, causing a 15s timeout. The task still succeeds — Chrome opens and searches — but wastes 15 seconds.
@@ -31,10 +32,11 @@ Actual: All of the above works, but adds a 15s timeout on hallucinated get_text
 
 ---
 
-## KI-2: Double shutdown log on exit
+## KI-2: ~~Double shutdown log on exit~~ FIXED
 
 **Priority:** Low
 **Effort:** Low (find duplicate signal/keyboard handler registration)
+**Fixed:** verified resolved 2026-06-19 — `main.py:2086` `signal_handler` now guards on `_shutdown_event.is_set()` (a second Ctrl+C logs `Force shutdown`, not a duplicate), the graceful path logs `Shutting down gracefully...` exactly once, and the `KeyboardInterrupt` catch logs the distinct `Goodbye!`. No code change needed.
 **Discovered:** 2026-05-10, during S11 live-test
 
 **Symptom:** On exit, `Shutting down...` is logged twice:
@@ -128,10 +130,11 @@ Input sequence:
 
 ---
 
-## KI-6: DA LLM hallucinates window names for desktop apps
+## KI-6: ~~DA LLM hallucinates window names for desktop apps~~ FIXED
 
 **Priority:** Medium
 **Effort:** Medium (DA planner prompt + window name injection)
+**Fixed:** 2026-06-19 — code-level over prompt-level. Added deterministic "Fix C" in `router.py` `_execute_native_task`: when the real focused window is known (`running_window`), every `click`/`type`/`get_text` step has its `window` param overwritten with the actual title, so a hallucinated title can no longer reach the focus-drift pre-check. The advisory `already_open_hint` remains as a soft hint. Generic — the value is whatever was detected at runtime, no app names. Test: `tests/test_known_issues_fixes.py::TestKI6WindowPinning`.
 **Discovered:** 2026-05-12, during N4+N6 live-test
 
 **Symptom:** When the planner hands a goal like "play lo-fi in Spotify" to the DA native automation layer, the LLM step-planner generates steps referencing the wrong window name. The actual window is `Spotify Premium` (desktop app), but the LLM hallucinates `Spotify - Web Player: Music for everyone` (browser title). This causes repeated focus-drift pre-check failures:
@@ -182,10 +185,11 @@ Actual: Spotify opens (step 1 OK), search bar click fails (wrong window name),
 
 ---
 
-## KI-8: Code executor synthesis drops actual output values
+## KI-8: ~~Code executor synthesis drops actual output values~~ FIXED
 
 **Priority:** Medium
 **Effort:** Low (prompt-level fix in code_executor synthesis step)
+**Fixed:** 2026-06-19 — both success-path synthesis prompts in `code_executor/orchestrator.py` (Tier 2 ~772 and Tier 1 ~846) now instruct the model to state the key output values and warn that the user cannot see the raw output, so it can't shortcut to "task done". Test: `tests/test_known_issues_fixes.py::TestKI8SynthesisValues`.
 **Discovered:** 2026-05-18, during I2 live-test
 
 **Symptom:** When code_executor runs code that produces concrete output (e.g., GPU prices in INR), the synthesis step acknowledges the task was done but doesn't include the actual values. User hears "here's your conversion" but never gets told the numbers.
@@ -253,10 +257,11 @@ These teach the planner LLM to prefer specific brands. Same pattern T13 fixed in
 
 ---
 
-## KI-7: SMTC verifier misapplied to non-music goals (close/open app)
+## KI-7: ~~SMTC verifier misapplied to non-music goals (close/open app)~~ FIXED
 
 **Priority:** Medium
 **Effort:** Medium (verifier goal classification + SMTC scope guard)
+**Fixed:** 2026-06-19 — root cause was `+ _music_apps` in the verifier's trigger keyword lists, so any goal *mentioning* a media app (e.g. "close spotify") fired SMTC. Added `_is_music_playback_goal()` in `vision/verifier.py`, a word-boundary regex over playback verbs (play/pause/skip/shuffle/…) — never app names. Both the window-title shortcut and the SMTC block are now gated on it; app-management goals fall through to normal window-state vision verification. Tests: `tests/test_known_issues_fixes.py::TestKI7MusicPlaybackGate`.
 **Discovered:** 2026-05-12, during P-items live-test
 
 **Symptom:** When the user says "close spotify app", the vision agent closes Spotify successfully (TODO #1 marked done), but then the SMTC verifier detects paused media and declares the goal unmet — "Wrong song paused: 'LET THE WORLD BURN'. Need to find and play the correct song." This forces the agent into a loop: it reopens Spotify to "fix" the nonexistent music problem, closes it again, and eventually aborts.
@@ -386,4 +391,43 @@ The second call is a memory/fact-extraction synthesis run that summarises prior 
 **Why not now:** Roadmap is locked through v1.0 ([[feedback_roadmap_locked]]). Park for v1.1.
 
 **Workaround:** Tune `WAKE_WORD_RECORD_SECONDS` per user — lower for short-command users, higher if commands routinely get clipped.
+
+---
+
+## KI-12: Secrets pasted into the chat are written to debug.log in plaintext
+
+**Priority:** Medium (security / privacy hygiene — not correctness)
+**Effort:** Low–Medium (redaction at the transcription + intent logging boundary)
+**Discovered:** 2026-06-19, KI-1/6/7/8 live-test session
+
+**Symptom:** When the user pastes a credential-shaped string into the chat console — e.g. a Spotify OAuth **authorization code** during the `code_executor` Spotify setup flow — it is logged verbatim at INFO level, twice:
+
+```
+23:10:36 [main] INFO: Transcription (Chat): "AQD39LKc4Tr5GvPuH7hmgxbz...<full auth code>...PAA%3D%3D"
+23:10:36 [intent] INFO: Classifying: "AQD39LKc4Tr5GvPuH7hmgxbz...<full auth code>...PAA%3D%3D"
+```
+
+Any secret the user types (auth codes, API keys, tokens, passwords) lands in `assistant/debug.log` in cleartext. In this instance the code was single-use and already expired (`400 invalid_grant`), so blast radius was low — but the pattern is a standing leak: long-lived tokens or API keys pasted the same way would persist on disk.
+
+**Root cause:** Two unconditional log lines echo the raw user input:
+1. `assistant/main.py:510` — `logger.info(f'Transcription (Chat): "{transcription}"')`
+2. `assistant/intent.py:69` — `logger.info(f'Classifying: "{transcribed_text}"')`
+
+Neither redacts. The OAuth paste flow funnels secrets straight through both.
+
+**Recommended fix (generic, no app-specific rules):** a single reusable `redact_secrets(text: str) -> str` helper (e.g. in `core/`) applied at both log sites. Heuristics, brand-agnostic:
+- Long high-entropy tokens (≥ N chars, no spaces, mixed alnum/`-_`/`%`/`=` — base64/url-encoded shapes).
+- Known credential markers in the *pending* state: when `code_executor` is mid-OAuth (a `NEEDS_OAUTH` / paste-the-code pending handler is active), treat the next user turn as sensitive and log a placeholder (`<redacted: N chars>`).
+- Keep the redaction in the log layer only — the real value still reaches the handler.
+
+Prefer gating on **pending-state context** over a pure regex where possible: when TENKA just asked "paste the code", the next input is known-sensitive regardless of shape.
+
+**Not introduced by KI-1/6/7/8** — pre-existing logging behavior, surfaced incidentally during their live-test.
+
+**Test case:**
+```
+1. Trigger any OAuth setup paste (or feed a 200-char base64-ish blob as chat input)
+2. Expect debug.log to show: Transcription (Chat): "<redacted: 213 chars>"
+3. Expect the handler to still receive the full literal value (functionality intact)
+```
 

@@ -6,10 +6,11 @@ full LLM-based screen verification pass. Extracted from the monolithic
 """
 
 import logging
+import re
 from typing import Callable
 
 from ._parsing import _parse_plan
-from ...core.known_apps import KNOWN_APPS, get_apps_by_category
+from ...core.known_apps import KNOWN_APPS
 
 logger = logging.getLogger("computer_agent")
 
@@ -17,6 +18,21 @@ _MUSIC_STOPWORDS = frozenset(
     {"open", "play", "playing", "listen", "song", "music", "track",
      "from", "with", "and", "the", "a", "on", "in", "by"}
 ) | frozenset(word for name in KNOWN_APPS for word in name.split())
+
+# Playback-intent verbs. SMTC media-state verification only makes sense for
+# goals that control playback — NOT for app-management goals that merely
+# mention a media app (e.g. "close spotify"). Gating on app names (KI-7) made
+# the verifier declare "wrong song" on a successful close and loop forever.
+# Keyed on verbs, never app names, so it stays generic across new apps.
+_PLAYBACK_VERB_RE = re.compile(
+    r"\b(play|playing|pause|resume|unpause|listen|skip|shuffle|repeat|queue|next|previous)\b"
+)
+
+
+def _is_music_playback_goal(goal: str) -> bool:
+    """True only when the goal is about controlling playback (play/pause/skip…),
+    not merely opening, closing, or switching an app that plays media."""
+    return bool(_PLAYBACK_VERB_RE.search(goal.lower()))
 
 
 # --- Verification System Prompt ---
@@ -171,9 +187,7 @@ async def _verify_goal(goal: str, llm_func: Callable) -> dict:
 
     from ...io import screen as _screen_ver
     active_ver = _screen_ver.get_active_window()
-    _music_apps = get_apps_by_category("music_app")
-    music_keywords_ver = ["play", "listen", "song", "music", "track"] + _music_apps
-    if any(kw in goal.lower() for kw in music_keywords_ver):
+    if _is_music_playback_goal(goal):
         goal_words_ver = [w for w in goal.lower().split()
                           if len(w) > 3 and w not in _MUSIC_STOPWORDS]
         if goal_words_ver and " - " in active_ver:
@@ -184,8 +198,7 @@ async def _verify_goal(goal: str, llm_func: Callable) -> dict:
                 logger.info(f"[AGENT] [OK] Verifier: window title confirms playback: '{active_ver}'")
                 return {"achieved": True, "result": result_text, "remaining": ""}
 
-    music_keywords = ["play", "playing", "listen", "song", "music", "track"] + _music_apps
-    if any(kw in goal.lower() for kw in music_keywords):
+    if _is_music_playback_goal(goal):
         now_playing = _get_now_playing()
         if now_playing and now_playing.get("is_playing"):
             title = now_playing["title"].lower()

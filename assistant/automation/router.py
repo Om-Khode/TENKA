@@ -1502,19 +1502,26 @@ async def _execute_native_task(goal: str, llm_func) -> str:
     # --- Deterministic step-plan fixes (like code_executor's deterministic fixes) ---
     # Applied BEFORE execution to compensate for common LLM planning errors.
 
-    # Fix A: Strip get_text steps from pure type/write tasks — LLM often adds get_text
-    # with hallucinated selectors, causing 60s+ tree walks for no reason
-    _TYPE_WORDS = {"type", "write", "enter", "input", "paste"}
+    # Fix A: Strip get_text steps from pure type/write/search tasks — LLM often adds
+    # get_text with hallucinated selectors, causing 60s+ tree walks for no reason.
+    # Type/write tasks just enter text; search tasks fire a query and don't read back
+    # the result. In both cases the optimistic read-back step is pure timeout cost.
+    _TYPE_WORDS = {"type", "write", "enter", "input", "paste", "search"}
     _RESULT_WORDS = {"calculate", "compute", "result", "read", "get", "show", "what", "check", "display"}
     goal_words_set = set(goal_for_planner.lower().split())
     if goal_words_set & _TYPE_WORDS and not goal_words_set & _RESULT_WORDS:
         before = len(steps)
         steps = [s for s in steps if s.get("action") != "get_text"]
         if len(steps) < before:
-            logger.info(f"[DA] Stripped {before - len(steps)} get_text steps from type task")
+            logger.info(f"[DA] Stripped {before - len(steps)} get_text steps from type/search task")
 
     # Fix B: Sanitize LLM steps — strip redundant open/focus, conflicting press_key
     steps = _sanitize_steps(steps, has_pre_steps=bool(pre_steps))
+
+    # Fix C: Pin window params to the real focused window (KI-6) — see _pin_step_windows.
+    _rewrote = _pin_step_windows(steps, running_window)
+    if _rewrote:
+        logger.info(f"[DA] Pinned {_rewrote} step window param(s) to '{running_window}'")
 
     # Prepend code-level steps (focus, new tab) before LLM steps
     if pre_steps:
@@ -1542,6 +1549,29 @@ async def _execute_native_task(goal: str, llm_func) -> str:
     except Exception as e:
         logger.error(f"[DA] run_app_steps failed: {e}")
         return "__FALLBACK__"
+
+def _pin_step_windows(steps: list, running_window: str | None) -> int:
+    """Force every interaction step's ``window`` param to the real focused window.
+
+    The LLM step-planner frequently hallucinates a different window title (e.g.
+    the web-player title for a desktop app), which then fails the focus-drift
+    pre-check (KI-6). When the actual window is known from process/active-window
+    detection, override deterministically instead of trusting the advisory prompt
+    hint. Generic: no app names, the value is whatever was detected at runtime.
+
+    Mutates ``steps`` in place. Returns the number of window params rewritten.
+    """
+    if not running_window:
+        return 0
+    rewrote = 0
+    for s in steps:
+        params = s.get("params") or {}
+        if s.get("action") in ("click", "type", "get_text") and params.get("window") \
+                and params["window"] != running_window:
+            params["window"] = running_window
+            rewrote += 1
+    return rewrote
+
 
 def _sanitize_steps(steps: list, has_pre_steps: bool = False) -> list:
     """
