@@ -9,14 +9,20 @@ Tests for TP-2 fixes:
 import asyncio
 import sys
 import os
+import tempfile
 import traceback
+from pathlib import Path
+
+import pytest
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from assistant import config as _config
 from assistant import procedures as ps
-from assistant.actions import (
+from assistant.storage.db import init_db, _reset_for_testing
+from assistant.actions.teaching import (
     _parse_teaching_step,
     _extract_slots_from_steps,
     _find_suspect_literals,
@@ -33,13 +39,43 @@ def _run(coro):
     return _loop.run_until_complete(coro)
 
 
-def setup():
+def _bind_procedure_db(root: Path) -> None:
+    """Point the procedures facade at a fresh SQLite file under *root*.
+
+    Post-RG-1 the facade is a thin wrapper over storage/repos, so state lives
+    on BOTH the Database singleton and ``procedures._repo``. Reset both, or
+    rows leak between tests.
+    """
+    (root / "memory").mkdir(parents=True, exist_ok=True)
+    _reset_for_testing()
+    ps._repo = None
+    init_db(root / "memory" / "tenka.db")
     ps.init_procedure_db()
-    # Clean up any leftover test procedures
-    for proc in ps.list_procedures(enabled_only=False):
-        if proc["id"] > 2:
-            ps._get_conn().execute("DELETE FROM user_procedures WHERE id = ?", (proc["id"],))
-    ps._get_conn().commit()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_procedure_db(tmp_path, monkeypatch):
+    """Give every test its own procedure DB.
+
+    Replaces a module-level ``setup()``: pytest 8 dropped nose-style collection
+    of a bare ``setup()``, so it silently stopped running and every DB-backed
+    test failed with "procedures not initialized". Its old row-cleanup also
+    called ``ps._get_conn()``, which no longer exists post-RG-1 — a fresh DB
+    per test makes that cleanup unnecessary, and keeps tests off the real
+    ~/TENKA/memory/tenka.db.
+    """
+    monkeypatch.setattr(_config, "SANDBOX_DIR", tmp_path)
+    _bind_procedure_db(tmp_path)
+    yield
+    _reset_for_testing()
+    ps._repo = None
+
+
+def setup():
+    """Entry point for the ``__main__`` script runner at the bottom of this file."""
+    root = Path(tempfile.mkdtemp())
+    _config.SANDBOX_DIR = root
+    _bind_procedure_db(root)
 
 
 # ─── Bug 1: Longest-match-wins ─────────────────────────────────────────────

@@ -4,7 +4,7 @@ test_dev_harness.py — Validates the headless HTTP test harness.
 Tests the mock functions, log capture, HTTP parsing, and response format
 WITHOUT booting the full pipeline (no LLM keys or audio hardware needed).
 
-Run: pytest tests/test_test_harness.py -v
+Run: pytest tests/test_dev_harness.py -v
 """
 
 import asyncio
@@ -39,7 +39,7 @@ class TestMockSpeak(unittest.TestCase):
         self.assertEqual(_captured[0]["emotion"], "neutral")
 
     def test_returns_true(self):
-        from assistant.test_harness import _mock_speak
+        from assistant.dev_harness import _mock_speak
         result = self._run(_mock_speak("anything"))
         self.assertTrue(result)
 

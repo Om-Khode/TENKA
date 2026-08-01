@@ -45,7 +45,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import assistant.browser_dom as bdom
+import assistant.automation.browser.dom as bdom
 
 
 # ─── JS source-level contracts ───────────────────────────────────────────

@@ -67,7 +67,6 @@ Thumbs.db
 desktop.ini
 
 # ─── Claude Code session state ───────────────────────────
-.claude/worktrees/
 .superpowers/
 
 # ─── Private / internal docs (not for public repo) ───────
@@ -76,4 +75,12 @@ ARCHITECTURE.md
 docs/
 
 # ─── Claude Code project-local config ────────────────────
-.claude/
+# Ignore everything under .claude/ EXCEPT shared project tooling:
+#   settings.json — .env-protection hook; benefits every contributor
+#   skills/       — project smoke-test skill
+# Uses .claude/* (not .claude/) so the negations below can take effect —
+# git cannot re-include a file whose parent directory is excluded.
+# settings.local.json stays ignored: personal per-machine overrides.
+.claude/*
+!.claude/settings.json
+!.claude/skills/

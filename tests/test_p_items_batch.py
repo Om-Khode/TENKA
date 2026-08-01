@@ -105,8 +105,9 @@ class TestP12ReadFileRemoved:
         assert "read_file" not in INTENTS
 
     def test_read_file_not_in_tools(self):
-        from assistant.actions import _TOOLS
-        assert "read_file" not in _TOOLS
+        import assistant.actions  # noqa: F401  (import triggers handler registration)
+        from assistant.actions.registry import tool_registry
+        assert not tool_registry.has("read_file")
 
     def test_read_file_remapped_in_execute(self):
         """read_file remap exists so stray LLM emissions still work."""
@@ -116,8 +117,9 @@ class TestP12ReadFileRemoved:
         assert '"read_file"' in src or "'read_file'" in src
 
     def test_file_task_still_in_tools(self):
-        from assistant.actions import _TOOLS
-        assert "file_task" in _TOOLS
+        import assistant.actions  # noqa: F401  (import triggers handler registration)
+        from assistant.actions.registry import tool_registry
+        assert tool_registry.has("file_task")
 
 
 # --- P13: DEBUG_LOG config flag ---

@@ -95,10 +95,12 @@ Types: `feat | fix | refactor | chore | docs | test | perf`
 Example:
 
 ```
-fix: stop browser planner from reusing stale page handle
+fix: keep speaker verification from dropping short utterances
 
-TENKA ~ "Hmph, fine, I'll remember which tab I was on. Don't get used to me being this thoughtful."
+TENKA ~ "So you want me to hear you even when you mumble. Demanding. It's done."
 ```
+
+**Write a fresh TENKA line every time.** The `commit-msg` hook rejects the examples in `.gitmessage` verbatim — copying one is not a shortcut, it's a blocked commit.
 
 **Never use `Co-Authored-By: Claude` or any AI-attribution trailer** — TENKA speaks in her own voice in the commit log.
 
@@ -112,13 +114,33 @@ git config commit.template .gitmessage
 
 ## Branching
 
-- **`main`** is the public, clean history. Only squash-merges land here.
-- **`development`** is the integration branch for general WIP.
-- **Feature work** happens on `feat/<short-name>`, branched from `development`.
-- **Bug fixes** happen on `fix/<short-name>`, branched from `development`.
-- Messy intermediate commits on feature branches are fine — they collapse to one polished commit when squash-merged.
+- **`main`** is the only long-lived branch — public, clean history. Only squash-merges land here.
+- **Everything branches from `main`** and squash-merges back into it. There is no integration branch.
+- **Branch names use the same type prefix as the commit**: `feat/<short-name>`, `fix/<short-name>`, `refactor/<short-name>`, `chore/`, `docs/`, `test/`, `perf/`.
+- **Every change gets a branch** — however small. A one-line fix is still `fix/<short-name>`.
+- Messy intermediate commits on a branch are fine — they collapse to one polished commit when squash-merged.
 
-**Never push directly to `main`**. Always go through a PR.
+```bash
+git switch main && git pull
+git switch -c fix/stale-page-handle
+# ...work, commit as often as you like...
+git switch main
+git merge --squash fix/stale-page-handle
+git commit                                 # one clean commit on main
+```
+
+**Never commit or push directly to `main`**, and never merge without `--squash` — a plain `git merge` replays the branch's whole history onto `main`. Contributors: always go through a PR.
+
+### Enforcement
+
+Two tracked git hooks enforce this locally — see [`hooks/README.md`](./hooks/README.md). Enable them once per clone:
+
+```bash
+git config core.hooksPath hooks
+git config commit.template .gitmessage
+```
+
+`pre-commit` blocks direct commits to `main` (the squash-merge commit is allowed), rejects non-squash merges, and runs `import-linter` whenever a `.py` file is staged. `commit-msg` enforces the `.gitmessage` template. Don't bypass them with `--no-verify`.
 
 ---
 

@@ -121,6 +121,23 @@ USER_TIMEZONE=Asia/Kolkata
 
 `USER_REGION` is a 2-letter ISO 3166-1 alpha-2 country code. Services like Spotify return `item:null` without it. `USER_TIMEZONE` is an IANA name — TENKA does all date math in Python, never in the LLM.
 
+### 6. Enable git hooks (contributors only)
+
+Skip this if you just want to run TENKA. If you intend to commit, run both lines once:
+
+```powershell
+git config core.hooksPath hooks
+git config commit.template .gitmessage
+```
+
+This points git at the tracked [`hooks/`](./hooks/README.md) directory instead of the local-only `.git/hooks/`. The hooks block direct commits to `main`, reject non-squash merges, run `import-linter` when Python changes, and enforce the `.gitmessage` template.
+
+Both settings are **per-clone** — a fresh clone has hooks off until you run them. Git has no way to auto-enable repo-supplied hooks on clone, by design. Verify with:
+
+```powershell
+git config core.hooksPath   # -> hooks
+```
+
 ---
 
 ## First launch

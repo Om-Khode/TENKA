@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Stub heavy modules
 for mod_name in (
     "assistant.io.audio.tts", "assistant.io.audio.stt",
-    "assistant.io.audio.speaker_verify", "assistant.io.unity_bridge",
+    "assistant.io.audio.speaker_verify",
     "assistant.io.audio.wake_word",
 ):
     if mod_name not in sys.modules:

@@ -99,3 +99,8 @@ neonize              # WhatsApp Web client (only needed if using WA-2 messaging)
 
 # Import boundary enforcement
 import-linter>=2.1
+
+# Test / dev tooling
+pytest               # Test runner (tests/)
+pytest-asyncio       # Async test support (@pytest.mark.asyncio)
+python-dotenv        # Loads .env in integration tests (test_computer_task_integration, test_gemini_provider)
