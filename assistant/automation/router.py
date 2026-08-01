@@ -327,7 +327,7 @@ def _build_new_tab_hint(window_title: str, goal: str) -> str:
 # the user actually looking at right now?" without each one re-implementing
 # psutil / pygetwindow / CDP plumbing. `detect_active_app()` is the public
 # composite — the manifest layer's manifest_registry reads it to choose which app manifest
-# to apply, and PV-5 routing can be re-expressed in terms of it later.
+# to apply, and preference-based routing can be re-expressed in terms of it later.
 #
 # Keep these synchronous. The browser-URL probe deliberately returns "" when
 # the only available source would require an async Playwright/CDP attachment
@@ -395,8 +395,9 @@ def detect_active_app() -> dict[str, Any]:
     Returns ``{"process_names": [...], "window_title": "...", "active_url": "..."}``.
 
     Used by the manifest layer's ``manifest_registry.get_for_active_app()`` and reusable by
-    any other caller that needs the same active-window signal that backs PV-5
-    routing — avoids duplicating the psutil / pygetwindow / CDP plumbing.
+    any other caller that needs the same active-window signal that backs
+    preference-based routing — avoids duplicating the psutil / pygetwindow /
+    CDP plumbing.
     """
     return {
         "process_names": _get_running_processes(),

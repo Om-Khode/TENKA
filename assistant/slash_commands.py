@@ -1,5 +1,5 @@
 """
-slash_commands.py — Runtime Config Slash Commands (RC-1c)
+slash_commands.py — Runtime Config Slash Commands
 
 Zero-LLM-cost command parser for user-facing runtime config. Recognized at
 the very top of the text pipeline, before teaching/shortcuts/intent.

@@ -1,16 +1,25 @@
 """
-test_claude_md.py — Tests for the CLAUDE.md project instructions file.
+test_claude_md.py — Guards the gitignored development docs.
 
-Verifies that:
-1. CLAUDE.md exists at the repo root
-2. It contains essential sections for project context
-3. Key architectural details are documented
+CLAUDE.md and ARCHITECTURE.md are NOT tracked in git (.gitignore:74-75), so
+nothing else notices when they go missing or rot. These tests are the only
+safety net.
+
+Scope is deliberately narrow: presence, and the handful of facts that silently
+go stale and then actively mislead (intent list, subpackage list, layering).
+Prose is not asserted — a doc test that pins wording just forces docs to
+describe whatever the test was written against, which is how the previous
+version of this file ended up demanding a module layout that no longer existed.
 """
 
 import os
+import re
+
 import pytest
 
-CLAUDE_MD_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "CLAUDE.md")
+REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
+CLAUDE_MD_PATH = os.path.join(REPO_ROOT, "CLAUDE.md")
+ARCHITECTURE_MD_PATH = os.path.join(REPO_ROOT, "ARCHITECTURE.md")
 
 
 @pytest.fixture
@@ -19,55 +28,124 @@ def claude_md():
         return f.read()
 
 
-class TestClaudeMdExists:
-    def test_file_exists(self):
-        assert os.path.isfile(CLAUDE_MD_PATH), "CLAUDE.md must exist at repo root"
-
-    def test_file_not_empty(self):
-        assert os.path.getsize(CLAUDE_MD_PATH) > 100, "CLAUDE.md must have content"
+@pytest.fixture
+def architecture_md():
+    with open(ARCHITECTURE_MD_PATH, "r", encoding="utf-8") as f:
+        return f.read()
 
 
-class TestClaudeMdContent:
-    def test_has_project_name(self, claude_md):
-        assert "TENKA" in claude_md
+class TestDocsExist:
+    def test_claude_md_exists(self):
+        assert os.path.isfile(CLAUDE_MD_PATH), (
+            "CLAUDE.md must exist at repo root. It is gitignored — if it is "
+            "missing, rebuild it from the code plus TENKA_Architecture.md."
+        )
 
-    def test_documents_architecture(self, claude_md):
-        assert "architecture" in claude_md.lower() or "unity" in claude_md.lower()
+    def test_architecture_md_exists(self):
+        assert os.path.isfile(ARCHITECTURE_MD_PATH), (
+            "ARCHITECTURE.md must exist at repo root. It is gitignored — if it "
+            "is missing, rebuild it from the code plus TENKA_Architecture.md."
+        )
 
-    def test_documents_tcp_ports(self, claude_md):
-        assert "7777" in claude_md
-        assert "7778" in claude_md
+    def test_docs_not_stubs(self):
+        assert os.path.getsize(CLAUDE_MD_PATH) > 2000
+        assert os.path.getsize(ARCHITECTURE_MD_PATH) > 5000
 
-    def test_documents_python_bridge(self, claude_md):
-        assert "bridge.py" in claude_md or "PythonBridge" in claude_md
 
-    def test_documents_running_instructions(self, claude_md):
-        assert "python" in claude_md.lower()
-        assert "requirements.txt" in claude_md or "pip install" in claude_md
+class TestTheRule:
+    """THE-rule is the one non-negotiable. If it's not in CLAUDE.md, the doc is broken."""
 
-    def test_documents_llm_providers(self, claude_md):
-        assert "Groq" in claude_md or "groq" in claude_md
-        assert "Ollama" in claude_md or "ollama" in claude_md
+    def test_claude_md_states_the_rule(self, claude_md):
+        assert "No hardcoded app-specific rules" in claude_md
 
-    def test_documents_stt(self, claude_md):
-        assert "whisper" in claude_md.lower() or "stt" in claude_md.lower()
+    def test_architecture_md_states_the_rule(self, architecture_md):
+        assert "No hardcoded app-specific rules" in architecture_md
 
-    def test_documents_tts(self, claude_md):
-        assert "Kokoro" in claude_md or "tts" in claude_md.lower()
 
-    def test_documents_key_modules(self, claude_md):
-        key_modules = ["actions.py", "code_executor.py", "llm.py", "config.py"]
-        for module in key_modules:
-            assert module in claude_md, f"{module} should be documented"
+class TestIntentsInSync:
+    """The intent list rots the moment an intent is added. Pin it to config.INTENTS."""
 
-    def test_documents_conventions(self, claude_md):
-        assert "convention" in claude_md.lower() or "commit" in claude_md.lower()
+    def test_every_intent_is_documented(self, claude_md):
+        from assistant.config import INTENTS
 
-    def test_documents_license(self, claude_md):
-        assert "license" in claude_md.lower()
+        missing = [i for i in INTENTS if i not in claude_md]
+        assert not missing, (
+            f"Intents in config.INTENTS are absent from CLAUDE.md: {missing}. "
+            f"Update the intent list in CLAUDE.md."
+        )
 
-    def test_documents_unity_version(self, claude_md):
-        assert "6000" in claude_md or "Unity" in claude_md
+    def test_no_phantom_intents_documented(self, claude_md):
+        """Catch intents deleted from config but left in the doc."""
+        from assistant.config import INTENTS
+
+        # The doc's intent block is the fenced section following the "## Intents" heading.
+        block = re.search(r"## Intents.*?```\n(.*?)```", claude_md, re.S)
+        assert block, "CLAUDE.md must carry a fenced intent list under '## Intents'"
+
+        documented = {t for t in re.split(r"[,\s]+", block.group(1)) if t}
+        phantom = documented - set(INTENTS)
+        assert not phantom, (
+            f"CLAUDE.md documents intents that no longer exist in config.INTENTS: "
+            f"{sorted(phantom)}."
+        )
+
+
+class TestSubpackagesInSync:
+    """The nine-subpackage contract is enforced by process rule; keep the doc honest."""
+
+    def test_documented_subpackages_match_disk(self, claude_md):
+        import assistant
+
+        pkg_root = os.path.dirname(assistant.__file__)
+        on_disk = {
+            name for name in os.listdir(pkg_root)
+            if os.path.isdir(os.path.join(pkg_root, name))
+            and not name.startswith(("_", "."))
+        }
+
+        for pkg in on_disk:
+            assert f"`{pkg}/`" in claude_md, (
+                f"Subpackage '{pkg}/' exists on disk but is not documented in "
+                f"CLAUDE.md's approved-subpackage list."
+            )
+
+
+class TestLayeringDocumented:
+    def test_io_boundary_stated(self, claude_md):
+        assert "io/" in claude_md
+        assert "NEVER" in claude_md
+
+    def test_contract_count_matches_pyproject(self, claude_md):
+        """CLAUDE.md claims a specific number of import-linter contracts."""
+        import tomllib
+
+        with open(os.path.join(REPO_ROOT, "pyproject.toml"), "rb") as f:
+            pyproject = tomllib.load(f)
+
+        actual = len(pyproject["tool"]["importlinter"]["contracts"])
+        words = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six"}
+        accepted = {str(actual), words.get(actual, str(actual))}
+
+        assert any(f"{form} contracts" in claude_md for form in accepted), (
+            f"pyproject.toml defines {actual} import-linter contracts; CLAUDE.md "
+            f"does not say so. Keep the count in sync "
+            f"(accepted: {sorted(f'{f} contracts' for f in accepted)})."
+        )
+
+
+class TestGitignoreWarning:
+    """The docs were lost once because they are gitignored. Keep the warning."""
+
+    def test_claude_md_notes_it_is_gitignored(self, claude_md):
+        assert "gitignored" in claude_md.lower()
+
+    def test_still_actually_gitignored(self):
+        """If someone starts tracking these, the warning becomes a lie."""
+        with open(os.path.join(REPO_ROOT, ".gitignore"), encoding="utf-8") as f:
+            ignore = f.read().splitlines()
+
+        assert "CLAUDE.md" in ignore
+        assert "ARCHITECTURE.md" in ignore
 
 
 if __name__ == "__main__":

@@ -225,9 +225,10 @@ class TestIntentRegistration(unittest.TestCase):
         self.assertIn("browser_cdp_setup", config.INTENTS)
 
     def test_handler_registered(self):
-        from assistant import actions
-        self.assertIn("browser_cdp_setup", actions._TOOLS)
-        self.assertTrue(callable(actions._TOOLS["browser_cdp_setup"]))
+        import assistant.actions  # noqa: F401  (import triggers handler registration)
+        from assistant.actions.registry import tool_registry
+        self.assertTrue(tool_registry.has("browser_cdp_setup"))
+        self.assertTrue(callable(tool_registry.get("browser_cdp_setup")))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -n \"$CLAUDE_TOOL_INPUT\" ]; then _in=\"$CLAUDE_TOOL_INPUT\"; elif [ ! -t 0 ]; then _in=\"\"; while IFS= read -r _l || [ -n \"$_l\" ]; do _in=\"$_in$_l\"; done; else _in=\"\"; fi; case \"$_in\" in *'\"file_path\"'*) _t=\"${_in#*\\\"file_path\\\"}\"; _t=\"${_t#*\\\"}\"; _f=\"${_t%%\\\"*}\";; *) _f=\"\";; esac; case \"$_f\" in *.env|*.env.*) printf 'BLOCKED: refusing to modify %s - .env holds real secrets. Edit .env.example instead.\\n' \"$_f\" >&2; exit 2;; esac; exit 0",
+            "timeout": 10,
+            "statusMessage": "Checking .env protection"
+          }
+        ]
+      }
+    ]
+  }
+}

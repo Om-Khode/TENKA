@@ -1,0 +1,81 @@
+#!/bin/sh
+# pre-commit — enforces TENKA's two hard pre-commit rules:
+#   1. never commit directly to main (squash-merge commits excepted)
+#   2. import-linter boundaries hold whenever Python changes
+#
+# Enabled by `git config core.hooksPath hooks` (see SETUP.md).
+
+. "$(dirname "$0")/_common.sh"
+
+GIT_DIR_PATH=$(git rev-parse --git-dir)
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+# ─── 1. Protect main ─────────────────────────────────────────────────────────
+#
+# The squash-merge workflow legitimately commits ON main: `git merge --squash`
+# stages the changes and leaves SQUASH_MSG behind, then you commit. That one is
+# allowed. Everything else on main is not.
+#
+# A real merge (MERGE_HEAD present) means someone merged without --squash,
+# which would put the branch's whole history on main.
+
+if [ "$BRANCH" = "main" ]; then
+    if [ -f "$GIT_DIR_PATH/MERGE_HEAD" ]; then
+        die "non-squash merge into main." \
+            "This would replay the branch's full history onto main." \
+            "" \
+            "  git merge --abort" \
+            "  git merge --squash <branch> && git commit"
+    elif [ ! -f "$GIT_DIR_PATH/SQUASH_MSG" ]; then
+        die "direct commit to main." \
+            "Every change goes on a branch first - however small." \
+            "" \
+            "  git stash" \
+            "  git switch -c fix/short-description   # or feat/, refactor/, chore/, docs/, test/, perf/" \
+            "  git stash pop"
+    fi
+fi
+
+# ─── 2. Import boundaries ────────────────────────────────────────────────────
+
+STAGED_PY=$(git diff --cached --name-only --diff-filter=ACMR -- '*.py')
+[ -z "$STAGED_PY" ] && exit 0
+
+PY=$(find_python) || die "no usable Python found (need 3.10+)." \
+    "import-linter cannot run, so layering is unverified." \
+    "On Windows use the launcher: py -3.11"
+
+if ! $PY -c "import importlinter" >/dev/null 2>&1; then
+    die "import-linter is not installed." \
+        "Layering rules cannot be checked." \
+        "" \
+        "  $PY -m pip install -r requirements.txt"
+fi
+
+# Do NOT trust exit codes here - all three obvious invocations lie (measured
+# against a deliberately broken contract on 2026-08-01):
+#   py -m importlinter.cli lint        -> exits 0, prints nothing at all
+#   from importlinter.cli import ...   -> exits 0 whether contracts pass or fail
+#   lint-imports.exe                   -> exits 1 whether contracts pass or fail
+# The summary line is the only reliable signal, so parse that. Anything else -
+# a crash, a bad config, a version whose output changed - leaves us without a
+# summary and we fail closed.
+LINT_OUT=$($PY -c "from importlinter.cli import lint_imports; lint_imports()" 2>&1)
+SUMMARY=$(printf '%s\n' "$LINT_OUT" | grep -E '^Contracts: [0-9]+ kept, [0-9]+ broken' | tail -1)
+
+if [ -z "$SUMMARY" ]; then
+    printf '%s\n' "$LINT_OUT" >&2
+    die "import-linter produced no contract summary." \
+        "It crashed or its output format changed - layering is unverified." \
+        "Re-run manually:" \
+        "  $PY -c \"from importlinter.cli import lint_imports; lint_imports()\""
+fi
+
+BROKEN=$(printf '%s' "$SUMMARY" | sed -E 's/.*kept, ([0-9]+) broken.*/\1/')
+if [ "$BROKEN" != "0" ]; then
+    printf '%s\n' "$LINT_OUT" >&2
+    die "import-linter: $SUMMARY" \
+        "Fix the layering - do not add entries to ignore_imports in pyproject.toml."
+fi
+
+exit 0
