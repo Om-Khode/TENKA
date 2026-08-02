@@ -55,6 +55,7 @@ PyYAML               # per-app manifests, generic config
 
 # Credentials
 cryptography         # AES-GCM at-rest encryption for OAuth tokens
+mnemonic              # BIP39 recovery-phrase generation for cloud backup encryption
 
 # Wake word detection (open-source, no API key needed)
 openwakeword         # openWakeWord engine (https://github.com/dscripka/openWakeWord)
