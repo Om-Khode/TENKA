@@ -69,32 +69,38 @@ class GoogleDriveBackupProvider(BackupProvider):
             f"Content-Type: application/octet-stream\r\n\r\n"
         ).encode("utf-8") + blob + f"\r\n--{boundary}--".encode("utf-8")
 
-        resp = requests.post(
-            _UPLOAD_URL,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": f"multipart/related; boundary={boundary}",
-            },
-            data=body,
-            timeout=_TIMEOUT,
-        )
+        try:
+            resp = requests.post(
+                _UPLOAD_URL,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": f"multipart/related; boundary={boundary}",
+                },
+                data=body,
+                timeout=_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as e:
+            raise BackupProviderError(f"Drive upload failed: {e}") from e
         if resp.status_code >= 300:
             raise BackupProviderError(f"Drive upload failed: {resp.status_code} {resp.text[:200]}")
         logger.info(f"[BACKUP][DRIVE] Uploaded version '{label}'")
 
     def _list_files(self) -> list[dict]:
         token = self._access_token()
-        resp = requests.get(
-            _FILES_URL,
-            headers={"Authorization": f"Bearer {token}"},
-            params={
-                "spaces": "appDataFolder",
-                "fields": "files(id,name,createdTime)",
-                "orderBy": "createdTime desc",
-                "pageSize": 100,
-            },
-            timeout=_TIMEOUT,
-        )
+        try:
+            resp = requests.get(
+                _FILES_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                params={
+                    "spaces": "appDataFolder",
+                    "fields": "files(id,name,createdTime)",
+                    "orderBy": "createdTime desc",
+                    "pageSize": 100,
+                },
+                timeout=_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as e:
+            raise BackupProviderError(f"Drive list failed: {e}") from e
         if resp.status_code >= 300:
             raise BackupProviderError(f"Drive list failed: {resp.status_code} {resp.text[:200]}")
         return resp.json().get("files", [])
@@ -111,12 +117,15 @@ class GoogleDriveBackupProvider(BackupProvider):
     def download(self, label: str) -> bytes:
         token = self._access_token()
         file_id = self._find_file_id(label)
-        resp = requests.get(
-            f"{_FILES_URL}/{file_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"alt": "media"},
-            timeout=_TIMEOUT,
-        )
+        try:
+            resp = requests.get(
+                f"{_FILES_URL}/{file_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"alt": "media"},
+                timeout=_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as e:
+            raise BackupProviderError(f"Drive download failed: {e}") from e
         if resp.status_code >= 300:
             raise BackupProviderError(f"Drive download failed: {resp.status_code} {resp.text[:200]}")
         return resp.content
@@ -124,11 +133,14 @@ class GoogleDriveBackupProvider(BackupProvider):
     def delete(self, label: str) -> None:
         token = self._access_token()
         file_id = self._find_file_id(label)
-        resp = requests.delete(
-            f"{_FILES_URL}/{file_id}",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=_TIMEOUT,
-        )
+        try:
+            resp = requests.delete(
+                f"{_FILES_URL}/{file_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=_TIMEOUT,
+            )
+        except requests.exceptions.RequestException as e:
+            raise BackupProviderError(f"Drive delete failed: {e}") from e
         if resp.status_code >= 300 and resp.status_code != 404:
             raise BackupProviderError(f"Drive delete failed: {resp.status_code} {resp.text[:200]}")
         logger.info(f"[BACKUP][DRIVE] Deleted version '{label}'")

@@ -6,6 +6,7 @@ response-parsing logic, not live Drive access (that's a manual live test).
 from unittest.mock import patch, MagicMock
 
 import pytest
+import requests
 
 from assistant.io.backup import backup_provider_registry
 from assistant.io.backup.google_drive import GoogleDriveBackupProvider, SERVICE_NAME
@@ -63,3 +64,48 @@ def test_download_raises_when_label_not_found(mock_get, provider, monkeypatch):
     mock_get.return_value = MagicMock(status_code=200, json=lambda: {"files": []})
     with pytest.raises(BackupProviderError):
         provider.download("nonexistent")
+
+
+# ─── Network-level failures ────────────────────────────────────────────
+# requests.exceptions.ConnectionError / Timeout never produce a response
+# object, so they can't hit the status_code >= 300 branch — each call site
+# needs its own try/except to convert them into BackupProviderError.
+
+
+@patch("assistant.io.backup.google_drive.requests.post")
+def test_upload_wraps_connection_error(mock_post, provider, monkeypatch):
+    monkeypatch.setattr(provider, "_access_token", lambda: "fake-token")
+    mock_post.side_effect = requests.exceptions.ConnectionError("no route to host")
+    with pytest.raises(BackupProviderError):
+        provider.upload(b"encrypted-bytes", "20260802T120000Z")
+
+
+@patch("assistant.io.backup.google_drive.requests.get")
+def test_list_files_wraps_timeout(mock_get, provider, monkeypatch):
+    monkeypatch.setattr(provider, "_access_token", lambda: "fake-token")
+    mock_get.side_effect = requests.exceptions.Timeout("timed out")
+    with pytest.raises(BackupProviderError):
+        provider.list_versions()
+
+
+@patch("assistant.io.backup.google_drive.requests.get")
+def test_download_wraps_connection_error_on_media_fetch(mock_get, provider, monkeypatch):
+    monkeypatch.setattr(provider, "_access_token", lambda: "fake-token")
+    # First get() (inside _find_file_id -> _list_files) succeeds; second
+    # get() (the actual media download) fails at the network level.
+    mock_get.side_effect = [
+        MagicMock(status_code=200, json=lambda: {"files": [{"id": "f1", "name": "v1"}]}),
+        requests.exceptions.ConnectionError("connection reset"),
+    ]
+    with pytest.raises(BackupProviderError):
+        provider.download("v1")
+
+
+@patch("assistant.io.backup.google_drive.requests.delete")
+@patch("assistant.io.backup.google_drive.requests.get")
+def test_delete_wraps_connection_error(mock_get, mock_delete, provider, monkeypatch):
+    monkeypatch.setattr(provider, "_access_token", lambda: "fake-token")
+    mock_get.return_value = MagicMock(status_code=200, json=lambda: {"files": [{"id": "f1", "name": "v1"}]})
+    mock_delete.side_effect = requests.exceptions.ConnectionError("no route to host")
+    with pytest.raises(BackupProviderError):
+        provider.delete("v1")
