@@ -160,3 +160,81 @@ def test_run_backup_records_failed_status_and_reraises_on_upload_error(sandbox, 
     assert status == "failed"
 
     orchestrator.set_unlocked_key(None)
+
+
+def test_run_restore_extracts_archive(sandbox, tmp_path, monkeypatch):
+    from assistant.io.backup import orchestrator, crypto, backup_provider_registry
+    from assistant import config
+
+    phrase = crypto.generate_recovery_phrase()
+    key = crypto.derive_key(phrase)
+    orchestrator.set_unlocked_key(key)
+
+    class _FakeProvider:
+        name = "google_drive"
+        def __init__(self):
+            self.uploads: dict[str, bytes] = {}
+        def is_connected(self): return True
+        def upload(self, blob, label): self.uploads[label] = blob
+        def list_versions(self): return sorted(self.uploads.keys(), reverse=True)
+        def download(self, label): return self.uploads[label]
+        def delete(self, label): del self.uploads[label]
+
+    fake = _FakeProvider()
+    monkeypatch.setattr(backup_provider_registry, "_entries", {"google_drive": fake})
+
+    orchestrator.run_backup()
+
+    restore_target = tmp_path / "restored_TENKA"
+    monkeypatch.setattr(config, "SANDBOX_DIR", restore_target)
+
+    orchestrator.run_restore(phrase)
+
+    assert (restore_target / "memory" / "tenka.db").exists()
+    assert (restore_target / "Notes" / "todo.md").exists()
+
+    orchestrator.set_unlocked_key(None)
+
+
+def test_run_restore_wrong_phrase_raises(sandbox, tmp_path, monkeypatch):
+    from assistant.io.backup import orchestrator, crypto, backup_provider_registry
+
+    phrase = crypto.generate_recovery_phrase()
+    orchestrator.set_unlocked_key(crypto.derive_key(phrase))
+
+    class _FakeProvider:
+        name = "google_drive"
+        def __init__(self):
+            self.uploads: dict[str, bytes] = {}
+        def is_connected(self): return True
+        def upload(self, blob, label): self.uploads[label] = blob
+        def list_versions(self): return sorted(self.uploads.keys(), reverse=True)
+        def download(self, label): return self.uploads[label]
+        def delete(self, label): del self.uploads[label]
+
+    fake = _FakeProvider()
+    monkeypatch.setattr(backup_provider_registry, "_entries", {"google_drive": fake})
+    orchestrator.run_backup()
+
+    wrong_phrase = crypto.generate_recovery_phrase()
+    with pytest.raises(RuntimeError, match="incorrect"):
+        orchestrator.run_restore(wrong_phrase)
+
+    orchestrator.set_unlocked_key(None)
+
+
+def test_run_restore_no_backups_raises(sandbox, monkeypatch):
+    from assistant.io.backup import orchestrator, backup_provider_registry
+
+    class _EmptyProvider:
+        name = "google_drive"
+        def is_connected(self): return True
+        def upload(self, blob, label): pass
+        def list_versions(self): return []
+        def download(self, label): raise KeyError(label)
+        def delete(self, label): pass
+
+    monkeypatch.setattr(backup_provider_registry, "_entries", {"google_drive": _EmptyProvider()})
+
+    with pytest.raises(RuntimeError, match="No backups found"):
+        orchestrator.run_restore("any twelve word phrase used only to derive a key here now")

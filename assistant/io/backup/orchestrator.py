@@ -130,3 +130,44 @@ def run_backup(provider_name: str = "google_drive") -> None:
         settings.set("backup_last_backup_status", "success", source="backup_run")
 
     logger.info(f"[BACKUP] Uploaded version '{label}' to {provider_name}")
+
+
+def run_restore(
+    recovery_phrase: str,
+    provider_name: str = "google_drive",
+    label: str | None = None,
+) -> None:
+    """Download, decrypt, and extract a backup into SANDBOX_DIR.
+
+    Raises RuntimeError with a user-facing message on any failure —
+    wrong phrase, corrupted blob, or no backups found. Never applies a
+    partial or corrupt extraction.
+    """
+    from cryptography.exceptions import InvalidTag
+
+    from . import crypto, backup_provider_registry
+    from ... import config
+
+    provider = backup_provider_registry.require(provider_name)
+
+    versions = provider.list_versions()
+    if not versions:
+        raise RuntimeError("No backups found for this provider.")
+    target_label = label or versions[0]
+
+    encrypted = provider.download(target_label)
+    key = crypto.derive_key(recovery_phrase)
+
+    try:
+        archive_bytes = crypto.decrypt(encrypted, key)
+    except InvalidTag:
+        raise RuntimeError("Recovery phrase is incorrect, or the backup is corrupted.")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        archive_path = Path(tmp) / "restore.tar"
+        archive_path.write_bytes(archive_bytes)
+        config.SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive_path, "r") as tar:
+            tar.extractall(config.SANDBOX_DIR)
+
+    logger.info(f"[BACKUP] Restored version '{target_label}' from {provider_name}")
