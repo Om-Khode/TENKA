@@ -132,3 +132,31 @@ def test_run_backup_uploads_and_applies_retention(sandbox, monkeypatch):
     assert status == "success"
 
     orchestrator.set_unlocked_key(None)
+
+
+def test_run_backup_records_failed_status_and_reraises_on_upload_error(sandbox, monkeypatch):
+    from assistant.io.backup import orchestrator, crypto, backup_provider_registry
+    from assistant.storage.db import get_db
+    from assistant.storage.repos.settings import SettingsRepo
+
+    key = crypto.derive_key(crypto.generate_recovery_phrase())
+    orchestrator.set_unlocked_key(key)
+
+    class _FailingProvider:
+        name = "google_drive"
+        def is_connected(self): return True
+        def upload(self, blob, label): raise RuntimeError("boom")
+        def list_versions(self): return []
+        def download(self, label): raise AssertionError("not reached")
+        def delete(self, label): raise AssertionError("not reached")
+
+    monkeypatch.setattr(backup_provider_registry, "_entries", {"google_drive": _FailingProvider()})
+
+    with pytest.raises(RuntimeError, match="boom"):
+        orchestrator.run_backup()
+
+    db = get_db()
+    status = SettingsRepo(db).get("backup_last_backup_status")
+    assert status == "failed"
+
+    orchestrator.set_unlocked_key(None)

@@ -122,11 +122,11 @@ def run_backup(provider_name: str = "google_drive") -> None:
         _apply_retention(provider)
     except Exception:
         if settings is not None:
-            settings.set("backup_last_backup_status", "failed")
+            settings.set("backup_last_backup_status", "failed", source="backup_run")
         raise
 
     if settings is not None:
-        settings.set("backup_last_backup_at", datetime.now(timezone.utc).isoformat())
-        settings.set("backup_last_backup_status", "success")
+        settings.set("backup_last_backup_at", datetime.now(timezone.utc).isoformat(), source="backup_run")
+        settings.set("backup_last_backup_status", "success", source="backup_run")
 
     logger.info(f"[BACKUP] Uploaded version '{label}' to {provider_name}")
