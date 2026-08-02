@@ -296,3 +296,102 @@ def test_start_stop_thread_lifecycle():
     orchestrator.stop()
     orchestrator._backup_thread.join(timeout=2)
     assert not orchestrator._backup_thread.is_alive()
+
+
+def test_maybe_run_scheduled_backup_skips_when_locked(sandbox, monkeypatch):
+    """The 'key not unlocked this session' gate is the critical security
+    constraint — a freshly-restarted process must never auto-backup."""
+    from assistant.io.backup import orchestrator
+    from assistant.storage.db import get_db
+    from assistant.storage.repos.settings import SettingsRepo
+
+    orchestrator.set_unlocked_key(None)
+    settings = SettingsRepo(get_db())
+    settings.set("backup_enabled", True, source="test")
+
+    calls = []
+    monkeypatch.setattr(orchestrator, "run_backup", lambda provider_name: calls.append(provider_name))
+
+    orchestrator._maybe_run_scheduled_backup()
+
+    assert calls == []
+
+
+def test_maybe_run_scheduled_backup_skips_when_disabled(sandbox, monkeypatch):
+    from assistant.io.backup import orchestrator, crypto
+    from assistant.storage.db import get_db
+    from assistant.storage.repos.settings import SettingsRepo
+
+    orchestrator.set_unlocked_key(crypto.derive_key(crypto.generate_recovery_phrase()))
+    SettingsRepo(get_db())  # backup_enabled left unset -> defaults False
+
+    calls = []
+    monkeypatch.setattr(orchestrator, "run_backup", lambda provider_name: calls.append(provider_name))
+
+    orchestrator._maybe_run_scheduled_backup()
+
+    assert calls == []
+    orchestrator.set_unlocked_key(None)
+
+
+def test_maybe_run_scheduled_backup_skips_when_interval_not_elapsed(sandbox, monkeypatch):
+    from assistant.io.backup import orchestrator, crypto
+    from assistant.storage.db import get_db
+    from assistant.storage.repos.settings import SettingsRepo
+    from datetime import datetime, timezone
+
+    orchestrator.set_unlocked_key(crypto.derive_key(crypto.generate_recovery_phrase()))
+    settings = SettingsRepo(get_db())
+    settings.set("backup_enabled", True, source="test")
+    settings.set("backup_last_backup_at", datetime.now(timezone.utc).isoformat(), source="test")
+
+    calls = []
+    monkeypatch.setattr(orchestrator, "run_backup", lambda provider_name: calls.append(provider_name))
+
+    orchestrator._maybe_run_scheduled_backup()
+
+    assert calls == []
+    orchestrator.set_unlocked_key(None)
+
+
+def test_maybe_run_scheduled_backup_runs_when_all_gates_pass(sandbox, monkeypatch):
+    from assistant.io.backup import orchestrator, crypto
+    from assistant.storage.db import get_db
+    from assistant.storage.repos.settings import SettingsRepo
+    from datetime import datetime, timedelta, timezone
+
+    orchestrator.set_unlocked_key(crypto.derive_key(crypto.generate_recovery_phrase()))
+    settings = SettingsRepo(get_db())
+    settings.set("backup_enabled", True, source="test")
+    stale = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    settings.set("backup_last_backup_at", stale, source="test")
+    settings.set("backup_provider", "google_drive", source="test")
+
+    calls = []
+    monkeypatch.setattr(orchestrator, "run_backup", lambda provider_name: calls.append(provider_name))
+
+    orchestrator._maybe_run_scheduled_backup()
+
+    assert calls == ["google_drive"]
+    orchestrator.set_unlocked_key(None)
+
+
+def test_maybe_run_scheduled_backup_runs_on_corrupted_timestamp(sandbox, monkeypatch):
+    """A corrupted/unparseable backup_last_backup_at must not permanently
+    wedge the scheduler into never backing up again — run anyway."""
+    from assistant.io.backup import orchestrator, crypto
+    from assistant.storage.db import get_db
+    from assistant.storage.repos.settings import SettingsRepo
+
+    orchestrator.set_unlocked_key(crypto.derive_key(crypto.generate_recovery_phrase()))
+    settings = SettingsRepo(get_db())
+    settings.set("backup_enabled", True, source="test")
+    settings.set("backup_last_backup_at", "not-a-valid-timestamp", source="test")
+
+    calls = []
+    monkeypatch.setattr(orchestrator, "run_backup", lambda provider_name: calls.append(provider_name))
+
+    orchestrator._maybe_run_scheduled_backup()
+
+    assert calls == ["google_drive"]  # default provider, backup_provider unset
+    orchestrator.set_unlocked_key(None)
