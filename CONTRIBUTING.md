@@ -119,15 +119,20 @@ git config commit.template .gitmessage
 - **Branch names use the same type prefix as the commit**: `feat/<short-name>`, `fix/<short-name>`, `refactor/<short-name>`, `chore/`, `docs/`, `test/`, `perf/`.
 - **Every change gets a branch** — however small. A one-line fix is still `fix/<short-name>`.
 - Messy intermediate commits on a branch are fine — they collapse to one polished commit when squash-merged.
+- **Branches are never deleted.** Squashing collapses a branch's commits into one on `main`, so the branch is the only surviving record of the individual steps. Push it and leave it.
 
 ```bash
 git switch main && git pull
 git switch -c fix/stale-page-handle
 # ...work, commit as often as you like...
+git push -u origin fix/stale-page-handle   # branch history lives on origin
 git switch main
 git merge --squash fix/stale-page-handle
 git commit                                 # one clean commit on main
+git push                                   # main, after the merge
 ```
+
+A squash-merged branch will look *unmerged* to `git branch --merged` — that's expected, since squashing breaks ancestry. To confirm the content landed, compare trees: `git diff <branch-tip> <squash-commit>` should be empty.
 
 **Never commit or push directly to `main`**, and never merge without `--squash` — a plain `git merge` replays the branch's whole history onto `main`. Contributors: always go through a PR.
 
