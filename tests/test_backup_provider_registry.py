@@ -42,14 +42,11 @@ def test_fake_provider_round_trips():
 
 
 def test_registry_register_and_require():
-    backup_provider_registry.reset()
     p = _FakeProvider()
-    backup_provider_registry.register("fake", p)
-    assert backup_provider_registry.require("fake") is p
-    backup_provider_registry.reset()
+    backup_provider_registry.register("fake_register_and_require_test", p)
+    assert backup_provider_registry.require("fake_register_and_require_test") is p
 
 
 def test_registry_require_missing_raises_keyerror():
-    backup_provider_registry.reset()
     with pytest.raises(KeyError):
-        backup_provider_registry.require("nope")
+        backup_provider_registry.require("definitely_nonexistent_provider_xyz")
