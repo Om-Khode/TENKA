@@ -12,6 +12,8 @@ logger = logging.getLogger("backup.orchestrator")
 
 _EXCLUDED_TOP_LEVEL_DIRS = {"browser-cache"}
 
+_DB_SIDECAR_SUFFIXES = (".db", ".db-wal", ".db-shm", ".db-journal")
+
 
 def _build_archive(dest_path: Path) -> None:
     """Tar up everything under SANDBOX_DIR a restore needs.
@@ -44,8 +46,8 @@ def _build_archive(dest_path: Path) -> None:
                 for item in src_dir.rglob("*"):
                     if item.is_dir():
                         continue
-                    if item.suffix == ".db":
-                        continue  # already snapshotted above
+                    if item.name.endswith(_DB_SIDECAR_SUFFIXES):
+                        continue  # already snapshotted above (or a live WAL-mode sidecar)
                     rel = item.relative_to(config.SANDBOX_DIR)
                     if any(part in _EXCLUDED_TOP_LEVEL_DIRS for part in rel.parts):
                         continue
