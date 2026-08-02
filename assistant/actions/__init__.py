@@ -63,6 +63,7 @@ from .pending_handlers import (
     handle_pending_messaging_disambig, handle_pending_messaging_send,
     handle_pending_incoming_message, handle_pending_knowledge_approval,
 )
+from .backup_pending import handle_pending_backup_confirm_phrase, handle_pending_backup_oauth
 from .da_handlers import (
     handle_computer_task, handle_read_screen, handle_find_and_click,
     handle_planner, handle_code_executor,
@@ -89,6 +90,8 @@ pending_messaging_disambig = pending_registry.register(PendingState("messaging_d
 pending_incoming_messages = pending_registry.register(PendingState("incoming_messages", timeout=30.0))
 pending_monitor_disambig = pending_registry.register(PendingState("monitor_disambig", timeout=30.0))
 teaching_session = pending_registry.register(PendingState("teaching_session", timeout=300.0))
+pending_backup_confirm_phrase = pending_registry.register(PendingState("backup_confirm_phrase", timeout=180.0))
+pending_backup_oauth = pending_registry.register(PendingState("backup_oauth", timeout=120.0))
 
 _destructive_disclosed: bool = False
 
