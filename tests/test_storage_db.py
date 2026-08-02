@@ -157,3 +157,26 @@ def test_procedures_index_exists(tmp_path):
     )
     assert idx is not None
     db.close()
+
+
+# --- backup_to ---
+
+def test_backup_to_produces_consistent_snapshot(tmp_path):
+    from assistant.storage.db import Database
+
+    db = Database(tmp_path / "source.db")
+    db.execute(
+        "INSERT INTO runtime_settings (key, value, updated_at, updated_source) "
+        "VALUES ('probe', '\"1\"', '2026-08-02T00:00:00', 'test')"
+    )
+    db.commit()
+
+    dest = tmp_path / "snapshot.db"
+    db.backup_to(dest)
+
+    import sqlite3
+    conn = sqlite3.connect(str(dest))
+    row = conn.execute("SELECT value FROM runtime_settings WHERE key='probe'").fetchone()
+    conn.close()
+    assert row == ('"1"',)
+    db.close()

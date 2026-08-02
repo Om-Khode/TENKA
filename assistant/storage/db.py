@@ -49,6 +49,20 @@ class Database:
     def close(self) -> None:
         self._conn.close()
 
+    def backup_to(self, dest_path: Path) -> None:
+        """Write a consistent on-disk snapshot of this database to dest_path.
+
+        Uses SQLite's own online backup API rather than copying the .db
+        file's bytes directly — safe under WAL mode and concurrent
+        writers, where a raw file copy can capture a mid-write state.
+        """
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_conn = sqlite3.connect(str(dest_path))
+        try:
+            self._conn.backup(dest_conn)
+        finally:
+            dest_conn.close()
+
     @property
     def path(self) -> Path:
         return self._path
