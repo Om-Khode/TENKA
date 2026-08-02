@@ -49,7 +49,7 @@ async def handle_manage_backup(params: dict, llm_response: str, bridge=None) -> 
     if action == "status":
         return _status()
     if action == "enable":
-        return await _enable()
+        return await _enable(goal)
     if action == "disable":
         return _disable()
     if action == "backup_now":
@@ -65,19 +65,40 @@ def _status() -> str:
     if not enabled:
         return "Cloud backup isn't set up yet. Say 'enable backup' to get started."
 
+    # Check status before last_at: a failed attempt (orchestrator.run_backup's
+    # except branch) sets backup_last_backup_status="failed" but never touches
+    # backup_last_backup_at — that only happens on the success path. Gating
+    # solely on last_at would silently swallow the failure as "hasn't run yet".
+    last_status = settings.get("backup_last_backup_status")
+    if last_status == "failed":
+        return "The last backup attempt failed. Say 'back up now' to try again."
+
     last_at = settings.get("backup_last_backup_at")
-    last_status = settings.get("backup_last_backup_status", "never")
     if not last_at:
         return "Backup is enabled but hasn't run yet."
     return f"Last backup was {last_at} — status: {last_status}."
 
 
-async def _enable() -> str:
+_REENABLE_CONFIRM_WORDS = ("replace it", "replace them", "start over", "yes, replace")
+
+
+async def _enable(goal: str = "") -> str:
     import assistant.actions as _act
     from ..io.backup import crypto
 
     if _act.pending_backup_confirm_phrase.active or _act.pending_backup_oauth.active:
         return "Already in the middle of setting up backup — finish that first."
+
+    settings = _get_settings_repo()
+    already_enabled = settings.get("backup_enabled", False)
+    confirmed_replace = any(w in goal.lower() for w in _REENABLE_CONFIRM_WORDS)
+    if already_enabled and not confirmed_replace:
+        return (
+            "Cloud backup is already set up. Enabling it again generates a "
+            "brand-new recovery phrase and key — any backups made under the "
+            "old one won't be recoverable without it. If you're sure, say "
+            "'enable backup, replace it' to confirm."
+        )
 
     phrase = crypto.generate_recovery_phrase()
     from ..io.backup import orchestrator
@@ -116,7 +137,8 @@ async def _backup_now() -> str:
     try:
         orchestrator.run_backup(provider_name)
     except (BackupProviderError, RuntimeError) as e:
-        return f"Backup failed: {str(e)[:150]}"
+        logger.error(f"[BACKUP] backup_now failed: {e}")
+        return "Backup failed — check the logs for details."
     return "Backup complete."
 
 
