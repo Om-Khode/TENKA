@@ -283,3 +283,16 @@ def test_run_restore_bad_archive_leaves_sandbox_clean(sandbox, tmp_path, monkeyp
     assert list(restore_target.iterdir()) == [restore_target / "pre_existing.txt"]
 
     orchestrator.set_unlocked_key(None)
+
+
+def test_start_stop_thread_lifecycle():
+    from assistant.io.backup import orchestrator
+    import threading
+
+    orchestrator.start()
+    assert orchestrator._backup_thread is not None
+    assert orchestrator._backup_thread.is_alive()
+
+    orchestrator.stop()
+    orchestrator._backup_thread.join(timeout=2)
+    assert not orchestrator._backup_thread.is_alive()

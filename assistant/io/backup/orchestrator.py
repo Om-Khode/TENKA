@@ -4,14 +4,19 @@ io/backup/orchestrator.py — Archive, encrypt, upload, and restore.
 run_backup() builds an archive, encrypts it with the in-memory unlocked
 key, uploads it via the configured provider, and applies a fixed-count
 retention policy. run_restore() downloads, decrypts, and extracts a
-backup into SANDBOX_DIR. Background scheduling lands in Task 8.
+backup into SANDBOX_DIR. start()/stop() run a background scheduler
+thread that checks periodically and calls run_backup() when a backup
+is due (see _maybe_run_scheduled_backup()).
 """
 import logging
 import shutil
 import tarfile
 import tempfile
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger("backup.orchestrator")
 
@@ -20,6 +25,12 @@ _EXCLUDED_TOP_LEVEL_DIRS = {"browser-cache"}
 _DB_SIDECAR_SUFFIXES = (".db", ".db-wal", ".db-shm", ".db-journal")
 
 _RETENTION_COUNT = 3
+
+_BACKUP_CHECK_SECONDS = 6 * 60 * 60   # check every 6 hours
+_BACKUP_INTERVAL_HOURS = 24           # run at most once per 24h
+
+_backup_thread: Optional[threading.Thread] = None
+_backup_stop_event = threading.Event()
 
 # In-memory only — the recovery phrase (and the key derived from it) is
 # NEVER written to disk. This means scheduled backups only run in a
@@ -188,3 +199,78 @@ def run_restore(
         shutil.copytree(staging_dir, config.SANDBOX_DIR, dirs_exist_ok=True)
 
     logger.info(f"[BACKUP] Restored version '{target_label}' from {provider_name}")
+
+
+def start() -> None:
+    """Start the background backup scheduler thread."""
+    global _backup_thread
+
+    if _backup_thread and _backup_thread.is_alive():
+        logger.debug("[BACKUP] Scheduler already running")
+        return
+
+    _backup_stop_event.clear()
+    _backup_thread = threading.Thread(
+        target=_backup_loop,
+        name="cloud-backup-scheduler",
+        daemon=True,
+    )
+    _backup_thread.start()
+    logger.info("[BACKUP] Scheduler started")
+
+
+def stop() -> None:
+    """Stop the background backup scheduler thread."""
+    _backup_stop_event.set()
+    if _backup_thread:
+        _backup_thread.join(timeout=5)
+    logger.info("[BACKUP] Scheduler stopped")
+
+
+def _backup_loop() -> None:
+    # Let everything else finish initializing first. Waited on the stop
+    # event (not a plain time.sleep) so stop() can interrupt this delay
+    # immediately instead of blocking for up to 30s.
+    if _backup_stop_event.wait(timeout=30.0):
+        return
+
+    while not _backup_stop_event.is_set():
+        try:
+            _maybe_run_scheduled_backup()
+        except Exception as e:
+            logger.warning(f"[BACKUP] Error in scheduled backup check: {e}")
+
+        for _ in range(_BACKUP_CHECK_SECONDS):
+            if _backup_stop_event.is_set():
+                return
+            time.sleep(1)
+
+
+def _maybe_run_scheduled_backup() -> None:
+    from ...storage.db import get_db
+    from ...storage.repos.settings import SettingsRepo
+
+    db = get_db()
+    if db is None:
+        return
+    settings = SettingsRepo(db)
+
+    if not settings.get("backup_enabled", False):
+        return
+    if not is_unlocked():
+        logger.debug("[BACKUP] Skipping scheduled backup — key not unlocked this session")
+        return
+
+    last_at = settings.get("backup_last_backup_at")
+    if last_at:
+        try:
+            last_dt = datetime.fromisoformat(last_at)
+            hours_elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+            if hours_elapsed < _BACKUP_INTERVAL_HOURS:
+                return
+        except (ValueError, TypeError):
+            pass  # corrupted timestamp -> run anyway
+
+    provider_name = settings.get("backup_provider", "google_drive")
+    logger.info("[BACKUP] Running scheduled backup")
+    run_backup(provider_name)
