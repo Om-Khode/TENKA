@@ -63,6 +63,7 @@ from .pending_handlers import (
     handle_pending_messaging_disambig, handle_pending_messaging_send,
     handle_pending_incoming_message, handle_pending_knowledge_approval,
 )
+from .backup import handle_manage_backup
 from .backup_pending import handle_pending_backup_confirm_phrase, handle_pending_backup_oauth
 from .da_handlers import (
     handle_computer_task, handle_read_screen, handle_find_and_click,
