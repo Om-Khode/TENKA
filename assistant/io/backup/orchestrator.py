@@ -3,10 +3,11 @@ io/backup/orchestrator.py — Archive, encrypt, upload, and restore.
 
 run_backup() builds an archive, encrypts it with the in-memory unlocked
 key, uploads it via the configured provider, and applies a fixed-count
-retention policy. run_restore() and background scheduling land in
-Tasks 7-8.
+retention policy. run_restore() downloads, decrypts, and extracts a
+backup into SANDBOX_DIR. Background scheduling lands in Task 8.
 """
 import logging
+import shutil
 import tarfile
 import tempfile
 from datetime import datetime, timezone
@@ -140,8 +141,12 @@ def run_restore(
     """Download, decrypt, and extract a backup into SANDBOX_DIR.
 
     Raises RuntimeError with a user-facing message on any failure —
-    wrong phrase, corrupted blob, or no backups found. Never applies a
-    partial or corrupt extraction.
+    wrong phrase, corrupted blob, no backups found, or a structurally
+    bad archive. Never applies a partial or corrupt extraction: the
+    archive is extracted into a scratch staging directory first (with
+    tarfile's 'data' filter, guarding against path traversal via
+    malicious member paths/symlinks — PEP 706), and only copied into
+    the live SANDBOX_DIR after extraction fully succeeds.
     """
     from cryptography.exceptions import InvalidTag
 
@@ -166,8 +171,20 @@ def run_restore(
     with tempfile.TemporaryDirectory() as tmp:
         archive_path = Path(tmp) / "restore.tar"
         archive_path.write_bytes(archive_bytes)
+
+        staging_dir = Path(tmp) / "extracted"
+        staging_dir.mkdir()
+        try:
+            with tarfile.open(archive_path, "r") as tar:
+                tar.extractall(staging_dir, filter="data")
+        except (tarfile.TarError, OSError) as exc:
+            raise RuntimeError(
+                "Backup archive is corrupted and could not be extracted."
+            ) from exc
+
+        # Only touch the live sandbox once the archive is proven fully
+        # extractable — nothing above this line has written to it.
         config.SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
-        with tarfile.open(archive_path, "r") as tar:
-            tar.extractall(config.SANDBOX_DIR)
+        shutil.copytree(staging_dir, config.SANDBOX_DIR, dirs_exist_ok=True)
 
     logger.info(f"[BACKUP] Restored version '{target_label}' from {provider_name}")

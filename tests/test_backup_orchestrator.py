@@ -238,3 +238,48 @@ def test_run_restore_no_backups_raises(sandbox, monkeypatch):
 
     with pytest.raises(RuntimeError, match="No backups found"):
         orchestrator.run_restore("any twelve word phrase used only to derive a key here now")
+
+
+def test_run_restore_bad_archive_leaves_sandbox_clean(sandbox, tmp_path, monkeypatch):
+    """A blob that decrypts fine (right phrase, valid AES-GCM tag) but isn't
+    a structurally valid tar must never leak partial content into the live
+    SANDBOX_DIR — the extract-to-staging-then-copy design means the sandbox
+    should be untouched entirely, not partially populated."""
+    from assistant.io.backup import orchestrator, crypto, backup_provider_registry
+    from assistant import config
+
+    phrase = crypto.generate_recovery_phrase()
+    key = crypto.derive_key(phrase)
+    orchestrator.set_unlocked_key(key)
+
+    # Valid ciphertext (decrypts cleanly), but the plaintext is not a tar
+    # archive at all — simulates a corrupted/malformed archive that still
+    # passes AES-GCM authentication.
+    bad_blob = crypto.encrypt(b"this is not a tar archive", key)
+
+    class _FakeProvider:
+        name = "google_drive"
+        def __init__(self):
+            self.uploads = {"20260101T000000.000000Z": bad_blob}
+        def is_connected(self): return True
+        def upload(self, blob, label): self.uploads[label] = blob
+        def list_versions(self): return sorted(self.uploads.keys(), reverse=True)
+        def download(self, label): return self.uploads[label]
+        def delete(self, label): del self.uploads[label]
+
+    monkeypatch.setattr(backup_provider_registry, "_entries", {"google_drive": _FakeProvider()})
+
+    restore_target = tmp_path / "restored_TENKA"
+    restore_target.mkdir(parents=True)
+    (restore_target / "pre_existing.txt").write_text("keep me")
+    monkeypatch.setattr(config, "SANDBOX_DIR", restore_target)
+
+    with pytest.raises(RuntimeError, match="corrupted"):
+        orchestrator.run_restore(phrase)
+
+    # Pre-existing content untouched, and nothing from the bad archive
+    # was ever written into the live sandbox.
+    assert (restore_target / "pre_existing.txt").read_text() == "keep me"
+    assert list(restore_target.iterdir()) == [restore_target / "pre_existing.txt"]
+
+    orchestrator.set_unlocked_key(None)
