@@ -9,8 +9,15 @@ Two-stage flow, both driven from actions/backup.py's "enable" action:
      retry flow — see Task 4's plan note for why).
 """
 import logging
+import re
 
 logger = logging.getLogger("backup_pending")
+
+# Wins over positive-keyword substring matches — catches negated phrasing like
+# "not done yet" or "don't have one" that would otherwise false-positive on
+# a bare "done" / "have one" substring match. Word-boundary regex (not
+# .split()) so "no," with trailing punctuation still matches "no" as a word.
+_NEGATION_RE = re.compile(r"\b(no|not|don'?t|dont|nope|haven'?t|havent|nah|yet)\b")
 
 
 async def handle_pending_backup_confirm_phrase(text: str, bridge=None) -> str | None:
@@ -20,7 +27,10 @@ async def handle_pending_backup_confirm_phrase(text: str, bridge=None) -> str | 
         return None
 
     text_low = text.strip().lower()
-    is_yes = any(w in text_low for w in ("yes", "saved", "done", "got it", "wrote it", "ok", "okay"))
+    has_negation = bool(_NEGATION_RE.search(text_low))
+    is_yes = (not has_negation) and any(
+        w in text_low for w in ("yes", "saved", "done", "got it", "wrote it", "ok", "okay")
+    )
 
     if not is_yes:
         return (
@@ -58,8 +68,11 @@ async def handle_pending_backup_oauth(text: str, bridge=None) -> str | None:
     text_low = text.strip().lower()
 
     if step == "has_app":
-        is_yes = any(w in text_low for w in ("yes", "yeah", "yep", "have one", "already"))
-        is_no = any(w in text_low for w in ("no", "nope", "don't", "dont", "haven't", "nah"))
+        has_negation = bool(_NEGATION_RE.search(text_low))
+        is_yes = (not has_negation) and any(
+            w in text_low for w in ("yes", "yeah", "yep", "have one", "already")
+        )
+        is_no = has_negation
 
         if is_yes:
             _act.pending_backup_oauth.payload["step"] = "client_id"
