@@ -78,3 +78,57 @@ def test_build_archive_excludes_live_wal_sidecar_files(sandbox, tmp_path):
     assert "memory/tenka.db-wal" not in names
     assert "memory/tenka.db-shm" not in names
     assert not any(n.endswith((".db-wal", ".db-shm")) for n in names)
+
+
+def test_is_unlocked_false_by_default():
+    from assistant.io.backup import orchestrator
+    orchestrator.set_unlocked_key(None)
+    assert orchestrator.is_unlocked() is False
+
+
+def test_set_and_get_unlocked_key():
+    from assistant.io.backup import orchestrator
+    orchestrator.set_unlocked_key(b"0" * 32)
+    assert orchestrator.is_unlocked() is True
+    assert orchestrator.get_unlocked_key() == b"0" * 32
+    orchestrator.set_unlocked_key(None)
+
+
+def test_run_backup_raises_when_locked(sandbox):
+    from assistant.io.backup import orchestrator
+    orchestrator.set_unlocked_key(None)
+    with pytest.raises(RuntimeError, match="unlocked"):
+        orchestrator.run_backup()
+
+
+def test_run_backup_uploads_and_applies_retention(sandbox, monkeypatch):
+    from assistant.io.backup import orchestrator, crypto, backup_provider_registry
+    from assistant.storage.db import get_db
+    from assistant.storage.repos.settings import SettingsRepo
+
+    key = crypto.derive_key(crypto.generate_recovery_phrase())
+    orchestrator.set_unlocked_key(key)
+
+    class _FakeProvider:
+        name = "google_drive"
+        def __init__(self):
+            self.uploads: dict[str, bytes] = {}
+        def is_connected(self): return True
+        def upload(self, blob, label): self.uploads[label] = blob
+        def list_versions(self): return sorted(self.uploads.keys(), reverse=True)
+        def download(self, label): return self.uploads[label]
+        def delete(self, label): del self.uploads[label]
+
+    fake = _FakeProvider()
+    monkeypatch.setattr(backup_provider_registry, "_entries", {"google_drive": fake})
+
+    for i in range(4):
+        orchestrator.run_backup()
+
+    assert len(fake.uploads) == 3  # retention kept only the last 3
+
+    db = get_db()
+    status = SettingsRepo(db).get("backup_last_backup_status")
+    assert status == "success"
+
+    orchestrator.set_unlocked_key(None)
