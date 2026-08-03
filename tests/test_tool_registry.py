@@ -22,7 +22,7 @@ _EXPECTED_INTENTS = [
     "app_action", "enroll_voice", "forget_voice", "browser_cdp_setup",
     "camera_look", "meet_face", "recognize_face",
     "forget_face", "start_recording", "stop_recording", "get_recording",
-    "summarize_recording", "hide_avatar", "show_avatar",
+    "summarize_recording", "hide_avatar", "show_avatar", "manage_backup",
 ]
 
 
