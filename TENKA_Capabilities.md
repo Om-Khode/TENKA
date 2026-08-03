@@ -49,7 +49,7 @@ If you find yourself wanting to add a new intent, read [Adding capabilities](#ad
 | `manage_procedure` | Add, list, edit, or delete taught procedures. Multi-step recipes TENKA learns from you. |
 | `manage_schedule` | Cron-style recurring tasks with optional conditions — "every weekday at 8 am, if I have a meeting today, remind me." Create, list, cancel, or toggle. |
 | `manage_monitor` | Subscribe to real-time desktop events — "tell me when my media player changes track" or "ping me when this window appears." Backed by event sources (SMTC media, WinEventHook, etc.). |
-| `manage_backup` | Enable, disable, check status of, run, or restore TENKA's own encrypted cloud backup — "enable cloud backup", "back up now", "when was my last backup", "restore from backup". |
+| `manage_backup` | Enable, disable, unlock, check status of, run, or restore TENKA's own encrypted cloud backup — "enable cloud backup", "unlock backup" (after a restart), "back up now", "when was my last backup", "restore from backup". |
 
 ---
 

@@ -20,7 +20,18 @@ from typing import Optional
 
 logger = logging.getLogger("backup.orchestrator")
 
-_EXCLUDED_TOP_LEVEL_DIRS = {"browser-cache"}
+# Directories under SANDBOX_DIR that are never archived, at any depth.
+# Checked against every path part of every candidate file, so a nested
+# copy (Sessions/captures/, memory/debug/) is skipped too.
+_EXCLUDED_DIRS = {
+    "credentials",     # OAuth tokens + API keys: machine-scoped secrets.
+                       # Reconnecting a provider is cheap; putting live
+                       # credentials inside a cloud-hosted archive is not.
+    "captures",        # vision-loop screenshots — regenerable, large
+    "debug",           # code_executor code dumps — dev artifacts only
+    "debug_captures",  # vision debug frames — dev artifacts only
+    "browser-cache",   # Playwright's bundled Chromium profile — pure cache
+}
 
 _DB_SIDECAR_SUFFIXES = (".db", ".db-wal", ".db-shm", ".db-journal")
 
@@ -39,14 +50,36 @@ _backup_stop_event = threading.Event()
 _unlocked_key: bytes | None = None
 
 
+def _backed_up_dirs() -> tuple[str, ...]:
+    """Top-level SANDBOX_DIR directories a restore needs, by name.
+
+    config.py owns constants for only three of these; the rest are
+    created by their owning module, cited below. Anything not listed
+    here is not backed up — _EXCLUDED_DIRS names the ones that is
+    deliberate for. Add a line here when a new durable data directory
+    appears; the alternative is silently losing it.
+    """
+    from ... import config
+    return (
+        "memory",                  # SQLite DB + FAISS index/ID-map (storage/db.py)
+        config.MANIFESTS_DIR.name,
+        config.NOTES_DIR.name,
+        config.SESSIONS_DIR.name,
+        "faces",                   # face embeddings (faces.py:19)
+        "scripts",                 # saved generated scripts (code_executor/templates.py:17)
+        "knowledge",               # per-service knowledge JSON (knowledge.py:69)
+        "service_data",            # messaging session data (io/messaging_bridge.py:78)
+    )
+
+
 def _build_archive(dest_path: Path) -> None:
     """Tar up everything under SANDBOX_DIR a restore needs.
 
     The SQLite DB is snapshotted via Database.backup_to() into a temp
     file first, rather than tarring the live .db file directly — WAL
-    mode means the .db file alone can be mid-write. browser-cache/ is
-    skipped entirely: it's Playwright's bundled Chromium profile,
-    purely regenerable, zero backup value.
+    mode means the .db file alone can be mid-write. The directory list
+    comes from _backed_up_dirs(); _EXCLUDED_DIRS prunes regenerable
+    caches and machine-scoped secrets wherever they appear inside it.
     """
     from ... import config
     from ...storage.db import get_db
@@ -63,7 +96,7 @@ def _build_archive(dest_path: Path) -> None:
         with tarfile.open(dest_path, "w") as tar:
             tar.add(db_snapshot, arcname="memory/tenka.db")
 
-            for top_level in ("memory", "manifests", "Notes", "Sessions"):
+            for top_level in _backed_up_dirs():
                 src_dir = config.SANDBOX_DIR / top_level
                 if not src_dir.exists():
                     continue
@@ -73,7 +106,7 @@ def _build_archive(dest_path: Path) -> None:
                     if item.name.endswith(_DB_SIDECAR_SUFFIXES):
                         continue  # already snapshotted above (or a live WAL-mode sidecar)
                     rel = item.relative_to(config.SANDBOX_DIR)
-                    if any(part in _EXCLUDED_TOP_LEVEL_DIRS for part in rel.parts):
+                    if any(part in _EXCLUDED_DIRS for part in rel.parts):
                         continue
                     tar.add(item, arcname=str(rel))
 

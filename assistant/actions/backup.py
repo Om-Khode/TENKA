@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 _RESTORE_WORDS = ("restore",)
 _STATUS_WORDS = ("status", "when was", "last backup")
 _DISABLE_WORDS = ("disable", "turn off", "stop backing up", "stop backup")
+_UNLOCK_WORDS = ("unlock",)
 _ENABLE_WORDS = ("enable", "set up", "setup", "turn on", "connect")
 
 
@@ -27,6 +28,11 @@ def _classify_action(goal: str) -> str:
         return "status"
     if any(w in goal_low for w in _DISABLE_WORDS):
         return "disable"
+    # Before "enable": "unlock" shares no substring with the enable/connect
+    # words, but it must not fall through to backup_now either — unlocking
+    # is the non-destructive counterpart of enabling after a restart.
+    if any(w in goal_low for w in _UNLOCK_WORDS):
+        return "unlock"
     if any(w in goal_low for w in _ENABLE_WORDS):
         return "enable"
     return "backup_now"
@@ -49,13 +55,15 @@ async def handle_manage_backup(params: dict, llm_response: str, bridge=None) -> 
     if action == "status":
         return _status()
     if action == "enable":
-        return await _enable(goal)
+        return await _enable(goal, bridge)
+    if action == "unlock":
+        return _unlock()
     if action == "disable":
         return _disable()
     if action == "backup_now":
         return await _backup_now()
     if action == "restore":
-        return await _restore()
+        return _restore()
     return "I'm not sure what to do with that backup command."
 
 
@@ -82,7 +90,40 @@ def _status() -> str:
 _REENABLE_CONFIRM_WORDS = ("replace it", "replace them", "start over", "yes, replace")
 
 
-async def _enable(goal: str = "") -> str:
+async def _show_phrase_privately(phrase: str, bridge=None) -> None:
+    """Put the recovery phrase on screen without it entering any record.
+
+    Everything a handler *returns* is spoken by TTS, written to debug.log
+    (main.py's `Response: "…"`), saved into the conversations table, and
+    replayed verbatim into later LLM prompts — so the phrase can never be
+    part of a return value, and must never reach a logger.* call either.
+
+    Two transient channels are used instead:
+      - the Unity overlay's thought bubble ("show_thought"), which is a
+        separate panel from the subtitle line — the subtitle would be
+        overwritten a second later by TTS speaking this turn's response.
+        _log_payload=False keeps unity_bridge's own debug trace from
+        writing the payload out.
+      - the console, which is always written to: it is the only channel
+        that exists in terminal-only mode / the dev harness, and print()
+        never passes through logging.
+    """
+    if bridge is not None and getattr(bridge, "unity_connected", False):
+        try:
+            await bridge.send_command(
+                "show_thought", state="done", text=f"Recovery phrase:\n{phrase}",
+                _log_payload=False,
+            )
+        except Exception:
+            # Never let an overlay failure surface the phrase in an
+            # exception message or abort the flow — the console copy below
+            # is the durable one anyway.
+            logger.warning("[BACKUP] Could not display recovery phrase on the overlay")
+
+    print(f"\n=== TENKA backup recovery phrase (shown once, never stored) ===\n{phrase}\n")
+
+
+async def _enable(goal: str = "", bridge=None) -> str:
     import assistant.actions as _act
     from ..io.backup import crypto
 
@@ -94,22 +135,57 @@ async def _enable(goal: str = "") -> str:
     confirmed_replace = any(w in goal.lower() for w in _REENABLE_CONFIRM_WORDS)
     if already_enabled and not confirmed_replace:
         return (
-            "Cloud backup is already set up. Enabling it again generates a "
-            "brand-new recovery phrase and key — any backups made under the "
-            "old one won't be recoverable without it. If you're sure, say "
-            "'enable backup, replace it' to confirm."
+            "Cloud backup is already set up. If you just need to unlock it "
+            "after a restart, say 'unlock backup' instead. Enabling it again "
+            "generates a brand-new recovery phrase and key — any backups made "
+            "under the old one won't be recoverable without it. If you're sure, "
+            "say 'enable backup, replace it' to confirm."
         )
 
     phrase = crypto.generate_recovery_phrase()
-    from ..io.backup import orchestrator
-    orchestrator.set_unlocked_key(crypto.derive_key(phrase))
 
+    # The key is NOT cached here: an abandoned or timed-out flow would
+    # otherwise leave the session unlocked with a phrase nobody wrote
+    # down, and the next backup would upload under that orphan key.
+    # handle_pending_backup_confirm_phrase caches it on confirmation.
     _act.pending_backup_confirm_phrase.set({"phrase": phrase})
+    await _show_phrase_privately(phrase, bridge)
+
     return (
-        f"Here's your recovery phrase — write it down somewhere safe, I won't "
-        f"repeat it and I'm not saving it anywhere: {phrase}. "
-        f"If you lose this, nobody, including me, can recover your backup. "
-        f"Say 'saved it' once you've written it down."
+        "Your recovery phrase is on screen now. Write it down somewhere safe — "
+        "I won't repeat it, and it isn't saved anywhere. If you lose it, nobody, "
+        "including me, can recover your backup. Say 'saved it' once it's written down."
+    )
+
+
+def _unlock() -> str:
+    """Re-arm this session's backup key from a phrase the user already has.
+
+    The key lives in process memory only, so every restart starts locked.
+    This is the non-destructive counterpart of 'enable backup' — it never
+    generates a new phrase and never orphans existing backups.
+    """
+    import assistant.actions as _act
+    from ..io.backup import orchestrator
+
+    if orchestrator.is_unlocked():
+        return "Backup is already unlocked for this session."
+
+    _act.pending_backup_unlock_phrase.set({})
+    return (
+        "Paste or say your 12-word recovery phrase and I'll unlock backup "
+        "for this session. Say 'cancel' to stop."
+    )
+
+
+def _restore() -> str:
+    """Start the restore flow — phrase entry happens in the pending handler."""
+    import assistant.actions as _act
+
+    _act.pending_backup_restore_phrase.set({})
+    return (
+        "Restoring overwrites what's on this machine with the latest backup. "
+        "Give me your 12-word recovery phrase to go ahead, or say 'cancel'."
     )
 
 
@@ -127,9 +203,8 @@ async def _backup_now() -> str:
 
     if not orchestrator.is_unlocked():
         return (
-            "I need your recovery phrase to back up right now — "
-            "say 'enable backup' if you haven't set it up, "
-            "or restart hasn't unlocked it yet this session."
+            "I need your recovery phrase first — say 'unlock backup' if you "
+            "already have one, or 'enable backup' to set it up."
         )
 
     settings = _get_settings_repo()
@@ -140,12 +215,3 @@ async def _backup_now() -> str:
         logger.error(f"[BACKUP] backup_now failed: {e}")
         return "Backup failed — check the logs for details."
     return "Backup complete."
-
-
-async def _restore() -> str:
-    return (
-        "Restore needs your recovery phrase and isn't something to do by "
-        "accident — run this from the setup wizard on a fresh install, "
-        "or say 'enable backup' first if you're already set up and just "
-        "want to check for a newer version."
-    )

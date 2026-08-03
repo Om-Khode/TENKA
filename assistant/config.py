@@ -342,7 +342,7 @@ TOP PRIORITY RULES (read first — these settle the common edge cases):
 11. IMPORTANT: "remember my X is Y" / "remember the X is Y" / "remember that X" → store_memory for a SINGLE fact. If the sentence contains multiple facts joined by "and"/"also"/"plus" (e.g. "remember X and Y", "remember X, also Y"), use planner instead — it will split into separate store_memory steps. NOT create_note, NOT manage_shortcut, NOT meet_face. Only use meet_face when the user is introducing themselves face-to-face ("this is Sarah", "I'm Alex"), not for "remember my name is X".
 12. "forget X" / "delete the fact about X" / "remove the memory of X" → forget_memory. User wants to delete a previously stored fact. NOT forget_face/forget_voice (those delete biometric data).
 13. "schedule X" / "every N minutes check X" / "daily at X" → manage_schedule (time-based, cron). "remind me X" → set_reminder (one-time alert). "when X happens do Y" / "skip songs that..." / "notify me when..." / "watch for..." → manage_monitor (event-driven, reacts to OS events like media changes or window focus).
-14. "back up my data" / "enable cloud backup" / "when was my last backup" / "restore from backup" → manage_backup. Distinct from manage_schedule (time-based recurring tasks) and manage_monitor (event-driven) — this is specifically about TENKA's own data durability.
+14. "back up my data" / "enable cloud backup" / "unlock backup" / "when was my last backup" / "restore from backup" → manage_backup. Distinct from manage_schedule (time-based recurring tasks) and manage_monitor (event-driven) — this is specifically about TENKA's own data durability.
 
 Intent catalog (intent | params | when to use):
 small_talk          | {}              | casual chat, greetings, jokes, stable knowledge (math, science, history)
@@ -374,7 +374,7 @@ manage_shortcut     | goal            | create/delete/list voice shortcuts ("whe
 manage_procedure    | goal            | list/delete/rename/edit taught procedures
 manage_schedule     | goal            | schedule/list/cancel/pause/resume recurring monitors
 manage_monitor      | goal            | create/list/pause/resume/delete event monitors ("when X happens, do Y")
-manage_backup       | goal            | enable/disable/back up now/check status/restore cloud backup
+manage_backup       | goal            | enable/disable/unlock/back up now/check status/restore cloud backup
 enroll_voice        | {}              | register voice for speaker verification
 forget_voice        | {}              | delete saved voiceprint
 store_memory        | content         | "remember my/the X is Y" — storing a fact (NOT meet_face, NOT reminder)

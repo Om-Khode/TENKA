@@ -31,6 +31,20 @@ def test_classify_action_enable():
     assert _classify_action("turn on backup") == "enable"
 
 
+def test_classify_action_unlock():
+    assert _classify_action("unlock backup") == "unlock"
+    assert _classify_action("unlock my cloud backup") == "unlock"
+
+
+def test_classify_action_unlock_does_not_shadow_other_actions():
+    """'unlock' is checked before 'enable' but after restore/status/disable —
+    a goal naming both must still take the more specific branch."""
+    assert _classify_action("restore backup") == "restore"
+    assert _classify_action("backup status") == "status"
+    assert _classify_action("disable backup") == "disable"
+    assert _classify_action("enable backup") == "enable"
+
+
 def test_classify_action_defaults_to_backup_now():
     assert _classify_action("back up now") == "backup_now"
     assert _classify_action("do a backup") == "backup_now"
@@ -82,6 +96,8 @@ def _clear_backup_state():
     yield
     _act.pending_backup_confirm_phrase.clear()
     _act.pending_backup_oauth.clear()
+    _act.pending_backup_unlock_phrase.clear()
+    _act.pending_backup_restore_phrase.clear()
     orchestrator.set_unlocked_key(None)
 
 
@@ -141,8 +157,22 @@ async def test_enable_already_enabled_with_explicit_confirmation_proceeds(db_ses
     result = await handle_manage_backup({"goal": "enable backup, replace it"}, "")
 
     assert _act.pending_backup_confirm_phrase.active
-    assert orchestrator.is_unlocked()
     assert "recovery phrase" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_enable_already_enabled_points_at_unlock_first(db_session):
+    """The non-destructive path must be offered before the destructive one —
+    'enable backup' on a configured install used to leave 'replace it' as the
+    only way forward, which orphans every existing backup."""
+    from assistant.actions.backup import handle_manage_backup
+
+    db_session.set("backup_enabled", True, source="test")
+
+    result = await handle_manage_backup({"goal": "enable backup"}, "")
+
+    assert "unlock backup" in result.lower()
+    assert result.lower().index("unlock backup") < result.lower().index("replace it")
 
 
 @pytest.mark.asyncio
@@ -152,8 +182,139 @@ async def test_enable_fresh_install_still_proceeds_without_confirmation(db_sessi
     result = await handle_manage_backup({"goal": "enable backup"}, "")
 
     assert _act.pending_backup_confirm_phrase.active
-    assert orchestrator.is_unlocked()
     assert "recovery phrase" in result.lower()
+
+
+# ─── Critical #1: the recovery phrase must never enter the response pipeline ─
+
+
+class _FakeBridge:
+    """Stands in for a connected UnityBridge, recording send_command calls."""
+
+    def __init__(self, connected=True):
+        self.unity_connected = connected
+        self.commands: list[tuple[str, dict]] = []
+
+    async def send_command(self, action, _log_payload=True, **kwargs):
+        self.commands.append((action, kwargs))
+
+
+@pytest.mark.asyncio
+async def test_enable_never_returns_or_logs_the_recovery_phrase(db_session, caplog, capsys):
+    """Everything a handler returns is spoken, written to debug.log, saved to
+    the conversations table, and replayed into later LLM prompts. The phrase
+    goes to the overlay (and the console) instead — never through any of that."""
+    from assistant.actions.backup import handle_manage_backup
+
+    bridge = _FakeBridge()
+
+    with caplog.at_level("DEBUG"):
+        result = await handle_manage_backup({"goal": "enable backup"}, "", bridge)
+
+    phrase = _act.pending_backup_confirm_phrase.payload["phrase"]
+    words = phrase.split()
+    assert len(words) == 12
+
+    # Not in the return value (→ TTS, logger.info, memory.save_turn, history).
+    # Checked by bigram, not by single word: a few BIP39 words ("safe",
+    # "write") are ordinary English and can legitimately appear in the
+    # spoken text, but two adjacent phrase words never can by chance.
+    assert phrase not in result
+    bigrams = [f"{a} {b}" for a, b in zip(words, words[1:])]
+    assert not [bg for bg in bigrams if bg in result.lower()]
+
+    # Not in any log record, at any level.
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert phrase not in logged
+
+    # It DID go to the overlay, on the persistent thought panel rather than
+    # the subtitle line (which TTS overwrites a moment later with `result`).
+    assert bridge.commands, "phrase was never sent to the overlay"
+    action, kwargs = bridge.commands[0]
+    assert action == "show_thought"
+    assert phrase in kwargs["text"]
+
+    # ...and to the console, which is the only channel in terminal-only mode.
+    assert phrase in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_enable_without_a_connected_overlay_falls_back_to_console(db_session, caplog, capsys):
+    from assistant.actions.backup import handle_manage_backup
+
+    bridge = _FakeBridge(connected=False)
+
+    with caplog.at_level("DEBUG"):
+        result = await handle_manage_backup({"goal": "enable backup"}, "", bridge)
+
+    phrase = _act.pending_backup_confirm_phrase.payload["phrase"]
+    assert bridge.commands == []           # nothing sent to a dead overlay
+    assert phrase not in result
+    assert phrase not in "\n".join(r.getMessage() for r in caplog.records)
+    assert phrase in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_enable_does_not_unlock_before_the_user_confirms(db_session):
+    """Important #6 — an abandoned or timed-out flow must leave the session
+    locked, not armed with a key for a phrase nobody wrote down."""
+    from assistant.actions.backup import handle_manage_backup
+
+    await handle_manage_backup({"goal": "enable backup"}, "")
+
+    assert _act.pending_backup_confirm_phrase.active
+    assert not orchestrator.is_unlocked()
+
+
+# ─── Critical #3: unlock after a restart ────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unlock_when_locked_starts_phrase_entry(db_session):
+    from assistant.actions.backup import handle_manage_backup
+
+    result = await handle_manage_backup({"goal": "unlock backup"}, "")
+
+    assert _act.pending_backup_unlock_phrase.active
+    assert "recovery phrase" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_unlock_when_already_unlocked_says_so(db_session):
+    from assistant.actions.backup import handle_manage_backup
+
+    orchestrator.set_unlocked_key(b"0" * 32)
+
+    result = await handle_manage_backup({"goal": "unlock backup"}, "")
+
+    assert not _act.pending_backup_unlock_phrase.active
+    assert "already unlocked" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_backup_now_while_locked_points_at_unlock(db_session):
+    """After a restart the key is gone; the recovery route must be the
+    non-destructive one, not 'enable backup' (which regenerates a phrase)."""
+    from assistant.actions.backup import handle_manage_backup
+
+    result = await handle_manage_backup({"goal": "back up now"}, "")
+
+    assert "unlock backup" in result.lower()
+
+
+# ─── Critical #4: restore actually starts a restore ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_restore_prompts_for_phrase_and_warns(db_session):
+    from assistant.actions.backup import handle_manage_backup
+
+    result = await handle_manage_backup({"goal": "restore my backup"}, "")
+
+    assert _act.pending_backup_restore_phrase.active
+    assert "recovery phrase" in result.lower()
+    assert "overwrit" in result.lower()
+    assert "wizard" not in result.lower()  # the old dead-end message
 
 
 # ─── Important #3: backup_now failure message must be TTS-safe ─────────────

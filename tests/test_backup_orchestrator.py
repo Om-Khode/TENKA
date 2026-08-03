@@ -23,6 +23,28 @@ def sandbox(tmp_path, monkeypatch):
     (sandbox_dir / "browser-cache").mkdir()
     (sandbox_dir / "browser-cache" / "chromium.bin").write_bytes(b"should-not-be-backed-up")
 
+    # Data directories that used to be silently omitted from every backup.
+    (sandbox_dir / "faces").mkdir()
+    (sandbox_dir / "faces" / "omkho.npy").write_bytes(b"fake-embedding")
+    (sandbox_dir / "scripts").mkdir()
+    (sandbox_dir / "scripts" / "open_thing.py").write_text("print('hi')")
+    (sandbox_dir / "knowledge").mkdir()
+    (sandbox_dir / "knowledge" / "some_service.json").write_text("{}")
+    (sandbox_dir / "service_data").mkdir(parents=True)
+    (sandbox_dir / "service_data" / "some_service").mkdir()
+    (sandbox_dir / "service_data" / "some_service" / "session.json").write_text("{}")
+
+    # Excluded, and deliberately nested inside a directory that IS backed up —
+    # the top-level allowlist alone would not skip these.
+    (sandbox_dir / "Sessions" / "captures").mkdir(parents=True)
+    (sandbox_dir / "Sessions" / "captures" / "frame.png").write_bytes(b"regenerable")
+    (sandbox_dir / "Notes" / "browser-cache").mkdir()
+    (sandbox_dir / "Notes" / "browser-cache" / "blob.bin").write_bytes(b"regenerable")
+
+    # Machine-scoped secrets — never archived.
+    (sandbox_dir / "credentials").mkdir()
+    (sandbox_dir / "credentials" / "google_drive.json").write_text('{"token": "secret"}')
+
     from assistant import config
     monkeypatch.setattr(config, "SANDBOX_DIR", sandbox_dir)
 
@@ -45,6 +67,54 @@ def test_build_archive_includes_expected_paths_excludes_browser_cache(sandbox, t
     assert "manifests/notepad.yaml" in names
     assert "Notes/todo.md" in names
     assert not any("browser-cache" in n for n in names)
+
+
+def test_build_archive_includes_every_durable_data_directory(sandbox, tmp_path):
+    """faces/, scripts/, knowledge/ and service_data/ are as unrecoverable as
+    Notes/ — a backup that omits them is not a backup."""
+    from assistant.io.backup.orchestrator import _build_archive
+
+    archive_path = tmp_path / "backup.tar"
+    _build_archive(archive_path)
+
+    with tarfile.open(archive_path, "r") as tar:
+        names = tar.getnames()
+
+    assert "faces/omkho.npy" in names
+    assert "scripts/open_thing.py" in names
+    assert "knowledge/some_service.json" in names
+    assert "service_data/some_service/session.json" in names
+
+
+def test_build_archive_prunes_excluded_dirs_nested_under_included_ones(sandbox, tmp_path):
+    """The exclusion set is walk-level, not just a top-level allowlist gap:
+    an excluded name anywhere in a backed-up tree is skipped."""
+    from assistant.io.backup.orchestrator import _build_archive
+
+    archive_path = tmp_path / "backup.tar"
+    _build_archive(archive_path)
+
+    with tarfile.open(archive_path, "r") as tar:
+        names = tar.getnames()
+
+    # Both live inside directories that ARE archived.
+    assert "Sessions/captures/frame.png" not in names
+    assert "Notes/browser-cache/blob.bin" not in names
+    assert not any("captures" in n for n in names)
+
+
+def test_build_archive_never_includes_credentials(sandbox, tmp_path):
+    """OAuth tokens are machine-scoped and cheap to re-obtain; shipping them
+    inside a cloud-hosted archive is not a trade worth making."""
+    from assistant.io.backup.orchestrator import _build_archive
+
+    archive_path = tmp_path / "backup.tar"
+    _build_archive(archive_path)
+
+    with tarfile.open(archive_path, "r") as tar:
+        names = tar.getnames()
+
+    assert not any("credentials" in n for n in names)
 
 
 def test_build_archive_excludes_live_wal_sidecar_files(sandbox, tmp_path):

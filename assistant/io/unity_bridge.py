@@ -87,7 +87,7 @@ class UnityBridge:
         )
         logger.info(f"Event server listening on 127.0.0.1:{config.UNITY_EVENT_PORT}")
 
-    async def send_command(self, action: str, **kwargs):
+    async def send_command(self, action: str, _log_payload: bool = True, **kwargs):
         """
         Send a JSON command to Unity.
 
@@ -95,9 +95,13 @@ class UnityBridge:
             await bridge.send_command("set_expression", value="happy")
             await bridge.send_command("play_animation", name="wave")
             await bridge.send_command("show_subtitle", text="Hello!")
+
+        Pass _log_payload=False for one-time secrets that must appear on
+        screen but never in debug.log (e.g. a backup recovery phrase) —
+        only the action name is traced then.
         """
         message = {"action": action, **kwargs}
-        await self._send_to_unity(message)
+        await self._send_to_unity(message, log_payload=_log_payload)
 
     async def send_thought(self, state: str, text: str = ""):
         """Send thought bubble command to Unity. state: 'thinking' | 'done'"""
@@ -170,13 +174,18 @@ class UnityBridge:
                 self._command_writer = None
                 self.unity_connected = False
 
-    async def _send_to_unity(self, message: dict):
-        """Send a length-prefixed JSON message to Unity."""
+    async def _send_to_unity(self, message: dict, log_payload: bool = True):
+        """Send a length-prefixed JSON message to Unity.
+
+        log_payload=False traces the action name only — for payloads that
+        must never be written to debug.log.
+        """
+        traced = message if log_payload else {"action": message.get("action"), "…": "redacted"}
         async with self._command_lock:
             writer = self._command_writer
             if writer is None:
                 # Unity not connected — that's okay, just log and skip
-                logger.debug(f"Unity not connected, skipping command: {message}")
+                logger.debug(f"Unity not connected, skipping command: {traced}")
                 return
 
         try:
@@ -185,7 +194,7 @@ class UnityBridge:
             header = struct.pack(">I", len(json_bytes))
             writer.write(header + json_bytes)
             await writer.drain()
-            logger.debug(f"Sent to Unity: {message}")
+            logger.debug(f"Sent to Unity: {traced}")
         except (ConnectionError, OSError) as e:
             logger.warning(f"Failed to send to Unity: {e}")
             async with self._command_lock:
@@ -254,8 +263,8 @@ class NullBridge:
     async def stop(self):
         return
 
-    async def send_command(self, action: str, **kwargs):
-        logger.debug(f"[null-bridge] drop: {action} {kwargs}")
+    async def send_command(self, action: str, _log_payload: bool = True, **kwargs):
+        logger.debug(f"[null-bridge] drop: {action} {kwargs if _log_payload else '…redacted…'}")
 
     async def send_thought(self, state: str, text: str = ""):
         logger.debug(f"[null-bridge] thought:{state} {text}")
