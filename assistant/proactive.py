@@ -69,6 +69,9 @@ def start_analyzer() -> None:
     from . import reflection
     reflection.start()
 
+    from .io.backup import orchestrator as backup_orchestrator
+    backup_orchestrator.start()
+
     if not getattr(config, "PROACTIVE_ENABLED", True):
         logger.info("[PROACTIVE] Disabled via config — skipping nudge analyzer")
         return
@@ -97,6 +100,9 @@ def stop_analyzer() -> None:
     # Stop reflection engine
     from . import reflection
     reflection.stop()
+
+    from .io.backup import orchestrator as backup_orchestrator
+    backup_orchestrator.stop()
 
 
 def get_queue() -> queue.Queue:

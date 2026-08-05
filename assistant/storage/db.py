@@ -49,6 +49,20 @@ class Database:
     def close(self) -> None:
         self._conn.close()
 
+    def backup_to(self, dest_path: Path) -> None:
+        """Write a consistent on-disk snapshot of this database to dest_path.
+
+        Uses SQLite's own online backup API rather than copying the .db
+        file's bytes directly — safe under WAL mode and concurrent
+        writers, where a raw file copy can capture a mid-write state.
+        """
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_conn = sqlite3.connect(str(dest_path))
+        try:
+            self._conn.backup(dest_conn)
+        finally:
+            dest_conn.close()
+
     @property
     def path(self) -> Path:
         return self._path
@@ -740,6 +754,31 @@ def init_db(path: Path) -> "Database":
 def get_db() -> "Database | None":
     """Return the singleton Database, or None if not yet initialized."""
     return _instance
+
+
+def close_for_restore() -> None:
+    """Close the live connection and clear the singleton before a backup
+    restore overwrites tenka.db on disk.
+
+    A still-open connection has its own page cache and WAL bookkeeping for
+    the file it originally opened — if the file's bytes get replaced out
+    from under it (as backup restore does) and anything then writes
+    through the stale connection, SQLite can write new WAL frames against
+    a file whose physical structure no longer matches what the connection
+    last read, corrupting it. Closing first prevents that.
+
+    Callers are expected to call init_db() again immediately after the
+    swap completes (io/backup/orchestrator.py's run_restore() does this)
+    — a get_db() left returning None until some later manual restart
+    turned out to be far more fragile than the corruption this guards
+    against: dozens of call sites across the app assume a live connection
+    always exists once init_db() has run once, and each one crashes the
+    moment it doesn't.
+    """
+    global _instance
+    if _instance is not None:
+        _instance.close()
+    _instance = None
 
 
 def _reset_for_testing() -> None:

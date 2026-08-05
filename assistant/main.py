@@ -399,6 +399,45 @@ def _match_batch_teach(text: str) -> tuple[str, str] | None:
     return (seed, body)
 
 
+# ─── Pending Handler Table ───────────────────────────────────────────────────
+# The dispatcher in process_text_from_queue() walks this in order; the first
+# handler that returns non-None owns the turn. Registering a pending state in
+# actions/__init__.py is NOT enough — a handler missing from this table is
+# simply never called, and its state silently expires. Module-level (not
+# function-local) so tests can assert every exported handle_pending_* is here.
+#
+# Each entry: (handler_func, log_label, memory_intent, needs_bridge)
+
+from .actions import (
+    handle_pending_destructive, handle_pending_camera_settings,
+    handle_pending_forget_face, handle_pending_file_search,
+    handle_pending_oauth_setup, handle_pending_device_auth,
+    handle_pending_messaging_disambig, handle_pending_messaging_send,
+    handle_pending_incoming_message, handle_pending_knowledge_approval,
+    handle_pending_monitor_disambig, handle_pending_backup_confirm_phrase,
+    handle_pending_backup_oauth, handle_pending_backup_unlock_phrase,
+    handle_pending_backup_restore_phrase,
+)
+
+_PENDING_HANDLERS = [
+    (handle_pending_destructive,        "DESTRUCTIVE",  "file_task",          False),
+    (handle_pending_camera_settings,    "CAMERA",       "camera_look",        False),
+    (handle_pending_forget_face,        "FACE",         "forget_face",        False),
+    (handle_pending_file_search,        "FILE",         "file_task",          False),
+    (handle_pending_oauth_setup,        "OAUTH",        "oauth_setup",        True),
+    (handle_pending_device_auth,        "DEVICE_AUTH",  "device_auth",        True),
+    (handle_pending_messaging_disambig, "MESSAGING",    "messaging_disambig", True),
+    (handle_pending_messaging_send,     "MESSAGING",    "messaging_send",     False),
+    (handle_pending_incoming_message,   "INCOMING",     "incoming_message",   False),
+    (handle_pending_knowledge_approval, "KNOWLEDGE",    "knowledge_approval", True),
+    (handle_pending_monitor_disambig,   "MONITOR",      "manage_monitor",     False),
+    (handle_pending_backup_confirm_phrase, "BACKUP",    "manage_backup",      False),
+    (handle_pending_backup_oauth,       "BACKUP",       "manage_backup",      False),
+    (handle_pending_backup_unlock_phrase, "BACKUP",     "manage_backup",      False),
+    (handle_pending_backup_restore_phrase, "BACKUP",    "manage_backup",      False),
+]
+
+
 # ─── Wake Word Listener (global reference) ───────────────────────────────────
 
 _wake_listener: WakeWordListener | None = None
@@ -737,33 +776,9 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             logger.debug(f"[TOPIC] Push failed (non-critical): {e}")
 
         # ── Pending handler chain — generic dispatcher ────────────────
-        # Each entry: (handler_func, log_label, memory_intent, takes_bridge)
-        # Adding a new pending handler = adding one tuple here.
+        # Table lives at module level (_PENDING_HANDLERS, near the top) so
+        # registration is testable; see tests/test_pending_dispatch_wiring.py.
         # Plan resume is handled ONCE at the end — no per-handler changes.
-        from .actions import (
-            handle_pending_destructive, handle_pending_camera_settings,
-            handle_pending_forget_face, handle_pending_file_search,
-            handle_pending_oauth_setup, handle_pending_device_auth,
-            handle_pending_messaging_disambig, handle_pending_messaging_send,
-            handle_pending_incoming_message, handle_pending_knowledge_approval,
-            handle_pending_monitor_disambig,
-        )
-
-        _PENDING_HANDLERS = [
-            # (handler, log_label, memory_intent, needs_bridge)
-            (handle_pending_destructive,       "DESTRUCTIVE",  "file_task",          False),
-            (handle_pending_camera_settings,    "CAMERA",       "camera_look",        False),
-            (handle_pending_forget_face,        "FACE",         "forget_face",        False),
-            (handle_pending_file_search,        "FILE",         "file_task",          False),
-            (handle_pending_oauth_setup,        "OAUTH",        "oauth_setup",        True),
-            (handle_pending_device_auth,        "DEVICE_AUTH",  "device_auth",        True),
-            (handle_pending_messaging_disambig, "MESSAGING",    "messaging_disambig", True),
-            (handle_pending_messaging_send,     "MESSAGING",    "messaging_send",     False),
-            (handle_pending_incoming_message,   "INCOMING",     "incoming_message",   False),
-            (handle_pending_knowledge_approval, "KNOWLEDGE",    "knowledge_approval", True),
-            (handle_pending_monitor_disambig,   "MONITOR",      "manage_monitor",     False),
-        ]
-
         pending_handled = False
         pending_response = None
 
@@ -785,6 +800,29 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                     else:
                         parsed_emotion = "neutral"
                 await tts.speak(resp, bridge, emotion=parsed_emotion)
+
+                # A pending handler (e.g. backup restore) can request a
+                # graceful exit — it already closed the live DB connection
+                # before this returned (see close_for_restore() in
+                # orchestrator.run_restore()), and deliberately does not
+                # reopen it: other modules cache their own repo/Database
+                # reference at startup (memory.py's _repo, etc.), so a
+                # fresh storage/db.py connection wouldn't reach them
+                # anyway — only a real process restart rebuilds those
+                # correctly. So from here on this turn must touch the DB
+                # exactly as little as the "shutdown" intent's own branch
+                # above does: no memory.save_turn, no planner-resume
+                # (which can itself write to the DB) — straight to the
+                # same finish + exit sequence.
+                from .core import shutdown_signal
+                if shutdown_signal.is_requested():
+                    logger.info("[SHUTDOWN] Handler requested graceful exit")
+                    _tracker.action_dispatched = f"pending_{label.lower()}"
+                    _tracker.action_outcome = "success"
+                    await _finish_turn(bridge)
+                    _shutdown_event.set()
+                    return
+
                 memory.save_turn(
                     transcription, mem_intent, resp,
                     session_mod.get_current_session_id(),

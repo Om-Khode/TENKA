@@ -63,6 +63,11 @@ from .pending_handlers import (
     handle_pending_messaging_disambig, handle_pending_messaging_send,
     handle_pending_incoming_message, handle_pending_knowledge_approval,
 )
+from .backup import handle_manage_backup
+from .backup_pending import (
+    handle_pending_backup_confirm_phrase, handle_pending_backup_oauth,
+    handle_pending_backup_unlock_phrase, handle_pending_backup_restore_phrase,
+)
 from .da_handlers import (
     handle_computer_task, handle_read_screen, handle_find_and_click,
     handle_planner, handle_code_executor,
@@ -89,6 +94,13 @@ pending_messaging_disambig = pending_registry.register(PendingState("messaging_d
 pending_incoming_messages = pending_registry.register(PendingState("incoming_messages", timeout=30.0))
 pending_monitor_disambig = pending_registry.register(PendingState("monitor_disambig", timeout=30.0))
 teaching_session = pending_registry.register(PendingState("teaching_session", timeout=300.0))
+pending_backup_confirm_phrase = pending_registry.register(PendingState("backup_confirm_phrase", timeout=180.0))
+# 300s: the "I don't have an OAuth app yet" branch sends the user off to
+# create one, enable the Drive API, and set a scope. Each step also
+# .touch()es, so this is a per-step silence budget, not a total budget.
+pending_backup_oauth = pending_registry.register(PendingState("backup_oauth", timeout=300.0))
+pending_backup_unlock_phrase = pending_registry.register(PendingState("backup_unlock_phrase", timeout=60.0))
+pending_backup_restore_phrase = pending_registry.register(PendingState("backup_restore_phrase", timeout=60.0))
 
 _destructive_disclosed: bool = False
 

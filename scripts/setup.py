@@ -32,7 +32,7 @@ REQUIREMENTS_PATH = REPO_ROOT / "requirements.txt"
 MIN_PY = (3, 11)
 MAX_PY = (3, 11)
 MARKER_SCHEMA_VERSION = 1
-TOTAL_STEPS = 7
+TOTAL_STEPS = 8
 
 
 # ─── Provider table — data, not branches ────────────────────────────
@@ -455,8 +455,25 @@ def step_region_timezone(marker: dict, args) -> dict:
     return out
 
 
+def step_backup_optin(marker: dict, args) -> dict:
+    heading(6, TOTAL_STEPS, "Cloud backup")
+    print()
+    info("TENKA can encrypt and back up her memory to Google Drive, so a")
+    info("dead disk doesn't mean starting over. Recovery-phrase setup")
+    info("happens on first launch, not here.")
+    print()
+    try:
+        ans = input("  Enable cloud backup? [y/N] ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        sys.exit(1)
+    enabled = ans in ("y", "yes")
+    marker.setdefault("steps", {})["backup_optin"] = {"enabled": enabled, "ok": True}
+    return {"BACKUP_ENABLED": "true" if enabled else "false"}
+
+
 def step_write_env(marker: dict, args, updates: dict) -> None:
-    heading(6, TOTAL_STEPS, "Write .env")
+    heading(7, TOTAL_STEPS, "Write .env")
     existing_text = ENV_PATH.read_text(encoding="utf-8") if ENV_PATH.exists() else ""
     template_text = ENV_EXAMPLE_PATH.read_text(encoding="utf-8") if ENV_EXAMPLE_PATH.exists() else ""
     new_text = merge_env_text(existing_text, updates, template_text)
@@ -467,12 +484,16 @@ def step_write_env(marker: dict, args, updates: dict) -> None:
     }
 
 
-def step_done(marker: dict, args) -> None:
-    heading(7, TOTAL_STEPS, "Done — next steps")
+def step_done(marker: dict, args, backup_enabled: bool = False) -> None:
+    heading(8, TOTAL_STEPS, "Done — next steps")
     print()
     print(f"  {green('TENKA is set up.')} To start her:")
     print(f"    {bold('Windows:')}  start_assistant.bat")
     print(f"    {bold('Any OS:')}   python -m assistant.main")
+    if backup_enabled:
+        print()
+        print(f"  {bold('Cloud backup:')} say \"enable backup\" the first time TENKA")
+        print(f"    starts — she'll generate your recovery phrase and connect Google Drive.")
     print()
     print(f"  Re-run the wizard later: {bold('python scripts/setup.py')}")
     print(f"  Edit settings directly:  {bold('.env')} at the repo root")
@@ -515,9 +536,10 @@ def main(argv: list[str] | None = None) -> int:
     step_playwright_chromium(marker, args)
     api_updates = step_api_keys(marker, args) or {}
     geo_updates = step_region_timezone(marker, args) or {}
-    step_write_env(marker, args, {**api_updates, **geo_updates})
+    backup_updates = step_backup_optin(marker, args) or {}
+    step_write_env(marker, args, {**api_updates, **geo_updates, **backup_updates})
     save_marker(marker)
-    step_done(marker, args)
+    step_done(marker, args, backup_enabled=backup_updates.get("BACKUP_ENABLED") == "true")
     return 0
 
 

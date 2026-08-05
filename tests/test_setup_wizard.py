@@ -272,3 +272,48 @@ def test_canonicalize_tz_covers_known_renames(setup_mod):
     }
     for old, new in expected.items():
         assert setup_mod._canonicalize_tz(old) == new, f"{old} should map to {new}"
+
+
+# ─── 8. Cloud backup opt-in step ─────────────────────────────────────
+def test_backup_optin_yes_sets_env_true(setup_mod, tmp_path, monkeypatch):
+    _redirect_paths(setup_mod, tmp_path, monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    marker: dict = {}
+    args = SimpleNamespace(force=False, no_launch=True)
+
+    result = setup_mod.step_backup_optin(marker, args)
+
+    assert result == {"BACKUP_ENABLED": "true"}
+    assert marker["steps"]["backup_optin"]["enabled"] is True
+
+
+def test_backup_optin_no_sets_env_false(setup_mod, tmp_path, monkeypatch):
+    _redirect_paths(setup_mod, tmp_path, monkeypatch)
+    monkeypatch.setattr("builtins.input", lambda *_: "n")
+    marker: dict = {}
+    args = SimpleNamespace(force=False, no_launch=True)
+
+    result = setup_mod.step_backup_optin(marker, args)
+
+    assert result == {"BACKUP_ENABLED": "false"}
+    assert marker["steps"]["backup_optin"]["enabled"] is False
+
+
+def test_total_steps_is_eight(setup_mod):
+    assert setup_mod.TOTAL_STEPS == 8
+
+
+def test_step_done_mentions_backup_when_enabled(setup_mod, tmp_path, monkeypatch, capsys):
+    _redirect_paths(setup_mod, tmp_path, monkeypatch)
+    args = SimpleNamespace(force=False, no_launch=True)
+    setup_mod.step_done({}, args, backup_enabled=True)
+    captured = capsys.readouterr()
+    assert "enable backup" in captured.out.lower()
+
+
+def test_step_done_silent_on_backup_when_disabled(setup_mod, tmp_path, monkeypatch, capsys):
+    _redirect_paths(setup_mod, tmp_path, monkeypatch)
+    args = SimpleNamespace(force=False, no_launch=True)
+    setup_mod.step_done({}, args, backup_enabled=False)
+    captured = capsys.readouterr()
+    assert "enable backup" not in captured.out.lower()
