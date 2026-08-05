@@ -12,3 +12,5 @@ from ...core.registry import RegistryBase
 from .provider import BackupProvider, BackupProviderError
 
 backup_provider_registry: RegistryBase[BackupProvider] = RegistryBase("backup_provider")
+
+from . import google_drive  # noqa: E402, F401

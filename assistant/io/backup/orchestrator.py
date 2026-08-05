@@ -186,11 +186,22 @@ def run_restore(
 
     Raises RuntimeError with a user-facing message on any failure —
     wrong phrase, corrupted blob, no backups found, or a structurally
-    bad archive. Never applies a partial or corrupt extraction: the
-    archive is extracted into a scratch staging directory first (with
-    tarfile's 'data' filter, guarding against path traversal via
-    malicious member paths/symlinks — PEP 706), and only copied into
-    the live SANDBOX_DIR after extraction fully succeeds.
+    bad archive. Never applies a partial or corrupt extraction: each
+    candidate archive is extracted into a scratch staging directory
+    first (with tarfile's 'data' filter, guarding against path
+    traversal via malicious member paths/symlinks — PEP 706), and only
+    copied into the live SANDBOX_DIR after extraction fully succeeds.
+
+    When label is None, every stored version is a fallback candidate,
+    newest first: a decrypt (InvalidTag) or extract failure on one
+    version moves on to the next rather than failing the whole restore.
+    This is safe even though InvalidTag can't distinguish "wrong
+    phrase" from "corrupted blob" — a wrong phrase fails identically
+    against every version, so falling through the whole list still
+    ends in the same correct error; a corrupted latest version with a
+    correct phrase now recovers via the next-older one instead of
+    failing outright. An explicit label is a specific request, so it
+    is tried alone with no fallback.
     """
     from cryptography.exceptions import InvalidTag
 
@@ -202,33 +213,88 @@ def run_restore(
     versions = provider.list_versions()
     if not versions:
         raise RuntimeError("No backups found for this provider.")
-    target_label = label or versions[0]
+    candidates = [label] if label else versions
 
-    encrypted = provider.download(target_label)
     key = crypto.derive_key(recovery_phrase)
 
-    try:
-        archive_bytes = crypto.decrypt(encrypted, key)
-    except InvalidTag:
-        raise RuntimeError("Recovery phrase is incorrect, or the backup is corrupted.")
-
     with tempfile.TemporaryDirectory() as tmp:
-        archive_path = Path(tmp) / "restore.tar"
-        archive_path.write_bytes(archive_bytes)
+        staging_dir = None
+        target_label = None
+        last_error: RuntimeError = RuntimeError("No backups found for this provider.")
 
-        staging_dir = Path(tmp) / "extracted"
-        staging_dir.mkdir()
-        try:
-            with tarfile.open(archive_path, "r") as tar:
-                tar.extractall(staging_dir, filter="data")
-        except (tarfile.TarError, OSError) as exc:
-            raise RuntimeError(
-                "Backup archive is corrupted and could not be extracted."
-            ) from exc
+        for candidate in candidates:
+            encrypted = provider.download(candidate)
+            try:
+                archive_bytes = crypto.decrypt(encrypted, key)
+            except InvalidTag:
+                last_error = RuntimeError("Recovery phrase is incorrect, or the backup is corrupted.")
+                continue
+
+            archive_path = Path(tmp) / f"restore_{candidate}.tar"
+            archive_path.write_bytes(archive_bytes)
+
+            candidate_staging = Path(tmp) / f"extracted_{candidate}"
+            candidate_staging.mkdir()
+            try:
+                with tarfile.open(archive_path, "r") as tar:
+                    tar.extractall(candidate_staging, filter="data")
+            except (tarfile.TarError, OSError) as exc:
+                last_error = RuntimeError("Backup archive is corrupted and could not be extracted.")
+                logger.warning(f"[BACKUP] Version '{candidate}' is unusable, trying older version: {exc}")
+                continue
+
+            staging_dir = candidate_staging
+            target_label = candidate
+            break
+
+        if staging_dir is None:
+            raise last_error
 
         # Only touch the live sandbox once the archive is proven fully
         # extractable — nothing above this line has written to it.
         config.SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
+
+        # The live process's own tenka.db connection must not survive
+        # having its file replaced out from under it: if anything writes
+        # through the stale connection afterward, SQLite writes new WAL
+        # frames against a file whose physical structure no longer matches
+        # what the connection last read — real corruption, not just a
+        # missed restore. Closing it first (close_for_restore()) prevents
+        # that.
+        #
+        # Deliberately NOT reopened afterward: storage/db.py's own
+        # singleton isn't the only reference in play — memory.py (and the
+        # rest of the 13-repo convention) each cache their own repo object
+        # at startup instead of calling get_db() fresh every time, so a
+        # new storage/db.py singleton wouldn't reach them anyway. A real
+        # process restart is the only thing that rebuilds every one of
+        # those caches correctly — this is why run_restore()'s caller
+        # (actions/backup_pending.py) requests a full shutdown rather than
+        # trying to keep the current process alive.
+        from ...storage.db import close_for_restore
+        close_for_restore()
+
+        # Backups never contain -wal/-shm/-journal sidecars (excluded by
+        # _build_archive — the DB is checkpointed into a clean single file
+        # via Database.backup_to() before archiving). copytree only
+        # overwrites files the archive actually has, so a stale sidecar
+        # left over from the live/pre-restore database would otherwise sit
+        # untouched next to the freshly restored .db file — and in WAL
+        # mode, SQLite replays an existing -wal file over the main file's
+        # content on next open, silently discarding the restore. Now that
+        # the connection above is closed, SQLite has released its lock on
+        # these, so the unlink can't hit Windows' WinError 32 the way it
+        # would against a still-open handle — but stay defensive anyway.
+        for db_file in staging_dir.rglob("*.db"):
+            rel = db_file.relative_to(staging_dir)
+            live_db = config.SANDBOX_DIR / rel
+            for suffix in ("-wal", "-shm", "-journal"):
+                stale = live_db.with_name(live_db.name + suffix)
+                try:
+                    stale.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning(f"[BACKUP] Could not remove {stale.name}: {exc}")
+
         shutil.copytree(staging_dir, config.SANDBOX_DIR, dirs_exist_ok=True)
 
     logger.info(f"[BACKUP] Restored version '{target_label}' from {provider_name}")

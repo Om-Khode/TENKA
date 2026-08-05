@@ -279,4 +279,11 @@ async def handle_pending_backup_restore_phrase(text: str, bridge=None) -> str | 
         logger.error(f"[BACKUP] restore failed: {e}")
         return "Restore failed — check the logs for details."
 
-    return "Restore finished. Restart me so I load the restored data."
+    # run_restore() already closed the live DB connection before swapping
+    # the file on disk (see close_for_restore()'s docstring) — nothing in
+    # this process may safely touch it again. Closing ourselves, rather
+    # than leaving that to the user to remember, is the only way to
+    # guarantee it.
+    from ..core import shutdown_signal
+    shutdown_signal.request()
+    return "Restore finished. Closing myself now — start me again when you're ready."

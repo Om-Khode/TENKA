@@ -14,10 +14,17 @@ from .registry import tool_registry
 logger = logging.getLogger(__name__)
 
 _RESTORE_WORDS = ("restore",)
-_STATUS_WORDS = ("status", "when was", "last backup")
+_STATUS_WORDS = (
+    "status", "when was", "last backup", "is it working", "working fine",
+    "working or not", "check if", "checking if", "is backup", "did it back up",
+)
 _DISABLE_WORDS = ("disable", "turn off", "stop backing up", "stop backup")
 _UNLOCK_WORDS = ("unlock",)
 _ENABLE_WORDS = ("enable", "set up", "setup", "turn on", "connect")
+_BACKUP_NOW_WORDS = (
+    "back up now", "backup now", "do a backup", "make a backup",
+    "run a backup", "start a backup", "back it up",
+)
 
 
 def _classify_action(goal: str) -> str:
@@ -35,7 +42,13 @@ def _classify_action(goal: str) -> str:
         return "unlock"
     if any(w in goal_low for w in _ENABLE_WORDS):
         return "enable"
-    return "backup_now"
+    if any(w in goal_low for w in _BACKUP_NOW_WORDS):
+        return "backup_now"
+    # An utterance that matched none of the above is ambiguous — reading it
+    # as a status check (safe, read-only) instead of a command to actually
+    # run a backup means unrecognized backup-related speech never silently
+    # triggers a side-effecting action.
+    return "status"
 
 
 def _get_settings_repo():
@@ -84,7 +97,8 @@ def _status() -> str:
     last_at = settings.get("backup_last_backup_at")
     if not last_at:
         return "Backup is enabled but hasn't run yet."
-    return f"Last backup was {last_at} — status: {last_status}."
+    from ..core.datetime_utils import humanize_relative
+    return f"Last backup was {humanize_relative(last_at)} — status: {last_status}."
 
 
 _REENABLE_CONFIRM_WORDS = ("replace it", "replace them", "start over", "yes, replace")
@@ -181,10 +195,18 @@ def _unlock() -> str:
 def _restore() -> str:
     """Start the restore flow — phrase entry happens in the pending handler."""
     import assistant.actions as _act
+    from ..io.backup import backup_provider_registry
+
+    settings = _get_settings_repo()
+    provider_name = settings.get("backup_provider", "google_drive")
+    provider = backup_provider_registry.require(provider_name)
+    if not provider.is_connected():
+        return "Google Drive isn't connected — say 'enable backup' to set it up first."
 
     _act.pending_backup_restore_phrase.set({})
     return (
-        "Restoring overwrites what's on this machine with the latest backup. "
+        "Restoring overwrites what's on this machine with the latest backup, "
+        "and I'll close myself when it's done — start me again after. "
         "Give me your 12-word recovery phrase to go ahead, or say 'cancel'."
     )
 

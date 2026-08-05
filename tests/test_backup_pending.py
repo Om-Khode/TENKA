@@ -337,7 +337,11 @@ async def test_restore_phrase_valid_runs_restore(monkeypatch, db_session):
     assert calls == [(phrase, "google_drive")]
     assert not _act.pending_backup_restore_phrase.active
     assert phrase not in result
-    assert "restart" in result.lower()
+    assert "closing" in result.lower()
+
+    from assistant.core import shutdown_signal
+    assert shutdown_signal.is_requested()
+    shutdown_signal._reset_for_testing()
 
 
 @pytest.mark.asyncio

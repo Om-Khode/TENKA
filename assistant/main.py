@@ -800,6 +800,29 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                     else:
                         parsed_emotion = "neutral"
                 await tts.speak(resp, bridge, emotion=parsed_emotion)
+
+                # A pending handler (e.g. backup restore) can request a
+                # graceful exit — it already closed the live DB connection
+                # before this returned (see close_for_restore() in
+                # orchestrator.run_restore()), and deliberately does not
+                # reopen it: other modules cache their own repo/Database
+                # reference at startup (memory.py's _repo, etc.), so a
+                # fresh storage/db.py connection wouldn't reach them
+                # anyway — only a real process restart rebuilds those
+                # correctly. So from here on this turn must touch the DB
+                # exactly as little as the "shutdown" intent's own branch
+                # above does: no memory.save_turn, no planner-resume
+                # (which can itself write to the DB) — straight to the
+                # same finish + exit sequence.
+                from .core import shutdown_signal
+                if shutdown_signal.is_requested():
+                    logger.info("[SHUTDOWN] Handler requested graceful exit")
+                    _tracker.action_dispatched = f"pending_{label.lower()}"
+                    _tracker.action_outcome = "success"
+                    await _finish_turn(bridge)
+                    _shutdown_event.set()
+                    return
+
                 memory.save_turn(
                     transcription, mem_intent, resp,
                     session_mod.get_current_session_id(),

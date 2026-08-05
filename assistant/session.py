@@ -5,6 +5,7 @@ Manages session lifecycle, resume context, and crash recovery.
 """
 
 import logging
+import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -47,8 +48,16 @@ def start_session() -> str:
 
 def end_session() -> None:
     if _current_session_id:
-        _get_repo().end_session(_current_session_id)
-        logger.info(f"[SESSION] Ended: {_current_session_id}")
+        try:
+            _get_repo().end_session(_current_session_id)
+            logger.info(f"[SESSION] Ended: {_current_session_id}")
+        except sqlite3.ProgrammingError:
+            # A pending handler (backup restore) can close the live DB
+            # connection deliberately, right before requesting the process
+            # exit — this cleanup call still runs as part of normal
+            # shutdown either way. Not being able to log the session's end
+            # is an acceptable loss on the way out, not a crash.
+            logger.debug("[SESSION] Could not end session — DB already closed")
 
 
 def record_turn(intent: str) -> None:

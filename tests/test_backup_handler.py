@@ -45,9 +45,20 @@ def test_classify_action_unlock_does_not_shadow_other_actions():
     assert _classify_action("enable backup") == "enable"
 
 
-def test_classify_action_defaults_to_backup_now():
+def test_classify_action_backup_now():
     assert _classify_action("back up now") == "backup_now"
     assert _classify_action("do a backup") == "backup_now"
+    assert _classify_action("backup now") == "backup_now"
+
+
+def test_classify_action_ambiguous_defaults_to_status_not_backup_now():
+    """An utterance that matches no keyword must never silently run a real
+    backup — reading it as a status check is the safe default. Regression
+    test for a live-test finding: "checking if the backup service is
+    working" was falling through to backup_now."""
+    assert _classify_action("checking if the backup service is working or not") == "status"
+    assert _classify_action("is backup working") == "status"
+    assert _classify_action("something about backup") == "status"
 
 
 @pytest.mark.asyncio
@@ -128,7 +139,10 @@ async def test_status_after_success_still_reports_last_backup(db_session):
     db_session.set("backup_last_backup_status", "success", source="test")
 
     result = await handle_manage_backup({"goal": "backup status"}, "")
-    assert "2026-08-02" in result
+    # Humanized relative time (e.g. "3 days ago"), never the raw ISO
+    # timestamp — TTS shouldn't speak machine-formatted dates.
+    assert "T" not in result.split("was", 1)[1].split("—", 1)[0]
+    assert "ago" in result.lower() or "just now" in result.lower()
     assert "success" in result.lower()
 
 
@@ -306,8 +320,14 @@ async def test_backup_now_while_locked_points_at_unlock(db_session):
 
 
 @pytest.mark.asyncio
-async def test_restore_prompts_for_phrase_and_warns(db_session):
+async def test_restore_prompts_for_phrase_and_warns(db_session, monkeypatch):
     from assistant.actions.backup import handle_manage_backup
+    from assistant.io.backup import backup_provider_registry
+
+    class _ConnectedProvider:
+        def is_connected(self): return True
+
+    monkeypatch.setattr(backup_provider_registry, "_entries", {"google_drive": _ConnectedProvider()})
 
     result = await handle_manage_backup({"goal": "restore my backup"}, "")
 
@@ -315,6 +335,26 @@ async def test_restore_prompts_for_phrase_and_warns(db_session):
     assert "recovery phrase" in result.lower()
     assert "overwrit" in result.lower()
     assert "wizard" not in result.lower()  # the old dead-end message
+
+
+@pytest.mark.asyncio
+async def test_restore_when_not_connected_refuses_up_front(db_session, monkeypatch):
+    """Regression test for a live-test finding: 'restore backup' with Drive
+    never connected used to enter the phrase-entry flow anyway, only to fail
+    later with a generic 'check the logs' message. It must refuse up front
+    and point at the fix, the same way 'back up now' does when locked."""
+    from assistant.actions.backup import handle_manage_backup
+    from assistant.io.backup import backup_provider_registry
+
+    class _DisconnectedProvider:
+        def is_connected(self): return False
+
+    monkeypatch.setattr(backup_provider_registry, "_entries", {"google_drive": _DisconnectedProvider()})
+
+    result = await handle_manage_backup({"goal": "restore my backup"}, "")
+
+    assert not _act.pending_backup_restore_phrase.active
+    assert "enable backup" in result.lower()
 
 
 # ─── Important #3: backup_now failure message must be TTS-safe ─────────────

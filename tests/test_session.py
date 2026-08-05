@@ -237,6 +237,18 @@ class TestSessionFacade:
         )
         assert row["ended_at"] is not None
 
+    def test_end_session_tolerates_closed_db(self, tmp_path):
+        """A pending handler (backup restore) can close the live DB
+        connection deliberately, right before requesting the process exit
+        — end_session() still runs as part of normal shutdown cleanup
+        either way and must not crash over it."""
+        from assistant.storage.db import close_for_restore
+        session = self._init_facade(tmp_path)
+        session.start_session()
+        close_for_restore()
+
+        session.end_session()  # must not raise
+
     def test_get_resume_context_empty_when_no_history(self, tmp_path):
         session = self._init_facade(tmp_path)
         assert session.get_resume_context() == ""

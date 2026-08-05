@@ -756,6 +756,31 @@ def get_db() -> "Database | None":
     return _instance
 
 
+def close_for_restore() -> None:
+    """Close the live connection and clear the singleton before a backup
+    restore overwrites tenka.db on disk.
+
+    A still-open connection has its own page cache and WAL bookkeeping for
+    the file it originally opened — if the file's bytes get replaced out
+    from under it (as backup restore does) and anything then writes
+    through the stale connection, SQLite can write new WAL frames against
+    a file whose physical structure no longer matches what the connection
+    last read, corrupting it. Closing first prevents that.
+
+    Callers are expected to call init_db() again immediately after the
+    swap completes (io/backup/orchestrator.py's run_restore() does this)
+    — a get_db() left returning None until some later manual restart
+    turned out to be far more fragile than the corruption this guards
+    against: dozens of call sites across the app assume a live connection
+    always exists once init_db() has run once, and each one crashes the
+    moment it doesn't.
+    """
+    global _instance
+    if _instance is not None:
+        _instance.close()
+    _instance = None
+
+
 def _reset_for_testing() -> None:
     """Reset singleton — test use only."""
     global _instance

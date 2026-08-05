@@ -153,6 +153,10 @@ async def test_full_backup_lifecycle_is_reachable(env):
     finally:
         cfg.SANDBOX_DIR = config_sandbox
 
-    assert "restart" in restored.lower()
+    assert "closing" in restored.lower()
     assert (restore_target / "memory" / "tenka.db").exists()
     assert (restore_target / "Notes" / "todo.md").read_text() == "- buy milk"
+
+    from assistant.core import shutdown_signal
+    assert shutdown_signal.is_requested()
+    shutdown_signal._reset_for_testing()
