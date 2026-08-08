@@ -1,5 +1,5 @@
 # assistant/io/api/routes/memory.py
-"""What she knows, made readable. Deletion lands in Task 9.
+"""What she knows, made readable, and forgettable.
 
 Knowledge is served as a graph -- entities, facts, relationships -- because the
 page renders supersession, provenance and an ego graph from exactly those three
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..schemas import Envelope
 from ..security import require
@@ -104,3 +104,19 @@ async def list_scope(scope: Scope, request: Request,
         }
         for record in records
     ]})
+
+
+@router.delete("/memory/{scope}/{item_id}")
+async def forget_item(scope: Scope, item_id: str, request: Request,
+                      _=Depends(require(Capability.CHAT))) -> Envelope:
+    removed = await request.app.state.runtime.memory.forget(scope, item_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="not found")
+    return Envelope(data={"forgotten": item_id})
+
+
+@router.delete("/memory")
+async def forget_everything(request: Request,
+                            _=Depends(require(Capability.CHAT))) -> Envelope:
+    removed = await request.app.state.runtime.memory.forget_all()
+    return Envelope(data={"removed": removed})
