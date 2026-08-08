@@ -50,7 +50,7 @@ async def get_conversation(conversation_id: str, request: Request,
                            _=Depends(require(Capability.CHAT))) -> Envelope:
     detail = await request.app.state.runtime.chat.conversation(conversation_id)
     if detail is None:
-        raise HTTPException(status_code=404, detail="not found")
+        raise HTTPException(status_code=404)  # detail is dead on a 404 -- see app.py's handler
     return Envelope(data={
         "conversation_id": detail.conversation_id,
         "title": detail.title,

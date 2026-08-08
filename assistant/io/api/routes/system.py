@@ -22,7 +22,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..schemas import Envelope, RestoreRequest
-from ..security import require
+from ..security import require, throttle
 from ..vault import Capability
 
 router = APIRouter()
@@ -31,6 +31,14 @@ router = APIRouter()
 # body ever runs, so an unknown kind ("fingerprint") is a 422 raised by the
 # framework, not a 404 this handler would have to construct by hand.
 EnrollmentKind = Literal["voice", "face"]
+
+# run_backup writes to real cloud storage on every call. The shared limiter
+# (120/60s, the same budget a status poll spends) would let a CHAT-only
+# device -- a phone that has never held SYSTEM_CONTROL -- trigger dozens of
+# real uploads a minute. A short, route-scoped budget on top of the shared
+# one bounds that without touching what any other CHAT route may do.
+_BACKUP_RUN_MAX_PER_WINDOW = 5
+_BACKUP_RUN_WINDOW_SECONDS = 60.0
 
 
 @router.get("/telemetry")
@@ -65,7 +73,10 @@ async def backup_state(request: Request,
 
 @router.post("/backup/run")
 async def run_backup(request: Request,
-                     _=Depends(require(Capability.CHAT))) -> Envelope:
+                     _=Depends(throttle(Capability.CHAT, "backup_run",
+                                        max_per_window=_BACKUP_RUN_MAX_PER_WINDOW,
+                                        window_seconds=_BACKUP_RUN_WINDOW_SECONDS))
+                     ) -> Envelope:
     return Envelope(data=_backup_body(
         await request.app.state.runtime.system.run_backup()))
 
@@ -108,5 +119,19 @@ async def forget_enrolled(kind: EnrollmentKind, item_id: str, request: Request,
                           _=Depends(require(Capability.CHAT))) -> Envelope:
     removed = await request.app.state.runtime.system.forget_enrolled(kind, item_id)
     if not removed:
-        raise HTTPException(status_code=404, detail="not found")
+        # `detail=` is dead on a 404: app.py's `@app.exception_handler(404)`
+        # dispatches on status code alone and always answers a fixed
+        # `{"error": "not found"}` body, discarding whatever is passed here.
+        raise HTTPException(status_code=404)
     return Envelope(data={"forgotten": item_id, "kind": kind})
+
+
+@router.get("/audit")
+async def audit(request: Request,
+                _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope:
+    entries = request.app.state.auth.audit.entries()
+    return Envelope(data={"entries": [
+        {"at": e.at, "device_id": e.device_id, "method": e.method,
+         "path": e.path, "outcome": e.outcome}
+        for e in reversed(entries)
+    ]})

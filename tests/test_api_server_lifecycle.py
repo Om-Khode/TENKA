@@ -29,6 +29,26 @@ def test_main_starts_it_only_behind_the_flag():
     assert any("if" in line for line in guard_line), "the flag is read but not guarded on"
 
 
+def test_main_wires_the_kill_switch_behind_the_same_flag():
+    """The kill switch (server.shutdown) has to actually run at shutdown, or
+    a stopped daemon is a pause, not a revocation. Guarded the same way
+    startup is: `config.STUDIO_API_ENABLED` must appear on a line at or
+    before the call, within the same shutdown block, not merely somewhere
+    else in the file (that would already pass thanks to the startup guard).
+    """
+    source = pathlib.Path("assistant/main.py").read_text(encoding="utf-8")
+    call = "shutdown_studio_api(_studio_task, _studio_vault)"
+    assert call in source, "main.py never calls the kill switch at shutdown"
+    idx = source.index(call)
+    window = source[max(0, idx - 700):idx]
+    assert "config.STUDIO_API_ENABLED" in window, (
+        "the kill switch call is not visibly guarded by the same flag as startup"
+    )
+    assert "_studio_vault is not None" in window, (
+        "the kill switch call does not guard against a daemon that never started"
+    )
+
+
 @pytest.mark.asyncio
 async def test_serve_returns_a_task_that_can_be_cancelled(tmp_path):
     import asyncio
@@ -45,6 +65,45 @@ async def test_serve_returns_a_task_that_can_be_cancelled(tmp_path):
     except asyncio.CancelledError:
         pass
     assert task.done()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_serve_task_actually_releases_the_port(tmp_path):
+    """A kill switch that revokes every token but leaves uvicorn's listening
+    socket open has only paused the daemon at the application layer -- the
+    OS still shows the port bound. `uvicorn.Server.main_loop()` awaits
+    `asyncio.sleep(0.1)` with no try/finally around it, so a bare
+    `task.cancel()` interrupts that sleep and unwinds straight out of
+    `_serve()`, skipping the `await self.shutdown(sockets=...)` call that
+    closes `self.servers` -- proven here by rebinding the same host:port
+    immediately after cancellation and requiring it to succeed.
+    """
+    import asyncio
+    import socket
+
+    from assistant.io.api import server
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    port = 8932
+    task = server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                        host="127.0.0.1", port=port, origins=["http://localhost:3000"])
+    await asyncio.sleep(0.2)
+
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    await asyncio.sleep(0.1)
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        pytest.fail(f"port {port} is still bound after cancellation: {exc}")
+    finally:
+        probe.close()
 
 
 def test_the_exporter_writes_a_schema(tmp_path):
@@ -245,6 +304,39 @@ async def test_stop_studio_daemon_retrieves_a_crashed_tasks_exception(caplog):
         await m._stop_studio_daemon(task)
 
     assert any("Studio daemon exited early" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_successful_start_leaves_the_vault_reachable_for_shutdown(tmp_path, monkeypatch):
+    """The kill switch (assistant.io.api.server.shutdown) needs the same
+    TokenVault _start_studio_daemon() built, but that object is a local
+    inside this function -- it never rides the returned task. main.py's
+    shutdown site reads module-level `_studio_vault` instead; this pins
+    that the module-level name is actually set to a real, usable vault
+    after a successful start, not left None or stale from a prior test.
+    """
+    import asyncio
+
+    import assistant.config as config
+    import assistant.main as m
+    from assistant.io.api.vault import TokenVault
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    async def _noop() -> None:
+        return None
+
+    def _fake_serve(*args, **kwargs):
+        return asyncio.create_task(_noop())
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _fake_serve)
+
+    task = await m._start_studio_daemon()
+    try:
+        assert isinstance(m._studio_vault, TokenVault)
+        assert m._studio_vault.devices(), "the studio vault should hold its issued device"
+    finally:
+        await task
 
 
 @pytest.mark.asyncio

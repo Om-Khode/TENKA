@@ -32,7 +32,10 @@ def _fail(exc: Exception) -> HTTPException:
         return HTTPException(status_code=400, detail="invalid path")
     if isinstance(exc, PermissionError):
         return HTTPException(status_code=403, detail="protected path")
-    return HTTPException(status_code=404, detail="not found")
+    # `detail=` on a 404 is dead code: app.py's status-code handler always
+    # answers a fixed body, discarding whatever is passed here. Omitted
+    # rather than written and ignored.
+    return HTTPException(status_code=404)
 
 
 @router.get("/files/roots")
@@ -90,5 +93,5 @@ async def delete_file(body: DeleteRequest, request: Request,
     except (KeyError, ValueError, PermissionError, OSError) as exc:
         raise _fail(exc)
     if not removed:
-        raise HTTPException(status_code=404, detail="not found")
+        raise HTTPException(status_code=404)  # detail is dead here; see _fail()
     return Envelope(data={"deleted": body.path})

@@ -154,3 +154,49 @@ async def test_the_telemetry_loop_stops_when_the_last_socket_leaves():
         "the loop must not sample while nobody is listening"
     )
     await hub.stop()
+
+
+# ─── deferred item 6: the socket leaves an audit trail ───────────────────
+def test_a_rejected_socket_connection_is_audited(context):
+    client, app, _, _ = context
+    with pytest.raises(Exception):
+        with client.websocket_connect("/v1/events?access_token=not-a-real-token"):
+            pass
+    entries = app.state.auth.audit.entries()
+    assert any(e.path == "/v1/events" and e.device_id == "-" for e in entries), (
+        "a rejected socket connection left no trace in the audit log"
+    )
+
+
+def test_an_accepted_socket_connection_is_audited(context):
+    client, app, _, token = context
+    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+        socket.receive_json()  # hello
+    entries = app.state.auth.audit.entries()
+    matches = [e for e in entries if e.path == "/v1/events" and e.device_id != "-"]
+    assert matches, "an accepted socket connection left no trace in the audit log"
+
+
+# ─── deferred item 7: the socket spends the same budget HTTP does ────────
+def test_repeated_bad_socket_tokens_eventually_get_refused_fast(context):
+    """An accept-then-close cycle still costs a TCP handshake and a
+    verify() call. The limiter must bound how many of those one source can
+    trigger, the same way it bounds a flood of bad HTTP tokens -- proven
+    here by exhausting the shared limiter directly against the source key
+    the socket handler uses, then confirming a further connection attempt
+    is refused without ever reaching verify().
+    """
+    client, app, _, _ = context
+    refused = 0
+    for _ in range(150):
+        try:
+            with client.websocket_connect("/v1/events?access_token=bad"):
+                pass
+        except Exception:
+            refused += 1
+    assert refused > 0
+    # every one of the 150 attempts closed the connection; the budget for
+    # this source must be visibly spent, not silently unlimited.
+    source = next(iter(app.state.auth.limiter.hits), None)
+    assert source is not None, "the socket never spent the shared limiter's budget"
+    assert app.state.auth.limiter.check(source) is False

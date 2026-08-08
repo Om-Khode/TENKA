@@ -250,6 +250,15 @@ class _StudioDispatch:
         return True
 
 
+_studio_vault: "TokenVault | None" = None
+# Module-level, not returned: _start_studio_daemon()'s return type
+# (`asyncio.Task | None`) is pinned by tests/test_api_server_lifecycle.py,
+# which asserts on it directly (`result is None`, `task is not None`,
+# `await task`). The vault has to be reachable from wherever shutdown runs
+# too -- a second local variable in a different function's scope can't do
+# that -- so it lives here instead of riding the return value.
+
+
 async def _start_studio_daemon() -> "asyncio.Task | None":
     """Build and start the Studio daemon. Returns the running task, or
     None if anything failed -- the daemon is an optional side channel and
@@ -258,6 +267,7 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
     Split out of async_main() so a test can drive this exact sequence
     (e.g. forcing serve() to fail) without booting the assistant.
     """
+    global _studio_vault
     try:
         from .actions.studio_runtime import build_studio_runtime
         from .io.api.events import EventHub
@@ -2230,6 +2240,14 @@ async def async_main():
 
         # ─── Studio daemon shutdown ─────────────────────────────────────────────
         await _stop_studio_daemon(_studio_task)
+        if config.STUDIO_API_ENABLED and _studio_vault is not None:
+            # A pause (the cancel above) is not a kill switch on its own: a
+            # token issued before this point would still verify against an
+            # untouched vault the next time the daemon starts. Rotating the
+            # instance secret here is what makes every previously issued
+            # token stop working, not just the running server.
+            from .io.api.server import shutdown as shutdown_studio_api
+            shutdown_studio_api(_studio_task, _studio_vault)
 
         await bridge.stop()
         logger.info("Voice Assistant shut down")

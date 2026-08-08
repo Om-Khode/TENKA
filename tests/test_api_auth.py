@@ -206,3 +206,77 @@ def test_a_bad_tenka_secret_fails_at_app_build_not_per_request(tmp_path, monkeyp
     with pytest.raises(ValueError, match="TENKA_SECRET"):
         create_app(build_fake_runtime(), TokenVault(tmp_path),
                    origins=["http://localhost:3000"])
+
+
+def _walk_every_registered_route(routes):
+    """Recurse through FastAPI 0.141.1's `_IncludedRouter` wrapping.
+
+    `include_router` in this version does not append flat routes to
+    `app.routes` -- each call adds one `_IncludedRouter` node whose real
+    routes live on `.original_router.routes` (see `app.py`'s own comment on
+    why `_sweep_v1_routes_require_auth` walks `app.openapi()` instead of
+    `app.routes` for auth). `app.openapi()` cannot serve this test's
+    purpose, though: it only ever lists schema-*visible* routes, so a
+    hidden route -- the exact thing this guard exists to catch -- would
+    never appear there to be flagged. Recursing through
+    `original_router.routes` sees every route regardless of whether it
+    opted out of the schema.
+    """
+    for route in routes:
+        yield route
+        router = getattr(route, "original_router", None)
+        if router is not None:
+            yield from _walk_every_registered_route(router.routes)
+
+
+def test_no_route_hides_from_the_schema_sweep(client):
+    """`_sweep_v1_routes_require_auth` walks `app.openapi()`'s resolved
+    paths -- which is exactly what a route registered with
+    `include_in_schema=False` or mounted via `Mount` never appears in. The
+    sweep cannot catch what it cannot see, so this is a cheap standing
+    guard: as long as nothing in this app opts out of the schema or mounts
+    a sub-application, the sweep's blind spot stays theoretical. If this
+    ever fails, a route was added that the auth sweep cannot check at all,
+    and it needs its own explicit auth test, not silent trust.
+    """
+    from starlette.routing import Mount
+
+    for route in _walk_every_registered_route(client.app.routes):
+        assert not isinstance(route, Mount), (
+            f"a Mount route ({getattr(route, 'path', '?')!r}) is invisible "
+            "to the openapi-based sweep"
+        )
+        if hasattr(route, "include_in_schema"):
+            assert route.include_in_schema, (
+                f"{route.path!r} hides from the schema the auth sweep walks"
+            )
+
+
+def test_the_hiding_guard_catches_a_route_that_opts_out_of_the_schema(vault):
+    """Regression guard for the guard itself: without the recursive walk
+    through `original_router`, a hidden route registered the ordinary way
+    is invisible to a naive `app.routes` scan in this FastAPI version --
+    proven by using that naive scan here and showing it finds nothing.
+    """
+    app = create_app(build_fake_runtime(), vault, origins=["http://localhost:3000"])
+    hidden = APIRouter()
+
+    @hidden.get("/hidden", include_in_schema=False)
+    async def hidden_handler():
+        return {"ok": True}
+
+    app.include_router(hidden, prefix="/v1")
+
+    found_via_walk = any(
+        getattr(r, "include_in_schema", True) is False
+        for r in _walk_every_registered_route(app.routes)
+    )
+    found_via_naive_scan = any(
+        getattr(r, "include_in_schema", True) is False for r in app.routes
+    )
+    assert found_via_walk, "the recursive walk failed to see the hidden route"
+    assert not found_via_naive_scan, (
+        "app.routes alone already saw the hidden route -- this FastAPI "
+        "version's _IncludedRouter wrapping must have changed; the walk "
+        "helper above may no longer be needed"
+    )

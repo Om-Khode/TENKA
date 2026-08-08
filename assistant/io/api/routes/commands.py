@@ -34,7 +34,9 @@ async def run_command(command_id: str, request: Request,
     catalogue = await request.app.state.runtime.commands.catalogue()
     match = next((c for c in catalogue if c.command_id == command_id), None)
     if match is None:
-        raise HTTPException(status_code=404, detail="unknown command")
+        # `detail=` is dead on a 404 (app.py's status-code handler discards
+        # it), so it is omitted here rather than left reading as live.
+        raise HTTPException(status_code=404)
 
     try:
         needed = Capability(match.required_grant)

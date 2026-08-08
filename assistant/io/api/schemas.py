@@ -9,6 +9,7 @@ Layering: io/api — core + config only.
 """
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
@@ -75,6 +76,13 @@ class SettingsPatch(BaseModel):
     @field_validator("changes")
     @classmethod
     def _bound_changes(cls, value: dict[str, SettingValue]) -> dict[str, SettingValue]:
+        # Every `raise ValueError` below embeds the raw settings `key` in its
+        # message. That is safe only because the 422 handler in app.py drops
+        # Pydantic's `msg` app-wide (it rebuilds every validation error body
+        # from `loc`/`type` alone) -- if a future change ever puts `msg` back
+        # for debuggability, these messages start leaking key names into a
+        # response again. Bound the value, not what you say about it, if
+        # that coupling ever gets undone.
         if len(value) > MAX_SETTINGS_KEYS:
             raise ValueError(
                 f"too many settings in one patch: {len(value)} > {MAX_SETTINGS_KEYS}"
@@ -98,6 +106,15 @@ class SettingsPatch(BaseModel):
                     f"value for {key!r} out of range: magnitude exceeds "
                     f"{MAX_SETTINGS_INT_MAGNITUDE}"
                 )
+            # A non-finite float is the risk here, not its magnitude: `inf`
+            # or `nan` reaching the settings store or a UI that renders it
+            # (a slider, a percentage) is a different failure mode than an
+            # oversized-but-ordinary number, and no magnitude bound catches
+            # it -- `float("inf") > MAX` is true, but so is `float("nan") >
+            # MAX` being *false*, silently passing a magnitude check that
+            # was never meant to guard against non-finite values at all.
+            if isinstance(item, float) and not math.isfinite(item):
+                raise ValueError(f"value for {key!r} must be finite")
         return value
 
 

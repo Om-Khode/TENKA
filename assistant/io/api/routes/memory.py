@@ -111,7 +111,7 @@ async def forget_item(scope: Scope, item_id: str, request: Request,
                       _=Depends(require(Capability.CHAT))) -> Envelope:
     removed = await request.app.state.runtime.memory.forget(scope, item_id)
     if not removed:
-        raise HTTPException(status_code=404, detail="not found")
+        raise HTTPException(status_code=404)  # detail is dead on a 404 -- see app.py's handler
     return Envelope(data={"forgotten": item_id})
 
 

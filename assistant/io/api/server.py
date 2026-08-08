@@ -44,7 +44,32 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
             await server.serve()
         except asyncio.CancelledError:
             server.should_exit = True
+            # uvicorn's own main_loop() awaits asyncio.sleep(0.1) with no
+            # try/finally around it, so a bare task.cancel() interrupts that
+            # sleep and unwinds straight out of _serve() -- skipping the
+            # `await self.shutdown(...)` call that closes self.servers.
+            # Left alone, the port stays bound at the OS level even though
+            # this task is done: a kill switch that revokes every token but
+            # never releases its own socket has only paused, not stopped.
+            # Calling shutdown() explicitly here (only if startup ever
+            # completed -- a task cancelled before that has nothing to
+            # close) is what actually frees the port before this coroutine
+            # finishes unwinding.
+            if server.started:
+                await server.shutdown()
             raise
 
     logger.info(f"[API] Studio daemon listening on http://{host}:{port}")
     return asyncio.create_task(_run(), name="studio-api")
+
+
+def shutdown(task: asyncio.Task | None, vault: TokenVault) -> None:
+    """Stop serving and invalidate every device.
+
+    Rotating the instance secret is what makes this a kill switch rather than a
+    pause: a token handed out before the switch is thrown never works again.
+    """
+    if task is not None:
+        task.cancel()
+    vault.reset()
+    logger.info("[API] Studio daemon stopped and all devices revoked")

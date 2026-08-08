@@ -32,7 +32,7 @@ from .routes import settings as settings_routes
 from .routes import status as status_routes
 from .routes import system as system_routes
 from .runtime import StudioRuntime
-from .security import AuditEntry, AuthState
+from .security import AuditEntry, AuthState, device_key
 from .vault import TokenVault
 
 logger = logging.getLogger(__name__)
@@ -104,6 +104,13 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
 
     @app.exception_handler(404)
     async def not_found(_request: Request, _exc) -> JSONResponse:
+        # Dispatches on status code alone (Starlette checks a registered
+        # status-code handler before it ever consults a class-based one), so
+        # this always answers the same fixed body regardless of what a route
+        # passed as `detail=` on its `HTTPException(status_code=404, ...)`.
+        # Routes under routes/ deliberately omit `detail=` on their 404s for
+        # exactly this reason -- writing one there would read as live when it
+        # is discarded here, unconditionally, every time.
         return JSONResponse(status_code=404, content={"error": "not found"})
 
     @app.exception_handler(RequestValidationError)
@@ -147,16 +154,51 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         # test_the_query_string_exception_is_only_the_socket pins that this
         # stays the only occurrence. It is loopback-only in this milestone;
         # Milestone 6 replaces this with a subprotocol handshake before any
-        # tunnel exists. The audit middleware below is HTTP-scope only
+        # tunnel exists. The audit middleware above is HTTP-scope only
         # (Starlette's BaseHTTPMiddleware skips non-"http" ASGI scopes
-        # outright), so this token never reaches request.url.path or the
-        # audit log -- there is simply no audit entry for this route at all
-        # yet, success or failure.
+        # outright), so it never sees this route at all -- the connect
+        # outcome (accepted or closed) is recorded explicitly below instead,
+        # directly against the same AuditLog, so a socket connection is no
+        # longer the one surface that leaves no trace either way.
+        auth: AuthState = app.state.auth
+        source = websocket.client.host if websocket.client else "unknown"
         token = websocket.query_params.get("access_token", "")
-        device = app.state.auth.vault.verify(token)
-        if device is None:
+        device = auth.vault.verify(token)
+
+        def _audit(outcome: str) -> None:
+            auth.audit.record(AuditEntry(
+                at=datetime.now(timezone.utc).isoformat(),
+                device_id=device.device_id if device else "-",
+                method="WS", path="/v1/events", outcome=outcome,
+            ))
+
+        # An accept-then-close cycle still costs a handshake and a verify()
+        # call, so it spends the same shared budget an HTTP request does --
+        # a 256-bit token defeats brute force, but nothing upstream of this
+        # check ever bounded how many connection attempts one source could
+        # trigger per second. Keyed exactly like authenticate(): a verified
+        # device spends its own budget (never a NAT-mate's), everything
+        # else spends the source's, and only a *presented* wrong token
+        # counts as a guess.
+        if device is not None:
+            budget_key = device_key(device)
+            if not auth.limiter.check(budget_key):
+                _audit("429")
+                await websocket.close(code=1013)
+                return
+            auth.limiter.record_success(budget_key)
+        else:
+            if not auth.limiter.check(source):
+                _audit("429")
+                await websocket.close(code=1013)
+                return
+            if token:
+                auth.limiter.record_failure(source)
+            _audit("1008")
             await websocket.close(code=1008)
             return
+
+        _audit("accepted")
 
         async def _safe_send(payload: dict) -> None:
             # A socket that already broke between the failed receive/abort
