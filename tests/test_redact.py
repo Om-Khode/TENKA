@@ -50,6 +50,46 @@ def test_is_idempotent():
     assert redact_secrets(once) == once
 
 
+# ─── Regression: label words in ordinary conversation ─────────────────────
+# A voice assistant logs conversation, and "key", "secret", "auth",
+# "credential" and "token" are ordinary English words. A labelled value must
+# still look secret-shaped before it is masked, or normal speech gets eaten.
+
+def test_does_not_redact_key_used_as_an_ordinary_word():
+    text = "the key thing to remember is to stay calm"
+    assert redact_secrets(text) == text
+
+
+def test_does_not_redact_secret_used_as_an_ordinary_word():
+    text = "she has a secret admirer at the office"
+    assert redact_secrets(text) == text
+
+
+def test_does_not_redact_credentials_used_as_an_ordinary_word():
+    text = "credentials matter in this job"
+    assert redact_secrets(text) == text
+
+
+def test_does_not_redact_auth_used_as_an_ordinary_word():
+    text = "you need auth before you can enter the building"
+    assert redact_secrets(text) == text
+
+
+def test_does_not_redact_token_used_as_an_ordinary_word():
+    text = "her token collection was impressive"
+    assert redact_secrets(text) == text
+
+
+# ─── Regression: unlabelled hex identifiers are not secrets ───────────────
+# A bare run of hex digits (a git commit SHA, for instance) has no case
+# mixing and no separator, so it must survive the bare path even though it
+# is long and alphanumeric.
+
+def test_does_not_redact_an_unlabelled_git_style_hex_sha():
+    text = "see commit d68e4d2fc73a1b9e2c3d4e5f6a7b8c9d0e1f2a3 for the fix"
+    assert redact_secrets(text) == text
+
+
 def test_names_no_brand():
     """THE rule: the redactor must not know any vendor by name."""
     import pathlib
