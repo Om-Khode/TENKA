@@ -78,6 +78,29 @@ def test_forget_all_demands_system_control_not_just_chat(tmp_path):
     assert single.status_code == 200
 
 
+# ─── capability tier: writing settings needs system_control ──────────────
+def test_saving_settings_demands_system_control_not_just_chat(tmp_path):
+    """The same ruling that moved forget-all off of chat: a phone paired
+    only for conversation must not be able to rewrite the daemon's own
+    CORS allow-list, switch the camera on, or flip any other setting.
+    Reading stays on chat -- proven here too, and that nothing changed.
+    """
+    vault = TokenVault(tmp_path)
+    chat_token = vault.issue("phone", frozenset({Capability.CHAT}))
+    runtime = build_fake_runtime()
+    client = TestClient(create_app(runtime, vault, origins=["http://localhost:3000"]))
+    headers = {"Authorization": f"Bearer {chat_token}"}
+
+    before = client.get("/v1/settings", headers=headers).json()["data"]["rows"]
+
+    response = client.patch("/v1/settings", headers=headers,
+                            json={"changes": {"followup_timer": 9.0}})
+    assert response.status_code == 403
+
+    after = client.get("/v1/settings", headers=headers).json()["data"]["rows"]
+    assert after == before, "settings changed despite the 403"
+
+
 def test_saving_a_setting_changes_what_is_read_back(context):
     client, _, headers = context
     response = client.patch("/v1/settings", headers=headers,
@@ -92,7 +115,7 @@ def test_saving_reports_restart_required_separately_from_saved(context):
     body = client.patch("/v1/settings", headers=headers,
                         json={"changes": {"active_personality": "dry"}}).json()["data"]
     assert body["saved"] == ["active_personality"]
-    assert body["restart_required"] == ["active_personality"]
+    assert body["restartRequired"] == ["active_personality"]
 
 
 def test_saving_a_row_sourced_from_env_flips_it_to_db(context):
@@ -133,6 +156,34 @@ def test_an_oversized_body_is_refused(context):
     client, _, headers = context
     response = client.patch("/v1/personality", headers=headers, json={"base": "x" * 5_000})
     assert response.status_code == 422
+
+
+def test_an_unknown_personality_is_400_and_changes_nothing(context):
+    """switch_personality() reports an unknown base as a return string, not
+    an exception -- unchecked, the route used to answer 200 with the
+    *previous*, unchanged state. Validated against state().available now, so
+    an unknown base is refused outright rather than silently no-opping
+    behind a success code.
+    """
+    client, _, headers = context
+    before = client.get("/v1/personality", headers=headers).json()["data"]
+
+    response = client.patch("/v1/personality", headers=headers,
+                            json={"base": "does-not-exist"})
+    assert response.status_code == 400
+
+    after = client.get("/v1/personality", headers=headers).json()["data"]
+    assert after == before
+
+
+def test_resetting_the_personality_puts_traits_back(context):
+    client, _, headers = context
+    client.patch("/v1/personality", headers=headers, json={"base": "dry"})
+
+    body = client.post("/v1/personality/reset", headers=headers).json()["data"]
+    assert body["base"] == "warm"
+    assert all(v == 0.5 for v in body["traits"].values())
+    assert client.get("/v1/personality", headers=headers).json()["data"]["base"] == "warm"
 
 
 def test_a_settings_patch_with_too_many_keys_is_refused(context):

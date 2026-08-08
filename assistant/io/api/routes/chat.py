@@ -25,8 +25,8 @@ async def send_chat(body: ChatRequest, request: Request,
         # than "holds a CHAT token" should not learn *what* she is doing --
         # only that she isn't free. `ref.reason` is never interpolated here.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="busy")
-    return Envelope(data={"turn_id": ref.turn_id,
-                          "conversation_id": ref.conversation_id})
+    return Envelope(data={"turnId": ref.turn_id,
+                          "conversationId": ref.conversation_id})
 
 
 # ─── Conversation history ────────────────────────────────────────────────
@@ -36,10 +36,10 @@ async def list_conversations(request: Request,
     conversations = await request.app.state.runtime.chat.conversations()
     return Envelope(data={"conversations": [
         {
-            "conversation_id": c.conversation_id,
+            "conversationId": c.conversation_id,
             "title": c.title,
-            "updated_at": c.updated_at,
-            "message_count": c.message_count,
+            "updatedAt": c.updated_at,
+            "messageCount": c.message_count,
         }
         for c in conversations
     ]})
@@ -52,14 +52,14 @@ async def get_conversation(conversation_id: str, request: Request,
     if detail is None:
         raise HTTPException(status_code=404)  # detail is dead on a 404 -- see app.py's handler
     return Envelope(data={
-        "conversation_id": detail.conversation_id,
+        "conversationId": detail.conversation_id,
         "title": detail.title,
         "messages": [
             {
-                "message_id": m.message_id,
+                "messageId": m.message_id,
                 "role": m.role,
                 "text": m.text,
-                "created_at": m.created_at,
+                "createdAt": m.created_at,
                 "intent": m.intent,
             }
             for m in detail.messages

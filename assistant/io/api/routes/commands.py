@@ -6,10 +6,20 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..schemas import Envelope
-from ..security import authenticate, require
+from ..security import authenticate, device_key, require
 from ..vault import Capability
 
 router = APIRouter()
+
+# A command's own grant, not one fixed capability, decides *whether* a
+# device may run it -- which is exactly why this route can't reuse
+# security.throttle() (a `require(capability)` dependency baked in at
+# declaration time). Bounding *how often*, regardless of which command, still
+# matters: a SCREEN-granted device left running "screenshot" in a loop is the
+# concrete case this closes, but the budget applies to every command_id
+# alike, the same way the shared limiter applies to every route.
+_RUN_MAX_PER_WINDOW = 20
+_RUN_WINDOW_SECONDS = 60.0
 
 
 @router.get("/commands")
@@ -18,11 +28,11 @@ async def list_commands(request: Request,
     catalogue = await request.app.state.runtime.commands.catalogue()
     return Envelope(data={"commands": [
         {
-            "command_id": command.command_id,
+            "commandId": command.command_id,
             "label": command.label,
             "description": command.description,
             "destructive": command.destructive,
-            "required_grant": command.required_grant,
+            "requiredGrant": command.required_grant,
         }
         for command in catalogue
     ]})
@@ -31,6 +41,12 @@ async def list_commands(request: Request,
 @router.post("/commands/{command_id}/run")
 async def run_command(command_id: str, request: Request,
                       device=Depends(authenticate)) -> Envelope:
+    state = request.app.state.auth
+    key = f"commands_run:{device_key(device)}"
+    if not state.limiter.check(key, max_per_window=_RUN_MAX_PER_WINDOW,
+                               window_seconds=_RUN_WINDOW_SECONDS):
+        raise HTTPException(status_code=429, detail="too many requests")
+
     catalogue = await request.app.state.runtime.commands.catalogue()
     match = next((c for c in catalogue if c.command_id == command_id), None)
     if match is None:
@@ -48,4 +64,4 @@ async def run_command(command_id: str, request: Request,
     outcome = await request.app.state.runtime.commands.run(command_id)
     if not outcome.ok:
         raise HTTPException(status_code=502, detail=outcome.message)
-    return Envelope(data={"command_id": command_id, "message": outcome.message})
+    return Envelope(data={"commandId": command_id, "message": outcome.message})

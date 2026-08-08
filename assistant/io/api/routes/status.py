@@ -15,9 +15,8 @@ router = APIRouter()
 async def get_status(request: Request, _=Depends(require(Capability.CHAT))) -> Envelope:
     info = await request.app.state.runtime.system.status()
     return Envelope(data={
-        "assistant_name": info.assistant_name,
-        "version": info.version,
-        "active_model": info.active_model,
+        "assistantName": info.assistant_name,
+        "activeModel": info.active_model,
         "personality": info.personality,
         "busy": info.busy,
     })

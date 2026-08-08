@@ -130,7 +130,7 @@ def test_personality_returns_base_traits_and_a_sample(context):
     body = client.get("/v1/personality", headers=headers).json()["data"]
     assert body["base"] == "warm"
     assert len(body["traits"]) == 6
-    assert body["sample_line"]
+    assert body["sampleLine"]
 
 
 def test_read_routes_are_enveloped(context):
@@ -138,3 +138,23 @@ def test_read_routes_are_enveloped(context):
     for path in ("/v1/memory/knowledge", "/v1/settings", "/v1/personality"):
         body = client.get(path, headers=headers).json()
         assert set(body) == {"data", "meta"}, f"{path} is not enveloped"
+
+
+# ─── fix wave: meta is no longer two permanently empty strings ───────────
+def test_meta_carries_a_request_id_matching_the_response_header(context):
+    client, _, headers = context
+    response = client.get("/v1/status", headers=headers)
+    assert response.json()["meta"]["requestId"] == response.headers["X-Request-Id"]
+
+
+def test_meta_request_id_differs_between_requests(context):
+    client, _, headers = context
+    first = client.get("/v1/status", headers=headers).json()["meta"]["requestId"]
+    second = client.get("/v1/status", headers=headers).json()["meta"]["requestId"]
+    assert first and second and first != second
+
+
+def test_meta_generated_at_is_populated(context):
+    client, _, headers = context
+    body = client.get("/v1/status", headers=headers).json()
+    assert body["meta"]["generatedAt"]

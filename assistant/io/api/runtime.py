@@ -251,8 +251,12 @@ class EnrollmentState:
 
 @dataclass(frozen=True)
 class StatusInfo:
+    # No `version` field: no app version constant exists anywhere in the
+    # codebase (config.py, assistant/__init__.py, pyproject.toml all checked),
+    # so the choice was between wiring a real one and shipping an eternal ""
+    # a Studio client has no honest use for. Dropped from the wire rather
+    # than faked; add it back if a real version string ever exists to report.
     assistant_name: str
-    version: str
     active_model: str
     personality: str
     busy: bool

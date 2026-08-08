@@ -28,9 +28,9 @@ def head(token):
 def test_telemetry_reports_the_meters(context):
     client, _, tokens = context
     body = client.get("/v1/telemetry", headers=head(tokens["full"])).json()["data"]
-    assert body["cpu_percent"] == 21.5
-    assert body["ram_percent"] == 63.0
-    assert body["battery_percent"] == 88.0
+    assert body["cpuPercent"] == 21.5
+    assert body["ramPercent"] == 63.0
+    assert body["batteryPercent"] == 88.0
 
 
 def test_telemetry_tolerates_a_machine_with_no_battery(context):
@@ -42,21 +42,56 @@ def test_telemetry_tolerates_a_machine_with_no_battery(context):
 
     runtime.system.telemetry = no_battery
     body = client.get("/v1/telemetry", headers=head(tokens["full"])).json()["data"]
-    assert body["battery_percent"] is None
+    assert body["batteryPercent"] is None
 
 
 def test_backup_state_is_readable(context):
     client, _, tokens = context
     body = client.get("/v1/backup", headers=head(tokens["full"])).json()["data"]
     assert body["provider"] == "google_drive"
-    assert body["last_result"] == "ok"
+    assert body["lastResult"] == "ok"
 
 
 def test_running_a_backup_updates_the_state(context):
     client, runtime, tokens = context
     body = client.post("/v1/backup/run", headers=head(tokens["full"])).json()["data"]
     assert runtime.system.backups_run == 1
-    assert body["last_backup_at"] == "2026-08-08T09:15:00Z"
+    assert body["lastBackupAt"] == "2026-08-08T09:15:00Z"
+
+
+# ─── fix wave: an exception a route did not catch is mapped, not a 500 ────
+def test_a_runtime_error_from_backup_run_is_mapped_not_500(context):
+    """A RuntimeError from run_backup() -- e.g. orchestrator.run_backup()
+    raising "the backup key is not unlocked yet", the default state on any
+    machine where the recovery phrase has not been entered this process --
+    used to reach the caller as a bare, unmapped 500. errors.to_http_exception,
+    registered app-wide in app.py, turns it into a structured 409 instead.
+    """
+    client, runtime, tokens = context
+
+    async def _boom():
+        raise RuntimeError("Backup key is not unlocked yet")
+
+    runtime.system.run_backup = _boom
+    response = client.post("/v1/backup/run", headers=head(tokens["full"]))
+    assert response.status_code == 409
+
+
+def test_a_route_that_raises_is_still_audited(context):
+    """audit_and_tag used to record nothing when call_next() raised past it
+    -- exactly the case an unmapped exception used to be, before the
+    app-wide handler started converting it into an ordinary response. Proven
+    directly against the audit log, not just the status code.
+    """
+    client, runtime, tokens = context
+
+    async def _boom():
+        raise RuntimeError("Backup key is not unlocked yet")
+
+    runtime.system.run_backup = _boom
+    client.post("/v1/backup/run", headers=head(tokens["full"]))
+    entries = client.get("/v1/audit", headers=head(tokens["full"])).json()["data"]["entries"]
+    assert any(e["path"] == "/v1/backup/run" and e["outcome"] == "409" for e in entries)
 
 
 def test_restore_needs_system_control(context):
@@ -109,6 +144,23 @@ def test_forgetting_an_unknown_kind_is_422(context):
     client, _, tokens = context
     assert client.delete("/v1/enrollment/fingerprint/f1",
                          headers=head(tokens["full"])).status_code == 422
+
+
+# ─── capability tier: forgetting an enrollment needs system_control ───────
+def test_forgetting_an_enrollment_needs_system_control_not_just_chat(context):
+    """Destroying a biometric enrollment (a voiceprint, a face) is not
+    ordinary conversational use -- the same ruling that moved forget-all and
+    settings writes off of chat. Proven both ways: refused, and nothing
+    actually changed -- not merely the status code.
+    """
+    client, runtime, tokens = context
+    before = client.get("/v1/enrollment", headers=head(tokens["full"])).json()["data"]
+
+    response = client.delete("/v1/enrollment/face/f1", headers=head(tokens["chat"]))
+    assert response.status_code == 403
+
+    after = client.get("/v1/enrollment", headers=head(tokens["full"])).json()["data"]
+    assert after == before, "the enrollment changed despite the 403"
 
 
 def test_enrollment_carries_count_and_last_seen_at_camel_cased(context):

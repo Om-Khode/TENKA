@@ -38,7 +38,7 @@ def test_status_requires_a_token(client):
 def test_status_with_a_token_answers(client, token):
     response = client.get("/v1/status", headers=auth(token))
     assert response.status_code == 200
-    assert response.json()["data"]["assistant_name"] == "TENKA"
+    assert response.json()["data"]["assistantName"] == "TENKA"
 
 
 def test_unauthenticated_status_leaks_nothing(client):
@@ -250,6 +250,39 @@ def test_no_route_hides_from_the_schema_sweep(client):
             assert route.include_in_schema, (
                 f"{route.path!r} hides from the schema the auth sweep walks"
             )
+
+
+# ─── fix wave: the wire is camelCase, pinned against the schema itself ────
+def test_no_schema_property_is_snake_case(client):
+    """Studio generates its TypeScript types from app.openapi(). Before the
+    fix wave, chat.py/commands.py/status.py/telemetry/_backup_body/audit's
+    hand-built response dicts and settings.py's own restart_required were
+    snake_case while memory.py/files.py were already camelCase -- and every
+    Pydantic-modelled field (Meta, RenameRequest, RestoreRequest) still is,
+    since `data: Any` never round-trips those hand-built dicts through a
+    schema Pydantic would otherwise normalise. Walking `components.schemas`
+    catches every *modelled* property; it cannot see inside `data: Any`,
+    which is exactly why the individual route tests (test_api_chat.py,
+    test_api_commands.py, test_api_system.py, ...) pin the hand-built dicts
+    directly -- this test and those together are the actual coverage.
+    """
+    schema = client.app.openapi()
+
+    def _walk(node) -> None:
+        if isinstance(node, dict):
+            props = node.get("properties")
+            if isinstance(props, dict):
+                for name in props:
+                    assert "_" not in name, f"snake_case wire property: {name!r}"
+            for value in node.values():
+                _walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+
+    schemas = schema.get("components", {}).get("schemas", {})
+    assert schemas, "sanity: no component schemas found to check"
+    _walk(schemas)
 
 
 def test_the_hiding_guard_catches_a_route_that_opts_out_of_the_schema(vault):

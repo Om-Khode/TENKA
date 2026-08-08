@@ -101,7 +101,7 @@ def test_a_rejected_call_is_recorded_without_a_device(context):
     client, _, tokens = context
     client.get("/v1/status", headers=head("bad"))
     entries = client.get("/v1/audit", headers=head(tokens["full"])).json()["data"]["entries"]
-    assert any(e["device_id"] == "-" for e in entries)
+    assert any(e["deviceId"] == "-" for e in entries)
 
 
 def test_the_audit_log_needs_system_control(context):

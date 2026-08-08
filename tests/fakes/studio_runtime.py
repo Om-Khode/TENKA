@@ -311,7 +311,7 @@ class FakeSystemRuntime:
         )
 
     async def status(self) -> StatusInfo:
-        return StatusInfo("TENKA", "1.0.0", "gemini-flash-lite", "warm", busy=False)
+        return StatusInfo("TENKA", "gemini-flash-lite", "warm", busy=False)
 
     async def telemetry(self) -> TelemetrySnapshot:
         return TelemetrySnapshot(21.5, 63.0, 88.0, "gemini-flash-lite", 4_512)

@@ -21,7 +21,7 @@ def test_sending_a_message_reaches_the_runtime(context):
     response = client.post("/v1/chat", headers=headers, json={"text": "what time is it"})
     assert response.status_code == 202
     assert runtime.chat.sent == ["what time is it"]
-    assert response.json()["data"]["turn_id"] == "t1"
+    assert response.json()["data"]["turnId"] == "t1"
 
 
 def test_a_busy_assistant_answers_409_and_does_not_queue(context):
@@ -56,7 +56,7 @@ def test_a_sealed_envelope_is_refused_for_now(context):
 def test_conversations_list(context):
     client, _, headers = context
     body = client.get("/v1/chat/conversations", headers=headers).json()["data"]
-    assert body["conversations"][0]["conversation_id"] == "c1"
+    assert body["conversations"][0]["conversationId"] == "c1"
 
 
 def test_a_conversation_returns_its_messages_in_order(context):

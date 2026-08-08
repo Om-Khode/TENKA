@@ -46,11 +46,11 @@ async def telemetry(request: Request,
                     _=Depends(require(Capability.CHAT))) -> Envelope:
     snapshot = await request.app.state.runtime.system.telemetry()
     return Envelope(data={
-        "cpu_percent": snapshot.cpu_percent,
-        "ram_percent": snapshot.ram_percent,
-        "battery_percent": snapshot.battery_percent,
-        "active_model": snapshot.active_model,
-        "uptime_seconds": snapshot.uptime_seconds,
+        "cpuPercent": snapshot.cpu_percent,
+        "ramPercent": snapshot.ram_percent,
+        "batteryPercent": snapshot.battery_percent,
+        "activeModel": snapshot.active_model,
+        "uptimeSeconds": snapshot.uptime_seconds,
     })
 
 
@@ -58,9 +58,9 @@ def _backup_body(state) -> dict:
     return {
         "enabled": state.enabled,
         "provider": state.provider,
-        "last_backup_at": state.last_backup_at,
-        "last_result": state.last_result,
-        "size_bytes": state.size_bytes,
+        "lastBackupAt": state.last_backup_at,
+        "lastResult": state.last_result,
+        "sizeBytes": state.size_bytes,
     }
 
 
@@ -116,7 +116,12 @@ async def enrollment(request: Request,
 
 @router.delete("/enrollment/{kind}/{item_id}")
 async def forget_enrolled(kind: EnrollmentKind, item_id: str, request: Request,
-                          _=Depends(require(Capability.CHAT))) -> Envelope:
+                          # SYSTEM_CONTROL, not CHAT: destroying a biometric
+                          # enrollment (a voiceprint, a face) is not ordinary
+                          # conversational use -- the same reasoning that put
+                          # forget-all and settings writes behind this grant.
+                          # Reading the enrollment list stays on chat.
+                          _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope:
     removed = await request.app.state.runtime.system.forget_enrolled(kind, item_id)
     if not removed:
         # `detail=` is dead on a 404: app.py's `@app.exception_handler(404)`
@@ -131,7 +136,7 @@ async def audit(request: Request,
                 _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope:
     entries = request.app.state.auth.audit.entries()
     return Envelope(data={"entries": [
-        {"at": e.at, "device_id": e.device_id, "method": e.method,
+        {"at": e.at, "deviceId": e.device_id, "method": e.method,
          "path": e.path, "outcome": e.outcome}
         for e in reversed(entries)
     ]})
