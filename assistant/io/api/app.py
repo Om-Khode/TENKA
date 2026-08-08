@@ -18,6 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ...core.redact import redact_secrets
+from .routes import memory as memory_routes
+from .routes import settings as settings_routes
 from .routes import status as status_routes
 from .runtime import StudioRuntime
 from .security import AuditEntry, AuthState
@@ -85,4 +87,6 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         return JSONResponse(status_code=404, content={"error": "not found"})
 
     app.include_router(status_routes.router, prefix="/v1")
+    app.include_router(memory_routes.router, prefix="/v1")
+    app.include_router(settings_routes.router, prefix="/v1")
     return app
