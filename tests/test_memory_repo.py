@@ -91,6 +91,38 @@ class TestSessionScopedContext:
         assert "msg2" in ctx
 
 
+class TestListConversationSessions:
+    """Distinct chat sessions for Studio -- not recording_sessions, which is
+    the unrelated screen/audio-capture transcript table."""
+
+    def test_groups_turns_by_session(self, repo):
+        repo.save_turn("hello", "small_talk", "hi", "sess_a")
+        repo.save_turn("do thing", "planner", "done", "sess_a")
+        repo.save_turn("other", "small_talk", "hey", "sess_b")
+        sessions = repo.list_conversation_sessions()
+        by_id = {s["session_id"]: s for s in sessions}
+        assert by_id["sess_a"]["turn_count"] == 2
+        assert by_id["sess_b"]["turn_count"] == 1
+
+    def test_last_input_is_the_most_recent_turn_in_that_session(self, repo):
+        repo.save_turn("first", "small_talk", "r1", "sess_a")
+        repo.save_turn("second", "small_talk", "r2", "sess_a")
+        sessions = repo.list_conversation_sessions()
+        assert sessions[0]["last_input"] == "second"
+
+    def test_most_recently_active_session_comes_first(self, repo):
+        repo.save_turn("older", "small_talk", "r1", "sess_old")
+        repo.save_turn("newer", "small_talk", "r2", "sess_new")
+        sessions = repo.list_conversation_sessions()
+        assert sessions[0]["session_id"] == "sess_new"
+
+    def test_respects_limit(self, repo):
+        repo.save_turn("a", "small_talk", "r", "sess_1")
+        repo.save_turn("b", "small_talk", "r", "sess_2")
+        repo.save_turn("c", "small_talk", "r", "sess_3")
+        assert len(repo.list_conversation_sessions(limit=2)) == 2
+
+
 class TestSearchConversationsSqlFallback:
     def test_finds_matching_input(self, repo):
         repo.save_turn("tell me about python", "small_talk", "python is great", "s")

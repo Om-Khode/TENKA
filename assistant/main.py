@@ -56,6 +56,7 @@ from . import telemetry as _telemetry
 from . import knowledge_graph
 from datetime import datetime as _dt
 from .core.abort import abort
+from .core.redact import redact_secrets
 from .io.esc_monitor import esc_monitor
 from .io.status_broadcaster import status, StatusPhase
 from .overlay_manager import overlay_manager
@@ -215,6 +216,164 @@ def _chat_input_loop(input_queue):
     """
     from .io import chat_input
     chat_input.chat_input_loop(input_queue)
+
+
+# ─── Studio dispatch ──────────────────────────────────────────────────────
+
+class _StudioDispatch:
+    """The only path from an HTTP request into the pipeline.
+
+    One turn at a time: a second concurrent submit is refused rather than
+    queued, because a browser tab left open should not be able to drive her
+    minutes after its owner walked away.
+
+    A plain bool, not an asyncio.Lock: submit() enqueues onto _input_queue
+    and returns immediately -- there is no `await` anywhere between checking
+    and setting the flag, so a lock bought nothing an equivalent bool
+    couldn't (an `async with` around a body with no suspension point can
+    never actually be observed "held" by a second coroutine; see the
+    original version this replaced). What actually needs to span "one turn"
+    is not the enqueue, which is instant, but the turn itself, which the
+    queue consumer processes asynchronously afterwards -- `mark_done()`,
+    called from process_text_from_queue's own `finally` block once a
+    "studio"-sourced turn has genuinely finished, is what the lock never did:
+    hold the busy state for the turn's real duration.
+    """
+
+    def __init__(self) -> None:
+        self._busy = False
+        self._counter = 0
+
+    @property
+    def busy(self) -> bool:
+        return self._busy
+
+    async def submit(self, text: str) -> tuple[str, str, bool, str]:
+        if self._busy:
+            return ("", "", False, "busy")
+        self._busy = True
+        from . import session as session_mod
+        self._counter += 1
+        turn_id = f"studio-{self._counter}"
+        # Same 2-tuple shape process_text_from_queue's consumer loop
+        # already expects from the "chat" source (main.py:~1379) --
+        # not a third invented shape.
+        _input_queue.put(("studio", text))
+        return (turn_id, session_mod.get_current_session_id(), True, "")
+
+    def mark_done(self) -> None:
+        """Called once, from process_text_from_queue's `finally` block, for
+        every turn whose source was "studio" -- success, failure, or an
+        early return partway through all reach it. Clearing the flag any
+        earlier (e.g. right after the enqueue) is the exact bug this
+        replaces."""
+        self._busy = False
+
+    async def abort(self) -> bool:
+        abort.request_abort("studio")
+        return True
+
+
+_studio_dispatch: "_StudioDispatch | None" = None
+# Module-level for the same reason `_studio_vault` is: process_text_from_queue
+# needs to reach the one dispatch instance _start_studio_daemon() built, to
+# call mark_done() once a "studio"-sourced turn finishes, and it has no other
+# handle on it (the instance is built and handed to build_studio_runtime()
+# inside that function's own local scope).
+
+_studio_vault: "TokenVault | None" = None
+# Module-level, not returned: _start_studio_daemon()'s return type
+# (`asyncio.Task | None`) is pinned by tests/test_api_server_lifecycle.py,
+# which asserts on it directly (`result is None`, `task is not None`,
+# `await task`). The vault has to be reachable from wherever shutdown runs
+# too -- a second local variable in a different function's scope can't do
+# that -- so it lives here instead of riding the return value.
+
+
+async def _start_studio_daemon() -> "asyncio.Task | None":
+    """Build and start the Studio daemon. Returns the running task, or
+    None if anything failed -- the daemon is an optional side channel and
+    must never stop the assistant itself from booting.
+
+    Split out of async_main() so a test can drive this exact sequence
+    (e.g. forcing serve() to fail) without booting the assistant.
+    """
+    global _studio_dispatch, _studio_vault
+    try:
+        from .actions.studio_runtime import build_studio_runtime
+        from .io.api.events import EventHub
+        from .io.api.server import serve as serve_studio_api
+        from .io.api.vault import Capability, TokenVault
+
+        _studio_vault = TokenVault(config.SANDBOX_DIR)
+        if not _studio_vault.devices():
+            _studio_token = _studio_vault.issue("studio", frozenset(Capability))
+            # The raw token goes to stdout ONLY -- a browser can't read a
+            # file, so this is the one and only time the operator can
+            # copy it into Studio's connect screen. The log line names
+            # the event, never the value: DEBUG_LOG defaults to true on a
+            # fresh install, so anything logged here reaches debug.log in
+            # plaintext (KI-12). redact_secrets() elsewhere in this
+            # function is a second line of defence, not the reason the
+            # token stays out -- it never appears in a string handed to
+            # logger in the first place.
+            logger.info("[API] Studio device token issued -- printed to "
+                        "the console once, not logged.")
+            print(f"\n  TENKA Studio token: {_studio_token}\n")
+
+        # hub is built, but NOT subscribed to status_broadcaster yet:
+        # StatusBroadcaster.subscribe() has no matching unsubscribe, so a
+        # subscription made before serve() can still fail (e.g. an
+        # eagerly-checked bad TENKA_SECRET raising inside create_app())
+        # would outlive the failed daemon -- every future status.set()
+        # call, which fires on every phase transition, would keep
+        # appending to a hub nothing ever drains, for the rest of the
+        # process, on a machine where the daemon is off. Subscribing only
+        # after serve() has returned without raising means a startup
+        # failure leaves no trace to leak.
+        _studio_hub = EventHub()
+        _studio_dispatch = _StudioDispatch()
+        _studio_task = serve_studio_api(
+            build_studio_runtime(_studio_dispatch),
+            _studio_vault,
+            port=config.STUDIO_API_PORT,
+            origins=[o.strip() for o in config.STUDIO_API_ORIGINS.split(",") if o.strip()],
+            hub=_studio_hub,
+        )
+        status.subscribe(_studio_hub.publish)
+        return _studio_task
+    except Exception as e:
+        logger.warning(
+            f"[API] Studio daemon failed to start (non-critical): {redact_secrets(str(e))}"
+        )
+        return None
+
+
+async def _stop_studio_daemon(task: "asyncio.Task | None") -> None:
+    """Cancel a running daemon task, or retrieve-and-log one that already
+    crashed before shutdown got here (e.g. the port was already taken, so
+    _run() raised inside the task instead of at the synchronous serve()
+    call _start_studio_daemon() already guards).
+
+    Retrieving a done task's exception marks it consumed, so asyncio's own
+    "exception was never retrieved" logger never prints it later,
+    unredacted, through a handler this module doesn't control.
+    """
+    if task is None:
+        return
+    if task.done():
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(f"[API] Studio daemon exited early: {redact_secrets(str(exc))}")
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.warning(f"[API] Studio daemon did not shut down cleanly: {redact_secrets(str(e))}")
 
 
 async def _drain_and_announce_notifications(bridge: UnityBridge):
@@ -544,9 +703,9 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
 
     try:
         if source == "stt":
-            logger.info(f'Transcription (STT): "{transcription}"')
+            logger.info(f'Transcription (STT): "{redact_secrets(transcription)}"')
         else:
-            logger.info(f'Transcription (Chat): "{transcription}"')
+            logger.info(f'Transcription (Chat): "{redact_secrets(transcription)}"')
 
         await bridge.send_command("show_subtitle", text=f"You: {transcription}")
 
@@ -1219,10 +1378,52 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     finally:
         _tracker.save()
         _telemetry.reset_current_tracker(_tracker_token)
+        # The turn this "studio" item started is only now actually over --
+        # success, failure or an early return above all reach this
+        # `finally`. Clearing the busy flag here, not at the instant
+        # _StudioDispatch.submit() enqueued it, is what makes the flag mean
+        # "a turn is in flight" rather than "an enqueue just happened".
+        if source == "studio" and _studio_dispatch is not None:
+            _studio_dispatch.mark_done()
         # Resume wake word detection after pipeline completes
         # (resume() auto-clears ring buffer to prevent TTS audio bleed)
         if _wake_listener:
             _wake_listener.resume()
+
+
+async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
+    """Handle exactly one item already pulled off `_input_queue`.
+
+    Split out of the consumer loop's inline body for one reason: a studio
+    turn's busy flag has to clear no matter *where* inside
+    process_text_from_queue a raise happens, and three things run before
+    that function's own `try:` -- constructing the TurnTracker, registering
+    it with `_telemetry.set_current_tracker`, and (if a wake-word listener
+    is running) pausing it. A raise in any of those three skips
+    process_text_from_queue's own `finally` entirely (it is never reached),
+    which used to strand `_busy=True` forever: no watchdog, no timeout, the
+    Studio channel answering 409 to every message until the process
+    restarted. This function's own `finally` covers the whole call --
+    including everything before process_text_from_queue's internal `try:` --
+    so `mark_done()` fires exactly once more here even on that failure path.
+
+    On the ordinary success path this means `mark_done()` runs twice (once
+    from inside process_text_from_queue's own `finally`, once from this
+    one) -- harmless, since it only ever does `self._busy = False`, an
+    idempotent assignment with no side effect to double up on.
+
+    A second benefit of the extraction: this exact seam is now callable
+    from a test with one queued item, without booting the assistant or
+    running the surrounding `while not _shutdown_event.is_set()` loop at
+    all.
+    """
+    source, text = item[0], item[1]
+    stt_ms = item[2] if len(item) > 2 else None
+    try:
+        await process_text_from_queue(source, text, bridge, stt_ms=stt_ms)
+    finally:
+        if source == "studio" and _studio_dispatch is not None:
+            _studio_dispatch.mark_done()
 
 
 # ─── Event Handling ──────────────────────────────────────────────────────────
@@ -1868,6 +2069,15 @@ async def async_main():
 
     asyncio.get_running_loop().create_task(_memory_cleanup_loop())
 
+    # Background task: the TENKA Studio daemon, off by default. A second
+    # asyncio task on this same loop rather than a second process, because
+    # that is what keeps it on the one SQLite connection the rest of the
+    # assistant shares. Building/starting it lives in _start_studio_daemon()
+    # so a test can drive that exact sequence without booting the assistant.
+    _studio_task: asyncio.Task | None = None
+    if config.STUDIO_API_ENABLED:
+        _studio_task = await _start_studio_daemon()
+
     # Background task: reset manifest-based daily vision cap when the local date rolls over.
     async def _vision_cap_daily_reset_loop():
         """Hourly check; reset the manifest-based vision cap when the local date rolls over."""
@@ -1950,9 +2160,7 @@ async def async_main():
         while not _shutdown_event.is_set():
             try:
                 item = _input_queue.get_nowait()
-                source, text = item[0], item[1]
-                stt_ms = item[2] if len(item) > 2 else None
-                await process_text_from_queue(source, text, bridge, stt_ms=stt_ms)
+                await _process_one_queued_item(item, bridge)
             except queue.Empty:
                 # Check if the recording worker detected a voice stop command
                 if recording.voice_stop_requested():
@@ -2101,6 +2309,34 @@ async def async_main():
             pass
         overlay_manager.stop()
         esc_monitor.stop()
+
+        # ─── Studio daemon shutdown ─────────────────────────────────────────────
+        # This block runs on every *orderly* exit from the loop above --
+        # Ctrl+C, the "shutdown" voice intent, even an exception caught
+        # somewhere upstream that unwinds through this `finally` -- which
+        # used to mean `shutdown_studio_api()` (server.shutdown, the kill
+        # switch that rotates the instance secret via vault.reset()) fired
+        # unconditionally too. That is backwards from what a kill switch is
+        # for: a phone paired yesterday would have to be re-paired after
+        # every ordinary restart, and the fresh token that is meant to print
+        # once, at first pairing, would print on every boot instead. A real
+        # crash (killed from Task Manager, a power loss) never reaches this
+        # `finally` at all, so the previous code had the two situations
+        # exactly inverted -- a clean exit destroyed pairing state that a
+        # crash would have preserved.
+        #
+        # Only stopping serving belongs here. `_stop_studio_daemon` cancels
+        # the task and awaits it, which is what actually releases the
+        # listening port (see server.serve()'s own comment on why a bare
+        # cancel alone is not enough) -- it never touches the vault, so every
+        # device issued before this restart still verifies after it.
+        # server.shutdown() (the kill switch) stays fully defined and
+        # covered by its own tests in test_api_hardening.py and
+        # test_api_server_lifecycle.py; nothing in this milestone gives it a
+        # deliberate trigger yet (a future "revoke every Studio device" admin
+        # action would call it explicitly), and it must not be reachable from
+        # a normal exit path in the meantime.
+        await _stop_studio_daemon(_studio_task)
 
         await bridge.stop()
         logger.info("Voice Assistant shut down")

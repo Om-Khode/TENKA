@@ -17,6 +17,13 @@ import os
 import time
 import logging
 
+import pytest
+
+# This file opens Calculator, clicks it, and reads it back through Terminator.
+# It must never run as part of a bare `pytest tests/` — see the addopts in
+# pyproject.toml. Ask for it by name, on a machine nobody is using.
+pytestmark = pytest.mark.live_automation
+
 # Add project root to path so we can import assistant modules
 sys.path.insert(0, os.path.dirname(__file__))
 

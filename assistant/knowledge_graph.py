@@ -744,6 +744,38 @@ def list_open_commitments_for_entity(
     return repo.list_open_commitments(owner_id=entity_id, limit=limit)
 
 
+# ─── Public helpers for Studio (browse + forget) ───────────────────────────
+def list_entities(limit: int = 5_000) -> list[dict]:
+    repo = _get_repo()
+    if repo is None:
+        return []
+    return repo.list_entities(limit=limit)
+
+
+def list_facts(limit: int = 20_000) -> list[dict]:
+    repo = _get_repo()
+    if repo is None:
+        return []
+    return repo.list_facts(limit=limit)
+
+
+def list_relationships(limit: int = 20_000) -> list[dict]:
+    repo = _get_repo()
+    if repo is None:
+        return []
+    return repo.list_relationships(limit=limit)
+
+
+def delete_entity(entity_id: int) -> bool:
+    """Remove an entity, its facts, and both directions of its
+    relationships. Used by the "forget" surface -- an orphaned fact would
+    keep answering questions about something the user asked to forget."""
+    repo = _get_repo()
+    if repo is None:
+        return False
+    return repo.delete_entity(entity_id)
+
+
 # ─── knowledge-graph H — Provenance query helper ──────────────────────────────────────
 def why_do_you_think_that(
     *, fact_id: int | None = None, entity_id: int | None = None,

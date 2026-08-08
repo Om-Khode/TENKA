@@ -24,6 +24,8 @@ groq                 # Groq cloud API (fallback)
 cerebras-cloud-sdk   # Cerebras Inference API (fallback)
 requests             # HTTP calls (Ollama fallback, whisper.cpp server, Tavily web search)
 pydantic>=2.0        # Schema validation (LLM JSON responses, app manifests)
+fastapi>=0.115       # Studio daemon HTTP surface (assistant/io/api)
+uvicorn>=0.34        # ASGI server for the Studio daemon, started from main.py
 
 # Screen reading & OCR
 mss                  # Fast cross-platform screenshots

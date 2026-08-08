@@ -358,6 +358,20 @@ class PreferenceRepo:
 
         return decayed_count
 
+    # --- Delete ---
+
+    def delete(self, key: str) -> bool:
+        """Remove one preference and its change log. Returns False if the
+        key didn't exist."""
+        cur = self._db.execute(
+            "DELETE FROM user_preferences WHERE key = ?", (key,)
+        )
+        self._db.execute(
+            "DELETE FROM preference_log WHERE key = ?", (key,)
+        )
+        self._db.commit()
+        return cur.rowcount > 0
+
     # --- Reset (Dev/Debug) ---
 
     def reset_preferences(self) -> None:

@@ -103,6 +103,10 @@ def reset_preferences() -> None:
     _get_repo().reset_preferences()
 
 
+def delete_preference(key: str) -> bool:
+    return _get_repo().delete(key)
+
+
 # ─── Explicit Correction Learning ────────────────────────────────────────────
 #
 # Detects when the user explicitly corrects behavior or states a preference,

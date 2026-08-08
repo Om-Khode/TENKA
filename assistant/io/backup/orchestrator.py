@@ -173,8 +173,38 @@ def run_backup(provider_name: str = "google_drive") -> None:
     if settings is not None:
         settings.set("backup_last_backup_at", datetime.now(timezone.utc).isoformat(), source="backup_run")
         settings.set("backup_last_backup_status", "success", source="backup_run")
+        settings.set("backup_last_backup_size_bytes", len(encrypted), source="backup_run")
 
     logger.info(f"[BACKUP] Uploaded version '{label}' to {provider_name}")
+
+
+def get_state() -> dict:
+    """Read the current backup configuration and most recent run outcome.
+
+    Settings, not provider.list_versions(), because run_backup() and
+    _maybe_run_scheduled_backup() already write here on every run --
+    scheduled or manual, from this process or a prior one -- and
+    BackupProvider has no size-reporting method to fall back on anyway.
+    A missing DB (not yet initialized) degrades to all-defaults rather
+    than raising, since this is a read a status panel polls freely.
+    """
+    from ...storage.db import get_db
+    from ...storage.repos.settings import SettingsRepo
+
+    db = get_db()
+    if db is None:
+        return {
+            "enabled": False, "provider": "google_drive",
+            "last_backup_at": "", "last_result": "", "size_bytes": 0,
+        }
+    settings = SettingsRepo(db)
+    return {
+        "enabled": bool(settings.get("backup_enabled", False)),
+        "provider": str(settings.get("backup_provider", "google_drive")),
+        "last_backup_at": str(settings.get("backup_last_backup_at") or ""),
+        "last_result": str(settings.get("backup_last_backup_status") or ""),
+        "size_bytes": int(settings.get("backup_last_backup_size_bytes", 0) or 0),
+    }
 
 
 def run_restore(

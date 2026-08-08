@@ -298,6 +298,27 @@ def test_reset(repo):
     assert repo.get_preference_history(days=3650) == []
 
 
+# --- delete ---
+
+
+def test_delete_removes_the_preference_and_its_log(repo):
+    repo.set_preference("music_app", "spotify", "app_routing", 0.5, "reflection", "r")
+    assert repo.delete("music_app") is True
+    assert repo.get_preference("music_app") is None
+    assert repo.get_preference_history(days=3650) == []
+
+
+def test_delete_missing_key_returns_false(repo):
+    assert repo.delete("nonexistent") is False
+
+
+def test_delete_leaves_other_preferences_alone(repo):
+    repo.set_preference("music_app", "spotify", "app_routing", 0.5, "reflection", "r")
+    repo.set_preference("browser", "firefox", "app_routing", 0.6, "reflection", "r")
+    repo.delete("music_app")
+    assert repo.get_preference("browser") is not None
+
+
 # --- confidence clamping ---
 
 

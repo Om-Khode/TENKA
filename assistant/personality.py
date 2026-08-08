@@ -138,6 +138,12 @@ def set_metadata(key: str, value: str) -> None:
     _get_repo().set_metadata(key, value)
 
 
+def list_personalities() -> list[str]:
+    """Every built-in personality base, for the Studio personality picker."""
+    from .personalities import PersonalityLoader
+    return list(PersonalityLoader.BUILTIN)
+
+
 def switch_personality(name: str) -> str:
     """Switch to a different personality base. Called from /set personality."""
     from .personalities import PersonalityLoader, set_active_personality
