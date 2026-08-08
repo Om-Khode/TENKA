@@ -24,6 +24,35 @@ logger = logging.getLogger(__name__)
 _ROOTS = ("desktop", "documents", "downloads")
 _STARTED_AT = time.monotonic()
 
+# A route.commands/{id}/run caller holding only SCREEN can call "screenshot"
+# repeatedly (POST /v1/commands/{id}/run's own throttle bounds the rate, not
+# the total); without a retention cap the capture directory grows without
+# bound over a long session. Kept newest-first: the oldest files beyond this
+# count are deleted every time a new one is saved.
+_MAX_CAPTURES = 50
+
+
+def _prune_captures(capture_dir: Path) -> None:
+    """Delete the oldest studio_*.png captures beyond `_MAX_CAPTURES`.
+
+    Sorted by filename, not mtime: the stamp embedded in the name
+    ("studio_%Y%m%dT%H%M%S.png") already sorts lexicographically in
+    chronological order, so this needs no extra stat() calls per file.
+    Best-effort -- a file that another process has open (e.g. a viewer)
+    is skipped rather than allowed to fail the capture that triggered
+    this call.
+    """
+    try:
+        shots = sorted(capture_dir.glob("studio_*.png"))
+    except OSError:
+        return
+    excess = len(shots) - _MAX_CAPTURES
+    for path in shots[:max(excess, 0)]:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
 # Windows redirects these to hardware/pseudo devices regardless of which real
 # directory addresses them -- "C:\Users\x\Desktop\CON" still opens the console
 # device, not a file named CON inside Desktop. Checked against the resolved
@@ -236,7 +265,19 @@ class LiveFileRuntime:
         from .. import file_manager
         if file_manager.is_protected_path(target):
             raise PermissionError(f"protected path: {target.name}")
-        _message, new_path = file_manager.rename_path(target, new_name)
+        message, new_path = file_manager.rename_path(target, new_name)
+        # file_manager.rename_path() catches every exception itself and
+        # returns ("Error: ...", the *original*, untouched path) rather than
+        # raising -- silently swallowed here before this fix, so a failed
+        # rename still `.stat()`-ed the old file and returned a valid-looking
+        # FileEntry: a 200 for a rename that never happened. Checked by
+        # postcondition, not by matching the message string, because the
+        # message's wording is an implementation detail of file_manager and
+        # could change out from under this check; whether the old path is
+        # gone and the new one exists cannot lie about whether the rename
+        # actually occurred.
+        if new_path == target or target.exists() or not new_path.exists():
+            raise OSError(message)
         root_path = Path(file_manager.get_user_folder(root)).resolve(strict=False)
         stat = new_path.stat()
         return FileEntry(
@@ -263,7 +304,16 @@ class LiveFileRuntime:
             raise PermissionError(f"protected path: {target.name}")
         if not target.exists():
             return False
-        file_manager.delete_path(target)
+        message = file_manager.delete_path(target)
+        # delete_path() catches every exception itself and returns
+        # f"Error: {e}" rather than raising -- the return value was ignored
+        # here before this fix, so a send2trash failure (locked file, no
+        # Recycle Bin on this volume, permissions) still reported success.
+        # Checked by postcondition for the same reason rename's check is:
+        # whether the path is actually gone cannot lie about whether the
+        # delete happened, regardless of what message text is chosen.
+        if target.exists():
+            raise OSError(message)
         return True
 
 
@@ -333,15 +383,22 @@ class LiveCommandRuntime:
         capture_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         image.save(capture_dir / f"studio_{stamp}.png")
+        _prune_captures(capture_dir)
         return CommandOutcome(True, "captured")
 
 
 class LiveSystemRuntime:
+    def __init__(self, dispatch=None) -> None:
+        # Optional so tests/callers that only need telemetry/backup/enrollment
+        # can still build one with no dispatch: `busy` just reports False in
+        # that case, the same honest default the hardcoded version reported
+        # for everyone.
+        self._dispatch = dispatch
+
     async def status(self) -> StatusInfo:
         return await asyncio.to_thread(self._status_sync)
 
-    @staticmethod
-    def _status_sync() -> StatusInfo:
+    def _status_sync(self) -> StatusInfo:
         from .. import config
         from ..llm.router import TASK_MODEL_MAP
         # config.ACTIVE_PERSONALITY is frozen at import time; the live switch
@@ -352,13 +409,13 @@ class LiveSystemRuntime:
         active_model = str(default_chain[0][1]) if default_chain else ""
         return StatusInfo(
             assistant_name=str(config.ASSISTANT_NAME),
-            # No app version constant exists anywhere in the codebase (checked
-            # config.py, assistant/__init__.py, pyproject.toml). An empty
-            # string is an honest "unknown"; inventing "1.0.0" would not be.
-            version="",
             active_model=active_model,
             personality=get_active_personality_id(),
-            busy=False,
+            # Reads the same in-flight flag `_StudioDispatch.submit()` sets
+            # and the queue consumer's completion hook clears -- not the
+            # unconditional False this used to hardcode, which meant Studio
+            # could never distinguish "a turn is running" from "idle".
+            busy=bool(getattr(self._dispatch, "busy", False)),
         )
 
     async def telemetry(self) -> TelemetrySnapshot:
@@ -403,7 +460,17 @@ class LiveSystemRuntime:
         from ..io.backup import crypto, orchestrator
         if not crypto.is_valid_recovery_phrase(recovery_phrase):
             return False
-        await asyncio.to_thread(orchestrator.run_restore, recovery_phrase)
+        try:
+            await asyncio.to_thread(orchestrator.run_restore, recovery_phrase)
+        except Exception as exc:
+            # run_restore() raises rather than returning a status (e.g. the
+            # phrase is well-formed but doesn't decrypt the stored archive,
+            # or the archive is unreachable) -- left uncaught, this method's
+            # declared `bool` return would still have been `True` on every
+            # path that reached this line, regardless of whether anything
+            # actually restored.
+            logger.warning(f"[API] backup restore failed: {exc}")
+            return False
         return True
 
     async def enrollment(self) -> EnrollmentState:

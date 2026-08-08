@@ -301,6 +301,34 @@ def test_lock_workstation_reports_failure_when_win32_returns_zero(monkeypatch):
     assert fake_user32.lock_calls == 1
 
 
+def test_prune_captures_keeps_only_the_newest_files(tmp_path):
+    """A SCREEN-granted device sustaining captures with no retention grows
+    SANDBOX_DIR/captures without bound. _prune_captures() keeps the newest
+    _MAX_CAPTURES and deletes the rest, oldest first by filename (the
+    embedded timestamp sorts lexicographically in chronological order).
+    """
+    srs._prune_captures(tmp_path)  # empty directory: must not raise
+
+    monkeypatch_max = srs._MAX_CAPTURES
+    try:
+        srs._MAX_CAPTURES = 3
+        stamps = ["20260101T000000", "20260101T000001", "20260101T000002",
+                 "20260101T000003", "20260101T000004"]
+        for stamp in stamps:
+            (tmp_path / f"studio_{stamp}.png").write_bytes(b"x")
+
+        srs._prune_captures(tmp_path)
+
+        remaining = sorted(p.name for p in tmp_path.glob("studio_*.png"))
+        assert remaining == [
+            "studio_20260101T000002.png",
+            "studio_20260101T000003.png",
+            "studio_20260101T000004.png",
+        ]
+    finally:
+        srs._MAX_CAPTURES = monkeypatch_max
+
+
 def test_lock_workstation_reports_success_when_win32_returns_nonzero(monkeypatch):
     import ctypes
     fake_user32 = _FakeUser32(lock_result=1)
@@ -310,3 +338,87 @@ def test_lock_workstation_reports_success_when_win32_returns_nonzero(monkeypatch
 
     assert outcome.ok is True
     assert fake_user32.lock_calls == 1
+
+
+# ─── Fix wave: rename/delete must not report success on failure ───────────
+# file_manager.rename_path()/delete_path() catch every exception themselves
+# and return an "Error: ..." message (rename_path) or string (delete_path)
+# rather than raising -- proven here exactly as the report asked: by making
+# the underlying helper return its error, not by forcing a real OS failure.
+# is_protected_path() is stubbed to False in every one of these: pytest's
+# own tmp_path lives under %LOCALAPPDATA%\Temp, which is-protected_path()
+# correctly flags as protected (it guards all of Path.home()/"AppData") --
+# without the stub, PermissionError (itself an OSError subclass) would make
+# the "raises" tests pass for the wrong reason and the "succeeds" tests fail
+# outright, neither of which has anything to do with the postcondition check
+# these tests exist to pin.
+@pytest.mark.asyncio
+async def test_rename_raises_when_file_manager_reports_failure(tmp_path, monkeypatch):
+    from assistant import file_manager
+
+    original = tmp_path / "notes.md"
+    original.write_text("hi", encoding="utf-8")
+    monkeypatch.setattr(file_manager, "get_user_folder", lambda name: tmp_path)
+    monkeypatch.setattr(file_manager, "is_protected_path", lambda path: False)
+    monkeypatch.setattr(
+        file_manager, "rename_path",
+        lambda path, new_name: (f"Error: {new_name} is locked", path),
+    )
+
+    with pytest.raises(OSError):
+        await LiveFileRuntime().rename("desktop/notes.md", "renamed.md")
+    # The failure must not have silently taken effect either.
+    assert original.exists()
+
+
+@pytest.mark.asyncio
+async def test_rename_succeeds_when_file_manager_reports_success(tmp_path, monkeypatch):
+    """The postcondition check must not reject a rename that actually
+    worked -- proven against the real filesystem, not a fake rename_path."""
+    original = tmp_path / "notes.md"
+    original.write_text("hi", encoding="utf-8")
+    monkeypatch.setattr("assistant.file_manager.get_user_folder", lambda name: tmp_path)
+    monkeypatch.setattr("assistant.file_manager.is_protected_path", lambda path: False)
+
+    entry = await LiveFileRuntime().rename("desktop/notes.md", "renamed.md")
+    assert entry.name == "renamed.md"
+    assert not original.exists()
+    assert (tmp_path / "renamed.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_raises_when_file_manager_reports_failure(tmp_path, monkeypatch):
+    from assistant import file_manager
+
+    target = tmp_path / "notes.md"
+    target.write_text("hi", encoding="utf-8")
+    monkeypatch.setattr(file_manager, "get_user_folder", lambda name: tmp_path)
+    monkeypatch.setattr(file_manager, "is_protected_path", lambda path: False)
+    monkeypatch.setattr(file_manager, "delete_path", lambda path: "Error: file in use")
+
+    with pytest.raises(OSError):
+        await LiveFileRuntime().delete("desktop/notes.md")
+    # The failure must not have silently taken effect either.
+    assert target.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_succeeds_when_file_manager_reports_success(tmp_path, monkeypatch):
+    """delete_path() normally goes through send2trash (the real Recycle Bin)
+    -- stubbed here to a plain unlink so this proves the postcondition check
+    accepts a genuine success without touching the real OS Recycle Bin."""
+    from assistant import file_manager
+
+    target = tmp_path / "notes.md"
+    target.write_text("hi", encoding="utf-8")
+    monkeypatch.setattr(file_manager, "get_user_folder", lambda name: tmp_path)
+    monkeypatch.setattr(file_manager, "is_protected_path", lambda path: False)
+
+    def _fake_delete(path):
+        path.unlink()
+        return f"Deleted '{path.name}'"
+
+    monkeypatch.setattr(file_manager, "delete_path", _fake_delete)
+
+    assert await LiveFileRuntime().delete("desktop/notes.md") is True
+    assert not target.exists()

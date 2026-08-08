@@ -34,6 +34,25 @@ class ChatDispatch(Protocol):
 
     async def submit(self, text: str) -> tuple[str, str, bool, str]: ...
     async def abort(self) -> bool: ...
+    # Whether a submitted turn is currently in flight -- read by
+    # LiveSystemRuntime for StatusInfo.busy. A plain attribute/property, not
+    # async: main.py's `_StudioDispatch` only ever flips a bool, no I/O.
+    busy: bool
+
+
+def _parse_int_id(item_id: str) -> int | None:
+    """`int(item_id)` on a non-numeric route parameter used to raise
+    ValueError straight out of `_forget_sync`, which nothing here caught --
+    it reached the client as a bare 500. A knowledge/procedure item_id that
+    isn't a number is exactly as absent as one that parses but doesn't
+    exist, so it is treated the same way `forget()` already treats an
+    unknown id: caught here and reported as "not found" (via a plain
+    `False`) rather than surfacing what shape the id-space happens to have.
+    """
+    try:
+        return int(item_id)
+    except (TypeError, ValueError):
+        return None
 
 
 def _load_properties(raw: Any) -> dict:
@@ -210,15 +229,21 @@ class LiveMemoryRuntime:
     def _forget_sync(scope: str, item_id: str) -> bool:
         if scope == "knowledge":
             from .. import knowledge_graph
+            entity_id = _parse_int_id(item_id)
+            if entity_id is None:
+                return False
             # Forgetting an entity takes its facts and edges with it. Leaving
             # orphaned facts behind would keep answering questions about
             # something the user asked her to forget.
-            return knowledge_graph.delete_entity(int(item_id))
+            return knowledge_graph.delete_entity(entity_id)
         if scope == "preferences":
             from .. import preferences
             return preferences.delete_preference(item_id)
         from .. import procedures
-        return procedures.delete_procedure(int(item_id))
+        procedure_id = _parse_int_id(item_id)
+        if procedure_id is None:
+            return False
+        return procedures.delete_procedure(procedure_id)
 
     async def forget_all(self) -> int:
         return await asyncio.to_thread(self._forget_all_sync)
@@ -235,6 +260,49 @@ class LiveMemoryRuntime:
             procedures.delete_procedure(int(proc["id"]))
             removed += 1
         return removed
+
+
+def _cast_env_value(cast: type, raw: str) -> Any:
+    """Apply the same cast `runtime_config.setting()` applies when it
+    resolves an env-sourced value, rather than reporting the raw os.getenv()
+    string verbatim while `default` (below) keeps its real type -- the
+    mismatch Studio would otherwise render as `value: "true"` next to
+    `default: false`. Returns None (never a legal SettingValue) on a cast
+    that would fail, exactly the case runtime_config.setting() itself falls
+    through to the hardcoded default for.
+    """
+    try:
+        if cast is bool:
+            return raw.strip().lower() in ("true", "1", "yes", "on")
+        return cast(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _matches_cast(cast: type, value: Any) -> bool:
+    """Whether `value` is a legitimate value for a setting whose registry
+    entry declares `cast`. Guards the write path the read path
+    (_cast_env_value / runtime_config.setting()) both already have to
+    tolerate: a value that fails its cast was being stored as-is, then
+    silently served back as `default` by runtime_config the next time
+    anything actually read it -- Studio would show the submitted value while
+    the assistant used something else entirely.
+
+    `bool` is checked by identity, not by attempting the cast: Python's
+    `bool("anything non-empty")` never raises, so a bare try/except would
+    accept literally any non-empty string for a toggle setting. `bool` is
+    also a subclass of `int`, so True/False must be excluded before an
+    int/float/str setting's own try/except gets a chance to accept them.
+    """
+    if cast is bool:
+        return isinstance(value, bool)
+    if isinstance(value, bool):
+        return False
+    try:
+        cast(value)
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 # ─── Settings ────────────────────────────────────────────────────────────
@@ -257,7 +325,15 @@ class LiveSettingsRuntime:
             if key in stored:
                 value, source = stored[key], "db"
             elif env_value is not None:
-                value, source = env_value, "env"
+                casted = _cast_env_value(cast, env_value)
+                if casted is None:
+                    # The same cast failure runtime_config.setting() itself
+                    # falls through on -- reported as "default", matching
+                    # what the assistant actually resolves at runtime rather
+                    # than the raw, wrongly-typed env string.
+                    value, source = meta["default"], "default"
+                else:
+                    value, source = casted, "env"
             else:
                 value, source = meta["default"], "default"
             rows.append(SettingRow(
@@ -289,6 +365,20 @@ class LiveSettingsRuntime:
             # value legitimately takes precedence over an environment one --
             # refusing the save here would invent a rule the assistant does not
             # have.
+            #
+            # Type-checked against the setting's own cast before it ever
+            # reaches storage: SettingsPatch's Pydantic type
+            # (str | int | float | bool) only proves `value` is *a* legal
+            # SettingValue, not that it is the *right one* for this key. A
+            # value that fails its cast used to be stored as-is, then
+            # silently served back as `meta["default"]` by
+            # runtime_config.setting() the next time anything actually read
+            # it -- Studio would show `value: "banana"` while the assistant
+            # used something else entirely.
+            cast = meta.get("cast", str)
+            if not _matches_cast(cast, value):
+                rejected[key] = "value does not match the setting's type"
+                continue
             try:
                 settings_facade.set(key, value, source="studio")
             except Exception as exc:  # storage failure, not user error
@@ -353,5 +443,8 @@ def build_studio_runtime(dispatch: ChatDispatch) -> StudioRuntime:
         personality=LivePersonalityRuntime(),
         files=LiveFileRuntime(),
         commands=LiveCommandRuntime(),
-        system=LiveSystemRuntime(),
+        # dispatch, not zero-arg: StatusInfo.busy reads the same in-flight
+        # state `dispatch.submit()`/the queue consumer's completion hook
+        # maintain, rather than a hardcoded False.
+        system=LiveSystemRuntime(dispatch),
     )
