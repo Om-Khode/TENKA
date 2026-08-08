@@ -171,8 +171,8 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         await app.state.hub.attach(websocket)
         try:
             info = await app.state.runtime.system.status()
-            await websocket.send_json({"type": "status", "phase": "connected",
-                                       "detail": info.active_model})
+            await _safe_send({"type": "status", "phase": "connected",
+                              "detail": info.active_model})
             while True:
                 try:
                     frame = await websocket.receive_json()

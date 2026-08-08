@@ -250,6 +250,90 @@ class _StudioDispatch:
         return True
 
 
+async def _start_studio_daemon() -> "asyncio.Task | None":
+    """Build and start the Studio daemon. Returns the running task, or
+    None if anything failed -- the daemon is an optional side channel and
+    must never stop the assistant itself from booting.
+
+    Split out of async_main() so a test can drive this exact sequence
+    (e.g. forcing serve() to fail) without booting the assistant.
+    """
+    try:
+        from .actions.studio_runtime import build_studio_runtime
+        from .io.api.events import EventHub
+        from .io.api.server import serve as serve_studio_api
+        from .io.api.vault import Capability, TokenVault
+
+        _studio_vault = TokenVault(config.SANDBOX_DIR)
+        if not _studio_vault.devices():
+            _studio_token = _studio_vault.issue("studio", frozenset(Capability))
+            # The raw token goes to stdout ONLY -- a browser can't read a
+            # file, so this is the one and only time the operator can
+            # copy it into Studio's connect screen. The log line names
+            # the event, never the value: DEBUG_LOG defaults to true on a
+            # fresh install, so anything logged here reaches debug.log in
+            # plaintext (KI-12). redact_secrets() elsewhere in this
+            # function is a second line of defence, not the reason the
+            # token stays out -- it never appears in a string handed to
+            # logger in the first place.
+            logger.info("[API] Studio device token issued -- printed to "
+                        "the console once, not logged.")
+            print(f"\n  TENKA Studio token: {_studio_token}\n")
+
+        # hub is built, but NOT subscribed to status_broadcaster yet:
+        # StatusBroadcaster.subscribe() has no matching unsubscribe, so a
+        # subscription made before serve() can still fail (e.g. an
+        # eagerly-checked bad TENKA_SECRET raising inside create_app())
+        # would outlive the failed daemon -- every future status.set()
+        # call, which fires on every phase transition, would keep
+        # appending to a hub nothing ever drains, for the rest of the
+        # process, on a machine where the daemon is off. Subscribing only
+        # after serve() has returned without raising means a startup
+        # failure leaves no trace to leak.
+        _studio_hub = EventHub()
+        _studio_task = serve_studio_api(
+            build_studio_runtime(_StudioDispatch()),
+            _studio_vault,
+            port=config.STUDIO_API_PORT,
+            origins=[o.strip() for o in config.STUDIO_API_ORIGINS.split(",") if o.strip()],
+            hub=_studio_hub,
+        )
+        status.subscribe(_studio_hub.publish)
+        return _studio_task
+    except Exception as e:
+        logger.warning(
+            f"[API] Studio daemon failed to start (non-critical): {redact_secrets(str(e))}"
+        )
+        return None
+
+
+async def _stop_studio_daemon(task: "asyncio.Task | None") -> None:
+    """Cancel a running daemon task, or retrieve-and-log one that already
+    crashed before shutdown got here (e.g. the port was already taken, so
+    _run() raised inside the task instead of at the synchronous serve()
+    call _start_studio_daemon() already guards).
+
+    Retrieving a done task's exception marks it consumed, so asyncio's own
+    "exception was never retrieved" logger never prints it later,
+    unredacted, through a handler this module doesn't control.
+    """
+    if task is None:
+        return
+    if task.done():
+        if not task.cancelled():
+            exc = task.exception()
+            if exc is not None:
+                logger.warning(f"[API] Studio daemon exited early: {redact_secrets(str(exc))}")
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.warning(f"[API] Studio daemon did not shut down cleanly: {redact_secrets(str(e))}")
+
+
 async def _drain_and_announce_notifications(bridge: UnityBridge):
     """
     Drain incoming message notifications from the messaging bridge,
@@ -1904,48 +1988,11 @@ async def async_main():
     # Background task: the TENKA Studio daemon, off by default. A second
     # asyncio task on this same loop rather than a second process, because
     # that is what keeps it on the one SQLite connection the rest of the
-    # assistant shares.
+    # assistant shares. Building/starting it lives in _start_studio_daemon()
+    # so a test can drive that exact sequence without booting the assistant.
     _studio_task: asyncio.Task | None = None
     if config.STUDIO_API_ENABLED:
-        try:
-            from .actions.studio_runtime import build_studio_runtime
-            from .io.api.events import EventHub
-            from .io.api.server import serve as serve_studio_api
-            from .io.api.vault import Capability, TokenVault
-
-            _studio_vault = TokenVault(config.SANDBOX_DIR)
-            if not _studio_vault.devices():
-                _studio_token = _studio_vault.issue("studio", frozenset(Capability))
-                # The raw token goes to stdout only -- a browser can't read a
-                # file, so this is the one and only time the operator can
-                # copy it into Studio's connect screen. The log line is
-                # redacted so the same value never lands in debug.log
-                # plaintext (KI-12): redact_secrets() catches it via the
-                # bare high-entropy-token path regardless of label wording.
-                logger.info(redact_secrets(
-                    "[API] Studio device token issued (paste into Studio once): "
-                    f"{_studio_token}"
-                ))
-                print(f"\n  TENKA Studio token: {_studio_token}\n")
-
-            # Built and subscribed before serve() ever binds the socket, so
-            # a status/task_step frame fired between now and the first
-            # connected client is buffered by the hub rather than lost.
-            _studio_hub = EventHub()
-            status.subscribe(_studio_hub.publish)
-
-            _studio_task = serve_studio_api(
-                build_studio_runtime(_StudioDispatch()),
-                _studio_vault,
-                port=config.STUDIO_API_PORT,
-                origins=[o.strip() for o in config.STUDIO_API_ORIGINS.split(",") if o.strip()],
-                hub=_studio_hub,
-            )
-        except Exception as e:
-            # The daemon is an optional side channel -- Studio not being
-            # reachable must never stop the assistant itself from booting.
-            logger.warning(f"[API] Studio daemon failed to start (non-critical): {e}")
-            _studio_task = None
+        _studio_task = await _start_studio_daemon()
 
     # Background task: reset manifest-based daily vision cap when the local date rolls over.
     async def _vision_cap_daily_reset_loop():
@@ -2182,14 +2229,7 @@ async def async_main():
         esc_monitor.stop()
 
         # ─── Studio daemon shutdown ─────────────────────────────────────────────
-        if _studio_task is not None and not _studio_task.done():
-            _studio_task.cancel()
-            try:
-                await _studio_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.warning(f"[API] Studio daemon did not shut down cleanly: {e}")
+        await _stop_studio_daemon(_studio_task)
 
         await bridge.stop()
         logger.info("Voice Assistant shut down")

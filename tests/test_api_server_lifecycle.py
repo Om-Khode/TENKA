@@ -125,3 +125,167 @@ async def test_studio_dispatch_abort_reaches_the_shared_abort_controller():
         assert abort.reason == "studio"
     finally:
         abort.reset()
+
+
+# ─── _start_studio_daemon / _stop_studio_daemon ────────────────────────────
+# Split out of async_main() so these exact sequences are drivable without
+# booting the assistant. serve() is always monkeypatched below -- never the
+# real one -- so build_studio_runtime()'s Live* runtimes are constructed
+# (side-effect-free: none of them touch storage in __init__, only in their
+# async methods, which nothing here calls) but never handed to a real
+# uvicorn app or exercised.
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_does_not_leak_a_status_subscription(tmp_path, monkeypatch):
+    """StatusBroadcaster.subscribe() has no unsubscribe. A daemon that fails
+    to start (e.g. create_app()'s eager instance_secret() check raising on a
+    bad TENKA_SECRET) must not have already subscribed its hub -- otherwise
+    every future status.set() call, which fires on every phase transition,
+    keeps appending to a hub nothing will ever drain, for the rest of the
+    process, on a machine where the daemon is off."""
+    import assistant.config as config
+    import assistant.main as m
+    from assistant.io.status_broadcaster import status
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    def _raise(*args, **kwargs):
+        raise ValueError("bad TENKA_SECRET")
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _raise)
+
+    before = len(status._subscribers)
+    result = await m._start_studio_daemon()
+    assert result is None
+    assert len(status._subscribers) == before, (
+        "a failed serve() must leave no trace on the broadcaster's subscriber list"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_successful_start_subscribes_exactly_once(tmp_path, monkeypatch):
+    """The mirror of the test above: once serve() *has* returned a task, the
+    subscription must actually happen -- ordering the fix around "subscribe
+    only after serve() succeeds" must not turn into "never subscribe"."""
+    import asyncio
+
+    import assistant.config as config
+    import assistant.main as m
+    from assistant.io.status_broadcaster import status
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    async def _noop() -> None:
+        return None
+
+    def _fake_serve(*args, **kwargs):
+        return asyncio.create_task(_noop())
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _fake_serve)
+
+    before = len(status._subscribers)
+    task = await m._start_studio_daemon()
+    try:
+        assert task is not None
+        assert len(status._subscribers) == before + 1
+    finally:
+        # This subscription is real and permanent (no unsubscribe exists),
+        # so this test's own hub must never actually publish anything for
+        # the rest of the session: drop the reference and let the task
+        # finish on its own rather than leaving anything running.
+        await task
+
+
+@pytest.mark.asyncio
+async def test_stop_studio_daemon_tolerates_no_task():
+    import assistant.main as m
+    await m._stop_studio_daemon(None)  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_stop_studio_daemon_cancels_a_running_task():
+    import asyncio
+
+    import assistant.main as m
+
+    async def _run_forever():
+        await asyncio.sleep(100)
+
+    task = asyncio.create_task(_run_forever())
+    await asyncio.sleep(0)  # let it actually start running
+    await m._stop_studio_daemon(task)
+    assert task.done()
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_stop_studio_daemon_retrieves_a_crashed_tasks_exception(caplog):
+    """A task that already finished before shutdown got here (e.g. the port
+    was taken, so _run() raised inside the task rather than at the
+    synchronous serve() call _start_studio_daemon() already guards) must
+    have its exception retrieved and logged -- not silently skipped, which
+    is what `if not task.done():` alone did before this fix, leaving
+    asyncio's own unretrieved-exception warning to fire later, unredacted."""
+    import asyncio
+    import contextlib
+    import logging
+
+    import assistant.main as m
+
+    async def _boom():
+        raise RuntimeError("port already in use: 8787")
+
+    task = asyncio.create_task(_boom())
+    with contextlib.suppress(Exception):
+        await task
+    assert task.done()
+
+    with caplog.at_level(logging.WARNING, logger="main"):
+        await m._stop_studio_daemon(task)
+
+    assert any("Studio daemon exited early" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_started_daemons_token_never_reaches_a_log_record(tmp_path, monkeypatch, caplog):
+    """Verified structurally, not just via redaction surviving it: the raw
+    token must never be handed to `logger` at all. redact_secrets() catches
+    it via the bare high-entropy-token path if it ever is, but that path is
+    probabilistic (needs a digit plus mixed case or a separator), and
+    DEBUG_LOG defaults to true on a fresh install -- so a log line that
+    merely relies on redaction working is one heuristic away from KI-12."""
+    import asyncio
+    import logging
+
+    import assistant.config as config
+    import assistant.main as m
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    async def _noop() -> None:
+        return None
+
+    def _fake_serve(*args, **kwargs):
+        return asyncio.create_task(_noop())
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _fake_serve)
+
+    printed: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+    )
+
+    with caplog.at_level(logging.INFO, logger="main"):
+        task = await m._start_studio_daemon()
+    assert task is not None
+    await task
+
+    token_line = next(line for line in printed if "TENKA Studio token" in line)
+    raw_token = token_line.rsplit(":", 1)[-1].strip()
+    assert len(raw_token) > 20, "sanity: the console line must carry the real token"
+
+    for record in caplog.records:
+        assert raw_token not in record.getMessage()
+        assert raw_token not in str(record.msg)
