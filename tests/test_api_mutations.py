@@ -154,3 +154,31 @@ def test_a_settings_patch_with_an_overlong_string_value_is_refused(context):
     changes = {"followup_timer": "x" * 4_097}
     response = client.patch("/v1/settings", headers=headers, json={"changes": changes})
     assert response.status_code == 422
+
+
+def test_a_settings_patch_with_a_list_value_is_refused(context):
+    client, _, headers = context
+    changes = {"followup_timer": [1, 2, 3]}
+    response = client.patch("/v1/settings", headers=headers, json={"changes": changes})
+    assert response.status_code == 422
+
+
+def test_a_settings_patch_with_a_dict_value_is_refused(context):
+    client, _, headers = context
+    changes = {"followup_timer": {"nested": True}}
+    response = client.patch("/v1/settings", headers=headers, json={"changes": changes})
+    assert response.status_code == 422
+
+
+def test_a_settings_patch_with_a_null_value_is_refused(context):
+    client, _, headers = context
+    changes = {"followup_timer": None}
+    response = client.patch("/v1/settings", headers=headers, json={"changes": changes})
+    assert response.status_code == 422
+
+
+def test_a_settings_patch_with_an_oversized_integer_is_refused(context):
+    client, _, headers = context
+    changes = {"followup_timer": 10 ** 13}
+    response = client.patch("/v1/settings", headers=headers, json={"changes": changes})
+    assert response.status_code == 422

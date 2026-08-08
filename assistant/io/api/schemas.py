@@ -13,6 +13,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator
 
+from .runtime import SettingValue
+
 
 class Meta(BaseModel):
     request_id: str = ""
@@ -50,18 +52,29 @@ class ChatRequest(BaseModel):
 
 # A settings page realistically edits a handful of rows at once and every key
 # is a short snake_case identifier; these bounds are generous for that and
-# absurd for a body built to exhaust memory or a database column.
+# absurd for a body built to exhaust memory or a database column. The value
+# type is SettingValue (str | int | float | bool) -- the same union
+# SettingsRuntime.save() actually stores -- rather than Any, so Pydantic
+# itself rejects a list, a dict, or None with a 422 before any length check
+# below ever runs; a nested structure or null can no longer arrive at all.
 MAX_SETTINGS_KEYS = 200
 MAX_SETTINGS_KEY_LENGTH = 200
 MAX_SETTINGS_STRING_VALUE_LENGTH = 4_096
+# Nesting is now impossible, but a bare int is still unbounded in principle
+# (Python ints have no width limit). Bounding the magnitude also bounds the
+# digit count Pydantic/json has to convert -- 10**12 is a terabyte in bytes,
+# comfortably past anything a real setting (a timer, a count, a byte size)
+# stores, and 13 digits nowhere near where int-to-str conversion cost would
+# start to matter.
+MAX_SETTINGS_INT_MAGNITUDE = 1_000_000_000_000
 
 
 class SettingsPatch(BaseModel):
-    changes: dict[str, Any] = Field(default_factory=dict)
+    changes: dict[str, SettingValue] = Field(default_factory=dict)
 
     @field_validator("changes")
     @classmethod
-    def _bound_changes(cls, value: dict[str, Any]) -> dict[str, Any]:
+    def _bound_changes(cls, value: dict[str, SettingValue]) -> dict[str, SettingValue]:
         if len(value) > MAX_SETTINGS_KEYS:
             raise ValueError(
                 f"too many settings in one patch: {len(value)} > {MAX_SETTINGS_KEYS}"
@@ -75,6 +88,15 @@ class SettingsPatch(BaseModel):
                 raise ValueError(
                     f"value for {key!r} too long: {len(item)} > "
                     f"{MAX_SETTINGS_STRING_VALUE_LENGTH} chars"
+                )
+            if (
+                isinstance(item, int)
+                and not isinstance(item, bool)
+                and abs(item) > MAX_SETTINGS_INT_MAGNITUDE
+            ):
+                raise ValueError(
+                    f"value for {key!r} out of range: magnitude exceeds "
+                    f"{MAX_SETTINGS_INT_MAGNITUDE}"
                 )
         return value
 
