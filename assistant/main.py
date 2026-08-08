@@ -56,6 +56,7 @@ from . import telemetry as _telemetry
 from . import knowledge_graph
 from datetime import datetime as _dt
 from .core.abort import abort
+from .core.redact import redact_secrets
 from .io.esc_monitor import esc_monitor
 from .io.status_broadcaster import status, StatusPhase
 from .overlay_manager import overlay_manager
@@ -544,9 +545,9 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
 
     try:
         if source == "stt":
-            logger.info(f'Transcription (STT): "{transcription}"')
+            logger.info(f'Transcription (STT): "{redact_secrets(transcription)}"')
         else:
-            logger.info(f'Transcription (Chat): "{transcription}"')
+            logger.info(f'Transcription (Chat): "{redact_secrets(transcription)}"')
 
         await bridge.send_command("show_subtitle", text=f"You: {transcription}")
 

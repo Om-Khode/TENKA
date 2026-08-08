@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 from . import config
 from . import llm
+from .core.redact import redact_secrets
 
 logger = logging.getLogger("intent")
 
@@ -66,7 +67,7 @@ async def detect_intent(
     if not transcribed_text or not transcribed_text.strip():
         return IntentResult(intent="unknown", response="I didn't catch that.")
 
-    logger.info(f'Classifying: "{transcribed_text}"')
+    logger.info(f'Classifying: "{redact_secrets(transcribed_text)}"')
 
     try:
         user_prompt = f"User said: {transcribed_text.strip()}"
