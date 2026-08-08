@@ -160,6 +160,32 @@ class KnowledgeGraphRepo:
         )
         return dict(row) if row else None
 
+    def list_entities(self, limit: int = 5_000) -> list[dict]:
+        """Every entity, most recently updated first. Bounded so a large
+        graph cannot hang a page."""
+        rows = self._db.fetchall(
+            "SELECT * FROM kg_entities ORDER BY updated_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+    def delete_entity(self, entity_id: int) -> bool:
+        """Remove an entity together with its facts and both directions of
+        its relationships. Orphaned facts would keep answering questions
+        about something the user asked to have forgotten. Returns False if
+        the entity was already gone."""
+        existing = self.get_entity(entity_id)
+        if existing is None:
+            return False
+        self._db.execute("DELETE FROM kg_facts WHERE subject_id = ?", (entity_id,))
+        self._db.execute(
+            "DELETE FROM kg_relationships WHERE from_id = ? OR to_id = ?",
+            (entity_id, entity_id),
+        )
+        self._db.execute("DELETE FROM kg_entities WHERE id = ?", (entity_id,))
+        self._db.commit()
+        return True
+
     # ─── Fact ops ──────────────────────────────────────────────────────────
     def add_fact(
         self, subject_id: int, predicate: str, object: str,
@@ -240,6 +266,15 @@ class KnowledgeGraphRepo:
         )
         return [dict(r) for r in rows]
 
+    def list_facts(self, limit: int = 20_000) -> list[dict]:
+        """Every fact, superseded ones included -- the UI shows what was
+        replaced, not just what currently holds."""
+        rows = self._db.fetchall(
+            "SELECT * FROM kg_facts ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
     def cleanup_expired_facts(self) -> int:
         now = _now_iso()
         cur = self._db.execute(
@@ -275,6 +310,16 @@ class KnowledgeGraphRepo:
         )
         self._db.commit()
         return cur.lastrowid
+
+    def list_relationships(self, limit: int = 20_000) -> list[dict]:
+        """Every relationship, including edges whose far entity is gone
+        (legacy rows predating FK enforcement, or a race with a delete) --
+        callers must not assume both endpoints resolve."""
+        rows = self._db.fetchall(
+            "SELECT * FROM kg_relationships ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in rows]
 
     def get_neighbors(
         self, entity_id: int, depth: int = 1, limit: int = 10,

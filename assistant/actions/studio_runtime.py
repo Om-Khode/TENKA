@@ -1,0 +1,365 @@
+# assistant/actions/studio_runtime.py
+"""The concrete StudioRuntime.
+
+io/api declares what the daemon may know; this module supplies it. Living in
+actions/ is what makes importing storage/, automation/ and llm/ legal, and what
+keeps io/api clean of all three.
+
+Every facade behind this module is synchronous, so every call goes through
+asyncio.to_thread. Calling one directly would block the assistant's event loop
+for the duration of a SQLite read.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from typing import Any, Protocol
+
+from ..core import runtime_config
+from ..io.api.runtime import (
+    ChatMessage, ConversationDetail, ConversationRef, Entity, Fact,
+    KnowledgeGraph, MemoryScope, PersonalityState, PreferenceChange,
+    PreferenceRecord, ProcedureRecord, Relationship, SaveOutcome, SettingRow,
+    StudioRuntime, TurnRef,
+)
+
+logger = logging.getLogger(__name__)
+
+_SCOPES = ("knowledge", "preferences", "procedures")
+
+_KIND_BY_CAST = {bool: "toggle", int: "number", float: "slider", str: "text"}
+
+
+class ChatDispatch(Protocol):
+    """Supplied by main.py — the only path from a request into the pipeline."""
+
+    async def submit(self, text: str) -> tuple[str, str, bool, str]: ...
+    async def abort(self) -> bool: ...
+
+
+def _load_properties(raw: Any) -> dict:
+    """kg_entities/kg_relationships store properties as a properties_json
+    TEXT column. Missing or corrupt JSON must not take the whole page down --
+    it degrades to an empty dict instead."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+# ─── Chat ────────────────────────────────────────────────────────────────
+class LiveChatRuntime:
+    def __init__(self, dispatch: ChatDispatch) -> None:
+        self._dispatch = dispatch
+
+    async def send(self, text: str) -> TurnRef:
+        turn_id, conversation_id, accepted, reason = await self._dispatch.submit(text)
+        return TurnRef(turn_id, conversation_id, accepted, reason)
+
+    async def conversations(self) -> list[ConversationRef]:
+        from .. import memory
+        # list_conversation_sessions groups the `conversations` table (chat
+        # turns) by session_id. memory.list_sessions() is a different
+        # feature -- it lists recording_sessions, the screen/audio-capture
+        # transcript table -- and would silently show the wrong history here.
+        sessions = await asyncio.to_thread(memory.list_conversation_sessions, 20)
+        return [
+            ConversationRef(
+                conversation_id=str(s.get("session_id", "")),
+                title=str(s.get("last_input") or s.get("started_at") or "Conversation")[:80],
+                updated_at=str(s.get("ended_at") or s.get("started_at") or ""),
+                message_count=int(s.get("turn_count") or 0),
+            )
+            for s in sessions
+        ]
+
+    async def conversation(self, conversation_id: str) -> ConversationDetail | None:
+        from .. import memory
+        turns = await asyncio.to_thread(memory.get_recent, 200, conversation_id)
+        if not turns:
+            return None
+        messages: list[ChatMessage] = []
+        for turn in turns:
+            turn_id = str(turn.get("id", ""))
+            messages.append(ChatMessage(
+                f"{turn_id}-u", "user", str(turn.get("user_input", "")),
+                str(turn.get("timestamp", "")), intent=str(turn.get("intent", "")),
+            ))
+            messages.append(ChatMessage(
+                f"{turn_id}-a", "assistant", str(turn.get("response", "")),
+                str(turn.get("timestamp", "")), intent=str(turn.get("intent", "")),
+            ))
+        return ConversationDetail(conversation_id, conversation_id, messages)
+
+    async def abort(self) -> bool:
+        return await self._dispatch.abort()
+
+
+# ─── Memory ──────────────────────────────────────────────────────────────
+class LiveMemoryRuntime:
+    async def list(self, scope: MemoryScope):
+        """Generic scope-keyed read, for callers that don't care which
+        typed accessor they're routed to. Mirrors forget()'s scope
+        dispatch -- same three scopes, same rejection for anything else."""
+        if scope not in _SCOPES:
+            raise ValueError(f"unknown scope: {scope}")
+        if scope == "knowledge":
+            return await self.knowledge()
+        if scope == "preferences":
+            return await self.preferences()
+        return await self.procedures()
+
+    async def knowledge(self) -> KnowledgeGraph:
+        return await asyncio.to_thread(self._knowledge_sync)
+
+    @staticmethod
+    def _knowledge_sync() -> KnowledgeGraph:
+        from .. import knowledge_graph
+        return KnowledgeGraph(
+            entities=[
+                Entity(
+                    id=int(row["id"]),
+                    type=str(row.get("type") or ""),
+                    canonical_name=str(row.get("canonical_name") or ""),
+                    display_name=str(row.get("display_name") or row.get("canonical_name") or ""),
+                    properties=_load_properties(row.get("properties_json")),
+                    source=str(row.get("source") or ""),
+                    confidence=float(row.get("confidence") or 0.0),
+                    created_at=str(row.get("created_at") or ""),
+                    updated_at=str(row.get("updated_at") or ""),
+                    source_turn_id=row.get("source_turn_id"),
+                )
+                for row in knowledge_graph.list_entities()
+            ],
+            facts=[
+                Fact(
+                    id=int(row["id"]),
+                    subject_id=int(row["subject_id"]),
+                    predicate=str(row.get("predicate") or ""),
+                    object=str(row.get("object") or ""),
+                    confidence=float(row.get("confidence") or 0.0),
+                    source=str(row.get("source") or ""),
+                    event_at=row.get("event_at"),
+                    invalid_at=row.get("invalid_at"),
+                    expires_at=row.get("expires_at"),
+                    verified_at=row.get("verified_at"),
+                    created_at=str(row.get("created_at") or ""),
+                    source_turn_id=row.get("source_turn_id"),
+                )
+                for row in knowledge_graph.list_facts()
+            ],
+            relationships=[
+                Relationship(
+                    id=int(row["id"]),
+                    from_id=int(row["from_id"]),
+                    to_id=int(row["to_id"]),
+                    type=str(row.get("type") or ""),
+                    confidence=float(row.get("confidence") or 0.0),
+                    source=str(row.get("source") or ""),
+                    source_turn_id=row.get("source_turn_id"),
+                    properties=_load_properties(row.get("properties_json")),
+                )
+                for row in knowledge_graph.list_relationships()
+            ],
+        )
+
+    async def preferences(self) -> list[PreferenceRecord]:
+        return await asyncio.to_thread(self._preferences_sync)
+
+    @staticmethod
+    def _preferences_sync() -> list[PreferenceRecord]:
+        from .. import preferences as preferences_facade
+        # get_all_preferences() first, and short-circuit on empty: with no
+        # preferences there is no key to attach history to, and skipping
+        # get_preference_history() here avoids a second query the result
+        # would never use.
+        prefs = preferences_facade.get_all_preferences()
+        if not prefs:
+            return []
+        history_by_key: dict[str, list[PreferenceChange]] = {}
+        for entry in preferences_facade.get_preference_history(days=3_650):
+            key = str(entry.get("key", ""))
+            history_by_key.setdefault(key, []).append(PreferenceChange(
+                value=str(entry.get("value", "")),
+                changed_at=str(entry.get("changed_at") or entry.get("timestamp") or ""),
+            ))
+        return [
+            PreferenceRecord(
+                key=str(pref.get("key", "")),
+                value=str(pref.get("value", "")),
+                updated_at=str(pref.get("updated_at") or ""),
+                history=history_by_key.get(str(pref.get("key", "")), []),
+            )
+            for pref in prefs
+        ]
+
+    async def procedures(self) -> list[ProcedureRecord]:
+        return await asyncio.to_thread(self._procedures_sync)
+
+    @staticmethod
+    def _procedures_sync() -> list[ProcedureRecord]:
+        from .. import procedures as procedures_facade
+        records = []
+        for proc in procedures_facade.list_procedures(enabled_only=False):
+            steps = proc.get("steps") or []
+            records.append(ProcedureRecord(
+                id=int(proc["id"]),
+                name=str(proc.get("name") or proc.get("trigger") or ""),
+                steps=[str(s if isinstance(s, str) else s.get("text", s)) for s in steps],
+                taught_at=str(proc.get("created_at") or ""),
+                run_count=int(proc.get("use_count") or 0),
+            ))
+        return records
+
+    async def forget(self, scope: MemoryScope, item_id: str) -> bool:
+        if scope not in _SCOPES:
+            raise ValueError(f"unknown scope: {scope}")
+        return await asyncio.to_thread(self._forget_sync, scope, item_id)
+
+    @staticmethod
+    def _forget_sync(scope: str, item_id: str) -> bool:
+        if scope == "knowledge":
+            from .. import knowledge_graph
+            # Forgetting an entity takes its facts and edges with it. Leaving
+            # orphaned facts behind would keep answering questions about
+            # something the user asked her to forget.
+            return knowledge_graph.delete_entity(int(item_id))
+        if scope == "preferences":
+            from .. import preferences
+            return preferences.delete_preference(item_id)
+        from .. import procedures
+        return procedures.delete_procedure(int(item_id))
+
+    async def forget_all(self) -> int:
+        return await asyncio.to_thread(self._forget_all_sync)
+
+    @staticmethod
+    def _forget_all_sync() -> int:
+        from .. import knowledge_graph, preferences, procedures
+        removed = 0
+        for row in knowledge_graph.list_entities():
+            if knowledge_graph.delete_entity(int(row["id"])):
+                removed += 1
+        preferences.reset_preferences()
+        for proc in procedures.list_procedures(enabled_only=False):
+            procedures.delete_procedure(int(proc["id"]))
+            removed += 1
+        return removed
+
+
+# ─── Settings ────────────────────────────────────────────────────────────
+class LiveSettingsRuntime:
+    async def all(self) -> list[SettingRow]:
+        return await asyncio.to_thread(self._all_sync)
+
+    @staticmethod
+    def _all_sync() -> list[SettingRow]:
+        from .. import settings as settings_facade
+        stored = settings_facade.list_all()
+        rows: list[SettingRow] = []
+        for key, meta in sorted(runtime_config.REGISTRY.items()):
+            cast = meta.get("cast", str)
+            env_value = os.getenv(key.upper())
+            # Same precedence runtime_config.setting() resolves with, reported
+            # rather than reinvented. Read it there before changing this: the DB
+            # wins over the environment, not the other way round, so a stored
+            # value is reported as "db" even when the env var is also set.
+            if key in stored:
+                value, source = stored[key], "db"
+            elif env_value is not None:
+                value, source = env_value, "env"
+            else:
+                value, source = meta["default"], "default"
+            rows.append(SettingRow(
+                key=key,
+                group=key.split("_")[0].title(),
+                description=meta.get("description", ""),
+                kind=_KIND_BY_CAST.get(cast, "text"),
+                value=value,
+                default=meta["default"],
+                needs_restart=bool(meta.get("needs_restart")),
+                source=source,
+                options=[],
+            ))
+        return rows
+
+    async def save(self, changes: dict) -> SaveOutcome:
+        return await asyncio.to_thread(self._save_sync, changes)
+
+    @staticmethod
+    def _save_sync(changes: dict) -> SaveOutcome:
+        from .. import settings as settings_facade
+        saved, rejected, restart = [], {}, []
+        for key, value in changes.items():
+            meta = runtime_config.REGISTRY.get(key)
+            if meta is None:
+                rejected[key] = "unknown setting"
+                continue
+            # No env check. runtime_config resolves DB before env, so a stored
+            # value legitimately takes precedence over an environment one --
+            # refusing the save here would invent a rule the assistant does not
+            # have.
+            try:
+                settings_facade.set(key, value, source="studio")
+            except Exception as exc:  # storage failure, not user error
+                rejected[key] = f"could not save: {exc}"
+                continue
+            saved.append(key)
+            if meta.get("needs_restart"):
+                restart.append(key)
+        return SaveOutcome(saved, rejected, restart)
+
+
+# ─── Personality ─────────────────────────────────────────────────────────
+class LivePersonalityRuntime:
+    async def state(self) -> PersonalityState:
+        return await asyncio.to_thread(self._state_sync)
+
+    @staticmethod
+    def _state_sync() -> PersonalityState:
+        from .. import personality
+        return PersonalityState(
+            base=personality.get_active_personality_id(),
+            available=sorted(personality.list_personalities()),
+            traits=personality.get_current_traits(),
+            sample_line=personality.get_metadata("sample_line") or "",
+        )
+
+    async def set_base(self, base: str) -> PersonalityState:
+        await asyncio.to_thread(self._set_base_sync, base)
+        return await self.state()
+
+    @staticmethod
+    def _set_base_sync(base: str) -> None:
+        from .. import personality
+        personality.switch_personality(base)
+
+    async def reset(self) -> PersonalityState:
+        await asyncio.to_thread(self._reset_sync)
+        return await self.state()
+
+    @staticmethod
+    def _reset_sync() -> None:
+        from .. import personality
+        personality.reset_traits()
+
+
+def build_studio_runtime(dispatch: ChatDispatch) -> StudioRuntime:
+    """Assemble the runtime. Files, commands and system land in Task 8."""
+    from .studio_runtime_system import (  # local import: same package, later task
+        LiveCommandRuntime, LiveFileRuntime, LiveSystemRuntime,
+    )
+    return StudioRuntime(
+        chat=LiveChatRuntime(dispatch),
+        memory=LiveMemoryRuntime(),
+        settings=LiveSettingsRuntime(),
+        personality=LivePersonalityRuntime(),
+        files=LiveFileRuntime(),
+        commands=LiveCommandRuntime(),
+        system=LiveSystemRuntime(),
+    )

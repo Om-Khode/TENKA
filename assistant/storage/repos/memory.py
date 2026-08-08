@@ -375,6 +375,35 @@ class MemoryRepo:
             )
         return [dict(row) for row in reversed(rows)]
 
+    def list_conversation_sessions(self, limit: int = 20) -> list[dict]:
+        """Distinct chat sessions from `conversations`, most recent activity
+        first. `conversations` has no title/summary column, so each row
+        carries the session's own most recent user_input as a stand-in --
+        distinct from recording_sessions, which is the screen/audio-capture
+        feature's transcript table, not chat history."""
+        rows = self._db.fetchall(
+            """
+            SELECT
+                session_id,
+                COUNT(*)       AS turn_count,
+                MIN(timestamp) AS started_at,
+                MAX(timestamp) AS ended_at,
+                (SELECT user_input FROM conversations c2
+                 WHERE c2.session_id = c1.session_id
+                 ORDER BY c2.id DESC LIMIT 1) AS last_input
+            FROM conversations c1
+            WHERE session_id IS NOT NULL AND session_id != ''
+            GROUP BY session_id
+            -- MAX(id) rather than MAX(timestamp): id is monotonically
+            -- increasing and immune to two turns landing in the same
+            -- millisecond, which an ISO timestamp string is not.
+            ORDER BY MAX(id) DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
     def build_recent_context(
         self, limit: int = 25, header: str = "RECENT CONVERSATION HISTORY:",
         session_id: str = "",

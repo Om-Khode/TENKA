@@ -116,5 +116,9 @@ def list_sessions(limit: int = 10) -> list[dict]:
     return _get_repo().list_sessions(limit)
 
 
+def list_conversation_sessions(limit: int = 20) -> list[dict]:
+    return _get_repo().list_conversation_sessions(limit)
+
+
 def warm_embed_model():
     return _get_repo()._get_embed_model()
