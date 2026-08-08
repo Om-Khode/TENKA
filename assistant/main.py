@@ -218,6 +218,38 @@ def _chat_input_loop(input_queue):
     chat_input.chat_input_loop(input_queue)
 
 
+# ─── Studio dispatch ──────────────────────────────────────────────────────
+
+class _StudioDispatch:
+    """The only path from an HTTP request into the pipeline.
+
+    One turn at a time: a second concurrent submit is refused rather than
+    queued, because a browser tab left open should not be able to drive her
+    minutes after its owner walked away.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._counter = 0
+
+    async def submit(self, text: str) -> tuple[str, str, bool, str]:
+        if self._lock.locked():
+            return ("", "", False, "busy")
+        async with self._lock:
+            from . import session as session_mod
+            self._counter += 1
+            turn_id = f"studio-{self._counter}"
+            # Same 2-tuple shape process_text_from_queue's consumer loop
+            # already expects from the "chat" source (main.py:~1379) --
+            # not a third invented shape.
+            _input_queue.put(("studio", text))
+            return (turn_id, session_mod.get_current_session_id(), True, "")
+
+    async def abort(self) -> bool:
+        abort.request_abort("studio")
+        return True
+
+
 async def _drain_and_announce_notifications(bridge: UnityBridge):
     """
     Drain incoming message notifications from the messaging bridge,
@@ -1869,6 +1901,52 @@ async def async_main():
 
     asyncio.get_running_loop().create_task(_memory_cleanup_loop())
 
+    # Background task: the TENKA Studio daemon, off by default. A second
+    # asyncio task on this same loop rather than a second process, because
+    # that is what keeps it on the one SQLite connection the rest of the
+    # assistant shares.
+    _studio_task: asyncio.Task | None = None
+    if config.STUDIO_API_ENABLED:
+        try:
+            from .actions.studio_runtime import build_studio_runtime
+            from .io.api.events import EventHub
+            from .io.api.server import serve as serve_studio_api
+            from .io.api.vault import Capability, TokenVault
+
+            _studio_vault = TokenVault(config.SANDBOX_DIR)
+            if not _studio_vault.devices():
+                _studio_token = _studio_vault.issue("studio", frozenset(Capability))
+                # The raw token goes to stdout only -- a browser can't read a
+                # file, so this is the one and only time the operator can
+                # copy it into Studio's connect screen. The log line is
+                # redacted so the same value never lands in debug.log
+                # plaintext (KI-12): redact_secrets() catches it via the
+                # bare high-entropy-token path regardless of label wording.
+                logger.info(redact_secrets(
+                    "[API] Studio device token issued (paste into Studio once): "
+                    f"{_studio_token}"
+                ))
+                print(f"\n  TENKA Studio token: {_studio_token}\n")
+
+            # Built and subscribed before serve() ever binds the socket, so
+            # a status/task_step frame fired between now and the first
+            # connected client is buffered by the hub rather than lost.
+            _studio_hub = EventHub()
+            status.subscribe(_studio_hub.publish)
+
+            _studio_task = serve_studio_api(
+                build_studio_runtime(_StudioDispatch()),
+                _studio_vault,
+                port=config.STUDIO_API_PORT,
+                origins=[o.strip() for o in config.STUDIO_API_ORIGINS.split(",") if o.strip()],
+                hub=_studio_hub,
+            )
+        except Exception as e:
+            # The daemon is an optional side channel -- Studio not being
+            # reachable must never stop the assistant itself from booting.
+            logger.warning(f"[API] Studio daemon failed to start (non-critical): {e}")
+            _studio_task = None
+
     # Background task: reset manifest-based daily vision cap when the local date rolls over.
     async def _vision_cap_daily_reset_loop():
         """Hourly check; reset the manifest-based vision cap when the local date rolls over."""
@@ -2102,6 +2180,16 @@ async def async_main():
             pass
         overlay_manager.stop()
         esc_monitor.stop()
+
+        # ─── Studio daemon shutdown ─────────────────────────────────────────────
+        if _studio_task is not None and not _studio_task.done():
+            _studio_task.cancel()
+            try:
+                await _studio_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"[API] Studio daemon did not shut down cleanly: {e}")
 
         await bridge.stop()
         logger.info("Voice Assistant shut down")

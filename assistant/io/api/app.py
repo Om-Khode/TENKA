@@ -2,7 +2,10 @@
 """The Studio daemon's FastAPI application.
 
 Nothing here knows how to reach the assistant. `runtime` is injected by
-main.py; `vault` decides who may ask.
+main.py; `vault` decides who may ask. `hub` is optional -- main.py passes its
+own EventHub when it needs to subscribe status_broadcaster to this exact app's
+socket before the daemon starts; every other caller (tests, the OpenAPI
+exporter) leaves it unset and gets a private one, scoped to that one app.
 
 Layering: io/api — core + config only.
 """
@@ -47,7 +50,7 @@ logger = logging.getLogger(__name__)
 
 
 def create_app(runtime: StudioRuntime, vault: TokenVault, *,
-               origins: list[str]) -> FastAPI:
+               origins: list[str], hub: EventHub | None = None) -> FastAPI:
     # Eager, once: instance_secret() is uncached on the environment-override
     # path, and a wrong-length TENKA_SECRET raises ValueError. Resolving it
     # here means a misconfigured override fails when the app is built, not
@@ -74,7 +77,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     app.state.runtime = runtime
     app.state.auth = AuthState(vault=vault)
     app.state.started_at = time.monotonic()
-    app.state.hub = EventHub()
+    app.state.hub = hub if hub is not None else EventHub()
 
     app.add_middleware(
         CORSMiddleware,
@@ -155,6 +158,15 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             await websocket.close(code=1008)
             return
 
+        async def _safe_send(payload: dict) -> None:
+            # A socket that already broke between the failed receive/abort
+            # and this reply must end cleanly through the finally below, not
+            # on a second, unhandled exception raised by the reply itself.
+            try:
+                await websocket.send_json(payload)
+            except Exception:
+                pass
+
         await websocket.accept()
         await app.state.hub.attach(websocket)
         try:
@@ -172,13 +184,13 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                     # the socket. One bad frame from a Studio build that
                     # doesn't match this daemon must not take down the one
                     # channel carrying status, steps, telemetry and toasts.
-                    await websocket.send_json({"type": "error", "detail": "malformed frame"})
+                    await _safe_send({"type": "error", "detail": "malformed frame"})
                     continue
                 if not isinstance(frame, dict) or frame.get("type") != "abort":
-                    await websocket.send_json({"type": "error", "detail": "unknown frame"})
+                    await _safe_send({"type": "error", "detail": "unknown frame"})
                     continue
                 await app.state.runtime.chat.abort()
-                await websocket.send_json({"type": "ack", "of": "abort"})
+                await _safe_send({"type": "ack", "of": "abort"})
         except WebSocketDisconnect:
             pass
         finally:

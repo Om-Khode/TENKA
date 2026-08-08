@@ -44,6 +44,13 @@ debug.log
 *.log
 assistant/debug.log
 
+# ─── Studio daemon (generated / per-run) ─────────────────
+# tools/export_openapi.py's throwaway vault root, and the schema it writes
+# at repo root when run without a target path -- both regenerated on demand,
+# neither meant to be tracked.
+.openapi-tmp/
+/openapi.json
+
 # ─── Downloaded / cached models ──────────────────────────
 # Root-level models/ holds downloaded SpeechBrain / etc. weights.
 # Wake-word models in assistant/models/ are ignored by default — only the

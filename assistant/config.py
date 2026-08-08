@@ -830,6 +830,25 @@ INCOMING_READ_THRESHOLD = _runtime_setting(
     description="≤N messages → read verbatim; more → LLM-summarize.",
 )
 
+# ─── Studio API (loopback daemon) ────
+STUDIO_API_ENABLED: bool = _runtime_setting(
+    "studio_api_enabled", False, cast=bool,
+    description="Serve the TENKA Studio daemon on loopback. Off unless you use Studio.",
+    needs_restart=True,
+)
+
+STUDIO_API_PORT: int = _runtime_setting(
+    "studio_api_port", 8787, cast=int,
+    description="Port the Studio daemon listens on. Loopback only.",
+    needs_restart=True,
+)
+
+STUDIO_API_ORIGINS: str = _runtime_setting(
+    "studio_api_origins", "http://localhost:3000",
+    description="Comma-separated browser origins allowed to call the Studio daemon.",
+    needs_restart=True,
+)
+
 # ─── Event monitor settings ───────────────────────────────────────────
 EVENT_MONITOR_ENABLED: bool = True
 EVENT_MONITOR_MAX_ACTIVE: int = 20

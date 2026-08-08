@@ -5,8 +5,10 @@ Not one SSE stream per concern: EventSource cannot set an Authorization header,
 abort needs a client-to-server channel, and one socket means one reconnect
 story on the client.
 
-The hub subscribes to status_broadcaster once for all sockets, and the
-telemetry sampler runs only while at least one socket is attached.
+main.py subscribes the hub's `publish()` to status_broadcaster once, at
+startup, so every socket the hub ever attaches receives its status and
+task_step frames; the telemetry sampler runs only while at least one socket
+is attached.
 
 `publish()` is the one method this module promises is safe to call from any
 thread, not just the event loop's. `status_broadcaster` calls it from
@@ -15,16 +17,21 @@ synchronous code that may be running on a worker thread, and
 thread -- calling it directly from elsewhere races the loop's internal
 bookkeeping. `publish()` therefore hands the enqueue off to the loop captured
 at `start()`/`attach()` time via `call_soon_threadsafe`, which is the one
-asyncio primitive built for exactly this handoff. When no loop has been
-captured yet (nothing has started or attached), the caller is assumed to
-already be running on some loop's own thread -- true for every current
-caller -- so enqueueing directly is safe.
+asyncio primitive built for exactly this handoff. Before any loop has been
+captured (nothing has started or attached yet -- exactly the window between
+main.py wiring the subscription and the daemon's first socket, during which
+status_broadcaster can already be firing from arbitrary worker threads), the
+event is buffered rather than touched at all: there is no thread on which
+enqueueing directly would be safe, so there is no such fallback. Once a loop
+is captured, the buffer drains onto it the same way every later publish()
+does.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -39,6 +46,12 @@ class EventHub:
         self._runtime = None
         self._interval = 2.0
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Guards `_loop` and `_pending` only -- both are touched from
+        # publish()'s arbitrary caller threads as well as the loop thread
+        # that runs attach()/start(). Nothing else in this class crosses
+        # threads, so nothing else needs it.
+        self._state_lock = threading.Lock()
+        self._pending: list[dict] = []
 
     # ─── membership ─────────────────────────────────────────────────────
     def subscriber_count(self) -> int:
@@ -52,7 +65,7 @@ class EventHub:
         # deployment that never calls start() before the first connection)
         # still needs publish() to land on the loop actually running this
         # socket's pump, not on whatever loop happened to exist first.
-        self._loop = asyncio.get_running_loop()
+        self._set_loop(asyncio.get_running_loop())
         self._sockets.add(socket)
         if self._pump_task is None:
             self._pump_task = asyncio.create_task(self._pump())
@@ -69,14 +82,27 @@ class EventHub:
 
     # ─── fan-out ────────────────────────────────────────────────────────
     def publish(self, event: dict) -> None:
-        """Non-blocking. Safe from sync code on any thread (status_broadcaster)."""
-        if self._loop is None:
-            # Nothing has started or attached yet, so no other loop can be
-            # racing this enqueue: the caller must be on a loop's own thread
-            # already, or there is no loop at all (e.g. a bare unit test).
-            self._enqueue(event)
-            return
-        self._loop.call_soon_threadsafe(self._enqueue, event)
+        """Non-blocking. Safe from sync code on any thread (status_broadcaster).
+
+        Buffers rather than enqueues while no loop is known yet -- see the
+        module docstring for why a direct enqueue here is never safe.
+        """
+        with self._state_lock:
+            loop = self._loop
+            if loop is None:
+                self._pending.append(event)
+                return
+        loop.call_soon_threadsafe(self._enqueue, event)
+
+    def _set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Capture the loop once, then flush anything published before it existed."""
+        with self._state_lock:
+            if self._loop is not None:
+                return
+            self._loop = loop
+            pending, self._pending = self._pending, []
+        for event in pending:
+            loop.call_soon_threadsafe(self._enqueue, event)
 
     def _enqueue(self, event: dict) -> None:
         try:
@@ -117,7 +143,7 @@ class EventHub:
     async def start(self, runtime, interval_seconds: float = 2.0) -> None:
         self._runtime = runtime
         self._interval = interval_seconds
-        self._loop = asyncio.get_running_loop()
+        self._set_loop(asyncio.get_running_loop())
         if self._pump_task is None:
             self._pump_task = asyncio.create_task(self._pump())
 
