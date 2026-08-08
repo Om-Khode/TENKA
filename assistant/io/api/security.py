@@ -113,9 +113,20 @@ async def authenticate(request: Request) -> Device:
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                             detail="too many requests")
 
-    device = state.vault.verify(_bearer(request))
+    token = _bearer(request)
+    device = state.vault.verify(token)
     if device is None:
-        state.limiter.record_failure(source)
+        # Only a presented-and-wrong token counts as a guess. A request that
+        # carries no bearer token at all (no header, wrong scheme, blank
+        # value) never attempted a credential and must not spend the same
+        # lockout budget as someone trying tokens -- otherwise the failure
+        # counter conflates "didn't try" with "tried and failed", and any
+        # source that touches enough distinct unauthenticated routes in a
+        # short window (an admin curl loop, the auth-sweep test itself once
+        # /v1 passed ten routes) locks itself into 429s that a real credential
+        # guesser would have earned by actually guessing ten times.
+        if token:
+            state.limiter.record_failure(source)
         raise _UNAUTHORIZED
 
     state.limiter.record_success(source)
