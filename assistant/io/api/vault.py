@@ -304,7 +304,35 @@ class TokenVault:
         return result
 
     def reset(self) -> None:
-        """Rotate the instance secret. Every existing token stops verifying."""
+        """Rotate the instance secret. Every existing token stops verifying.
+
+        Cross-process note: a *different* TokenVault instance -- e.g. the
+        running daemon's, while this call is made from a slash command in
+        the same process -- does not learn about the new secret. Its
+        `instance_secret()` returns the cached `self._secret` forever once
+        populated; nothing here or in `verify()` ever refreshes another
+        instance's cache. What actually makes revocation visible
+        cross-process is that `_DEVICES_FILE` is deleted: `verify()` calls
+        `_load()`, which re-reads that file from disk on every call, so
+        the daemon's stale secret still gets hashed against an empty
+        device list and matches nothing. The secret never refreshes in
+        the daemon's process; it just stops mattering because there is
+        nothing left to compare against. Single-device `revoke()` is
+        visible cross-process the same way -- the device list is never
+        cached, only the secret is.
+
+        This has a sharp edge `issue()` does not guard against: calling
+        `issue()` on a vault instance whose cached secret predates a
+        rotation hashes the new token against the *stale* secret. It
+        verifies fine for the rest of that process's lifetime, then
+        silently and permanently stops verifying the next time a fresh
+        vault reads the rotated secret off disk (e.g. after a restart).
+        Today `issue()` has exactly one caller, gated on there being no
+        devices yet at daemon startup, so this can't yet occur in
+        practice -- but nothing in the vault itself enforces that, and a
+        future pairing route that calls `issue()` on a long-running
+        daemon after a rotation would reintroduce it.
+        """
         self._secret = None
         (self._root / _SECRET_FILE).unlink(missing_ok=True)
         (self._root / _DEVICES_FILE).unlink(missing_ok=True)

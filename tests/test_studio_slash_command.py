@@ -62,9 +62,13 @@ def test_devices_lists_id_label_grants_and_created_at(vault_root):
 def test_devices_never_prints_a_plaintext_token(vault_root):
     vault = TokenVault(vault_root)
     token = vault.issue("phone", frozenset({Capability.CHAT}))
+    device_id = vault.devices()[0].device_id
 
     result = slash_commands.handle("/studio devices")
 
+    # Assert the device actually shows up -- otherwise "token not in result"
+    # would pass just as well against "No Studio devices issued.".
+    assert device_id in result
     assert token not in result
 
 
