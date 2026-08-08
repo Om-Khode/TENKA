@@ -50,6 +50,25 @@ def test_is_idempotent():
     assert redact_secrets(once) == once
 
 
+# ─── Regression: strong labels redact on the label alone ──────────────────
+# "password" (and its close kin) is essentially never followed by a
+# non-secret. A real passphrase can be a plain lowercase word or pure
+# digits -- shape alone can never tell "letmein" apart from "admirer" -- so
+# for these labels the label itself has to be enough evidence, with no
+# digit/letter-mixing requirement on the value.
+
+def test_redacts_a_plain_lowercase_password_with_no_digits():
+    out = redact_secrets("my password is letmein")
+    assert "letmein" not in out
+    assert REDACTED in out
+
+
+def test_redacts_a_digits_only_password_with_no_letters():
+    out = redact_secrets("my password is 13579246")
+    assert "13579246" not in out
+    assert REDACTED in out
+
+
 # ─── Regression: label words in ordinary conversation ─────────────────────
 # A voice assistant logs conversation, and "key", "secret", "auth",
 # "credential" and "token" are ordinary English words. A labelled value must
