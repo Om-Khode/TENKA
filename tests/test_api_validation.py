@@ -29,7 +29,7 @@ def test_an_oversized_recovery_phrase_is_422_and_never_echoed(context):
     client, headers = context
     phrase = "z" * 600
     response = client.post("/v1/backup/restore", headers=headers,
-                           json={"recovery_phrase": phrase})
+                           json={"recoveryPhrase": phrase})
     assert response.status_code == 422
     assert phrase not in response.text
     assert '"input"' not in response.text
@@ -45,7 +45,7 @@ def test_a_missing_recovery_phrase_is_422_with_no_input_key(context):
 def test_an_empty_recovery_phrase_is_422_with_no_input_key(context):
     client, headers = context
     response = client.post("/v1/backup/restore", headers=headers,
-                           json={"recovery_phrase": ""})
+                           json={"recoveryPhrase": ""})
     assert response.status_code == 422
     assert '"input"' not in response.text
 

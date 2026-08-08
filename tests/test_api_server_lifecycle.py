@@ -299,6 +299,108 @@ def test_process_text_from_queue_is_wired_to_clear_busy_for_a_studio_turn():
     )
 
 
+# ─── fix wave 2: the busy flag must not strand permanently ────────────────
+# process_text_from_queue does three things before its *own* try: block --
+# construct a TurnTracker, register it with _telemetry.set_current_tracker,
+# and (if a wake listener is running) pause it. A raise in any of those
+# skipped that function's own finally entirely, leaving _busy permanently
+# True: no watchdog, no timeout, the Studio channel answering 409 to every
+# message until the process restarted. Driven through the actual production
+# seam, _process_one_queued_item (what the consumer loop now calls), not
+# through process_text_from_queue directly -- the fix lives in that seam's
+# own try/finally, not inside process_text_from_queue.
+@pytest.mark.asyncio
+async def test_a_raise_before_process_text_from_queues_own_try_still_clears_busy(monkeypatch):
+    import assistant.main as m
+
+    dispatch = m._StudioDispatch()
+    monkeypatch.setattr(m, "_studio_dispatch", dispatch)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("telemetry is down")
+
+    # TurnTracker construction is the very first line of
+    # process_text_from_queue -- before session_mod, before bridge, before
+    # its own try:. Forcing the raise here hits the earliest possible point
+    # in the "skips the finally entirely" window the review named.
+    monkeypatch.setattr(m._telemetry, "TurnTracker", _boom)
+
+    turn_id, _, accepted, _ = await dispatch.submit("first")
+    assert accepted is True
+    assert dispatch.busy is True
+
+    with pytest.raises(RuntimeError):
+        await m._process_one_queued_item(("studio", "first"), bridge=None)
+
+    assert dispatch.busy is False, (
+        "a raise before process_text_from_queue's own try: left the busy flag stranded"
+    )
+
+    second = await dispatch.submit("second")
+    assert second[2] is True, (
+        "the studio channel is still refusing after the raise -- exactly the "
+        "permanent lockout the review flagged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_normal_turn_through_the_consumer_seam_still_clears_busy(monkeypatch):
+    """The mirror of the test above: the new outer try/finally must not have
+    simply disabled the busy mechanism just built. process_text_from_queue
+    itself is stubbed (it is the real pipeline -- intent, LLM, TTS -- which
+    this suite must not run), so this proves the *seam's* plumbing, not the
+    pipeline's correctness.
+    """
+    import assistant.main as m
+
+    dispatch = m._StudioDispatch()
+    monkeypatch.setattr(m, "_studio_dispatch", dispatch)
+
+    async def _fake_process(source, text, bridge, stt_ms=None):
+        return None
+
+    monkeypatch.setattr(m, "process_text_from_queue", _fake_process)
+
+    await dispatch.submit("hello")
+    assert dispatch.busy is True
+
+    await m._process_one_queued_item(("studio", "hello"), bridge=None)
+
+    assert dispatch.busy is False
+
+
+@pytest.mark.asyncio
+async def test_the_seam_does_not_clear_busy_before_the_turn_actually_finishes(monkeypatch):
+    """The other half of "did not simply disable the mechanism": while
+    process_text_from_queue is still running, a second submit must still be
+    refused -- the outer finally must fire only after the call returns (or
+    raises), never eagerly."""
+    import asyncio
+
+    import assistant.main as m
+
+    dispatch = m._StudioDispatch()
+    monkeypatch.setattr(m, "_studio_dispatch", dispatch)
+
+    release = asyncio.Event()
+
+    async def _slow_process(source, text, bridge, stt_ms=None):
+        await release.wait()
+
+    monkeypatch.setattr(m, "process_text_from_queue", _slow_process)
+
+    await dispatch.submit("hello")
+    task = asyncio.create_task(m._process_one_queued_item(("studio", "hello"), bridge=None))
+    await asyncio.sleep(0)  # let the task actually start awaiting release
+
+    still_busy = await dispatch.submit("second")
+    assert still_busy[2] is False, "the seam cleared busy before the turn actually finished"
+
+    release.set()
+    await task
+    assert dispatch.busy is False
+
+
 @pytest.mark.asyncio
 async def test_studio_dispatch_abort_reaches_the_shared_abort_controller():
     import assistant.main as m

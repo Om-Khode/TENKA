@@ -71,7 +71,7 @@ def test_reading_something_with_no_preview_is_404(context):
 def test_renaming_reads_back_under_the_new_path(context):
     client, headers, _ = context
     response = client.post("/v1/files/rename", headers=headers, json={
-        "path": "desktop/notes.md", "new_name": "renamed.md"})
+        "path": "desktop/notes.md", "newName": "renamed.md"})
     assert response.status_code == 200
     assert response.json()["data"]["id"] == "desktop/renamed.md"
     entries = client.get("/v1/files?path=desktop", headers=headers).json()["data"]["entries"]
@@ -108,7 +108,7 @@ def test_a_chat_only_device_cannot_read_file_content(context):
 def test_a_chat_only_device_cannot_rename(context):
     client, _, chat_only = context
     response = client.post("/v1/files/rename", headers=chat_only,
-                           json={"path": "desktop/notes.md", "new_name": "renamed.md"})
+                           json={"path": "desktop/notes.md", "newName": "renamed.md"})
     assert response.status_code == 403
 
 
@@ -122,7 +122,7 @@ def test_a_traversing_path_is_refused_by_the_route(context):
 def test_a_rename_to_a_path_is_refused(context):
     client, headers, _ = context
     response = client.post("/v1/files/rename", headers=headers, json={
-        "path": "desktop/notes.md", "new_name": "../escaped.md"})
+        "path": "desktop/notes.md", "newName": "../escaped.md"})
     assert response.status_code == 400
 
 

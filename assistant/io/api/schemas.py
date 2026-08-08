@@ -150,8 +150,10 @@ class PersonalityPatch(BaseModel):
 
 
 class RenameRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
+    # No populate_by_name: openapi() advertises only "newName", and nothing
+    # outside this repo has ever consumed "new_name" (openapi.json is
+    # gitignored -- nothing generated from the old shape has shipped). A
+    # silent second accepted spelling is complexity with no consumer.
     path: str = Field(min_length=1, max_length=1_024)
     new_name: str = Field(min_length=1, max_length=255, alias="newName")
 
@@ -161,8 +163,9 @@ class DeleteRequest(BaseModel):
 
 
 class RestoreRequest(BaseModel):
-    model_config = ConfigDict(populate_by_name=True)
-
+    # No populate_by_name -- see RenameRequest's comment above. Doubly true
+    # on a recovery-phrase field: a second, undocumented accepted spelling
+    # is not a thing a security-relevant body should carry for free.
     recovery_phrase: str = Field(
         min_length=1, max_length=512, alias="recoveryPhrase"
     )

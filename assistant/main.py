@@ -1391,6 +1391,41 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             _wake_listener.resume()
 
 
+async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
+    """Handle exactly one item already pulled off `_input_queue`.
+
+    Split out of the consumer loop's inline body for one reason: a studio
+    turn's busy flag has to clear no matter *where* inside
+    process_text_from_queue a raise happens, and three things run before
+    that function's own `try:` -- constructing the TurnTracker, registering
+    it with `_telemetry.set_current_tracker`, and (if a wake-word listener
+    is running) pausing it. A raise in any of those three skips
+    process_text_from_queue's own `finally` entirely (it is never reached),
+    which used to strand `_busy=True` forever: no watchdog, no timeout, the
+    Studio channel answering 409 to every message until the process
+    restarted. This function's own `finally` covers the whole call --
+    including everything before process_text_from_queue's internal `try:` --
+    so `mark_done()` fires exactly once more here even on that failure path.
+
+    On the ordinary success path this means `mark_done()` runs twice (once
+    from inside process_text_from_queue's own `finally`, once from this
+    one) -- harmless, since it only ever does `self._busy = False`, an
+    idempotent assignment with no side effect to double up on.
+
+    A second benefit of the extraction: this exact seam is now callable
+    from a test with one queued item, without booting the assistant or
+    running the surrounding `while not _shutdown_event.is_set()` loop at
+    all.
+    """
+    source, text = item[0], item[1]
+    stt_ms = item[2] if len(item) > 2 else None
+    try:
+        await process_text_from_queue(source, text, bridge, stt_ms=stt_ms)
+    finally:
+        if source == "studio" and _studio_dispatch is not None:
+            _studio_dispatch.mark_done()
+
+
 # ─── Event Handling ──────────────────────────────────────────────────────────
 
 # Flag to track recording state
@@ -2125,9 +2160,7 @@ async def async_main():
         while not _shutdown_event.is_set():
             try:
                 item = _input_queue.get_nowait()
-                source, text = item[0], item[1]
-                stt_ms = item[2] if len(item) > 2 else None
-                await process_text_from_queue(source, text, bridge, stt_ms=stt_ms)
+                await _process_one_queued_item(item, bridge)
             except queue.Empty:
                 # Check if the recording worker detected a voice stop command
                 if recording.voice_stop_requested():

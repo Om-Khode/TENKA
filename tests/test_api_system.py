@@ -97,7 +97,7 @@ def test_a_route_that_raises_is_still_audited(context):
 def test_restore_needs_system_control(context):
     client, runtime, tokens = context
     response = client.post("/v1/backup/restore", headers=head(tokens["chat"]),
-                           json={"recovery_phrase": PHRASE})
+                           json={"recoveryPhrase": PHRASE})
     assert response.status_code == 403
     assert runtime.system.restored_with == []
 
@@ -105,7 +105,7 @@ def test_restore_needs_system_control(context):
 def test_restore_verifies_the_phrase_server_side(context):
     client, runtime, tokens = context
     bad = client.post("/v1/backup/restore", headers=head(tokens["full"]),
-                      json={"recovery_phrase": "too short"})
+                      json={"recoveryPhrase": "too short"})
     assert bad.status_code == 400
     assert runtime.system.restored_with == ["too short"]
 
@@ -113,7 +113,7 @@ def test_restore_verifies_the_phrase_server_side(context):
 def test_a_valid_phrase_restores(context):
     client, _, tokens = context
     response = client.post("/v1/backup/restore", headers=head(tokens["full"]),
-                           json={"recovery_phrase": PHRASE})
+                           json={"recoveryPhrase": PHRASE})
     assert response.status_code == 200
 
 
@@ -121,7 +121,7 @@ def test_the_phrase_is_never_echoed_back(context):
     client, _, tokens = context
     for phrase in (PHRASE, "wrong wrong wrong"):
         response = client.post("/v1/backup/restore", headers=head(tokens["full"]),
-                               json={"recovery_phrase": phrase})
+                               json={"recoveryPhrase": phrase})
         assert phrase not in response.text
 
 
