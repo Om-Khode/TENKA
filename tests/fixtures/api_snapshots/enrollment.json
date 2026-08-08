@@ -1,0 +1,20 @@
+{
+  "voices": [
+    {
+      "itemId": "v1",
+      "name": "primary",
+      "enrolledAt": "2026-07-01T08:00:00Z",
+      "count": 6,
+      "lastSeenAt": "2026-08-07T22:10:00Z"
+    }
+  ],
+  "faces": [
+    {
+      "itemId": "f1",
+      "name": "Om",
+      "enrolledAt": "2026-07-03T19:20:00Z",
+      "count": 14,
+      "lastSeenAt": "2026-08-06T21:24:00Z"
+    }
+  ]
+}

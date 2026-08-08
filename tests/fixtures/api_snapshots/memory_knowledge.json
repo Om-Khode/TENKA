@@ -1,0 +1,101 @@
+{
+  "entities": [
+    {
+      "id": 1,
+      "type": "person",
+      "canonicalName": "sister",
+      "displayName": "Sister",
+      "properties": {
+        "relation": "family",
+        "age": 34,
+        "verified": true,
+        "nickname": null
+      },
+      "source": "conversation",
+      "confidence": 0.82,
+      "createdAt": "2026-07-19T10:11:00Z",
+      "updatedAt": "2026-07-30T09:00:00Z",
+      "sourceTurnId": "turn-8812"
+    },
+    {
+      "id": 2,
+      "type": "event",
+      "canonicalName": "thesis defence",
+      "displayName": "Thesis defence",
+      "properties": {},
+      "source": "conversation",
+      "confidence": 0.64,
+      "createdAt": "2026-07-22T18:02:00Z",
+      "updatedAt": "2026-07-22T18:02:00Z",
+      "sourceTurnId": "turn-8840"
+    }
+  ],
+  "facts": [
+    {
+      "id": 10,
+      "subjectId": 1,
+      "predicate": "lives_in",
+      "object": "Pune",
+      "confidence": 0.7,
+      "source": "conversation",
+      "eventAt": null,
+      "invalidAt": "2026-07-25T12:00:00Z",
+      "expiresAt": null,
+      "verifiedAt": null,
+      "createdAt": "2026-07-19T10:11:00Z",
+      "sourceTurnId": "turn-8812"
+    },
+    {
+      "id": 11,
+      "subjectId": 1,
+      "predicate": "lives_in",
+      "object": "Bengaluru",
+      "confidence": 0.9,
+      "source": "conversation",
+      "eventAt": null,
+      "invalidAt": null,
+      "expiresAt": null,
+      "verifiedAt": "2026-07-30T09:00:00Z",
+      "createdAt": "2026-07-25T12:00:00Z",
+      "sourceTurnId": "turn-9001"
+    },
+    {
+      "id": 12,
+      "subjectId": 2,
+      "predicate": "happens_on",
+      "object": "2026-09-04",
+      "confidence": 0.95,
+      "source": "conversation",
+      "eventAt": "2026-09-04T00:00:00Z",
+      "invalidAt": null,
+      "expiresAt": null,
+      "verifiedAt": null,
+      "createdAt": "2026-07-22T18:02:00Z",
+      "sourceTurnId": "turn-8840"
+    }
+  ],
+  "relationships": [
+    {
+      "id": 20,
+      "fromId": 1,
+      "toId": 2,
+      "type": "attending",
+      "properties": {
+        "role": "plus one"
+      },
+      "confidence": 0.6,
+      "source": "conversation",
+      "sourceTurnId": "turn-8840"
+    },
+    {
+      "id": 21,
+      "fromId": 1,
+      "toId": 99,
+      "type": "mentions",
+      "properties": {},
+      "confidence": 0.4,
+      "source": "conversation",
+      "sourceTurnId": null
+    }
+  ]
+}
