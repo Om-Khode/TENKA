@@ -9,6 +9,17 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# ─── Import-unsafe modules ───────────────────────────────────────────────
+# A `live_automation` marker cannot protect these: pytest imports a module to
+# read its markers, and these do their work at import time. test_pw_standalone
+# ends in a bare `asyncio.run(main())` with no __main__ guard, so collecting it
+# launches a browser. Ignoring them at collection is the only thing that stops
+# that.
+collect_ignore = [
+    "test_pw_standalone.py",
+]
+
+
 _GUARDED_MODULES = [
     "assistant.io.screen",
     "assistant.llm",

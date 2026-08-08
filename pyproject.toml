@@ -1,3 +1,17 @@
+[tool.pytest.ini_options]
+# Live-automation tests drive the real desktop: they open applications, click,
+# type, and launch browsers. A bare `pytest tests/` used to collect them, which
+# on 2026-08-08 typed into the machine's foreground window while someone was
+# working. They are excluded by default and must be asked for by name:
+#
+#   py -3.11 -m pytest -m live_automation tests/test_computer_task_integration.py
+#
+# Run those only on a machine nobody is using.
+addopts = "-m 'not live_automation'"
+markers = [
+    "live_automation: drives the real desktop or launches a real browser. Never collected by default.",
+]
+
 [tool.importlinter]
 root_packages = ["assistant"]
 
