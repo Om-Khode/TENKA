@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 from typing import Any, Protocol
 
@@ -24,8 +23,6 @@ from ..io.api.runtime import (
     PreferenceRecord, ProcedureRecord, Relationship, SaveOutcome, SettingRow,
     StudioRuntime, TurnRef,
 )
-
-logger = logging.getLogger(__name__)
 
 _SCOPES = ("knowledge", "preferences", "procedures")
 
@@ -102,18 +99,6 @@ class LiveChatRuntime:
 
 # ─── Memory ──────────────────────────────────────────────────────────────
 class LiveMemoryRuntime:
-    async def list(self, scope: MemoryScope):
-        """Generic scope-keyed read, for callers that don't care which
-        typed accessor they're routed to. Mirrors forget()'s scope
-        dispatch -- same three scopes, same rejection for anything else."""
-        if scope not in _SCOPES:
-            raise ValueError(f"unknown scope: {scope}")
-        if scope == "knowledge":
-            return await self.knowledge()
-        if scope == "preferences":
-            return await self.preferences()
-        return await self.procedures()
-
     async def knowledge(self) -> KnowledgeGraph:
         return await asyncio.to_thread(self._knowledge_sync)
 
@@ -323,8 +308,15 @@ class LivePersonalityRuntime:
     @staticmethod
     def _state_sync() -> PersonalityState:
         from .. import personality
+        # The active personality id lives on assistant.personalities'
+        # module-level loader (get_active_personality_id), not on
+        # assistant.personality -- that module only ever imports the name
+        # locally inside _get_repo(); it never re-exports it. This is the
+        # live source switch_personality() actually writes through, unlike
+        # config.ACTIVE_PERSONALITY, which is frozen at import time.
+        from ..personalities import get_active_personality_id
         return PersonalityState(
-            base=personality.get_active_personality_id(),
+            base=get_active_personality_id(),
             available=sorted(personality.list_personalities()),
             traits=personality.get_current_traits(),
             sample_line=personality.get_metadata("sample_line") or "",

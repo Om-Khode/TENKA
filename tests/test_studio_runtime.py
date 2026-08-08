@@ -137,7 +137,7 @@ async def test_no_facade_is_called_on_the_event_loop_thread(monkeypatch):
 
     monkeypatch.setattr(preferences, "get_all_preferences", spy)
     runtime = build_studio_runtime(StubDispatch())
-    await runtime.memory.list("preferences")
+    await runtime.memory.preferences()
     assert calling_threads and "MainThread" not in calling_threads[0], (
         f"facade ran on {calling_threads}; it must go through asyncio.to_thread"
     )
