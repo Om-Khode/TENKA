@@ -193,7 +193,14 @@ def test_the_exporter_writes_a_schema(tmp_path):
     assert result.returncode == 0, result.stderr
     schema = json.loads(out.read_text(encoding="utf-8"))
     assert "/v1/status" in schema["paths"]
-    assert "/v1/memory/{scope}" in schema["paths"]
+    # GET /v1/memory/{scope} was split into three static routes (review
+    # finding, 2026-08-08): one dynamic-scope route describing its response
+    # as a three-way union gave a generated client no discriminator to key
+    # off; three routes give a clean 1:1 type each. The URLs themselves are
+    # unchanged -- these three were always the only ones a client called.
+    assert "/v1/memory/knowledge" in schema["paths"]
+    assert "/v1/memory/preferences" in schema["paths"]
+    assert "/v1/memory/procedures" in schema["paths"]
 
 
 # ─── _StudioDispatch — the only path from a request into the pipeline ─────

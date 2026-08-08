@@ -13,7 +13,7 @@ Layering: io/api — core + config only.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 MemoryScope = Literal["knowledge", "preferences", "procedures"]
 SettingValue = str | int | float | bool
@@ -63,7 +63,13 @@ class Entity:
     type: str
     canonical_name: str
     display_name: str
-    properties: dict[str, str]
+    # A taught fact's shape is arbitrary JSON (`_load_properties()` in
+    # studio_runtime.py parses `properties_json` and hands back whatever
+    # `json.loads` produced, unvalidated past "is it a dict"). `dict[str,
+    # str]` here used to silently lie about that -- a taught property
+    # holding a number or a boolean is normal, not exotic, for a codebase
+    # whose stated philosophy is that behaviour is taught data.
+    properties: dict[str, Any]
     source: str
     confidence: float
     created_at: str
@@ -99,7 +105,10 @@ class Relationship:
     # Mirrors kg_relationships.properties_json, the way Entity.properties
     # mirrors kg_entities' — defaulted empty so existing positional
     # construction sites (built before this field existed) stay valid.
-    properties: dict[str, str] = field(default_factory=dict)
+    # `dict[str, Any]`, not `dict[str, str]`, for the same reason as
+    # Entity.properties above: `_load_properties()` guarantees a dict, never
+    # a value type.
+    properties: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

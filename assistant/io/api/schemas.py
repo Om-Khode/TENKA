@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
-from typing import Any
+from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -42,16 +42,29 @@ class Meta(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 
-class Envelope(BaseModel):
-    """Deliberately not generic.
+T = TypeVar("T")
 
-    `Envelope[T]` as a FastAPI response annotation forces a distinct model per
-    payload shape and buys nothing here: the payload types already live in
-    runtime.py, and the routes build plain dicts from them. `data: Any` keeps
-    one envelope across every route, which is what the client parses against.
+
+class Envelope(BaseModel, Generic[T]):
+    """Generic on purpose: `data: Any` described every response as an
+    untyped object in `openapi.json`, so a client generating TypeScript from
+    the exported schema got `data: unknown` for all 27 operations -- the
+    request side (`ChatRequest`, `SettingsPatch`, ...) was typed and the
+    response side was not, which is exactly backwards once a frontend is
+    generating real types from this contract and relying on drift becoming a
+    compile error. `Envelope[SomePayload]` on a route's return annotation
+    makes FastAPI validate the payload against `SomePayload` *and* describe
+    it in the schema, at the cost of one payload model per response shape
+    (`payloads.py`) instead of the route building a plain dict.
+
+    `data` must never lose a `null` -- `EnrolledItem.count` and several of
+    `Fact`'s timestamp fields are genuinely nullable, and a missing accessor
+    is a different fact than a zero. Never set `response_model_exclude_none`
+    or `exclude_unset` on this model or on any route: both would silently
+    turn a present `null` into an absent key.
     """
 
-    data: Any
+    data: T
     meta: Meta = Field(default_factory=Meta)
 
 

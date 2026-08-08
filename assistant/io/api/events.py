@@ -120,8 +120,13 @@ def telemetry_frame(snapshot) -> dict:
     """The one `"telemetry"` wire shape -- `telemetry_body()`'s keys plus the
     frame envelope's `type`, so this can never drift from what
     `GET /v1/telemetry` reports for the same snapshot.
+
+    `telemetry_body()` now returns a `TelemetryPayload` model (the typed-
+    response rework), not a plain dict -- `model_dump(by_alias=True)` is the
+    one place that has to change to keep spreading its keys; the camelCase
+    key set itself is unaffected.
     """
-    return {"type": "telemetry", **telemetry_body(snapshot)}
+    return {"type": "telemetry", **telemetry_body(snapshot).model_dump(by_alias=True)}
 
 
 def build_error_frame(detail: str) -> dict:

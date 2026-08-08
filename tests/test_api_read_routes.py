@@ -48,6 +48,27 @@ def test_provenance_survives_the_wire(context):
     assert any(f["sourceTurnId"] for f in facts), "every fact lost its turn id"
 
 
+def test_a_non_string_taught_property_round_trips_not_400s(context):
+    """`Entity.properties` is arbitrary JSON a user taught -- a number, a
+    bool, a null are all legal values, not just strings (Finding 1,
+    2026-08-08 review). Before EntityPayload.properties was widened to
+    `dict[str, JsonValue]`, a `dict[str, str]` annotation made this 400 the
+    *entire* /v1/memory/knowledge response -- ResponseValidationError
+    subclasses ValueError, so errors.py mapped it to a 400 that looked like
+    a malformed client request for what was actually a server-side type
+    mismatch. This must come back 200 with the values intact.
+    """
+    client, _, headers = context
+    response = client.get("/v1/memory/knowledge", headers=headers)
+    assert response.status_code == 200
+    entities = {e["id"]: e for e in response.json()["data"]["entities"]}
+    props = entities[1]["properties"]
+    assert props["relation"] == "family"
+    assert props["age"] == 34
+    assert props["verified"] is True
+    assert props["nickname"] is None
+
+
 def test_relationship_properties_survive_the_wire(context):
     """Relationship.properties mirrors Entity.properties (see runtime.py); a
     serialiser that maps entities' properties but drops relationships' would
@@ -87,9 +108,20 @@ def test_procedures_carry_their_steps(context):
     assert body["procedures"][0]["runCount"] == 12
 
 
-def test_memory_scope_is_validated(context):
+def test_an_unknown_memory_path_is_404_not_422(context):
+    """GET /v1/memory/{scope} used to be one route with a `Literal` path
+    parameter, so an unknown scope was a 422 FastAPI raised before the
+    handler ran. It is now three static routes -- /v1/memory/knowledge,
+    /v1/memory/preferences, /v1/memory/procedures (review finding,
+    2026-08-08: the response shape is fully determined by scope, so three
+    typed routes beat one route describing a union) -- and those are the
+    only three URLs a client has ever called here. "not-a-scope" was never
+    one of them; it now falls through to ordinary routing (no matching
+    path) rather than being validated and rejected by a route that no
+    longer exists, so it is a 404 like any other unmatched path.
+    """
     client, _, headers = context
-    assert client.get("/v1/memory/not-a-scope", headers=headers).status_code == 422
+    assert client.get("/v1/memory/not-a-scope", headers=headers).status_code == 404
 
 
 def test_every_scope_is_reachable(context):

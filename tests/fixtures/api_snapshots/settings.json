@@ -1,0 +1,52 @@
+{
+  "rows": [
+    {
+      "key": "followup_timer",
+      "group": "Conversation",
+      "description": "Seconds to keep listening after a reply.",
+      "kind": "slider",
+      "value": 4.5,
+      "default": 3.0,
+      "needsRestart": false,
+      "source": "db",
+      "options": []
+    },
+    {
+      "key": "tts_speed",
+      "group": "Voice",
+      "description": "Playback rate for spoken replies.",
+      "kind": "slider",
+      "value": 1.0,
+      "default": 1.0,
+      "needsRestart": false,
+      "source": "default",
+      "options": []
+    },
+    {
+      "key": "active_personality",
+      "group": "Personality",
+      "description": "Which base persona she speaks from.",
+      "kind": "select",
+      "value": "warm",
+      "default": "warm",
+      "needsRestart": true,
+      "source": "default",
+      "options": [
+        "warm",
+        "dry",
+        "brisk"
+      ]
+    },
+    {
+      "key": "camera_enabled",
+      "group": "Perception",
+      "description": "Allow the camera to be opened on request.",
+      "kind": "toggle",
+      "value": true,
+      "default": false,
+      "needsRestart": true,
+      "source": "env",
+      "options": []
+    }
+  ]
+}

@@ -55,7 +55,15 @@ class FakeMemoryRuntime:
 
     def __init__(self) -> None:
         self._entities = [
-            Entity(1, "person", "sister", "Sister", {"relation": "family"},
+            # Properties mixes a string with a number, a bool and a null --
+            # exactly what `_load_properties()` (studio_runtime.py) hands
+            # back from an arbitrary taught properties_json blob. A fixture
+            # with only string values could never catch response validation
+            # 400ing the whole scope over a taught age or a taught flag
+            # (Finding 1, 2026-08-08 review).
+            Entity(1, "person", "sister",
+                   "Sister", {"relation": "family", "age": 34,
+                             "verified": True, "nickname": None},
                    "conversation", 0.82, "2026-07-19T10:11:00Z",
                    "2026-07-30T09:00:00Z", "turn-8812"),
             Entity(2, "event", "thesis defence", "Thesis defence", {},

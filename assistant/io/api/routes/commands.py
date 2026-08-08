@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from ..payloads import CommandDefPayload, CommandRunPayload, CommandsPayload
 from ..schemas import Envelope
 from ..security import authenticate, device_key, require
 from ..vault import Capability
@@ -24,23 +25,23 @@ _RUN_WINDOW_SECONDS = 60.0
 
 @router.get("/commands")
 async def list_commands(request: Request,
-                        _=Depends(require(Capability.CHAT))) -> Envelope:
+                        _=Depends(require(Capability.CHAT))) -> Envelope[CommandsPayload]:
     catalogue = await request.app.state.runtime.commands.catalogue()
-    return Envelope(data={"commands": [
-        {
-            "commandId": command.command_id,
-            "label": command.label,
-            "description": command.description,
-            "destructive": command.destructive,
-            "requiredGrant": command.required_grant,
-        }
+    return Envelope(data=CommandsPayload(commands=[
+        CommandDefPayload(
+            command_id=command.command_id,
+            label=command.label,
+            description=command.description,
+            destructive=command.destructive,
+            required_grant=command.required_grant,
+        )
         for command in catalogue
-    ]})
+    ]))
 
 
 @router.post("/commands/{command_id}/run")
 async def run_command(command_id: str, request: Request,
-                      device=Depends(authenticate)) -> Envelope:
+                      device=Depends(authenticate)) -> Envelope[CommandRunPayload]:
     state = request.app.state.auth
     key = f"commands_run:{device_key(device)}"
     if not state.limiter.check(key, max_per_window=_RUN_MAX_PER_WINDOW,
@@ -64,4 +65,4 @@ async def run_command(command_id: str, request: Request,
     outcome = await request.app.state.runtime.commands.run(command_id)
     if not outcome.ok:
         raise HTTPException(status_code=502, detail=outcome.message)
-    return Envelope(data={"commandId": command_id, "message": outcome.message})
+    return Envelope(data=CommandRunPayload(command_id=command_id, message=outcome.message))

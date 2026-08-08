@@ -264,7 +264,11 @@ def test_the_telemetry_frame_keys_match_the_http_telemetry_route():
                                   uptime_seconds=99)
     frame = telemetry_frame(snapshot)
     assert frame["type"] == "telemetry"
-    assert {k: v for k, v in frame.items() if k != "type"} == telemetry_body(snapshot)
+    # telemetry_body() now returns a TelemetryPayload (typed-response rework),
+    # not a plain dict -- model_dump(by_alias=True) is the wire shape it used
+    # to *be* directly.
+    assert {k: v for k, v in frame.items() if k != "type"} == \
+        telemetry_body(snapshot).model_dump(by_alias=True)
 
 
 def test_no_frame_the_socket_can_emit_has_a_snake_case_key():

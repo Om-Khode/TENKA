@@ -21,6 +21,10 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from ..payloads import (
+    AuditEntryPayload, AuditPayload, BackupStatePayload, EnrolledItemPayload,
+    EnrollmentPayload, ForgetEnrolledPayload, RestorePayload, TelemetryPayload,
+)
 from ..schemas import Envelope, RestoreRequest
 from ..security import require, throttle
 from ..vault import Capability
@@ -41,40 +45,40 @@ _BACKUP_RUN_MAX_PER_WINDOW = 5
 _BACKUP_RUN_WINDOW_SECONDS = 60.0
 
 
-def telemetry_body(snapshot) -> dict:
+def telemetry_body(snapshot) -> TelemetryPayload:
     """The one serialisation of `TelemetrySnapshot` -- reused verbatim by the
     `"telemetry"` WebSocket frame in `../events.py` so the same numbers carry
     the same names on both transports instead of growing a second vocabulary.
     """
-    return {
-        "cpuPercent": snapshot.cpu_percent,
-        "ramPercent": snapshot.ram_percent,
-        "batteryPercent": snapshot.battery_percent,
-        "activeModel": snapshot.active_model,
-        "uptimeSeconds": snapshot.uptime_seconds,
-    }
+    return TelemetryPayload(
+        cpu_percent=snapshot.cpu_percent,
+        ram_percent=snapshot.ram_percent,
+        battery_percent=snapshot.battery_percent,
+        active_model=snapshot.active_model,
+        uptime_seconds=snapshot.uptime_seconds,
+    )
 
 
 @router.get("/telemetry")
 async def telemetry(request: Request,
-                    _=Depends(require(Capability.CHAT))) -> Envelope:
+                    _=Depends(require(Capability.CHAT))) -> Envelope[TelemetryPayload]:
     snapshot = await request.app.state.runtime.system.telemetry()
     return Envelope(data=telemetry_body(snapshot))
 
 
-def _backup_body(state) -> dict:
-    return {
-        "enabled": state.enabled,
-        "provider": state.provider,
-        "lastBackupAt": state.last_backup_at,
-        "lastResult": state.last_result,
-        "sizeBytes": state.size_bytes,
-    }
+def _backup_body(state) -> BackupStatePayload:
+    return BackupStatePayload(
+        enabled=state.enabled,
+        provider=state.provider,
+        last_backup_at=state.last_backup_at,
+        last_result=state.last_result,
+        size_bytes=state.size_bytes,
+    )
 
 
 @router.get("/backup")
 async def backup_state(request: Request,
-                       _=Depends(require(Capability.CHAT))) -> Envelope:
+                       _=Depends(require(Capability.CHAT))) -> Envelope[BackupStatePayload]:
     return Envelope(data=_backup_body(
         await request.app.state.runtime.system.backup_state()))
 
@@ -84,14 +88,14 @@ async def run_backup(request: Request,
                      _=Depends(throttle(Capability.CHAT, "backup_run",
                                         max_per_window=_BACKUP_RUN_MAX_PER_WINDOW,
                                         window_seconds=_BACKUP_RUN_WINDOW_SECONDS))
-                     ) -> Envelope:
+                     ) -> Envelope[BackupStatePayload]:
     return Envelope(data=_backup_body(
         await request.app.state.runtime.system.run_backup()))
 
 
 @router.post("/backup/restore")
 async def restore_backup(body: RestoreRequest, request: Request,
-                         _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope:
+                         _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope[RestorePayload]:
     ok = await request.app.state.runtime.system.restore_backup(body.recovery_phrase)
     if not ok:
         # Deliberately generic: "restore failed" tells a caller the phrase was
@@ -99,27 +103,27 @@ async def restore_backup(body: RestoreRequest, request: Request,
         # was submitted -- HTTPException's default JSON body only ever holds
         # this literal string, never `body.recovery_phrase`.
         raise HTTPException(status_code=400, detail="restore failed")
-    return Envelope(data={"restored": True})
+    return Envelope(data=RestorePayload(restored=True))
 
 
-def _enrolled_item(item) -> dict:
-    return {
-        "itemId": item.item_id,
-        "name": item.name,
-        "enrolledAt": item.enrolled_at,
-        "count": item.count,
-        "lastSeenAt": item.last_seen_at,
-    }
+def _enrolled_item(item) -> EnrolledItemPayload:
+    return EnrolledItemPayload(
+        item_id=item.item_id,
+        name=item.name,
+        enrolled_at=item.enrolled_at,
+        count=item.count,
+        last_seen_at=item.last_seen_at,
+    )
 
 
 @router.get("/enrollment")
 async def enrollment(request: Request,
-                     _=Depends(require(Capability.CHAT))) -> Envelope:
+                     _=Depends(require(Capability.CHAT))) -> Envelope[EnrollmentPayload]:
     state = await request.app.state.runtime.system.enrollment()
-    return Envelope(data={
-        "voices": [_enrolled_item(v) for v in state.voices],
-        "faces": [_enrolled_item(f) for f in state.faces],
-    })
+    return Envelope(data=EnrollmentPayload(
+        voices=[_enrolled_item(v) for v in state.voices],
+        faces=[_enrolled_item(f) for f in state.faces],
+    ))
 
 
 @router.delete("/enrollment/{kind}/{item_id}")
@@ -129,22 +133,22 @@ async def forget_enrolled(kind: EnrollmentKind, item_id: str, request: Request,
                           # conversational use -- the same reasoning that put
                           # forget-all and settings writes behind this grant.
                           # Reading the enrollment list stays on chat.
-                          _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope:
+                          _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope[ForgetEnrolledPayload]:
     removed = await request.app.state.runtime.system.forget_enrolled(kind, item_id)
     if not removed:
         # `detail=` is dead on a 404: app.py's `@app.exception_handler(404)`
         # dispatches on status code alone and always answers a fixed
         # `{"error": "not found"}` body, discarding whatever is passed here.
         raise HTTPException(status_code=404)
-    return Envelope(data={"forgotten": item_id, "kind": kind})
+    return Envelope(data=ForgetEnrolledPayload(forgotten=item_id, kind=kind))
 
 
 @router.get("/audit")
 async def audit(request: Request,
-                _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope:
+                _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope[AuditPayload]:
     entries = request.app.state.auth.audit.entries()
-    return Envelope(data={"entries": [
-        {"at": e.at, "deviceId": e.device_id, "method": e.method,
-         "path": e.path, "outcome": e.outcome}
+    return Envelope(data=AuditPayload(entries=[
+        AuditEntryPayload(at=e.at, device_id=e.device_id, method=e.method,
+                          path=e.path, outcome=e.outcome)
         for e in reversed(entries)
-    ]})
+    ]))
