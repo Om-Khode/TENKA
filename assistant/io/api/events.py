@@ -124,6 +124,24 @@ def telemetry_frame(snapshot) -> dict:
     return {"type": "telemetry", **telemetry_body(snapshot)}
 
 
+def build_error_frame(detail: str) -> dict:
+    """The `"error"` reply app.py sends for a malformed or unrecognised
+    client frame. Routed through a builder -- not a literal dict at the
+    call site -- so the socket's one snake_case sweep (see the module
+    docstring and `tests/test_api_events.py`) covers it the same way it
+    covers every other frame the socket can emit, even though `EventHub`
+    itself never produces this one.
+    """
+    return {"type": "error", "detail": detail}
+
+
+def build_ack_frame(of: str) -> dict:
+    """The `"ack"` reply app.py sends after acting on a client frame (only
+    `{"type": "abort"}` today). Same reasoning as `build_error_frame`.
+    """
+    return {"type": "ack", "of": of}
+
+
 class EventHub:
     def __init__(self) -> None:
         self._sockets: set[Any] = set()

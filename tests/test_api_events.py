@@ -267,11 +267,16 @@ def test_the_telemetry_frame_keys_match_the_http_telemetry_route():
     assert {k: v for k, v in frame.items() if k != "type"} == telemetry_body(snapshot)
 
 
-def test_no_frame_the_hub_can_produce_has_a_snake_case_key():
-    """A sweep over every frame shape the hub itself can build (the
-    connect/status builder, the broadcaster translator, and the telemetry
-    frame) -- not three separate spot checks that could miss a fourth."""
+def test_no_frame_the_socket_can_emit_has_a_snake_case_key():
+    """A sweep over every frame builder in events.py -- the connect/status
+    builder, the broadcaster translator, the telemetry frame, and the
+    error/ack builders app.py's socket handler calls directly (not
+    EventHub-produced, but they reach the same client over the same socket,
+    so a snake-case key added there would be exactly as real a regression).
+    One sweep, not five separate spot checks that could miss a sixth."""
     from assistant.io.api.events import (
+        build_ack_frame,
+        build_error_frame,
         build_status_frame,
         status_frame_from_broadcaster_event,
         telemetry_frame,
@@ -288,6 +293,8 @@ def test_no_frame_the_hub_can_produce_has_a_snake_case_key():
             cpu_percent=1.0, ram_percent=2.0, battery_percent=None,
             active_model="m", uptime_seconds=5,
         )),
+        build_error_frame("malformed frame"),
+        build_ack_frame("abort"),
     ]
     for frame in frames:
         assert not any("_" in key for key in frame), frame

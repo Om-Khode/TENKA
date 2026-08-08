@@ -486,6 +486,47 @@ async def test_a_successful_start_subscribes_exactly_once(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_a_successful_start_subscribes_publish_status_not_publish(tmp_path, monkeypatch):
+    """The precise regression the socket-contract fix repairs: reverting
+    main.py back to `status.subscribe(_studio_hub.publish)` would still
+    subscribe *something* (the test above stays green), still type-check,
+    and still pass lint-imports -- but every status frame reaching a
+    browser would be snake_case again. Pin the *method identity* of what
+    got subscribed, not just that a subscription happened. Drives the real
+    `_start_studio_daemon()` (serve() faked, same as the sibling test above)
+    rather than statically parsing main.py's source, matching this file's
+    existing pattern for exercising that function."""
+    import asyncio
+
+    import assistant.config as config
+    import assistant.main as m
+    from assistant.io.api.events import EventHub
+    from assistant.io.status_broadcaster import status
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    async def _noop() -> None:
+        return None
+
+    def _fake_serve(*args, **kwargs):
+        return asyncio.create_task(_noop())
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _fake_serve)
+
+    task = await m._start_studio_daemon()
+    try:
+        assert task is not None
+        subscribed = status._subscribers[-1]
+        assert subscribed.__func__ is EventHub.publish_status, (
+            "main.py must subscribe publish_status (translates a "
+            "broadcaster event before publishing it), not publish (raw "
+            f"passthrough) -- got {subscribed.__func__!r}"
+        )
+    finally:
+        await task
+
+
+@pytest.mark.asyncio
 async def test_stop_studio_daemon_tolerates_no_task():
     import assistant.main as m
     await m._stop_studio_daemon(None)  # must not raise
