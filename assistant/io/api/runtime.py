@@ -96,6 +96,10 @@ class Relationship:
     confidence: float
     source: str
     source_turn_id: str | None
+    # Mirrors kg_relationships.properties_json, the way Entity.properties
+    # mirrors kg_entities' — defaulted empty so existing positional
+    # construction sites (built before this field existed) stay valid.
+    properties: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

@@ -72,7 +72,8 @@ class FakeMemoryRuntime:
                  "2026-09-04T00:00:00Z", None, None, None, "2026-07-22T18:02:00Z", "turn-8840"),
         ]
         self._relationships = [
-            Relationship(20, 1, 2, "attending", 0.6, "conversation", "turn-8840"),
+            Relationship(20, 1, 2, "attending", 0.6, "conversation", "turn-8840",
+                         properties={"role": "plus one"}),
             Relationship(21, 1, 99, "mentions", 0.4, "conversation", None),
         ]
         self._preferences = [
@@ -291,6 +292,7 @@ class FakeSystemRuntime:
     def __init__(self) -> None:
         self.backups_run = 0
         self.restored_with: list[str] = []
+        self._backup = BackupState(True, "google_drive", "2026-08-07T04:00:00Z", "ok", 18_432_112)
         self._enrollment = EnrollmentState(
             voices=[EnrolledItem("v1", "primary", "2026-07-01T08:00:00Z")],
             faces=[EnrolledItem("f1", "Om", "2026-07-03T19:20:00Z")],
@@ -303,11 +305,12 @@ class FakeSystemRuntime:
         return TelemetrySnapshot(21.5, 63.0, 88.0, "gemini-flash-lite", 4_512)
 
     async def backup_state(self) -> BackupState:
-        return BackupState(True, "google_drive", "2026-08-07T04:00:00Z", "ok", 18_432_112)
+        return self._backup
 
     async def run_backup(self) -> BackupState:
         self.backups_run += 1
-        return BackupState(True, "google_drive", "2026-08-08T09:15:00Z", "ok", 18_500_000)
+        self._backup = BackupState(True, "google_drive", "2026-08-08T09:15:00Z", "ok", 18_500_000)
+        return self._backup
 
     async def restore_backup(self, recovery_phrase: str) -> bool:
         self.restored_with.append(recovery_phrase)
