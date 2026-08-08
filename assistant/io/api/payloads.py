@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue
 from pydantic.alias_generators import to_camel
 
 from .runtime import FileKind, SettingValue
@@ -82,7 +82,15 @@ class EntityPayload(CamelModel):
     type: str
     canonical_name: str
     display_name: str
-    properties: dict[str, str]
+    # `JsonValue`, not `str`: a taught entity's properties are whatever
+    # `_load_properties()` (studio_runtime.py) parsed out of a JSON column --
+    # a number, a bool, a nested object, `null`, all legal. `dict[str, str]`
+    # here used to make response validation 400 the *entire scope* the
+    # moment one taught property held anything but a string (Finding 1,
+    # 2026-08-08 review) -- ResponseValidationError subclasses ValueError,
+    # so errors.py mapped it to a 400 that looked like a bad client request
+    # for what was actually a server-side type mismatch.
+    properties: dict[str, JsonValue]
     source: str
     confidence: float
     created_at: str
@@ -110,7 +118,8 @@ class RelationshipPayload(CamelModel):
     from_id: int
     to_id: int
     type: str
-    properties: dict[str, str]
+    # Same reasoning as EntityPayload.properties above.
+    properties: dict[str, JsonValue]
     confidence: float
     source: str
     source_turn_id: str | None
