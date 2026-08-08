@@ -26,8 +26,6 @@ router = APIRouter()
 
 Scope = Literal["knowledge", "preferences", "procedures"]
 
-MemoryPayload = KnowledgeGraphPayload | PreferencesPayload | ProceduresPayload
-
 
 def _entity(entity) -> EntityPayload:
     return EntityPayload(
@@ -74,33 +72,50 @@ def _relationship(rel) -> RelationshipPayload:
     )
 
 
-@router.get("/memory/{scope}")
-async def list_scope(scope: Scope, request: Request,
-                     _=Depends(require(Capability.CHAT))) -> Envelope[MemoryPayload]:
-    memory = request.app.state.runtime.memory
+# Three explicit routes, not one `/memory/{scope}` dispatching on a path
+# parameter (review finding, 2026-08-08): the response shape is fully
+# determined by `scope`, which the caller already supplied in the URL, so a
+# single parameterised route could only describe its response as a union of
+# all three payloads -- `oneOf` in the schema, with no discriminator, and a
+# generated client left to duck-type which one it got. Three routes give a
+# clean 1:1 type per operation instead. The URLs a client calls are
+# unchanged -- /v1/memory/knowledge, /v1/memory/preferences,
+# /v1/memory/procedures were always the only three paths this ever served;
+# only the routing (one dynamic segment vs three static ones) and the
+# handler split, not what a caller sends or receives for any of them.
+# DELETE /memory/{scope}/{item_id} stays parameterised below: it has one
+# response shape regardless of scope, so a union was never the issue there.
+@router.get("/memory/knowledge")
+async def get_knowledge(request: Request,
+                        _=Depends(require(Capability.CHAT))) -> Envelope[KnowledgeGraphPayload]:
+    graph = await request.app.state.runtime.memory.knowledge()
+    return Envelope(data=KnowledgeGraphPayload(
+        entities=[_entity(e) for e in graph.entities],
+        facts=[_fact(f) for f in graph.facts],
+        relationships=[_relationship(r) for r in graph.relationships],
+    ))
 
-    if scope == "knowledge":
-        graph = await memory.knowledge()
-        return Envelope(data=KnowledgeGraphPayload(
-            entities=[_entity(e) for e in graph.entities],
-            facts=[_fact(f) for f in graph.facts],
-            relationships=[_relationship(r) for r in graph.relationships],
-        ))
 
-    if scope == "preferences":
-        records = await memory.preferences()
-        return Envelope(data=PreferencesPayload(preferences=[
-            PreferenceRecordPayload(
-                key=record.key,
-                value=record.value,
-                updated_at=record.updated_at,
-                history=[PreferenceChangePayload(value=h.value, changed_at=h.changed_at)
-                         for h in record.history],
-            )
-            for record in records
-        ]))
+@router.get("/memory/preferences")
+async def get_preferences(request: Request,
+                          _=Depends(require(Capability.CHAT))) -> Envelope[PreferencesPayload]:
+    records = await request.app.state.runtime.memory.preferences()
+    return Envelope(data=PreferencesPayload(preferences=[
+        PreferenceRecordPayload(
+            key=record.key,
+            value=record.value,
+            updated_at=record.updated_at,
+            history=[PreferenceChangePayload(value=h.value, changed_at=h.changed_at)
+                     for h in record.history],
+        )
+        for record in records
+    ]))
 
-    records = await memory.procedures()
+
+@router.get("/memory/procedures")
+async def get_procedures(request: Request,
+                         _=Depends(require(Capability.CHAT))) -> Envelope[ProceduresPayload]:
+    records = await request.app.state.runtime.memory.procedures()
     return Envelope(data=ProceduresPayload(procedures=[
         ProcedureRecordPayload(
             id=record.id,
