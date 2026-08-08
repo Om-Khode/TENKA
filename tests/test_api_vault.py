@@ -199,6 +199,35 @@ def test_entry_with_unknown_capability_fails_closed_but_stays_revocable(tmp_path
     assert vault.revoke(device_id) is True
 
 
+def test_entry_with_empty_grants_fails_closed_but_a_normal_entry_still_verifies(tmp_path):
+    """`issue()` refuses an empty grant set, but a hand-edited devices.json
+    can still produce one: a valid token_hmac paired with `"grants": []`.
+    That combination used to parse into `Device(grants=frozenset())`, which
+    `authenticate()` passes straight through -- reproducing, on any route
+    gated by `authenticate` alone, the 404-vs-403 oracle Finding 2 was meant
+    to close. A second, untouched device in the same file proves the check
+    is discriminating: it rejects the empty entry without taking down every
+    entry in the store.
+    """
+    vault = TokenVault(tmp_path)
+    ghost_token = vault.issue("ghost", frozenset({Capability.CHAT}))
+    ghost_id = vault.verify(ghost_token).device_id
+    normal_token = vault.issue("normal", frozenset({Capability.CHAT}))
+
+    raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    for entry in raw["devices"]:
+        if entry["device_id"] == ghost_id:
+            entry["grants"] = []
+    (tmp_path / "devices.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    assert vault.verify(ghost_token) is None
+    assert vault.verify(normal_token) is not None
+
+    labels = sorted(d.label for d in vault.devices())
+    assert labels == ["normal"]  # the ghost entry drops out of listing too
+    assert vault.revoke(ghost_id) is True  # still administrable by raw id
+
+
 def test_entry_missing_device_id_fails_closed_everywhere(tmp_path):
     vault = TokenVault(tmp_path)
     token = vault.issue("studio", frozenset({Capability.CHAT}))

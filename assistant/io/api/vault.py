@@ -197,14 +197,30 @@ class TokenVault:
         _restrict_to_current_user(path)
 
     def _parse_device(self, entry: object) -> Device | None:
-        """Fail closed: a malformed record is treated as absent, not trusted."""
+        """Fail closed: a malformed record is treated as absent, not trusted.
+
+        An empty `grants` list is malformed in the same sense an unknown
+        capability string is: `issue()` refuses to create one, so the only
+        way one reaches here is a hand-edited devices.json. Treated the same
+        way -- caught below, logged, no `Device` returned -- rather than
+        parsing cleanly into a `Device(grants=frozenset())` that `verify()`
+        would then hand to `authenticate()` unchanged. `devices()` calls this
+        too, so a zero-grant entry drops out of the admin listing exactly
+        like an unknown-capability one does -- but `revoke()` matches on the
+        raw dict's device_id without going through this method, so an
+        operator who reads devices.json directly can still find and revoke
+        it by id even though it no longer verifies or lists.
+        """
         if not isinstance(entry, dict):
             return None
         try:
+            grants = frozenset(Capability(g) for g in entry["grants"])
+            if not grants:
+                raise ValueError("device has no grants")
             return Device(
                 device_id=entry["device_id"],
                 label=entry["label"],
-                grants=frozenset(Capability(g) for g in entry["grants"]),
+                grants=grants,
                 created_at=entry["created_at"],
             )
         except (KeyError, TypeError, ValueError) as exc:
