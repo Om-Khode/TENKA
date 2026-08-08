@@ -106,6 +106,62 @@ async def test_cancelling_the_serve_task_actually_releases_the_port(tmp_path):
         probe.close()
 
 
+@pytest.mark.asyncio
+async def test_shutdown_revokes_devices_and_eventually_frees_the_port(tmp_path):
+    """Drives `server.shutdown()` itself -- the entry point callers actually
+    use -- on a real started daemon, not a hand-rolled cancel-and-await that
+    only mimics it. Two halves, proven in the order `shutdown()`'s own
+    docstring documents as required:
+
+    Device revocation is synchronous: `vault.reset()` runs inline inside
+    `shutdown()`, so it holds the instant the call returns, no `await`
+    needed. Port release is not: `shutdown()` only calls `task.cancel()`,
+    which *schedules* cancellation -- `_run()`'s own cleanup (the
+    `await server.shutdown()` that actually closes the listening socket)
+    still has to run on the event loop. Checked directly: calling
+    `server.shutdown()` and probing the port with no intervening `await` at
+    all shows it still bound (confirmed manually while writing this test,
+    not asserted here as a permanent regression case, since a test that
+    must observe a race is not one this suite should depend on timing to
+    pass). What this test proves is the guarantee that actually matters and
+    that `main.py` actually relies on: after giving the task the one
+    `await` its own cancellation needs, both halves hold.
+    """
+    import asyncio
+    import contextlib
+    import socket
+
+    from assistant.io.api import server
+    from assistant.io.api.vault import Capability, TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    port = 8933
+    vault = TokenVault(tmp_path)
+    vault.issue("studio", frozenset(Capability))
+    task = server.serve(build_fake_runtime(), vault, host="127.0.0.1", port=port,
+                        origins=["http://localhost:3000"])
+    await asyncio.sleep(0.2)
+
+    server.shutdown(task, vault)
+
+    # Half one: revocation, synchronous, already true.
+    assert vault.devices() == []
+
+    # Half two: port release, scheduled by shutdown()'s task.cancel() but
+    # not yet run -- give the task the turn its own cleanup needs.
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.1)
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        pytest.fail(f"port {port} is still bound after shutdown(): {exc}")
+    finally:
+        probe.close()
+
+
 def test_the_exporter_writes_a_schema(tmp_path):
     import json
     import subprocess

@@ -64,10 +64,30 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
 
 
 def shutdown(task: asyncio.Task | None, vault: TokenVault) -> None:
-    """Stop serving and invalidate every device.
+    """Invalidate every device immediately; stop serving on the next tick.
 
     Rotating the instance secret is what makes this a kill switch rather than a
     pause: a token handed out before the switch is thrown never works again.
+    That half of the contract is synchronous and holds the instant this
+    function returns -- `vault.reset()` runs inline, no event-loop turn
+    needed.
+
+    The other half is not synchronous. `task.cancel()` only *schedules*
+    cancellation; it does not run `_run()`'s except-CancelledError cleanup
+    (the `await server.shutdown()` that actually closes the listening
+    socket -- see `serve()` above). This function stays `-> None` rather
+    than `async def` because a synchronous kill switch that a signal handler
+    or a non-async call site can fire without ceremony is worth more than a
+    guarantee this function alone cannot keep anyway: `shutdown()` never
+    awaits anything, on any signature, without a caller who can await it in
+    turn. Concretely, a caller that needs the port provably free right
+    after calling this must give the event loop a turn first -- either
+    `await task` (as `main.py`'s `_stop_studio_daemon` already does, before
+    it ever calls this function) or an `await asyncio.sleep(0)` at minimum.
+    Checking the port with no intervening `await` at all will see it still
+    bound. `tests/test_api_server_lifecycle.py::
+    test_shutdown_revokes_devices_and_eventually_frees_the_port` pins both
+    halves against a real socket, in the correct order.
     """
     if task is not None:
         task.cancel()

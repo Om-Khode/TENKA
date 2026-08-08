@@ -109,11 +109,41 @@ def test_the_audit_log_needs_system_control(context):
     assert client.get("/v1/audit", headers=head(tokens["chat"])).status_code == 403
 
 
-def test_the_audit_log_never_holds_a_token(context):
+def test_the_audit_log_records_the_path_without_its_query_string(context):
+    """Corrected from the brief's `test_the_audit_log_never_holds_a_token`,
+    which asserted the token wasn't in the *response body* -- a property
+    that holds whether `redact_secrets` works, is a no-op, or is deleted
+    entirely. Starlette parses a query string into `request.url.query`,
+    never `.path`, and the audit middleware only ever records `.path` --
+    there was never anything here for `redact_secrets` to strip, so the
+    original assertion passed for a reason that had nothing to do with
+    redaction. This pins the real, structural mechanism instead: a token
+    riding the query string never reaches the recorded path at all.
+    """
     client, _, tokens = context
     client.get(f"/v1/status?access_token={tokens['full']}", headers=head(tokens["full"]))
-    body = client.get("/v1/audit", headers=head(tokens["full"])).text
-    assert tokens["full"] not in body
+    entries = client.get("/v1/audit", headers=head(tokens["full"])).json()["data"]["entries"]
+    match = next(e for e in entries
+                 if e["method"] == "GET" and e["path"] == "/v1/status" and e["outcome"] == "200")
+    assert "access_token" not in match["path"]
+    assert tokens["full"] not in match["path"]
+
+
+def test_a_secret_shaped_path_segment_is_redacted_in_the_audit_log(context):
+    """Where `redact_secrets` genuinely earns its place in the audit
+    middleware: a path *parameter* -- unlike a query string -- really does
+    reach `request.url.path`. A high-entropy item_id (mixed case + digits,
+    24+ chars, shaped like `_BARE` in core/redact.py) must not survive into
+    the logged path.
+    """
+    client, _, tokens = context
+    secret_shaped = "AbCdEfGh12345678ZzYyXxWw"
+    client.delete(f"/v1/memory/knowledge/{secret_shaped}", headers=head(tokens["full"]))
+    entries = client.get("/v1/audit", headers=head(tokens["full"])).json()["data"]["entries"]
+    match = next(e for e in entries
+                 if e["method"] == "DELETE" and e["path"].startswith("/v1/memory/knowledge/"))
+    assert secret_shaped not in match["path"]
+    assert "[REDACTED]" in match["path"]
 
 
 # ─── kill switch ─────────────────────────────────────────────────────────
