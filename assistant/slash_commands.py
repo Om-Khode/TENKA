@@ -22,7 +22,7 @@ from typing import Optional
 from . import config, settings
 
 
-RESERVED = {"help", "config", "set", "reset", "compress", "promote"}
+RESERVED = {"help", "config", "set", "reset", "compress", "promote", "studio"}
 
 
 # ─── Background task strong-refs ───────────────────────────────────────────
@@ -40,6 +40,9 @@ HELP_TEXT = """Runtime config commands:
   /reset <key>               — revert to default
   /compress                  — compress conversation history
   /promote                   — trigger a manifest-based promotion cycle (background)
+  /studio devices            — list Studio device tokens
+  /studio revoke <device_id> — revoke one Studio device
+  /studio revoke all confirm — revoke every Studio device (re-pairing required)
   /help                      — this message
 
 Shortcuts:
@@ -89,6 +92,9 @@ def handle(text: str) -> str:
 
     if cmd == "promote":
         return _promote_me1()
+
+    if cmd == "studio":
+        return _studio_command(parts[1:])
 
     # Shortcut form: /<key> [value]
     key = cmd
@@ -240,6 +246,97 @@ def _promote_me1() -> str:
         )
         return f"manifest-based promotion scheduling failed: {e}"
     return "manifest-based promotion cycle scheduled. Results will be logged."
+
+
+# ─── Studio device revocation ──────────────────────────────────────────────
+# Local-only: revocation deliberately has no HTTP route. A route behind
+# `system_control` would be reachable by the very token being revoked
+# (Milestone 5 issues one token holding every grant), and pairing's trust
+# anchor -- "you are physically at the desktop" -- should be the same
+# anchor revocation rests on. See the Milestone 5/6 design docs for the
+# full reasoning. Per-device revocation from a *paired phone's* own view
+# belongs to the future pairing UI (Milestone 6), not here.
+
+_STUDIO_USAGE = (
+    "Usage:\n"
+    "  /studio devices              — list issued Studio device tokens\n"
+    "  /studio revoke <device_id>   — revoke one device\n"
+    "  /studio revoke all confirm   — revoke every device (rotates the "
+    "instance secret; every paired device must be re-paired)"
+)
+
+
+def _studio_vault():
+    """A fresh TokenVault over the real vault root.
+
+    Deferred import: `io/` follows the codebase convention of importing
+    inside the function, not at module top (see `from ..io.audio import
+    tts`). Constructing a new instance per call -- rather than reaching
+    into `assistant.main`'s running daemon -- means `/studio` works
+    whether or not the Studio daemon happens to be running right now, and
+    keeps this command testable against an isolated vault root without
+    touching the live assistant process.
+    """
+    from .io.api.vault import TokenVault
+    return TokenVault(config.SANDBOX_DIR)
+
+
+def _studio_command(args: list) -> str:
+    if not args:
+        return _STUDIO_USAGE
+    sub = args[0].lower()
+    if sub == "devices":
+        return _studio_list_devices()
+    if sub == "revoke":
+        return _studio_revoke(args[1] if len(args) > 1 else "")
+    return _STUDIO_USAGE
+
+
+def _studio_list_devices() -> str:
+    vault = _studio_vault()
+    devices = vault.devices()
+    if not devices:
+        return "No Studio devices issued."
+
+    lines = ["Studio devices:"]
+    for device in sorted(devices, key=lambda d: d.created_at):
+        grants = ", ".join(sorted(g.value for g in device.grants))
+        lines.append(
+            f"  {device.device_id}  {device.label!r}  [{grants}]  "
+            f"created {device.created_at}"
+        )
+    return "\n".join(lines)
+
+
+def _studio_revoke(raw_target: str) -> str:
+    vault = _studio_vault()
+    tokens = raw_target.split()
+    if not tokens:
+        return _STUDIO_USAGE
+
+    if tokens[0].lower() == "all":
+        if len(tokens) == 1:
+            return (
+                "Revoking all devices rotates the instance secret and is "
+                "irreversible: every paired device (phone, browser, anything "
+                "holding a Studio token) stops working immediately and must "
+                "be re-paired from scratch. To proceed: /studio revoke all confirm"
+            )
+        if len(tokens) == 2 and tokens[1].lower() == "confirm":
+            vault.reset()
+            return (
+                "All Studio devices revoked -- instance secret rotated. "
+                "Every previously issued token is now invalid; re-pair each device."
+            )
+        return _STUDIO_USAGE
+
+    if len(tokens) > 1:
+        return _STUDIO_USAGE
+
+    device_id = tokens[0]
+    if vault.revoke(device_id):
+        return f"Revoked Studio device {device_id}."
+    return f"No Studio device found with id {device_id!r} -- nothing was revoked."
 
 
 # ─── Mutators ────────────────────────────────────────────────────────────────

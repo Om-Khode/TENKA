@@ -147,6 +147,8 @@ Any frontend can connect. The reference implementation is the **Mate Engine** Un
 
 A messaging bridge listens on port 7780 (HTTP) for adapter integrations (e.g. WhatsApp).
 
+**TENKA Studio** (`assistant/io/api/`) is a loopback-only companion API: devices pair once and hold a token, hashed (never stored in plaintext) in `~/TENKA/devices.json`. Manage pairings from the assistant itself — `/studio devices` lists what's issued, `/studio revoke <device_id>` revokes one, `/studio revoke all confirm` rotates the instance secret and revokes everything at once (every device must then re-pair). Revocation is a local slash command, not an HTTP route, on purpose — it shouldn't be reachable by the token it's revoking. If TENKA itself won't start, or you'd rather reset by hand, delete `~/TENKA/devices.json` (and `~/TENKA/instance_secret` to also rotate the secret) — the daemon rebuilds both from scratch on next launch.
+
 ---
 
 ## Project layout
