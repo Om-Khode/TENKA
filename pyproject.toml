@@ -66,3 +66,15 @@ name = "Overlay never imports actions or automation"
 type = "forbidden"
 source_modules = ["assistant.io.overlay"]
 forbidden_modules = ["assistant.actions", "assistant.automation"]
+
+[[tool.importlinter.contracts]]
+name = "io.api never reaches past core and config"
+type = "forbidden"
+source_modules = ["assistant.io.api"]
+forbidden_modules = [
+    "assistant.storage",
+    "assistant.actions",
+    "assistant.automation",
+    "assistant.llm",
+    "assistant.main",
+]
