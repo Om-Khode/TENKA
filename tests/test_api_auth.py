@@ -1,8 +1,10 @@
 """Nothing is reachable without a token. Not even status."""
 import pytest
+from fastapi import APIRouter, Depends
 from fastapi.testclient import TestClient
 
 from assistant.io.api.app import create_app
+from assistant.io.api.security import require
 from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.studio_runtime import build_fake_runtime
 
@@ -77,30 +79,98 @@ def test_a_token_in_the_query_string_does_not_work(client, token):
     assert client.get(f"/v1/status?token={token}").status_code == 401
 
 
-def test_every_registered_route_rejects_an_anonymous_call(client):
-    from starlette.routing import Route
+def _sweep_v1_routes_require_auth(client) -> int:
+    """Call every /v1 route with no token; fail loudly if any answers publicly.
 
+    Enumerated via `app.openapi()` rather than `app.routes`: FastAPI's
+    `include_router` does not always append flat routes to `app.routes` --
+    0.141.1 wraps an included router in an internal `_IncludedRouter` node
+    that is a `BaseRoute` but not a `Route`/`APIRoute`, so a sweep that does
+    `isinstance(route, Route)` over `app.routes` silently finds nothing for
+    routes registered that way, no matter how they're authenticated. The
+    OpenAPI schema is built by walking the *effective* routes regardless of
+    how they were registered -- it is what /docs would render -- so it can't
+    be dodged by choice of registration call. `openapi_url=None` only
+    disables the public `/openapi.json` endpoint; building the schema
+    in-process via `app.openapi()` still works and exposes nothing over the
+    wire.
+    """
+    schema = client.app.openapi()
     checked = 0
-    for route in client.app.routes:
-        if not isinstance(route, Route) or not route.path.startswith("/v1"):
+    for path, operations in schema.get("paths", {}).items():
+        if not path.startswith("/v1"):
             continue
-        for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
-            response = client.request(method, route.path.replace("{scope}", "knowledge")
-                                              .replace("{conversation_id}", "c1")
-                                              .replace("{item_id}", "k1")
-                                              .replace("{command_id}", "volume_up")
-                                              .replace("{kind}", "voice"))
+        concrete = (path.replace("{scope}", "knowledge")
+                        .replace("{conversation_id}", "c1")
+                        .replace("{item_id}", "k1")
+                        .replace("{command_id}", "volume_up")
+                        .replace("{kind}", "voice"))
+        for method in operations:
+            if method.upper() in ("HEAD", "OPTIONS"):
+                continue
+            response = client.request(method.upper(), concrete)
             assert response.status_code in (401, 403), (
-                f"{method} {route.path} answered {response.status_code} with no token"
+                f"{method.upper()} {path} answered {response.status_code} with no token"
             )
             checked += 1
+    return checked
+
+
+def test_every_registered_route_rejects_an_anonymous_call(client):
+    checked = _sweep_v1_routes_require_auth(client)
     assert checked > 0, "no /v1 routes were checked — the sweep found nothing"
 
 
+def test_the_sweep_catches_a_route_registered_without_auth(vault):
+    """Guard for the sweep itself, not for the app.
+
+    A route added the ordinary `app.include_router()` way -- the exact call
+    every later route module's brief instructs -- with no auth dependency at
+    all, must still be caught. If this test ever fails, the sweep has
+    regressed to something that can be dodged by registration style, which
+    is exactly the gap `_sweep_v1_routes_require_auth` exists to close.
+    """
+    app = create_app(build_fake_runtime(), vault, origins=["http://localhost:3000"])
+
+    leaky = APIRouter()
+
+    @leaky.get("/leaky")
+    async def leaky_handler():
+        return {"ok": True}
+
+    app.include_router(leaky, prefix="/v1")
+    leaky_client = TestClient(app)
+
+    with pytest.raises(AssertionError, match="answered 200"):
+        _sweep_v1_routes_require_auth(leaky_client)
+
+
 def test_a_capability_it_lacks_is_refused(client, vault):
+    """A token that lacks the capability a route requires must be refused.
+
+    `/v1/status` requires CHAT and is the only shipped route, so an
+    all-grants or CHAT-holding token can never exercise `require()`'s 403
+    branch -- the original version of this test issued a CHAT token against
+    the CHAT-gated route and asserted 200, which would pass identically if
+    the capability check were deleted outright. A second, FILES-gated route
+    is mounted here to force the refusal, with a mirror case proving the
+    same route accepts a token that does hold the capability it demands.
+    """
+    probe = APIRouter()
+
+    @probe.get("/probe")
+    async def probe_handler(_=Depends(require(Capability.FILES))):
+        return {"ok": True}
+
+    client.app.include_router(probe, prefix="/v1")
+
     chat_only = vault.issue("phone", frozenset({Capability.CHAT}))
-    response = client.get("/v1/status", headers=auth(chat_only))
-    assert response.status_code == 200
+    refused = client.get("/v1/probe", headers=auth(chat_only))
+    assert refused.status_code == 403
+
+    files_holder = vault.issue("laptop", frozenset({Capability.FILES}))
+    allowed = client.get("/v1/probe", headers=auth(files_holder))
+    assert allowed.status_code == 200
 
 
 def test_openapi_is_not_public(client):

@@ -13,10 +13,9 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.routing import APIRoute
 
 from ...core.redact import redact_secrets
 from .routes import status as status_routes
@@ -26,38 +25,16 @@ from .vault import TokenVault
 
 logger = logging.getLogger(__name__)
 
-
-def _mount(app: FastAPI, router: APIRouter, *, prefix: str) -> None:
-    """Register a route module's routes directly on `app`, flat.
-
-    `FastAPI.include_router` no longer appends plain routes to `app.routes`;
-    it wraps the whole router in an internal node so nested routers can share
-    one prefix/dependency context. That is fine for dispatch, but it means
-    `app.routes` is no longer a flat, introspectable list of real routes --
-    which breaks anything that walks it looking for every registered path,
-    including this daemon's own route-sweep test (`test_api_auth.py`,
-    `test_every_registered_route_rejects_an_anonymous_call`), and that sweep
-    is exactly what keeps a future route from shipping unauthenticated.
-    Registering each route directly with the prefix baked into its path
-    keeps `app.routes` flat while dispatch behaves identically.
-    """
-    for route in router.routes:
-        if not isinstance(route, APIRoute):
-            continue
-        app.add_api_route(
-            prefix + route.path,
-            route.endpoint,
-            methods=list(route.methods),
-            name=route.name,
-            response_model=route.response_model,
-            status_code=route.status_code,
-            tags=route.tags,
-            dependencies=route.dependencies,
-            summary=route.summary,
-            description=route.description,
-            deprecated=route.deprecated,
-            include_in_schema=route.include_in_schema,
-        )
+# Route modules are mounted with plain `include_router` -- the call every
+# later route module's brief in this milestone instructs. An earlier
+# revision of this file bypassed it with a bespoke `_mount()` helper to work
+# around FastAPI 0.141.1 wrapping included routers in an internal
+# `_IncludedRouter` node that isn't a flat `Route`, which made a naive
+# `app.routes` sweep in the auth test see nothing. That was fixing the wrong
+# layer: the sweep in tests/test_api_auth.py now walks `app.openapi()`'s
+# resolved paths instead, which is correct regardless of how a router was
+# registered. Keeping a bespoke mount here would only mean the next nine
+# tasks' briefs and the code they edit no longer match.
 
 
 def create_app(runtime: StudioRuntime, vault: TokenVault, *,
@@ -107,5 +84,5 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     async def not_found(_request: Request, _exc) -> JSONResponse:
         return JSONResponse(status_code=404, content={"error": "not found"})
 
-    _mount(app, status_routes.router, prefix="/v1")
+    app.include_router(status_routes.router, prefix="/v1")
     return app
