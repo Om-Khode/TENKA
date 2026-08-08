@@ -232,6 +232,15 @@ class EnrolledItem:
     item_id: str
     name: str
     enrolled_at: str
+    # Deliberately one generic field, not "encoding_count" for faces and
+    # "sample_count" for voices -- the panel renders both kinds the same
+    # way. None means the assistant has no accessor for this item's count
+    # (speaker_verify exposes none today); a real 0 would be a wrong fact
+    # stated confidently about an enrollment that plainly exists.
+    count: int | None = None
+    # Last time this item was recognised/heard, if the assistant tracks
+    # one. "" means it genuinely doesn't know, not "never".
+    last_seen_at: str = ""
 
 
 @dataclass(frozen=True)

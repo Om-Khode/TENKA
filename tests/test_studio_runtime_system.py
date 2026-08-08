@@ -1,6 +1,7 @@
 """Files, commands and system — with confinement proven, not asserted."""
 import pytest
 
+from assistant.actions import studio_runtime_system as srs
 from assistant.actions.studio_runtime_system import (
     LiveCommandRuntime, LiveFileRuntime, resolve_within,
 )
@@ -171,3 +172,141 @@ class TestBackupStateAccessor:
             "last_result": "success",
             "size_bytes": 18432112,
         }
+
+
+# ─── Review fix 1: a bare root is not a valid delete/rename target ────────
+# is_protected_path() guards Windows/Program Files/drive roots, never these
+# three user-data roots -- nothing downstream catches delete("desktop") on
+# its own. The guard must raise before any real filesystem call, which is
+# exactly why these are safe to run for real: _resolve() (inside the
+# to_thread call) raises ValueError before _delete_sync/_rename_sync ever run.
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_name", ["desktop", "documents", "downloads"])
+async def test_deleting_a_root_itself_is_refused(root_name):
+    with pytest.raises(ValueError):
+        await LiveFileRuntime().delete(root_name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_name", ["desktop", "documents", "downloads"])
+async def test_renaming_a_root_itself_is_refused(root_name):
+    with pytest.raises(ValueError):
+        await LiveFileRuntime().rename(root_name, "x")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_name", ["desktop", "documents", "downloads"])
+async def test_deleting_a_path_that_traverses_back_to_root_is_refused(root_name):
+    with pytest.raises(ValueError):
+        await LiveFileRuntime().delete(f"{root_name}/sub/..")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("root_name", ["desktop", "documents", "downloads"])
+async def test_renaming_a_path_that_traverses_back_to_root_is_refused(root_name):
+    with pytest.raises(ValueError):
+        await LiveFileRuntime().rename(f"{root_name}/sub/..", "x")
+
+
+@pytest.mark.asyncio
+async def test_listing_a_bare_root_is_still_allowed():
+    """listing() is the one caller that legitimately means the root itself --
+    it's how the client shows the top level of "desktop" at all."""
+    entries = await LiveFileRuntime().listing("desktop")
+    assert isinstance(entries, list)
+
+
+# ─── Review fix 2: read() is bounded for every content kind ───────────────
+# No test in the original suite called read() at all. _MAX_PREVIEW_BYTES is
+# monkeypatched small so "oversized" doesn't require gigabyte fixtures --
+# the mechanism under test is "does the cap apply", not "how big is default".
+@pytest.mark.parametrize("suffix,write", [
+    (".txt", lambda p: p.write_text("x" * 1000, encoding="utf-8")),
+    (".py", lambda p: p.write_text("y" * 1000, encoding="utf-8")),
+])
+def test_read_caps_text_and_code_previews(tmp_path, monkeypatch, suffix, write):
+    monkeypatch.setattr(srs, "_MAX_PREVIEW_BYTES", 100)
+    target = tmp_path / f"big{suffix}"
+    write(target)
+    content = LiveFileRuntime._read_sync(f"desktop/big{suffix}", target)
+    assert content.truncated is True
+    assert len(content.text) == 100
+
+
+def test_read_caps_an_image_preview_without_reading_the_bytes_at_all(tmp_path, monkeypatch):
+    monkeypatch.setattr(srs, "_MAX_PREVIEW_BYTES", 100)
+    target = tmp_path / "big.png"
+    target.write_bytes(b"\x89PNG" + b"0" * 1000)
+    content = LiveFileRuntime._read_sync("desktop/big.png", target)
+    assert content.truncated is True
+    assert content.text == ""  # size check short-circuits before read_bytes()
+
+
+def test_read_of_a_formerly_unbounded_readable_extension_is_now_capped(tmp_path, monkeypatch):
+    """.env used to fall through _classify() to "binary", which delegated to
+    file_manager.read_file()'s unbounded path.read_text(). It is classified
+    as "text" now, so it takes the same capped path.open().read(cap) as any
+    other text file -- this is the exact gap the review flagged."""
+    monkeypatch.setattr(srs, "_MAX_PREVIEW_BYTES", 100)
+    target = tmp_path / "secrets.env"
+    target.write_text("z" * 1000, encoding="utf-8")
+    content = LiveFileRuntime._read_sync("desktop/secrets.env", target)
+    assert content.content_kind == "text"
+    assert content.truncated is True
+    assert len(content.text) == 100
+
+
+def test_read_of_a_binary_extension_never_reads_the_whole_file(tmp_path):
+    """.dat is neither a READABLE_EXTENSIONS suffix nor a rich document --
+    file_manager.read_file() returns a short "can't read" message without
+    calling read_text() at all, so this path is bounded independent of file
+    size (no monkeypatched cap needed to prove it)."""
+    target = tmp_path / "blob.dat"
+    target.write_bytes(b"\x00" * 2000)
+    content = LiveFileRuntime._read_sync("desktop/blob.dat", target)
+    assert content.content_kind == "binary"
+    assert len(content.text) < 200
+
+
+# ─── Review fix 3: lock_workstation reports what Win32 actually returned ──
+# ctypes.windll is replaced wholesale with a fake before any call -- the real
+# Win32 API is never reached, so this does not execute the command the
+# task's dispatch prohibits. Only lock_workstation is exercised: it is the
+# one branch with a documented, checkable return value (LockWorkStation is a
+# BOOL; keybd_event is VOID and has nothing to check -- see the source
+# comment). volume_up/down and screenshot are never invoked by these tests.
+class _FakeUser32:
+    def __init__(self, lock_result: int) -> None:
+        self._lock_result = lock_result
+        self.lock_calls = 0
+
+    def LockWorkStation(self):
+        self.lock_calls += 1
+        return self._lock_result
+
+
+class _FakeWindll:
+    def __init__(self, user32) -> None:
+        self.user32 = user32
+
+
+def test_lock_workstation_reports_failure_when_win32_returns_zero(monkeypatch):
+    import ctypes
+    fake_user32 = _FakeUser32(lock_result=0)
+    monkeypatch.setattr(ctypes, "windll", _FakeWindll(fake_user32))
+
+    outcome = LiveCommandRuntime._run_sync("lock_workstation")
+
+    assert outcome.ok is False
+    assert fake_user32.lock_calls == 1
+
+
+def test_lock_workstation_reports_success_when_win32_returns_nonzero(monkeypatch):
+    import ctypes
+    fake_user32 = _FakeUser32(lock_result=1)
+    monkeypatch.setattr(ctypes, "windll", _FakeWindll(fake_user32))
+
+    outcome = LiveCommandRuntime._run_sync("lock_workstation")
+
+    assert outcome.ok is True
+    assert fake_user32.lock_calls == 1

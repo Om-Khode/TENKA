@@ -67,11 +67,22 @@ def resolve_within(root_path: Path, relative_path: str) -> Path:
     return candidate
 
 
-_TEXT_SUFFIXES = {".md", ".txt", ".log", ".csv", ".json", ".yaml", ".yml", ".ini"}
+# Every extension file_manager.READABLE_EXTENSIONS accepts must land in one
+# of these two sets, not the "binary" default -- read_file()'s plain-text
+# fallback for a READABLE_EXTENSIONS suffix is an unbounded path.read_text(),
+# and only MAX_PREVIEW_BYTES-capped _classify branches (text/code/image) read
+# through the bounded path in _read_sync below. Missing one here means a
+# large file of that type gets read into memory whole before truncation --
+# exactly the memory spike the bounded read exists to avoid.
+_TEXT_SUFFIXES = {
+    ".md", ".txt", ".log", ".csv", ".json", ".yaml", ".yml", ".ini",
+    ".cfg", ".env", ".rst",
+}
 _CODE_SUFFIXES = {
     ".py": "python", ".ts": "typescript", ".tsx": "tsx", ".js": "javascript",
-    ".jsx": "jsx", ".css": "css", ".html": "html", ".sh": "bash", ".sql": "sql",
-    ".rs": "rust", ".go": "go", ".java": "java", ".toml": "toml",
+    ".jsx": "jsx", ".css": "css", ".html": "html", ".htm": "html",
+    ".sh": "bash", ".sql": "sql", ".rs": "rust", ".go": "go", ".java": "java",
+    ".toml": "toml", ".xml": "xml", ".bat": "bat",
 }
 _IMAGE_SUFFIXES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                    ".gif": "image/gif", ".webp": "image/webp"}
@@ -92,14 +103,36 @@ def _classify(path: Path) -> tuple[str, str]:
 
 class LiveFileRuntime:
     """Path-keyed: "desktop" and "desktop/captures" are both listable, and a
-    node's id is its path, which is what the client's breadcrumb splits."""
+    node's id is its path, which is what the client's breadcrumb splits.
+
+    Every method below does its path resolution *inside* the to_thread call,
+    not before it: file_manager.get_user_folder() is a shell32 COM call with
+    a filesystem-probing fallback, and resolve_within() calls Path.resolve(),
+    a syscall. Both are blocking I/O; running either one directly on the
+    caller's coroutine would block the assistant's event loop for as long as
+    they take, the same rule Task 7 has a test for on the settings/memory
+    facades.
+    """
 
     async def roots(self) -> list[str]:
         return sorted(_ROOTS)
 
     @staticmethod
-    def _resolve(path: str) -> tuple[str, Path]:
-        """Split "<root>/<rest>" into its root name and its real absolute path."""
+    def _resolve(path: str, *, allow_bare_root: bool = False) -> tuple[str, Path]:
+        """Split "<root>/<rest>" into its root name and its real absolute path.
+
+        allow_bare_root=False (the default, and every caller except
+        listing()) refuses a path that names the root directory itself --
+        directly ("desktop") or via a traversal that cancels back down to it
+        ("desktop/sub/.."; resolve_within's own containment check already
+        catches this shape once there is a non-empty rest, since the
+        resolved candidate equals root_real). Without this, delete("desktop")
+        sends the user's entire Desktop to the Recycle Bin in one call, and
+        rename("desktop", "x") renames the folder out from under every other
+        listing -- file_manager.is_protected_path() guards Windows, Program
+        Files and drive roots, never these three user-data roots, so nothing
+        downstream catches this on its own.
+        """
         if not isinstance(path, str) or not path.strip():
             raise ValueError("empty path")
         normalised = path.replace("\\", "/").strip("/")
@@ -109,12 +142,18 @@ class LiveFileRuntime:
         from .. import file_manager
         root_path = file_manager.get_user_folder(root)
         if not rest:
+            if not allow_bare_root:
+                raise ValueError(f"path must not be the root itself: {path}")
             return (root, Path(root_path).resolve(strict=False))
         return (root, resolve_within(root_path, rest))
 
     async def listing(self, path: str) -> list[FileEntry]:
-        root, target = self._resolve(path)
-        return await asyncio.to_thread(self._listing_sync, root, target)
+        return await asyncio.to_thread(self._listing_thread, path)
+
+    @classmethod
+    def _listing_thread(cls, path: str) -> list[FileEntry]:
+        root, target = cls._resolve(path, allow_bare_root=True)
+        return cls._listing_sync(root, target)
 
     @staticmethod
     def _listing_sync(root: str, target: Path) -> list[FileEntry]:
@@ -136,8 +175,12 @@ class LiveFileRuntime:
         return entries
 
     async def read(self, path: str) -> FileContent:
-        _root, target = self._resolve(path)
-        return await asyncio.to_thread(self._read_sync, path, target)
+        return await asyncio.to_thread(self._read_thread, path)
+
+    @classmethod
+    def _read_thread(cls, path: str) -> FileContent:
+        _root, target = cls._resolve(path)
+        return cls._read_sync(path, target)
 
     @staticmethod
     def _read_sync(path: str, target: Path) -> FileContent:
@@ -153,8 +196,14 @@ class LiveFileRuntime:
             return FileContent(path, "image", f"data:{mime};base64,{encoded}")
 
         if content_kind == "binary":
-            # file_manager.read_file already extracts text from documents; if it
-            # cannot, the client renders "no preview" from an empty body.
+            # Every plain-text READABLE_EXTENSIONS suffix is classified as
+            # "text" or "code" above and never reaches here -- this branch is
+            # now only rich documents (file_manager's own extractors: pypdf /
+            # python-docx / openpyxl / python-pptx, each already bounded by
+            # MAX_READ_CHARS after parsing) and genuinely unreadable
+            # extensions, for which read_file() returns a short message
+            # without reading the file at all. Neither does an unbounded
+            # plain read_text() the way the six-suffix gap used to.
             from .. import file_manager
             try:
                 text = file_manager.read_file(target)
@@ -175,8 +224,12 @@ class LiveFileRuntime:
     async def rename(self, path: str, new_name: str) -> FileEntry:
         if "/" in new_name or "\\" in new_name or new_name in (".", ".."):
             raise ValueError("new name must be a bare file name")
-        root, target = self._resolve(path)
-        return await asyncio.to_thread(self._rename_sync, root, target, new_name)
+        return await asyncio.to_thread(self._rename_thread, path, new_name)
+
+    @classmethod
+    def _rename_thread(cls, path: str, new_name: str) -> FileEntry:
+        root, target = cls._resolve(path)
+        return cls._rename_sync(root, target, new_name)
 
     @staticmethod
     def _rename_sync(root: str, target: Path, new_name: str) -> FileEntry:
@@ -196,8 +249,12 @@ class LiveFileRuntime:
         )
 
     async def delete(self, path: str) -> bool:
-        _root, target = self._resolve(path)
-        return await asyncio.to_thread(self._delete_sync, target)
+        return await asyncio.to_thread(self._delete_thread, path)
+
+    @classmethod
+    def _delete_thread(cls, path: str) -> bool:
+        _root, target = cls._resolve(path)
+        return cls._delete_sync(target)
 
     @staticmethod
     def _delete_sync(target: Path) -> bool:
@@ -241,9 +298,21 @@ class LiveCommandRuntime:
     def _run_sync(command_id: str) -> CommandOutcome:
         import ctypes
         if command_id == "lock_workstation":
-            ctypes.windll.user32.LockWorkStation()
-            return CommandOutcome(True, "locked")
+            # LockWorkStation is documented to return a nonzero BOOL on
+            # success and 0 on failure (call GetLastError for why) --
+            # unlike keybd_event below, it actually has a checkable failure
+            # signal. This command is destructive=True in the catalogue;
+            # reporting "locked" without checking it would be a false
+            # positive on a security-relevant action.
+            ok = bool(ctypes.windll.user32.LockWorkStation())
+            return CommandOutcome(ok, "locked" if ok else "lock failed")
         if command_id in ("volume_up", "volume_down"):
+            # keybd_event is documented VOID -- Win32 gives it no return
+            # value to check at all (unlike LockWorkStation above), so there
+            # is nothing honest to verify here without switching to the
+            # Core Audio API (IAudioEndpointVolume), which is a bigger
+            # change than this fix. Flagged in the task report rather than
+            # fabricating a check against a value the API doesn't provide.
             key = 0xAF if command_id == "volume_up" else 0xAE
             ctypes.windll.user32.keybd_event(key, 0, 0, 0)
             ctypes.windll.user32.keybd_event(key, 0, 2, 0)
@@ -344,13 +413,27 @@ class LiveSystemRuntime:
     def _enrollment_sync() -> EnrollmentState:
         from .. import faces
         from ..io.audio import speaker_verify
-        voices = [EnrolledItem("primary", "primary", "")] if speaker_verify.is_enrolled() else []
+        # speaker_verify exposes is_enrolled()/clear_enrollment() only -- no
+        # public accessor for a sample count or a last-heard timestamp
+        # (_enrolled_embeddings is module-private). count=None and
+        # last_seen_at="" are the honest values, not zeros: a real "0
+        # samples" would misstate an enrollment that plainly exists.
+        voices = (
+            [EnrolledItem("primary", "primary", "", count=None, last_seen_at="")]
+            if speaker_verify.is_enrolled() else []
+        )
         known = [
             # faces.load_encodings() entries key their enrollment date as
             # "added" (and "updated"), not "added_at" -- there is no
-            # "added_at" key anywhere in faces.py.
+            # "added_at" key anywhere in faces.py. encoding_count() is a
+            # real public accessor; "updated" (last time this person's
+            # stored encoding set changed) is the closest honest signal for
+            # "last seen" that exists -- there is no live-recognition log to
+            # draw an exact one from.
             EnrolledItem(entry.get("name", ""), entry.get("name", ""),
-                        str(entry.get("added", "")))
+                        str(entry.get("added", "")),
+                        count=faces.encoding_count(entry.get("name", "")),
+                        last_seen_at=str(entry.get("updated", "")))
             for entry in faces.load_encodings()
         ]
         seen, unique = set(), []

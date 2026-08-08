@@ -294,8 +294,10 @@ class FakeSystemRuntime:
         self.restored_with: list[str] = []
         self._backup = BackupState(True, "google_drive", "2026-08-07T04:00:00Z", "ok", 18_432_112)
         self._enrollment = EnrollmentState(
-            voices=[EnrolledItem("v1", "primary", "2026-07-01T08:00:00Z")],
-            faces=[EnrolledItem("f1", "Om", "2026-07-03T19:20:00Z")],
+            voices=[EnrolledItem("v1", "primary", "2026-07-01T08:00:00Z",
+                                 count=6, last_seen_at="2026-08-07T22:10:00Z")],
+            faces=[EnrolledItem("f1", "Om", "2026-07-03T19:20:00Z",
+                                count=14, last_seen_at="2026-08-06T21:24:00Z")],
         )
 
     async def status(self) -> StatusInfo:
