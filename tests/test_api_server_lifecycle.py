@@ -29,24 +29,44 @@ def test_main_starts_it_only_behind_the_flag():
     assert any("if" in line for line in guard_line), "the flag is read but not guarded on"
 
 
-def test_main_wires_the_kill_switch_behind_the_same_flag():
-    """The kill switch (server.shutdown) has to actually run at shutdown, or
-    a stopped daemon is a pause, not a revocation. Guarded the same way
-    startup is: `config.STUDIO_API_ENABLED` must appear on a line at or
-    before the call, within the same shutdown block, not merely somewhere
-    else in the file (that would already pass thanks to the startup guard).
+def test_a_normal_shutdown_does_not_call_the_kill_switch():
+    """Reversed from the original version of this test, which required
+    server.shutdown() (the kill switch that rotates the instance secret via
+    vault.reset()) to fire unconditionally at shutdown. That was backwards:
+    this block runs on every *orderly* exit -- Ctrl+C, the "shutdown" voice
+    intent, an exception unwinding through the surrounding `finally` -- so
+    calling the kill switch there meant a phone paired yesterday had to be
+    re-paired after every ordinary restart, and the token meant to print
+    once, at first pairing, printed on every boot. Only `_stop_studio_daemon`
+    (stop serving, never touch the vault) belongs in this block now;
+    server.shutdown/shutdown_studio_api must not appear in it at all.
     """
     source = pathlib.Path("assistant/main.py").read_text(encoding="utf-8")
-    call = "shutdown_studio_api(_studio_task, _studio_vault)"
-    assert call in source, "main.py never calls the kill switch at shutdown"
-    idx = source.index(call)
-    window = source[max(0, idx - 700):idx]
-    assert "config.STUDIO_API_ENABLED" in window, (
-        "the kill switch call is not visibly guarded by the same flag as startup"
+    marker = "# ─── Studio daemon shutdown"
+    idx = source.index(marker)
+    # Up to the next top-level section marker (or a generous window if this
+    # is the last one in the function) -- wide enough to catch the call
+    # wherever in the block it might be reintroduced, narrow enough not to
+    # accidentally match the unrelated bridge-shutdown code right after it.
+    block = source[idx: idx + 2_500]
+    assert "shutdown_studio_api(_studio_task, _studio_vault)" not in block, (
+        "the kill switch must not be called from the normal shutdown path"
     )
-    assert "_studio_vault is not None" in window, (
-        "the kill switch call does not guard against a daemon that never started"
+    assert "_stop_studio_daemon(_studio_task)" in block, (
+        "normal shutdown must still stop serving"
     )
+
+
+def test_the_kill_switch_itself_is_still_fully_defined_and_reachable():
+    """The fix above removes the *automatic* call, not the mechanism. Nothing
+    in this milestone gives server.shutdown() a deliberate trigger yet (a
+    future "revoke every Studio device" admin action would call it
+    explicitly) -- it stays covered by test_api_hardening.py's
+    test_shutdown_revokes_every_device and this file's own
+    test_shutdown_revokes_devices_and_eventually_frees_the_port.
+    """
+    from assistant.io.api import server
+    assert callable(server.shutdown)
 
 
 @pytest.mark.asyncio
@@ -209,23 +229,74 @@ async def test_studio_dispatch_puts_the_shape_the_consumer_loop_expects():
 
 @pytest.mark.asyncio
 async def test_studio_dispatch_refuses_rather_than_queues_a_concurrent_submit():
-    """The single-turn lock: a second submit while the first is still being
-    handled must be refused outright, not queued behind it."""
+    """The single-turn state: two real concurrent submits (asyncio.gather
+    through the actual dispatch, not a hand-held lock standing in for one)
+    must produce exactly one acceptance and one refusal. The original
+    version of this test manually held `dispatch._lock` across an
+    `asyncio.sleep(0.2)` to *simulate* a turn in flight -- a state production
+    code never produced, since submit() itself never awaited between
+    checking and acquiring the lock. There is no lock left to hold: busy is
+    a plain flag now, set the instant a submit is accepted and cleared only
+    by mark_done() (called from process_text_from_queue's own `finally`
+    once a "studio"-sourced turn genuinely finishes) -- proven below by
+    checking it is still refused *before* mark_done() runs, and accepted
+    again only *after*.
+    """
     import asyncio
 
     import assistant.main as m
 
     dispatch = m._StudioDispatch()
 
-    async def _hold_the_lock():
-        async with dispatch._lock:
-            await asyncio.sleep(0.2)
+    results = await asyncio.gather(
+        dispatch.submit("first"), dispatch.submit("second"),
+    )
+    accepted = [r for r in results if r[2] is True]
+    refused = [r for r in results if r[2] is False]
+    assert len(accepted) == 1, f"expected exactly one acceptance, got {results}"
+    assert len(refused) == 1, f"expected exactly one refusal, got {results}"
+    assert refused[0] == ("", "", False, "busy")
 
-    holder = asyncio.create_task(_hold_the_lock())
-    await asyncio.sleep(0.02)  # let the holder actually acquire first
-    turn_id, session_id, accepted, reason = await dispatch.submit("should be refused")
-    assert (turn_id, session_id, accepted, reason) == ("", "", False, "busy")
-    await holder
+    # Still busy: the accepted turn has not finished (mark_done() has not
+    # run) -- a third submit must still be refused.
+    still_busy = await dispatch.submit("third")
+    assert still_busy[2] is False
+
+    dispatch.mark_done()
+    now_free = await dispatch.submit("fourth")
+    assert now_free[2] is True
+
+
+@pytest.mark.asyncio
+async def test_mark_done_is_a_no_op_when_already_idle():
+    import assistant.main as m
+
+    dispatch = m._StudioDispatch()
+    dispatch.mark_done()  # must not raise
+    assert dispatch.busy is False
+
+
+def test_process_text_from_queue_is_wired_to_clear_busy_for_a_studio_turn():
+    """process_text_from_queue is a heavy, real pipeline (intent
+    classification, LLM calls, TTS) -- exercising it end-to-end from a unit
+    test would mean the exact live-runtime/API-spend/audio calls this test
+    suite must not make. Checked structurally instead, the same way this
+    file already pins the startup/shutdown flag-guards: mark_done() must be
+    called from within the function's own `finally` block, gated on
+    `source == "studio"`, not unconditionally (a voice/chat turn never went
+    through _StudioDispatch.submit() in the first place, so it must not
+    clear a flag it never set).
+    """
+    source = pathlib.Path("assistant/main.py").read_text(encoding="utf-8")
+    fn_start = source.index("async def process_text_from_queue(")
+    finally_idx = source.index("\n    finally:", fn_start)
+    finally_block = source[finally_idx: finally_idx + 800]
+    assert "_studio_dispatch.mark_done()" in finally_block, (
+        "process_text_from_queue's finally block does not clear studio's busy flag"
+    )
+    assert 'source == "studio"' in finally_block, (
+        "mark_done() must be gated on source == \"studio\", not unconditional"
+    )
 
 
 @pytest.mark.asyncio
@@ -391,6 +462,35 @@ async def test_a_successful_start_leaves_the_vault_reachable_for_shutdown(tmp_pa
     try:
         assert isinstance(m._studio_vault, TokenVault)
         assert m._studio_vault.devices(), "the studio vault should hold its issued device"
+    finally:
+        await task
+
+
+@pytest.mark.asyncio
+async def test_a_successful_start_leaves_the_dispatch_reachable_too(tmp_path, monkeypatch):
+    """process_text_from_queue's finally block reads module-level
+    `_studio_dispatch` the same way main.py's shutdown site reads
+    `_studio_vault` -- both are locals inside _start_studio_daemon() until
+    this pins that the module-level name actually gets set."""
+    import asyncio
+
+    import assistant.config as config
+    import assistant.main as m
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    async def _noop() -> None:
+        return None
+
+    def _fake_serve(*args, **kwargs):
+        return asyncio.create_task(_noop())
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _fake_serve)
+
+    task = await m._start_studio_daemon()
+    try:
+        assert isinstance(m._studio_dispatch, m._StudioDispatch)
+        assert m._studio_dispatch.busy is False
     finally:
         await task
 
