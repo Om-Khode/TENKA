@@ -24,6 +24,7 @@ from .routes import files as file_routes
 from .routes import memory as memory_routes
 from .routes import settings as settings_routes
 from .routes import status as status_routes
+from .routes import system as system_routes
 from .runtime import StudioRuntime
 from .security import AuditEntry, AuthState
 from .vault import TokenVault
@@ -95,4 +96,5 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     app.include_router(file_routes.router, prefix="/v1")
     app.include_router(command_routes.router, prefix="/v1")
     app.include_router(chat_routes.router, prefix="/v1")
+    app.include_router(system_routes.router, prefix="/v1")
     return app
