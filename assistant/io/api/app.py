@@ -14,6 +14,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -89,6 +90,25 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     @app.exception_handler(404)
     async def not_found(_request: Request, _exc) -> JSONResponse:
         return JSONResponse(status_code=404, content={"error": "not found"})
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_body(_request: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default handler forwards Pydantic's exc.errors() verbatim,
+        # and each error dict carries an "input" key holding the raw
+        # offending value -- for a missing field, the whole body. Left alone,
+        # a 422 becomes the one response guaranteed to print back whatever
+        # was submitted: a recovery phrase, a chat message, a settings value,
+        # a file path, unbounded by anything the field's own validator chose
+        # to bound. Rebuilding the body from `loc` and `type` only -- never
+        # `input`, never `msg` (which for some error types embeds the value
+        # too) -- keeps "where validation failed" without ever repeating
+        # "what was sent". This is app-wide: every route with a bounded field
+        # inherits it, not just the ones the current tests happen to probe.
+        errors = [
+            {"loc": list(error.get("loc", [])), "type": error.get("type", "")}
+            for error in exc.errors()
+        ]
+        return JSONResponse(status_code=422, content={"detail": errors})
 
     app.include_router(status_routes.router, prefix="/v1")
     app.include_router(memory_routes.router, prefix="/v1")

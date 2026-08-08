@@ -2,9 +2,18 @@
 """Telemetry, backup and enrollment.
 
 The recovery phrase is verified here, on the assistant's side. It never ships
-in a client bundle and never appears in a response body -- including the 422
-FastAPI would otherwise echo it into, which is why `RestoreRequest` bounds the
-field's length instead of matching it against a pattern.
+in a client bundle and never appears in a response body. A wrong or malformed
+phrase is a 400 built from a static `detail` string, never the submitted
+value. `RestoreRequest` bounds the field's length rather than matching it
+against a pattern only so a *pattern* violation doesn't read differently from
+a length violation to a caller -- the length bound alone does not, by itself,
+keep the phrase out of a 422: Pydantic's `ValidationError.errors()` carries an
+`"input"` key with the raw value regardless of which check failed, and
+FastAPI's default `RequestValidationError` handler forwards it verbatim. What
+actually closes that channel is the handler registered in `app.py`, which
+rebuilds every 422 body from `loc`/`type` only and drops `input` app-wide --
+this route does not, and could not on its own, guarantee the phrase stays out
+of a validation error.
 """
 from __future__ import annotations
 
