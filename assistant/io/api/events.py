@@ -5,10 +5,38 @@ Not one SSE stream per concern: EventSource cannot set an Authorization header,
 abort needs a client-to-server channel, and one socket means one reconnect
 story on the client.
 
-main.py subscribes the hub's `publish()` to status_broadcaster once, at
-startup, so every socket the hub ever attaches receives its status and
-task_step frames; the telemetry sampler runs only while at least one socket
-is attached.
+Three frame types actually have a producer today:
+
+  - `"status"` -- forwarded from `assistant.io.status_broadcaster` via
+    `EventHub.publish_status()` (main.py subscribes that method, not
+    `publish()` directly, once at startup: `status.subscribe(hub.publish_status)`).
+    The connect-time frame `app.py` sends before any broadcaster event has
+    fired is built by the same `build_status_frame()` used here, so it carries
+    the identical key set -- a client never has to special-case "the first
+    status frame" versus every later one. There is no separate frame type for
+    task/step progress: `step` (`[n, total] | None`) and `tier` already ride
+    as fields on `"status"` (`status_broadcaster.py`'s `set()`); a live task
+    display should read those off `"status"`, not wait on a distinct frame
+    type that nothing produces.
+  - `"telemetry"` -- sampled from the runtime's `TelemetrySnapshot` every
+    `_interval` seconds while >=1 socket is attached (`_sample_telemetry`
+    below). Keys are `telemetry_body()`'s (`routes/system.py`, the same
+    function `GET /v1/telemetry` uses) so the wire has one telemetry
+    vocabulary, not one per transport.
+  - `"error"` / `"ack"` -- built inline in `app.py`'s socket handler, in reply
+    to a malformed/unrecognised client frame or a client's own
+    `{"type": "abort"}`. Not hub-produced, so not covered by the frame
+    builders below.
+
+`"toast"` is reserved, not produced: a one-off notification is a different
+shape of thing than a phase transition, so the type name is worth keeping for
+whenever something actually emits one -- but nothing in `assistant/` does
+today. Treat it as reserved-and-unproduced; do not build a client that waits
+on it.
+
+main.py subscribes the hub's `publish_status()` to status_broadcaster once,
+at startup, so every socket the hub ever attaches receives its status frames;
+the telemetry sampler runs only while at least one socket is attached.
 
 `publish()` is the one method this module promises is safe to call from any
 thread, not just the event loop's. `status_broadcaster` calls it from
@@ -34,7 +62,66 @@ import logging
 import threading
 from typing import Any
 
+from .routes.system import telemetry_body
+
 logger = logging.getLogger(__name__)
+
+
+# ─── frame builders ─────────────────────────────────────────────────────────
+# Pure dict-in/dict-out functions, deliberately: this module may not import
+# `assistant.io.status_broadcaster` (io/api sits one layer below `assistant.io`
+# and may only reach `assistant.core`/`assistant.config`/third-party), so a
+# broadcaster event is accepted here only as data -- a dict shaped the way
+# `status_broadcaster.py`'s `set()` builds one -- never via the module that
+# builds it. main.py is what actually bridges the two modules together.
+
+def build_status_frame(*, phase: str, detail: str = "",
+                        v: int | None = None,
+                        cursor_follows: bool | None = None,
+                        step: list[int] | None = None,
+                        tier: str | None = None,
+                        ts: float | None = None) -> dict:
+    """The one `"status"` wire shape, camelCased. Shared by the connect-time
+    synthetic frame (`app.py`, before any broadcaster event has ever fired)
+    and every real one (`status_frame_from_broadcaster_event` below) so both
+    carry exactly the same key set -- whatever the caller doesn't know yet is
+    passed through as `None` (-> JSON `null`), never omitted.
+    """
+    return {
+        "v": v,
+        "type": "status",
+        "phase": phase,
+        "detail": detail,
+        "cursorFollows": cursor_follows,
+        "step": step,
+        "tier": tier,
+        "ts": ts,
+    }
+
+
+def status_frame_from_broadcaster_event(event: dict) -> dict:
+    """Translate a `status_broadcaster.py`-shaped event dict (`v`, `type`,
+    `phase`, `detail`, `cursor_follows`, `step`, `tier`, `ts`) into this
+    socket's wire frame -- camelCasing `cursor_follows` and dropping nothing.
+    Takes a plain dict, not a broadcaster import; see the module note above.
+    """
+    return build_status_frame(
+        v=event.get("v"),
+        phase=event.get("phase", ""),
+        detail=event.get("detail", ""),
+        cursor_follows=event.get("cursor_follows"),
+        step=event.get("step"),
+        tier=event.get("tier"),
+        ts=event.get("ts"),
+    )
+
+
+def telemetry_frame(snapshot) -> dict:
+    """The one `"telemetry"` wire shape -- `telemetry_body()`'s keys plus the
+    frame envelope's `type`, so this can never drift from what
+    `GET /v1/telemetry` reports for the same snapshot.
+    """
+    return {"type": "telemetry", **telemetry_body(snapshot)}
 
 
 class EventHub:
@@ -84,6 +171,11 @@ class EventHub:
     def publish(self, event: dict) -> None:
         """Non-blocking. Safe from sync code on any thread (status_broadcaster).
 
+        Sends `event` verbatim -- no translation happens here. Anything that
+        needs shaping before it reaches a socket (a status_broadcaster event,
+        today) goes through a dedicated method like `publish_status()`
+        instead, which translates and then calls this.
+
         Buffers rather than enqueues while no loop is known yet -- see the
         module docstring for why a direct enqueue here is never safe.
         """
@@ -93,6 +185,15 @@ class EventHub:
                 self._pending.append(event)
                 return
         loop.call_soon_threadsafe(self._enqueue, event)
+
+    def publish_status(self, event: dict) -> None:
+        """The bridge point for `status_broadcaster`: main.py subscribes this
+        method (`status.subscribe(hub.publish_status)`), not `publish()`
+        directly, so every broadcaster event is translated to this socket's
+        camelCase wire shape (`status_frame_from_broadcaster_event`) before
+        anything reaches a browser. Safe from any thread, same as `publish()`.
+        """
+        self.publish(status_frame_from_broadcaster_event(event))
 
     def _set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Capture the loop once, then flush anything published before it existed."""
@@ -132,12 +233,7 @@ class EventHub:
             except Exception as exc:
                 logger.debug(f"[API] telemetry sample failed: {exc}")
                 continue
-            self.publish({
-                "type": "telemetry",
-                "cpu": snapshot.cpu_percent,
-                "ram": snapshot.ram_percent,
-                "battery": snapshot.battery_percent,
-            })
+            self.publish(telemetry_frame(snapshot))
 
     # ─── lifecycle ──────────────────────────────────────────────────────
     async def start(self, runtime, interval_seconds: float = 2.0) -> None:

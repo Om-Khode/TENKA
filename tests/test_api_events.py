@@ -210,6 +210,89 @@ def test_a_chat_token_still_connects(context):
 
 
 # ─── deferred item 7: the socket spends the same budget HTTP does ────────
+# ─── socket contract fix: one camelCase status shape, aligned telemetry ──
+def test_a_broadcaster_shaped_event_arrives_camelcased_via_publish_status(context):
+    """publish_status() is the bridge point main.py actually subscribes to
+    status_broadcaster -- exercise it directly with a dict shaped exactly
+    the way status_broadcaster.py's set() builds one, snake_case and all."""
+    client, app, _, token = context
+    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+        socket.receive_json()  # connect frame
+        app.state.hub.publish_status({
+            "v": 2, "type": "status", "phase": "THINKING", "detail": "",
+            "cursor_follows": True, "step": [1, 3], "tier": "vision",
+            "ts": 123.0,
+        })
+        frame = socket.receive_json()
+    assert frame == {
+        "v": 2, "type": "status", "phase": "THINKING", "detail": "",
+        "cursorFollows": True, "step": [1, 3], "tier": "vision", "ts": 123.0,
+    }
+    assert "cursor_follows" not in frame
+
+
+def test_the_connect_frame_and_a_real_status_frame_share_one_shape(context):
+    """A client that destructures every 'status' frame the same way must
+    not find the connect-time one short any keys."""
+    client, app, _, token = context
+    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+        connect_frame = socket.receive_json()
+        app.state.hub.publish_status({
+            "v": 2, "phase": "IDLE", "detail": "", "cursor_follows": False,
+            "step": None, "tier": None, "ts": 1.0,
+        })
+        real_frame = socket.receive_json()
+    assert set(connect_frame.keys()) == set(real_frame.keys())
+    assert connect_frame["type"] == real_frame["type"] == "status"
+    # the connect frame's unknowns are explicit nulls, not missing keys
+    assert connect_frame["cursorFollows"] is None
+    assert connect_frame["step"] is None
+    assert connect_frame["tier"] is None
+    assert connect_frame["ts"] is None
+    assert connect_frame["v"] is None
+
+
+def test_the_telemetry_frame_keys_match_the_http_telemetry_route():
+    """Asserted against the route's own serialiser, not a hardcoded list of
+    names, so the two cannot silently drift apart again."""
+    from assistant.io.api.events import telemetry_frame
+    from assistant.io.api.routes.system import telemetry_body
+    from assistant.io.api.runtime import TelemetrySnapshot
+
+    snapshot = TelemetrySnapshot(cpu_percent=12.0, ram_percent=34.0,
+                                  battery_percent=None, active_model="m",
+                                  uptime_seconds=99)
+    frame = telemetry_frame(snapshot)
+    assert frame["type"] == "telemetry"
+    assert {k: v for k, v in frame.items() if k != "type"} == telemetry_body(snapshot)
+
+
+def test_no_frame_the_hub_can_produce_has_a_snake_case_key():
+    """A sweep over every frame shape the hub itself can build (the
+    connect/status builder, the broadcaster translator, and the telemetry
+    frame) -- not three separate spot checks that could miss a fourth."""
+    from assistant.io.api.events import (
+        build_status_frame,
+        status_frame_from_broadcaster_event,
+        telemetry_frame,
+    )
+    from assistant.io.api.runtime import TelemetrySnapshot
+
+    frames = [
+        build_status_frame(phase="connected", detail="model-x"),
+        status_frame_from_broadcaster_event({
+            "v": 2, "phase": "THINKING", "detail": "", "cursor_follows": True,
+            "step": [1, 2], "tier": "native", "ts": 1.0,
+        }),
+        telemetry_frame(TelemetrySnapshot(
+            cpu_percent=1.0, ram_percent=2.0, battery_percent=None,
+            active_model="m", uptime_seconds=5,
+        )),
+    ]
+    for frame in frames:
+        assert not any("_" in key for key in frame), frame
+
+
 def test_repeated_bad_socket_tokens_eventually_get_refused_fast(context):
     """An accept-then-close cycle still costs a TCP handshake and a
     verify() call. The limiter must bound how many of those one source can
