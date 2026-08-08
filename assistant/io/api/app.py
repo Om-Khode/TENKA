@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from ...core.redact import redact_secrets
 from .context import request_id_var
 from .errors import to_http_exception
-from .events import EventHub
+from .events import EventHub, build_ack_frame, build_error_frame, build_status_frame
 from .routes import chat as chat_routes
 from .routes import commands as command_routes
 from .routes import files as file_routes
@@ -293,8 +293,13 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         await app.state.hub.attach(websocket)
         try:
             info = await app.state.runtime.system.status()
-            await _safe_send({"type": "status", "phase": "connected",
-                              "detail": info.active_model})
+            # Same builder as every real status frame (`build_status_frame`,
+            # events.py) -- so this first frame carries the identical key set
+            # as the ones that follow it, with whatever isn't known yet
+            # (`v`, `cursorFollows`, `step`, `tier`, `ts`) as `null` rather
+            # than simply absent.
+            await _safe_send(build_status_frame(phase="connected",
+                                                 detail=info.active_model))
             while True:
                 try:
                     frame = await websocket.receive_json()
@@ -305,14 +310,15 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                     # raise short of a disconnect: the frame is unusable, not
                     # the socket. One bad frame from a Studio build that
                     # doesn't match this daemon must not take down the one
-                    # channel carrying status, steps, telemetry and toasts.
-                    await _safe_send({"type": "error", "detail": "malformed frame"})
+                    # channel carrying status and telemetry (see events.py
+                    # for what actually flows here today).
+                    await _safe_send(build_error_frame("malformed frame"))
                     continue
                 if not isinstance(frame, dict) or frame.get("type") != "abort":
-                    await _safe_send({"type": "error", "detail": "unknown frame"})
+                    await _safe_send(build_error_frame("unknown frame"))
                     continue
                 await app.state.runtime.chat.abort()
-                await _safe_send({"type": "ack", "of": "abort"})
+                await _safe_send(build_ack_frame("abort"))
         except WebSocketDisconnect:
             pass
         finally:

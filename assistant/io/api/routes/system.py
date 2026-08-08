@@ -41,17 +41,25 @@ _BACKUP_RUN_MAX_PER_WINDOW = 5
 _BACKUP_RUN_WINDOW_SECONDS = 60.0
 
 
-@router.get("/telemetry")
-async def telemetry(request: Request,
-                    _=Depends(require(Capability.CHAT))) -> Envelope:
-    snapshot = await request.app.state.runtime.system.telemetry()
-    return Envelope(data={
+def telemetry_body(snapshot) -> dict:
+    """The one serialisation of `TelemetrySnapshot` -- reused verbatim by the
+    `"telemetry"` WebSocket frame in `../events.py` so the same numbers carry
+    the same names on both transports instead of growing a second vocabulary.
+    """
+    return {
         "cpuPercent": snapshot.cpu_percent,
         "ramPercent": snapshot.ram_percent,
         "batteryPercent": snapshot.battery_percent,
         "activeModel": snapshot.active_model,
         "uptimeSeconds": snapshot.uptime_seconds,
-    })
+    }
+
+
+@router.get("/telemetry")
+async def telemetry(request: Request,
+                    _=Depends(require(Capability.CHAT))) -> Envelope:
+    snapshot = await request.app.state.runtime.system.telemetry()
+    return Envelope(data=telemetry_body(snapshot))
 
 
 def _backup_body(state) -> dict:

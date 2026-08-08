@@ -340,7 +340,12 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
             origins=[o.strip() for o in config.STUDIO_API_ORIGINS.split(",") if o.strip()],
             hub=_studio_hub,
         )
-        status.subscribe(_studio_hub.publish)
+        # publish_status(), not publish() directly: it translates the
+        # broadcaster's own snake_case event shape into the daemon's
+        # camelCase wire frame (assistant/io/api/events.py) before it ever
+        # reaches a socket -- status_broadcaster's shape stays its own,
+        # unmodified, for its other consumer (the overlay's IPC writer).
+        status.subscribe(_studio_hub.publish_status)
         return _studio_task
     except Exception as e:
         logger.warning(
