@@ -191,6 +191,13 @@ def test_openapi_is_not_public(client):
         assert client.get(path).status_code in (401, 404)
 
 
+def test_the_query_string_exception_is_only_the_socket():
+    """One route may take a token from the query string. Exactly one."""
+    import pathlib
+    source = pathlib.Path("assistant/io/api/app.py").read_text(encoding="utf-8")
+    assert source.count("query_params.get(\"access_token\"") == 1
+
+
 def test_a_bad_tenka_secret_fails_at_app_build_not_per_request(tmp_path, monkeypatch):
     """instance_secret() is uncached on the env-override path, so a wrong-length
     TENKA_SECRET would otherwise surface as a 500 on the first authenticated
