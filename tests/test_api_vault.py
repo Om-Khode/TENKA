@@ -37,6 +37,17 @@ def test_issued_token_verifies_and_carries_its_grants(vault):
     assert device.grants == frozenset({Capability.CHAT, Capability.FILES})
 
 
+def test_issuing_a_device_with_no_grants_is_refused(vault):
+    """A device with no capabilities can still authenticate -- just not do
+    anything, except distinguish 404 from 403 on a route gated by
+    `authenticate` alone rather than `require(capability)`, which leaks
+    membership it was never granted CHAT to read. Refusing at issuance
+    closes that for every such route, not just the ones known today.
+    """
+    with pytest.raises(ValueError):
+        vault.issue("ghost", frozenset())
+
+
 def test_token_is_at_least_256_bits_of_entropy(vault):
     token = vault.issue("studio", frozenset({Capability.CHAT}))
     assert len(token) >= 43  # 32 bytes, url-safe base64, unpadded

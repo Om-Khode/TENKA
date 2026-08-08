@@ -269,6 +269,14 @@ class FakeFileRuntime:
 
 
 class FakeCommandRuntime:
+    """Two grants, not one -- lock/volume need system_control, screenshot needs
+    only screen, mirroring LiveCommandRuntime's actual catalogue. A fixture
+    where every entry declares the same grant can't tell a route that reads
+    `required_grant` per-command apart from one with that grant hardcoded:
+    every full-capability token clears either version, every capability-less
+    token is refused by either version, and nothing distinguishes them. Only
+    a caller holding one of the two grants but not the other does."""
+
     def __init__(self) -> None:
         self.ran: list[str] = []
         self._catalogue = [
@@ -276,6 +284,8 @@ class FakeCommandRuntime:
                        True, "system_control"),
             CommandDef("volume_up", "Volume Up", "Raises the system volume.",
                        False, "system_control"),
+            CommandDef("screenshot", "Take Screenshot", "Captures the current screen.",
+                       False, "screen"),
         ]
 
     async def catalogue(self) -> list[CommandDef]:

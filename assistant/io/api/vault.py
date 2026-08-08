@@ -212,6 +212,20 @@ class TokenVault:
             return None
 
     def issue(self, label: str, grants: frozenset[Capability]) -> str:
+        # A device with no grants can do nothing useful, but it can still
+        # authenticate: every route gated by `authenticate` alone (rather
+        # than `require(capability)`) would answer it before any capability
+        # is checked. For a route like POST /v1/commands/{id}/run, whose 404
+        # (unknown command) and 403 (known, not granted) both come after
+        # authentication, that is enough to let a zero-grant device tell the
+        # two apart -- learning which command ids exist without ever holding
+        # the CHAT grant that GET /v1/commands requires to read the same
+        # list. Refusing to issue an empty grant set at all closes that
+        # oracle at its source, for every current and future route shaped
+        # this way, rather than patching each route that happens to need a
+        # capability floor before its own logic runs.
+        if not grants:
+            raise ValueError("a device must be issued at least one capability")
         token = secrets.token_urlsafe(32)
         data = self._load()
         data["devices"].append({
