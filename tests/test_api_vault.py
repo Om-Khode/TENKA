@@ -100,3 +100,100 @@ def test_stored_record_holds_a_hash_not_the_token(vault, tmp_path):
     assert "token_hmac" in entry
     assert len(entry["token_hmac"]) == 64  # sha256 hex
     assert "token" not in entry
+
+
+# ─── Corruption: the vault must fail closed, never raise, never fail open ──
+
+
+def test_corrupt_secret_file_regenerates_and_revokes_everything(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    (tmp_path / "instance_secret").write_text("not-hex-garbage", encoding="utf-8")
+
+    fresh = TokenVault(tmp_path)  # no in-memory cache -- forces a file read
+    secret = fresh.instance_secret()
+    assert len(secret) == 32
+    assert fresh.verify(token) is None
+
+
+def test_devices_json_as_bare_array_is_rejected_wholesale(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    device_id = vault.verify(token).device_id
+    (tmp_path / "devices.json").write_text("[]", encoding="utf-8")
+
+    assert vault.verify(token) is None
+    assert vault.devices() == []
+    assert vault.revoke(device_id) is False
+
+
+def test_devices_field_as_string_is_rejected_wholesale(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    device_id = vault.verify(token).device_id
+    (tmp_path / "devices.json").write_text(
+        json.dumps({"version": 1, "devices": "oops"}), encoding="utf-8"
+    )
+
+    assert vault.verify(token) is None
+    assert vault.devices() == []
+    assert vault.revoke(device_id) is False
+
+
+def test_entry_that_is_not_a_dict_is_skipped(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    device_id = vault.verify(token).device_id
+    raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    raw["devices"][0] = "not-a-dict"
+    (tmp_path / "devices.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    assert vault.verify(token) is None
+    assert vault.devices() == []
+    assert vault.revoke(device_id) is False
+
+
+def test_entry_with_non_string_token_hmac_fails_closed_but_stays_administrable(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    device_id = vault.verify(token).device_id
+    raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    raw["devices"][0]["token_hmac"] = 12345
+    (tmp_path / "devices.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    # A non-string hash can never compare equal to a real hex digest, so the
+    # token that used to work now correctly fails closed.
+    assert vault.verify(token) is None
+    # device_id/label/grants/created_at are untouched, so admin listing and
+    # revocation -- which never look at token_hmac -- are unaffected.
+    devices = vault.devices()
+    assert len(devices) == 1
+    assert vault.revoke(device_id) is True
+
+
+def test_entry_with_unknown_capability_fails_closed_but_stays_revocable(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    device_id = vault.verify(token).device_id
+    raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    raw["devices"][0]["grants"] = ["not-a-real-capability"]
+    (tmp_path / "devices.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    assert vault.verify(token) is None
+    assert vault.devices() == []
+    # device_id is untouched, so an operator can still revoke a device whose
+    # grants got hand-edited into garbage.
+    assert vault.revoke(device_id) is True
+
+
+def test_entry_missing_device_id_fails_closed_everywhere(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    device_id = vault.verify(token).device_id
+    raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    del raw["devices"][0]["device_id"]
+    (tmp_path / "devices.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    assert vault.verify(token) is None
+    assert vault.devices() == []
+    assert vault.revoke(device_id) is False

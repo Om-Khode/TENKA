@@ -16,6 +16,7 @@ import logging
 import os
 import secrets
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -66,6 +67,30 @@ def _restrict_to_current_user(path: Path) -> None:
         logger.warning(f"[API] icacls failed for {path.name}: {exc}")
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    """Write `content` to `path` without ever leaving it truncated.
+
+    A plain `write_text()` that is interrupted mid-write (power loss, a kill
+    -9) leaves `path` truncated. For the instance secret specifically, a
+    truncated file reads back as corrupt and silently regenerates the secret
+    -- which revokes every device (see `TokenVault.instance_secret`'s
+    docstring). Writing to a same-directory temp file and swapping it in with
+    `os.replace` makes the update atomic: a reader sees either the old
+    content or the new content, never a partial write.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 class TokenVault:
     """Owns the instance secret and the device records under `root`."""
 
@@ -75,6 +100,22 @@ class TokenVault:
 
     # ─── instance secret ────────────────────────────────────────────────
     def instance_secret(self) -> bytes:
+        """Return the per-installation secret used to hash and verify tokens.
+
+        Precedence: `TENKA_SECRET` env var, then the on-disk secret file,
+        then a freshly generated secret persisted to that file.
+
+        Side effect a caller must know about: a corrupt or hand-truncated
+        secret file is treated as no file at all -- this method regenerates
+        the secret and overwrites the file rather than raising. Every
+        existing device's `token_hmac` was computed against the old secret,
+        so regenerating silently revokes every device that was ever issued.
+        That is the intended recovery path (a vault that raises here takes
+        the whole daemon down at startup, with no way back), but it means
+        this call, despite reading like a pure getter, can invalidate the
+        whole device list as a side effect. `_hash`, `verify`, `issue`,
+        `revoke`, and `devices` all call this and inherit that risk.
+        """
         env = os.getenv("TENKA_SECRET")
         if env:
             try:
@@ -91,13 +132,13 @@ class TokenVault:
                 self._secret = bytes.fromhex(path.read_text(encoding="utf-8").strip())
                 return self._secret
             except ValueError as exc:
-                # Hand-edited or truncated secret file. A vault that raises here
-                # takes the whole daemon down at startup; regenerate instead.
-                logger.warning(f"[API] instance secret file is corrupt, regenerating: {exc}")
+                logger.warning(
+                    f"[API] instance secret was unreadable; regenerated, all devices revoked ({exc})"
+                )
 
         self._root.mkdir(parents=True, exist_ok=True)
         secret = secrets.token_bytes(32)
-        path.write_text(secret.hex(), encoding="utf-8")
+        _atomic_write(path, secret.hex())
         _restrict_to_current_user(path)
         self._secret = secret
         return secret
@@ -127,7 +168,7 @@ class TokenVault:
     def _save(self, data: dict) -> None:
         self._root.mkdir(parents=True, exist_ok=True)
         path = self._root / _DEVICES_FILE
-        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        _atomic_write(path, json.dumps(data, indent=2))
         _restrict_to_current_user(path)
 
     def _parse_device(self, entry: object) -> Device | None:
@@ -164,6 +205,12 @@ class TokenVault:
         try:
             candidate = self._hash(token)
         except ValueError:
+            # instance_secret() no longer raises ValueError on a corrupt
+            # secret file (it regenerates instead), so this no longer guards
+            # that. What it still guards: a token containing a lone UTF-16
+            # surrogate code point, which token.encode("utf-8") rejects with
+            # UnicodeEncodeError -- a ValueError subclass. Untrusted input
+            # must never raise out of verify().
             return None
         match: dict | None = None
         for entry in self._load()["devices"]:
