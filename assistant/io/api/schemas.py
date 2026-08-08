@@ -10,16 +10,36 @@ Layering: io/api — core + config only.
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .context import request_id_var
 from .runtime import SettingValue
 
 
 class Meta(BaseModel):
-    request_id: str = ""
-    generated_at: str = ""
+    # default_factory, not a fixed "" -- a Meta built with no arguments (the
+    # common case: every route does `Envelope(data=...)` and leaves `meta` on
+    # its default) used to ship two permanently empty strings on every single
+    # response. request_id_var is set by app.py's `audit_and_tag` middleware
+    # before the router ever runs, so it is already populated by the time a
+    # route constructs its Envelope.
+    #
+    # Aliased to camelCase, like every other wire key in this schema: Studio
+    # generates its TypeScript types from app.openapi(), and a mix of
+    # request_id/requestId across the same contract is exactly the
+    # inconsistency the wire-naming fix wave closed everywhere else.
+    request_id: str = Field(
+        default_factory=lambda: request_id_var.get(), alias="requestId"
+    )
+    generated_at: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+        alias="generatedAt",
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class Envelope(BaseModel):
@@ -48,6 +68,13 @@ class ErrorBody(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    # extra="forbid": a Milestone-6 client sending {text, sealed, nonce} (a
+    # sealed-envelope body against a route that doesn't understand sealing
+    # yet) must be refused outright, not have "sealed"/"nonce" silently
+    # dropped while "text" is accepted -- half-honouring a body shaped for a
+    # different protocol version is worse than rejecting it.
+    model_config = ConfigDict(extra="forbid")
+
     text: str = Field(min_length=1, max_length=8_000)
 
 
@@ -123,8 +150,10 @@ class PersonalityPatch(BaseModel):
 
 
 class RenameRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     path: str = Field(min_length=1, max_length=1_024)
-    new_name: str = Field(min_length=1, max_length=255)
+    new_name: str = Field(min_length=1, max_length=255, alias="newName")
 
 
 class DeleteRequest(BaseModel):
@@ -132,4 +161,8 @@ class DeleteRequest(BaseModel):
 
 
 class RestoreRequest(BaseModel):
-    recovery_phrase: str = Field(min_length=1, max_length=512)
+    model_config = ConfigDict(populate_by_name=True)
+
+    recovery_phrase: str = Field(
+        min_length=1, max_length=512, alias="recoveryPhrase"
+    )

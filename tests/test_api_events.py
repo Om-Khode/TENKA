@@ -177,6 +177,38 @@ def test_an_accepted_socket_connection_is_audited(context):
     assert matches, "an accepted socket connection left no trace in the audit log"
 
 
+# ─── fix wave: the socket enforces the same capability its HTTP twins do ──
+def test_a_non_chat_token_is_refused_before_accept(context):
+    """Every HTTP analogue of what this socket serves -- GET /v1/status,
+    GET /v1/telemetry, POST /v1/abort -- requires Capability.CHAT. A
+    FILES-only token must be refused the same way, and refused before
+    accept(): the connection must close, not merely answer nothing useful
+    once open.
+    """
+    client, app, _, _ = context
+    vault = app.state.auth.vault
+    files_only = vault.issue("laptop", frozenset({Capability.FILES}))
+
+    with pytest.raises(Exception):
+        with client.websocket_connect(f"/v1/events?access_token={files_only}"):
+            pass
+
+    entries = app.state.auth.audit.entries()
+    assert any(e.path == "/v1/events" and e.outcome == "1008" for e in entries), (
+        "a capability-refused socket connection left no trace in the audit log"
+    )
+
+
+def test_a_chat_token_still_connects(context):
+    """The fix above must not have collapsed into refusing everyone."""
+    client, app, _, token = context
+    device = app.state.auth.vault.verify(token)
+    assert Capability.CHAT in device.grants
+    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+        frame = socket.receive_json()
+        assert frame["type"] == "status"
+
+
 # ─── deferred item 7: the socket spends the same budget HTTP does ────────
 def test_repeated_bad_socket_tokens_eventually_get_refused_fast(context):
     """An accept-then-close cycle still costs a TCP handshake and a

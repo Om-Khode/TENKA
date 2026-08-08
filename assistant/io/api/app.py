@@ -23,6 +23,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ...core.redact import redact_secrets
+from .context import request_id_var
+from .errors import to_http_exception
 from .events import EventHub
 from .routes import chat as chat_routes
 from .routes import commands as command_routes
@@ -33,7 +35,7 @@ from .routes import status as status_routes
 from .routes import system as system_routes
 from .runtime import StudioRuntime
 from .security import AuditEntry, AuthState, device_key
-from .vault import TokenVault
+from .vault import Capability, TokenVault
 
 logger = logging.getLogger(__name__)
 
@@ -89,18 +91,44 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
 
     @app.middleware("http")
     async def audit_and_tag(request: Request, call_next):
+        # Set before call_next(), not after: schemas.py's Meta reads this
+        # contextvar via a default_factory when a route builds its Envelope,
+        # deep inside the call this middleware is about to make. Set any
+        # later and every route's response would carry the empty default.
         request_id = uuid.uuid4().hex[:12]
-        response = await call_next(request)
-        device = getattr(request.state, "device", None)
-        request.app.state.auth.audit.record(AuditEntry(
-            at=datetime.now(timezone.utc).isoformat(),
-            device_id=device.device_id if device else "-",
-            method=request.method,
-            path=redact_secrets(request.url.path),
-            outcome=str(response.status_code),
-        ))
-        response.headers["X-Request-Id"] = request_id
-        return response
+        token = request_id_var.set(request_id)
+        try:
+            try:
+                response = await call_next(request)
+            except Exception:
+                # An exception reaching here means the app-wide handler below
+                # (or a more specific one) did *not* convert it into a
+                # response -- something truly unhandled. Audited before the
+                # re-raise so the failures most worth logging are not also
+                # the ones the audit log cannot show; ServerErrorMiddleware
+                # (outside this middleware) still turns it into the actual
+                # 500 sent on the wire.
+                device = getattr(request.state, "device", None)
+                request.app.state.auth.audit.record(AuditEntry(
+                    at=datetime.now(timezone.utc).isoformat(),
+                    device_id=device.device_id if device else "-",
+                    method=request.method,
+                    path=redact_secrets(request.url.path),
+                    outcome="500",
+                ))
+                raise
+            device = getattr(request.state, "device", None)
+            request.app.state.auth.audit.record(AuditEntry(
+                at=datetime.now(timezone.utc).isoformat(),
+                device_id=device.device_id if device else "-",
+                method=request.method,
+                path=redact_secrets(request.url.path),
+                outcome=str(response.status_code),
+            ))
+            response.headers["X-Request-Id"] = request_id
+            return response
+        finally:
+            request_id_var.reset(token)
 
     @app.exception_handler(404)
     async def not_found(_request: Request, _exc) -> JSONResponse:
@@ -112,6 +140,42 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         # exactly this reason -- writing one there would read as live when it
         # is discarded here, unconditionally, every time.
         return JSONResponse(status_code=404, content={"error": "not found"})
+
+    async def unhandled_error(_request: Request, exc: Exception) -> JSONResponse:
+        # Catches anything a route or a runtime call raised that nobody
+        # mapped locally -- a bare 500 with a traceback was the prior
+        # behaviour for, e.g., int("not-a-number") from a bad memory item id,
+        # or a RuntimeError from a backup precondition that was never met.
+        http_exc = to_http_exception(exc)
+        if http_exc.status_code == 404:
+            content: dict = {"error": "not found"}
+        else:
+            content = {"detail": http_exc.detail}
+        return JSONResponse(status_code=http_exc.status_code, content=content)
+
+    # Registered per concrete type below, never on the bare `Exception`
+    # class: Starlette's own `build_middleware_stack()` special-cases a
+    # handler registered for `Exception` (or the literal status code 500) by
+    # routing it to `ServerErrorMiddleware` instead of `ExceptionMiddleware` --
+    # the outermost layer, entirely outside `audit_and_tag` above. That
+    # middleware still calls the handler and sends its response over the
+    # wire, but it unconditionally *re-raises the original exception
+    # afterwards* (so a real ASGI server can log it) -- which is also exactly
+    # what `starlette.testclient.TestClient`'s default
+    # `raise_server_exceptions=True` re-raises into the calling test, instead
+    # of ever handing back the 409/400/404 this handler built. Registering
+    # each concrete type individually keeps them inside `ExceptionMiddleware`
+    # -- the ordinary, non-500 path every other status code in this app
+    # already takes -- where the response is simply returned, not
+    # sent-then-re-raised. A handful of named types is deliberate: anything
+    # NOT in this list is a genuinely *unexpected* failure, and stays a plain
+    # 500 rather than being silently absorbed into a false sense of "every
+    # exception is handled".
+    for _exc_type in (
+        ValueError, KeyError, PermissionError, FileNotFoundError,
+        NotADirectoryError, RuntimeError, OSError,
+    ):
+        app.add_exception_handler(_exc_type, unhandled_error)
 
     @app.exception_handler(RequestValidationError)
     async def invalid_body(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -171,6 +235,22 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                 device_id=device.device_id if device else "-",
                 method="WS", path="/v1/events", outcome=outcome,
             ))
+
+        # Every HTTP analogue of what this socket serves -- GET /v1/status,
+        # GET /v1/telemetry, POST /v1/abort -- requires Capability.CHAT via
+        # `require(Capability.CHAT)`. Verifying the token proves *a* device
+        # is on the other end; it says nothing about what that device is
+        # allowed to see or do. Without this, a FILES-only or SCREEN-only
+        # token -- issued for a narrower purpose, never meant to hold CHAT --
+        # could stream status/telemetry and call `runtime.chat.abort()`
+        # through this one socket, bypassing every one of those routes'
+        # capability checks. Checked, audited and closed before `accept()`:
+        # a capability failure is a rejection, not a connection that then
+        # gets torn down.
+        if device is not None and Capability.CHAT not in device.grants:
+            _audit("1008")
+            await websocket.close(code=1008)
+            return
 
         # An accept-then-close cycle still costs a handshake and a verify()
         # call, so it spends the same shared budget an HTTP request does --

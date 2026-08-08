@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from ..errors import to_http_exception
 from ..schemas import DeleteRequest, Envelope, RenameRequest
 from ..security import require
 from ..vault import Capability
@@ -27,15 +28,10 @@ def _entry(entry) -> dict:
     }
 
 
-def _fail(exc: Exception) -> HTTPException:
-    if isinstance(exc, ValueError):
-        return HTTPException(status_code=400, detail="invalid path")
-    if isinstance(exc, PermissionError):
-        return HTTPException(status_code=403, detail="protected path")
-    # `detail=` on a 404 is dead code: app.py's status-code handler always
-    # answers a fixed body, discarding whatever is passed here. Omitted
-    # rather than written and ignored.
-    return HTTPException(status_code=404)
+# `_fail` used to be this module's own private copy of the exception ->
+# HTTPException mapping; it is now the shared one in errors.py, kept as a
+# local alias so every call site below stays unchanged.
+_fail = to_http_exception
 
 
 @router.get("/files/roots")
