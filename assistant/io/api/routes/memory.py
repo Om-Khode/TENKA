@@ -117,6 +117,6 @@ async def forget_item(scope: Scope, item_id: str, request: Request,
 
 @router.delete("/memory")
 async def forget_everything(request: Request,
-                            _=Depends(require(Capability.CHAT))) -> Envelope:
+                            _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope:
     removed = await request.app.state.runtime.memory.forget_all()
     return Envelope(data={"removed": removed})

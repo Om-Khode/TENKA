@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Meta(BaseModel):
@@ -48,8 +48,35 @@ class ChatRequest(BaseModel):
     text: str = Field(min_length=1, max_length=8_000)
 
 
+# A settings page realistically edits a handful of rows at once and every key
+# is a short snake_case identifier; these bounds are generous for that and
+# absurd for a body built to exhaust memory or a database column.
+MAX_SETTINGS_KEYS = 200
+MAX_SETTINGS_KEY_LENGTH = 200
+MAX_SETTINGS_STRING_VALUE_LENGTH = 4_096
+
+
 class SettingsPatch(BaseModel):
     changes: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("changes")
+    @classmethod
+    def _bound_changes(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(value) > MAX_SETTINGS_KEYS:
+            raise ValueError(
+                f"too many settings in one patch: {len(value)} > {MAX_SETTINGS_KEYS}"
+            )
+        for key, item in value.items():
+            if len(key) > MAX_SETTINGS_KEY_LENGTH:
+                raise ValueError(
+                    f"setting key too long: {len(key)} > {MAX_SETTINGS_KEY_LENGTH} chars"
+                )
+            if isinstance(item, str) and len(item) > MAX_SETTINGS_STRING_VALUE_LENGTH:
+                raise ValueError(
+                    f"value for {key!r} too long: {len(item)} > "
+                    f"{MAX_SETTINGS_STRING_VALUE_LENGTH} chars"
+                )
+        return value
 
 
 class PersonalityPatch(BaseModel):

@@ -57,6 +57,27 @@ def test_forget_all_empties_every_scope(context):
                       headers=headers).json()["data"]["procedures"] == []
 
 
+def test_forget_all_demands_system_control_not_just_chat(tmp_path):
+    """Wiping every entity, fact, preference and procedure is not ordinary use.
+
+    Single-item forget stays on `chat` -- a phone paired for conversation can
+    delete one thing it was told about. The wipe is different: in Milestone 6
+    a chat-only device must not be able to erase her memory outright, so it
+    demands `system_control` while single-item forget does not.
+    """
+    vault = TokenVault(tmp_path)
+    chat_token = vault.issue("phone", frozenset({Capability.CHAT}))
+    runtime = build_fake_runtime()
+    client = TestClient(create_app(runtime, vault, origins=["http://localhost:3000"]))
+    headers = {"Authorization": f"Bearer {chat_token}"}
+
+    wipe = client.delete("/v1/memory", headers=headers)
+    assert wipe.status_code == 403
+
+    single = client.delete("/v1/memory/preferences/reading_pace", headers=headers)
+    assert single.status_code == 200
+
+
 def test_saving_a_setting_changes_what_is_read_back(context):
     client, _, headers = context
     response = client.patch("/v1/settings", headers=headers,
@@ -111,4 +132,25 @@ def test_changing_the_personality_base_reads_back(context):
 def test_an_oversized_body_is_refused(context):
     client, _, headers = context
     response = client.patch("/v1/personality", headers=headers, json={"base": "x" * 5_000})
+    assert response.status_code == 422
+
+
+def test_a_settings_patch_with_too_many_keys_is_refused(context):
+    client, _, headers = context
+    changes = {f"key_{i}": 1 for i in range(201)}
+    response = client.patch("/v1/settings", headers=headers, json={"changes": changes})
+    assert response.status_code == 422
+
+
+def test_a_settings_patch_with_an_overlong_key_is_refused(context):
+    client, _, headers = context
+    changes = {"x" * 201: 1}
+    response = client.patch("/v1/settings", headers=headers, json={"changes": changes})
+    assert response.status_code == 422
+
+
+def test_a_settings_patch_with_an_overlong_string_value_is_refused(context):
+    client, _, headers = context
+    changes = {"followup_timer": "x" * 4_097}
+    response = client.patch("/v1/settings", headers=headers, json={"changes": changes})
     assert response.status_code == 422
