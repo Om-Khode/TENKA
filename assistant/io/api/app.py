@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ...core.redact import redact_secrets
+from .routes import commands as command_routes
 from .routes import files as file_routes
 from .routes import memory as memory_routes
 from .routes import settings as settings_routes
@@ -91,4 +92,5 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     app.include_router(memory_routes.router, prefix="/v1")
     app.include_router(settings_routes.router, prefix="/v1")
     app.include_router(file_routes.router, prefix="/v1")
+    app.include_router(command_routes.router, prefix="/v1")
     return app
