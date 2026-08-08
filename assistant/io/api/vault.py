@@ -105,36 +105,61 @@ class TokenVault:
         Precedence: `TENKA_SECRET` env var, then the on-disk secret file,
         then a freshly generated secret persisted to that file.
 
-        Side effect a caller must know about: a corrupt or hand-truncated
-        secret file is treated as no file at all -- this method regenerates
-        the secret and overwrites the file rather than raising. Every
-        existing device's `token_hmac` was computed against the old secret,
-        so regenerating silently revokes every device that was ever issued.
-        That is the intended recovery path (a vault that raises here takes
-        the whole daemon down at startup, with no way back), but it means
-        this call, despite reading like a pure getter, can invalidate the
-        whole device list as a side effect. `_hash`, `verify`, `issue`,
+        Side effect a caller must know about: a stored secret file that is
+        corrupt, empty, whitespace-only, or valid hex decoding to anything
+        other than exactly 32 bytes is treated as no file at all -- this
+        method regenerates the secret and overwrites the file rather than
+        raising. (`bytes.fromhex("")` returns `b""` without raising, so the
+        length check is load-bearing, not redundant with the hex decode.)
+        Every existing device's `token_hmac` was computed against the old
+        secret, so regenerating silently revokes every device that was ever
+        issued. That is the intended recovery path (a vault that raises here
+        takes the whole daemon down at startup, with no way back), but it
+        means this call, despite reading like a pure getter, can invalidate
+        the whole device list as a side effect. `_hash`, `verify`, `issue`,
         `revoke`, and `devices` all call this and inherit that risk.
+
+        `TENKA_SECRET` is handled differently, because the operator chose
+        that value on purpose: an empty string is treated the same as the
+        variable being unset (falls through to the file), but a non-empty
+        value that decodes as hex to anything other than exactly 32 bytes
+        raises `ValueError` immediately. There is nothing to regenerate for
+        an explicit override -- silently accepting a weak key, or silently
+        substituting a different secret than the one asked for, would both
+        hide the operator's mistake instead of surfacing it.
         """
         env = os.getenv("TENKA_SECRET")
         if env:
+            stripped = env.strip()
             try:
-                return bytes.fromhex(env.strip())
+                secret = bytes.fromhex(stripped)
             except ValueError:
-                return sha256(env.strip().encode("utf-8")).digest()
+                return sha256(stripped.encode("utf-8")).digest()
+            if len(secret) != 32:
+                raise ValueError(
+                    f"TENKA_SECRET decodes to {len(secret)} bytes; a 256-bit "
+                    "secret needs exactly 32 (64 hex chars). Refusing to run "
+                    "with an explicit secret that isn't the size it claims to be."
+                )
+            return secret
 
         if self._secret is not None:
             return self._secret
 
         path = self._root / _SECRET_FILE
         if path.exists():
+            raw = path.read_text(encoding="utf-8").strip()
             try:
-                self._secret = bytes.fromhex(path.read_text(encoding="utf-8").strip())
-                return self._secret
+                secret = bytes.fromhex(raw)
+                if len(secret) != 32:
+                    raise ValueError(f"decoded to {len(secret)} bytes, not 32")
             except ValueError as exc:
                 logger.warning(
                     f"[API] instance secret was unreadable; regenerated, all devices revoked ({exc})"
                 )
+            else:
+                self._secret = secret
+                return secret
 
         self._root.mkdir(parents=True, exist_ok=True)
         secret = secrets.token_bytes(32)

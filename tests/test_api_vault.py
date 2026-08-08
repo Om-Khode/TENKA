@@ -1,5 +1,7 @@
 """Token vault — the only thing that decides whether a caller is real."""
 import json
+from hashlib import sha256
+
 import pytest
 
 from assistant.io.api.vault import Capability, Device, TokenVault
@@ -197,3 +199,73 @@ def test_entry_missing_device_id_fails_closed_everywhere(tmp_path):
     assert vault.verify(token) is None
     assert vault.devices() == []
     assert vault.revoke(device_id) is False
+
+
+# ─── A stored/overridden secret that decodes to the wrong size ────────────
+# bytes.fromhex("") == b"" with no exception, so an empty or whitespace-only
+# secret file reads back as a "valid" zero-length key unless length is
+# checked explicitly. Same shape for hex of the wrong length (e.g. a 4-byte
+# secret instead of 32) -- decodes cleanly, just isn't a 256-bit secret.
+
+
+def test_empty_secret_file_regenerates_and_revokes_everything(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    (tmp_path / "instance_secret").write_text("", encoding="utf-8")
+
+    fresh = TokenVault(tmp_path)  # no in-memory cache -- forces a file read
+    secret = fresh.instance_secret()
+    assert len(secret) == 32
+    assert fresh.verify(token) is None
+
+
+def test_whitespace_only_secret_file_regenerates_and_revokes_everything(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    (tmp_path / "instance_secret").write_text("   \n\t  ", encoding="utf-8")
+
+    fresh = TokenVault(tmp_path)
+    secret = fresh.instance_secret()
+    assert len(secret) == 32
+    assert fresh.verify(token) is None
+
+
+def test_short_but_valid_hex_secret_file_regenerates_and_revokes_everything(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    (tmp_path / "instance_secret").write_text("ab" * 4, encoding="utf-8")  # 4 bytes, not 32
+
+    fresh = TokenVault(tmp_path)
+    secret = fresh.instance_secret()
+    assert len(secret) == 32
+    assert fresh.verify(token) is None
+
+
+def test_env_var_empty_string_is_treated_as_unset(tmp_path, monkeypatch):
+    # A caller-supplied empty override must not silently become a weak key.
+    # Decision: an empty TENKA_SECRET is treated as if the variable were
+    # unset at all, so the secret still comes from -- and is persisted to --
+    # the on-disk file, never derived from the empty string itself.
+    monkeypatch.setenv("TENKA_SECRET", "")
+    vault = TokenVault(tmp_path)
+
+    secret = vault.instance_secret()
+
+    assert len(secret) == 32
+    assert secret != b""
+    assert secret != sha256(b"").digest()
+    assert (tmp_path / "instance_secret").exists()
+
+
+def test_env_var_with_wrong_length_hex_raises_loudly(tmp_path, monkeypatch):
+    # Decision: unlike a corrupt on-disk file, a bad TENKA_SECRET is not
+    # something the vault can recover from by regenerating -- there is
+    # nothing to regenerate, the operator asked for this exact secret and
+    # got the length wrong. Silently accepting a weak key or silently
+    # substituting a different secret would both hide the mistake, so this
+    # raises instead of returning anything.
+    monkeypatch.setenv("TENKA_SECRET", "ab" * 4)  # valid hex, 4 bytes, not 32
+    vault = TokenVault(tmp_path)
+
+    with pytest.raises(ValueError):
+        vault.instance_secret()
