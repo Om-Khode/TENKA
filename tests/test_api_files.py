@@ -99,6 +99,19 @@ def test_a_chat_only_device_cannot_touch_files(context):
                           json={"path": "desktop/notes.md"}).status_code == 403
 
 
+def test_a_chat_only_device_cannot_read_file_content(context):
+    client, _, chat_only = context
+    response = client.get("/v1/files/content?path=desktop/notes.md", headers=chat_only)
+    assert response.status_code == 403
+
+
+def test_a_chat_only_device_cannot_rename(context):
+    client, _, chat_only = context
+    response = client.post("/v1/files/rename", headers=chat_only,
+                           json={"path": "desktop/notes.md", "new_name": "renamed.md"})
+    assert response.status_code == 403
+
+
 def test_a_traversing_path_is_refused_by_the_route(context):
     client, headers, _ = context
     for attack in ("desktop/../../outside.txt", "..\\outside.txt", "/etc/passwd"):

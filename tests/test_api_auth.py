@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends
 from fastapi.testclient import TestClient
 
 from assistant.io.api.app import create_app
-from assistant.io.api.security import require
+from assistant.io.api.security import RateLimiter, require
 from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.studio_runtime import build_fake_runtime
 
@@ -108,6 +108,19 @@ def _sweep_v1_routes_require_auth(client) -> int:
         for method in operations:
             if method.upper() in ("HEAD", "OPTIONS"):
                 continue
+            # A fresh limiter before every probe, not once before the loop:
+            # the sweep's whole point is "every route answers 401/403 with no
+            # token," and that guarantee must hold no matter how many routes
+            # exist. Sharing one TestClient's source identity across N
+            # sequential anonymous calls would otherwise make the Nth+1
+            # (once N crosses RateLimiter._MAX_FAILURES) collide with the
+            # limiter's own lockout and answer 429 instead -- a growing
+            # route count breaking the auth guarantee's own test, not the
+            # guarantee itself. Resetting per call keeps this sweep correct
+            # at 13 routes today and however many Tasks 11-14 add, without
+            # this test needing to know the limiter's internal thresholds or
+            # the exact source key `authenticate()` computes.
+            client.app.state.auth.limiter = RateLimiter()
             response = client.request(method.upper(), concrete)
             assert response.status_code in (401, 403), (
                 f"{method.upper()} {path} answered {response.status_code} with no token"

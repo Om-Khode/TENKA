@@ -38,7 +38,10 @@ def _fail(exc: Exception) -> HTTPException:
 @router.get("/files/roots")
 async def list_roots(request: Request,
                      _=Depends(require(Capability.FILES))) -> Envelope:
-    roots = await request.app.state.runtime.files.roots()
+    try:
+        roots = await request.app.state.runtime.files.roots()
+    except OSError as exc:
+        raise _fail(exc)
     return Envelope(data={"roots": roots})
 
 
