@@ -21,7 +21,15 @@ def _imported_modules(path: pathlib.Path) -> set[str]:
 
 
 def test_no_module_under_io_api_imports_a_forbidden_package():
-    for path in pathlib.Path("assistant/io/api").rglob("*.py"):
+    paths = list(pathlib.Path("assistant/io/api").rglob("*.py"))
+    # A relative "assistant/io/api" resolves against the process's cwd, not
+    # this file's location -- run from anywhere else and rglob() silently
+    # walks zero files, and every assertion below passes vacuously whether or
+    # not a forbidden import actually exists. This is the guard the whole
+    # test exists to be: without it, a broken layering contract and a broken
+    # working directory look identical -- both are a clean pytest run.
+    assert paths, "no files found under assistant/io/api -- run pytest from the repo root"
+    for path in paths:
         for module in _imported_modules(path):
             for banned in FORBIDDEN:
                 assert not module.startswith(banned), f"{path}: imports {module}"
@@ -29,7 +37,9 @@ def test_no_module_under_io_api_imports_a_forbidden_package():
 
 def test_no_module_under_io_api_climbs_out_relatively():
     """`from ...actions import x` is the same violation spelled differently."""
-    for path in pathlib.Path("assistant/io/api").rglob("*.py"):
+    paths = list(pathlib.Path("assistant/io/api").rglob("*.py"))
+    assert paths, "no files found under assistant/io/api -- run pytest from the repo root"
+    for path in paths:
         source = path.read_text(encoding="utf-8")
         for banned in ("actions", "storage", "automation", "llm"):
             assert f"from ...{banned}" not in source, f"{path}: relative import of {banned}"
