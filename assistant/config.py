@@ -884,6 +884,11 @@ def reload_runtime_settings() -> None:
     global VERIFY_ENABLED, VERIFY_BROWSER_STEPS, VERIFY_APP_STEPS
     global VERIFY_VISION_FALLBACK, VERIFY_STRICT_TEXT_MATCH
     global VERIFY_MIN_CONFIDENCE, VERIFY_MAX_RETRIES
+    global STUDIO_API_ENABLED, STUDIO_API_PORT, STUDIO_API_ORIGINS
+    global BROWSER_CDP_PORT, BROWSER_CDP_PROBE_TTL, BROWSER_DOM_CACHE_TTL
+    global BROWSER_DOM_MODE_ENABLED, BROWSER_DOM_TREE_TOKEN_BUDGET, BROWSER_PREFER_CDP
+    global DETERMINISTIC_MATCHING_ENABLED, DIALOG_ENGAGEMENT_GATE_ENABLED
+    global DROPDOWN_COMMIT_GUARD_ENABLED, DYNAMIC_BUDGET_ENABLED
 
     ASSISTANT_NAME = new_values.get("assistant_name", ASSISTANT_NAME)
     ASSISTANT_NAME_LOWER = ASSISTANT_NAME.lower()
@@ -918,3 +923,23 @@ def reload_runtime_settings() -> None:
     VERIFY_STRICT_TEXT_MATCH = new_values.get("verify_strict_text_match", VERIFY_STRICT_TEXT_MATCH)
     VERIFY_MIN_CONFIDENCE = new_values.get("verify_min_confidence", VERIFY_MIN_CONFIDENCE)
     VERIFY_MAX_RETRIES = new_values.get("verify_max_retries", VERIFY_MAX_RETRIES)
+
+    STUDIO_API_ENABLED = new_values.get("studio_api_enabled", STUDIO_API_ENABLED)
+    STUDIO_API_PORT = new_values.get("studio_api_port", STUDIO_API_PORT)
+    STUDIO_API_ORIGINS = new_values.get("studio_api_origins", STUDIO_API_ORIGINS)
+
+    BROWSER_CDP_PORT = new_values.get("browser_cdp_port", BROWSER_CDP_PORT)
+    BROWSER_CDP_PROBE_TTL = new_values.get("browser_cdp_probe_ttl", BROWSER_CDP_PROBE_TTL)
+    BROWSER_DOM_CACHE_TTL = new_values.get("browser_dom_cache_ttl", BROWSER_DOM_CACHE_TTL)
+    BROWSER_DOM_MODE_ENABLED = new_values.get("browser_dom_mode_enabled", BROWSER_DOM_MODE_ENABLED)
+    BROWSER_DOM_TREE_TOKEN_BUDGET = new_values.get(
+        "browser_dom_tree_token_budget", BROWSER_DOM_TREE_TOKEN_BUDGET)
+    BROWSER_PREFER_CDP = new_values.get("browser_prefer_cdp", BROWSER_PREFER_CDP)
+
+    DETERMINISTIC_MATCHING_ENABLED = new_values.get(
+        "deterministic_matching_enabled", DETERMINISTIC_MATCHING_ENABLED)
+    DIALOG_ENGAGEMENT_GATE_ENABLED = new_values.get(
+        "dialog_engagement_gate_enabled", DIALOG_ENGAGEMENT_GATE_ENABLED)
+    DROPDOWN_COMMIT_GUARD_ENABLED = new_values.get(
+        "dropdown_commit_guard_enabled", DROPDOWN_COMMIT_GUARD_ENABLED)
+    DYNAMIC_BUDGET_ENABLED = new_values.get("dynamic_budget_enabled", DYNAMIC_BUDGET_ENABLED)
