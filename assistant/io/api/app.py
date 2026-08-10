@@ -298,6 +298,13 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             # as the ones that follow it, with whatever isn't known yet
             # (`v`, `cursorFollows`, `step`, `tier`, `ts`) as `null` rather
             # than simply absent.
+            # Logged because nothing else marks a Studio client attaching:
+            # the daemon's own startup lines say it is listening, but a user
+            # watching the console had no way to tell a connected dashboard
+            # from a silent one. Device id only -- never the token, which is
+            # in this socket's query string.
+            logger.info(f"[API] Studio client attached to /v1/events "
+                        f"(device={device.device_id})")
             await _safe_send(build_status_frame(phase="connected",
                                                  detail=info.active_model))
             while True:

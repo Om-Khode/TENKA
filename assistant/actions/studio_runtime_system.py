@@ -471,6 +471,25 @@ class LiveSystemRuntime:
             # actually restored.
             logger.warning(f"[API] backup restore failed: {exc}")
             return False
+
+        # run_restore() closed the live DB connection before swapping the file
+        # on disk and deliberately does NOT reopen it -- see
+        # close_for_restore()'s docstring and orchestrator.run_restore()'s own
+        # comment: the 13 repos each cache their own handle at startup, so a
+        # fresh singleton would never reach them. Only a real restart rebuilds
+        # those caches.
+        #
+        # The voice path (actions/backup_pending.py) has always requested that
+        # shutdown; this one did not, so a restore triggered from Studio left
+        # the assistant running against a closed database -- "Cannot operate
+        # on a closed database" from the scheduler, and the reminder poller
+        # failing every ten seconds, until someone noticed and restarted her
+        # by hand. Restoring successfully and leaving her broken is a worse
+        # outcome than refusing the restore would have been.
+        from ..core import shutdown_signal
+        logger.info("[API] restore complete -- requesting shutdown; "
+                    "she must be restarted before anything touches the DB again.")
+        shutdown_signal.request()
         return True
 
     async def enrollment(self) -> EnrollmentState:
