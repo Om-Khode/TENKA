@@ -234,6 +234,14 @@ class BackupState:
     last_backup_at: str
     last_result: str
     size_bytes: int
+    #: Whether the encryption key is armed in THIS process. Derived from the
+    #: recovery phrase and held in memory only, so it is false after every
+    #: restart until someone supplies the phrase again -- and while it is
+    #: false, `_backup_loop` skips every scheduled run and run_backup()
+    #: refuses. A client that shows `enabled` without this reports a machine
+    #: that is backing up when it has quietly stopped; that is how a week
+    #: passed with backup_enabled true and nothing written.
+    unlocked: bool
 
 
 @dataclass(frozen=True)
@@ -324,6 +332,7 @@ class SystemRuntime(Protocol):
     async def backup_state(self) -> BackupState: ...
     async def run_backup(self) -> BackupState: ...
     async def restore_backup(self, recovery_phrase: str) -> bool: ...
+    async def unlock_backup(self, recovery_phrase: str) -> bool: ...
     async def enrollment(self) -> EnrollmentState: ...
     async def forget_enrolled(self, kind: str, item_id: str) -> bool: ...
 

@@ -182,3 +182,17 @@ class RestoreRequest(BaseModel):
     recovery_phrase: str = Field(
         min_length=1, max_length=512, alias="recoveryPhrase"
     )
+
+
+class UnlockRequest(BaseModel):
+    """Same field, deliberately a separate model from RestoreRequest.
+
+    Unlock and restore take the same secret and mean entirely different
+    things: one arms an in-memory key, the other overwrites every memory she
+    has. Sharing a request model would make it a one-word edit to point a
+    caller at the wrong route, and would tie the two together the next time
+    either needs a field the other must not accept.
+    """
+    recovery_phrase: str = Field(
+        min_length=1, max_length=512, alias="recoveryPhrase"
+    )

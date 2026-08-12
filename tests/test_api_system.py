@@ -202,3 +202,63 @@ def test_an_unknown_count_survives_as_null_not_zero(context):
     voice = body["voices"][0]
     assert "count" in voice
     assert voice["count"] is None
+
+
+# ─── Backup unlock ────────────────────────────────────────────────────────────
+# The key is derived from the recovery phrase and lives in process memory only,
+# so it is gone after every restart. While it is gone, orchestrator's scheduler
+# skips every run and run_backup() refuses -- so before this route existed, a
+# Studio user could not resume backups at all. Restore happened to unlock as a
+# side effect, which is not a workflow anyone should have to discover.
+
+
+def test_unlock_needs_system_control(context):
+    """CHAT must not reach it. The phrase this accepts is the same secret that
+    can overwrite every memory she has via /backup/restore."""
+    client, runtime, tokens = context
+    response = client.post("/v1/backup/unlock", headers=head(tokens["chat"]),
+                           json={"recoveryPhrase": PHRASE})
+    assert response.status_code == 403
+    assert runtime.system.unlocked_with == []
+
+
+def test_a_valid_phrase_unlocks(context):
+    client, runtime, tokens = context
+    response = client.post("/v1/backup/unlock", headers=head(tokens["full"]),
+                           json={"recoveryPhrase": PHRASE})
+    assert response.status_code == 200
+    assert response.json()["data"]["unlocked"] is True
+    assert runtime.system.unlocked_with == [PHRASE]
+
+
+def test_a_malformed_phrase_is_a_400_not_a_crash(context):
+    client, runtime, tokens = context
+    response = client.post("/v1/backup/unlock", headers=head(tokens["full"]),
+                           json={"recoveryPhrase": "too short"})
+    assert response.status_code == 400
+    assert runtime.system.unlocked_with == ["too short"]
+
+
+def test_the_unlock_phrase_is_never_echoed_back(context):
+    client, _, tokens = context
+    for phrase in (PHRASE, "wrong wrong wrong"):
+        response = client.post("/v1/backup/unlock", headers=head(tokens["full"]),
+                               json={"recoveryPhrase": phrase})
+        assert phrase not in response.text
+
+
+def test_backup_state_reports_whether_the_key_is_armed(context):
+    """`enabled` alone describes a machine that INTENDS to back up. A client
+    that shows it without `unlocked` reports one that is backing up when it has
+    quietly stopped -- which is exactly what happened for a week."""
+    client, _, tokens = context
+
+    before = client.get("/v1/backup", headers=head(tokens["full"])).json()["data"]
+    assert before["enabled"] is True
+    assert before["unlocked"] is False
+
+    client.post("/v1/backup/unlock", headers=head(tokens["full"]),
+                json={"recoveryPhrase": PHRASE})
+
+    after = client.get("/v1/backup", headers=head(tokens["full"])).json()["data"]
+    assert after["unlocked"] is True

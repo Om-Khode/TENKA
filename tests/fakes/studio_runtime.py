@@ -310,7 +310,11 @@ class FakeSystemRuntime:
     def __init__(self) -> None:
         self.backups_run = 0
         self.restored_with: list[str] = []
-        self._backup = BackupState(True, "google_drive", "2026-08-07T04:00:00Z", "ok", 18_432_112)
+        self.unlocked_with: list[str] = []
+        # unlocked=False on purpose: that is the state of a freshly started
+        # assistant, and the one the panel used to misreport as healthy.
+        self._backup = BackupState(True, "google_drive", "2026-08-07T04:00:00Z", "ok",
+                                   18_432_112, unlocked=False)
         self._enrollment = EnrollmentState(
             voices=[EnrolledItem("v1", "primary", "2026-07-01T08:00:00Z",
                                  count=6, last_seen_at="2026-08-07T22:10:00Z")],
@@ -329,12 +333,24 @@ class FakeSystemRuntime:
 
     async def run_backup(self) -> BackupState:
         self.backups_run += 1
-        self._backup = BackupState(True, "google_drive", "2026-08-08T09:15:00Z", "ok", 18_500_000)
+        self._backup = BackupState(True, "google_drive", "2026-08-08T09:15:00Z", "ok",
+                                   18_500_000, unlocked=True)
         return self._backup
 
     async def restore_backup(self, recovery_phrase: str) -> bool:
         self.restored_with.append(recovery_phrase)
         return len(recovery_phrase.split()) == 8
+
+    async def unlock_backup(self, recovery_phrase: str) -> bool:
+        self.unlocked_with.append(recovery_phrase)
+        ok = len(recovery_phrase.split()) == 8
+        if ok:
+            self._backup = BackupState(
+                self._backup.enabled, self._backup.provider,
+                self._backup.last_backup_at, self._backup.last_result,
+                self._backup.size_bytes, unlocked=True,
+            )
+        return ok
 
     async def enrollment(self) -> EnrollmentState:
         return self._enrollment
