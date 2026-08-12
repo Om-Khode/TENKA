@@ -22,6 +22,25 @@ def to_http_exception(exc: Exception) -> HTTPException:
     before the bare ValueError/RuntimeError/OSError catch-alls so a more
     specific exception never falls through to a coarser bucket.
     """
+    # Imported here rather than at module scope: this maps domain failures for
+    # every route, and it must not pull the backup stack into the import graph
+    # of routes that have nothing to do with backups.
+    from ..backup.provider import BackupProviderError
+
+    if isinstance(exc, BackupProviderError):
+        # 502: the request was valid and she tried -- the failure is between
+        # her and the storage provider (expired OAuth token, no network, quota).
+        # Not a 500, which would say the daemon itself is broken, and not a 409,
+        # which would say the caller has a precondition to fix.
+        #
+        # This mattered more than the status code alone suggests. Before it,
+        # BackupProviderError was not in app.py's handled list, so a failed
+        # upload became an unhandled 500 -- a full traceback in her console, and
+        # a response that never passed through the CORS middleware, so the
+        # browser reported it as unreachable. Studio told the user it could not
+        # reach her while she was running fine and had simply failed to refresh
+        # a Google token.
+        return HTTPException(status_code=502, detail="backup provider unavailable")
     if isinstance(exc, PermissionError):
         return HTTPException(status_code=403, detail="protected path")
     if isinstance(exc, (KeyError, FileNotFoundError, NotADirectoryError)):

@@ -262,3 +262,31 @@ def test_backup_state_reports_whether_the_key_is_armed(context):
 
     after = client.get("/v1/backup", headers=head(tokens["full"])).json()["data"]
     assert after["unlocked"] is True
+
+
+def test_a_provider_failure_is_a_502_not_a_traceback(context, monkeypatch):
+    """A failed upload used to be an unhandled 500.
+
+    BackupProviderError was not in app.py's handled-type list, so it escaped as
+    a bare 500: a full traceback in her console, and a response that never
+    passed through the CORS middleware -- so the browser reported it as
+    unreachable and Studio told the user it could not reach her, while she was
+    running fine and had simply failed to refresh a Google token. Seen live on
+    2026-08-10.
+    """
+    from assistant.io.backup.provider import BackupProviderError
+
+    client, runtime, tokens = context
+
+    async def _fails():
+        raise BackupProviderError("Failed to refresh Google Drive token.")
+
+    monkeypatch.setattr(runtime.system, "run_backup", _fails)
+
+    response = client.post("/v1/backup/run", headers=head(tokens["full"]))
+
+    assert response.status_code == 502
+    # The provider's own message may name accounts, URLs or tokens; the wire
+    # carries a fixed string, exactly as the other mapped failures do.
+    assert "Google" not in response.text
+    assert response.json()["detail"] == "backup provider unavailable"

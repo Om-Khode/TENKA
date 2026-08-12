@@ -171,9 +171,16 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # NOT in this list is a genuinely *unexpected* failure, and stays a plain
     # 500 rather than being silently absorbed into a false sense of "every
     # exception is handled".
+    from ..backup.provider import BackupProviderError
+
     for _exc_type in (
         ValueError, KeyError, PermissionError, FileNotFoundError,
         NotADirectoryError, RuntimeError, OSError,
+        # A failed upload (expired provider token, no network, quota) was NOT
+        # in this list, so it was a bare 500: a traceback in her console, and a
+        # response that skipped the CORS middleware entirely, which the browser
+        # then reported as "could not reach her" while she was running fine.
+        BackupProviderError,
     ):
         app.add_exception_handler(_exc_type, unhandled_error)
 
