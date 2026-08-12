@@ -127,6 +127,7 @@ WRAPPER_PAYLOADS_WITHOUT_A_DATACLASS: dict[type[payloads.CamelModel], str] = {
     payloads.AuditPayload: "wraps list[AuditEntry]; the route builds the list directly",
     payloads.AbortPayload: "sourced from ChatRuntime.abort()'s bare bool, not a dataclass",
     payloads.RestorePayload: "sourced from SystemRuntime.restore_backup()'s bare bool, not a dataclass",
+    payloads.UnlockPayload: "sourced from SystemRuntime.unlock_backup()'s bare bool, not a dataclass",
     payloads.ForgottenPayload: "echoes the route's item_id path parameter, not a dataclass",
     payloads.RemovedPayload: "sourced from MemoryRuntime.forget_all()'s bare int, not a dataclass",
     payloads.DeletedPayload: "echoes the route's own request body path, not a dataclass",

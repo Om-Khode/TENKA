@@ -217,7 +217,12 @@ def test_backup_state_keys(context):
         client.post("/v1/backup/run", headers=headers),
     ):
         assert _keys(response.json()["data"]) == {
-            "enabled", "provider", "lastBackupAt", "lastResult", "sizeBytes",
+            # `unlocked` is not optional decoration: the key is derived from the
+            # recovery phrase and held in memory only, so `enabled` alone
+            # describes a machine that INTENDS to back up rather than one that
+            # can. A client without this field showed a healthy panel through a
+            # week of skipped backups.
+            "enabled", "provider", "lastBackupAt", "lastResult", "sizeBytes", "unlocked",
         }
 
 

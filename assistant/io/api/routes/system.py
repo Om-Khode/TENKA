@@ -24,8 +24,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from ..payloads import (
     AuditEntryPayload, AuditPayload, BackupStatePayload, EnrolledItemPayload,
     EnrollmentPayload, ForgetEnrolledPayload, RestorePayload, TelemetryPayload,
+    UnlockPayload,
 )
-from ..schemas import Envelope, RestoreRequest
+from ..schemas import Envelope, RestoreRequest, UnlockRequest
 from ..security import require, throttle
 from ..vault import Capability
 
@@ -43,6 +44,15 @@ EnrollmentKind = Literal["voice", "face"]
 # one bounds that without touching what any other CHAT route may do.
 _BACKUP_RUN_MAX_PER_WINDOW = 5
 _BACKUP_RUN_WINDOW_SECONDS = 60.0
+
+# Tighter than the run budget above. /backup/unlock takes a recovery phrase and
+# derives a key from it, which is the one route where an attacker who already
+# holds a SYSTEM_CONTROL token could grind candidate phrases -- and unlike
+# restore, a wrong-but-well-formed guess has no destructive side effect to make
+# attempts self-limiting. Five a minute is far above any honest use (a person
+# types this once per restart) and far below anything useful for guessing.
+_UNLOCK_MAX_PER_WINDOW = 5
+_UNLOCK_WINDOW_SECONDS = 60.0
 
 
 def telemetry_body(snapshot) -> TelemetryPayload:
@@ -73,6 +83,7 @@ def _backup_body(state) -> BackupStatePayload:
         last_backup_at=state.last_backup_at,
         last_result=state.last_result,
         size_bytes=state.size_bytes,
+        unlocked=state.unlocked,
     )
 
 
@@ -104,6 +115,33 @@ async def restore_backup(body: RestoreRequest, request: Request,
         # this literal string, never `body.recovery_phrase`.
         raise HTTPException(status_code=400, detail="restore failed")
     return Envelope(data=RestorePayload(restored=True))
+
+
+@router.post("/backup/unlock")
+async def unlock_backup(body: UnlockRequest, request: Request,
+                        _=Depends(throttle(Capability.SYSTEM_CONTROL, "backup_unlock",
+                                           max_per_window=_UNLOCK_MAX_PER_WINDOW,
+                                           window_seconds=_UNLOCK_WINDOW_SECONDS))
+                        ) -> Envelope[UnlockPayload]:
+    """Arm this process's backup encryption key from the recovery phrase.
+
+    SYSTEM_CONTROL, not CHAT: the phrase this accepts is the same secret that
+    can overwrite every memory she has through /backup/restore, so it must not
+    be reachable by a device holding only a chat grant.
+
+    Throttled harder than the other write routes. Deriving a key from a
+    submitted phrase is the one place an attacker with a foothold could grind
+    candidate phrases, and unlike restore there is no destructive side effect
+    to make attempts self-limiting -- a wrong-but-well-formed phrase simply
+    arms a useless key and can be retried. The rate limit is the only thing
+    bounding that.
+    """
+    ok = await request.app.state.runtime.system.unlock_backup(body.recovery_phrase)
+    if not ok:
+        # Generic, and never echoes any part of what was submitted -- the same
+        # reasoning as /backup/restore's 400 above.
+        raise HTTPException(status_code=400, detail="unlock failed")
+    return Envelope(data=UnlockPayload(unlocked=True))
 
 
 def _enrolled_item(item) -> EnrolledItemPayload:

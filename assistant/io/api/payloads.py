@@ -268,10 +268,18 @@ class BackupStatePayload(CamelModel):
     last_backup_at: str
     last_result: str
     size_bytes: int
+    # Whether the encryption key is armed in this process. See BackupState's
+    # own comment in runtime.py: `enabled` without this describes a machine
+    # that intends to back up, not one that can.
+    unlocked: bool
 
 
 class RestorePayload(CamelModel):
     restored: bool
+
+
+class UnlockPayload(CamelModel):
+    unlocked: bool
 
 
 class EnrolledItemPayload(CamelModel):

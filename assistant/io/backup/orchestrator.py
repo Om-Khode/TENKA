@@ -387,7 +387,18 @@ def _maybe_run_scheduled_backup() -> None:
     if not settings.get("backup_enabled", False):
         return
     if not is_unlocked():
-        logger.debug("[BACKUP] Skipping scheduled backup — key not unlocked this session")
+        # WARNING, not DEBUG. Backup is enabled, the user believes it is
+        # running, and every scheduled attempt is being skipped because the
+        # in-memory key died with the last restart. At DEBUG this was invisible
+        # in a default install: a week passed with backup_enabled true, the
+        # panel showing a stale "last backup" date, and nothing written.
+        # Logged once per skipped cycle is the correct volume -- it is one line
+        # per interval, and the condition genuinely persists until someone acts.
+        logger.warning(
+            "[BACKUP] Backup is enabled but the key is NOT unlocked this session "
+            "— every scheduled backup is being skipped. Unlock it (say 'unlock "
+            "backup', or use Studio's Settings page) to resume."
+        )
         return
 
     last_at = settings.get("backup_last_backup_at")

@@ -449,6 +449,10 @@ class LiveSystemRuntime:
             last_backup_at=str(state.get("last_backup_at", "")),
             last_result=str(state.get("last_result", "")),
             size_bytes=int(state.get("size_bytes", 0)),
+            # Read from the orchestrator directly, not from get_state(): the
+            # key is process memory, never persisted, so no stored row can
+            # answer this.
+            unlocked=orchestrator.is_unlocked(),
         )
 
     async def run_backup(self) -> BackupState:
@@ -490,6 +494,31 @@ class LiveSystemRuntime:
         logger.info("[API] restore complete -- requesting shutdown; "
                     "she must be restarted before anything touches the DB again.")
         shutdown_signal.request()
+        return True
+
+    async def unlock_backup(self, recovery_phrase: str) -> bool:
+        """Re-arm this process's backup key from a phrase the user already has.
+
+        The Studio counterpart to the voice flow's
+        handle_pending_backup_unlock_phrase(). The key is derived from the
+        phrase and held in memory only, so it is gone after every restart --
+        and while it is gone `_backup_loop` skips every scheduled run at DEBUG
+        level and run_backup() refuses. Without this route a Studio user could
+        not restart backups at all: restore happened to unlock as a side
+        effect, which is not a workflow anyone should have to discover.
+
+        Returns False for a malformed phrase rather than raising, exactly as
+        restore_backup() does. NOTE: a well-formed phrase always unlocks, even
+        if it is the wrong phrase -- deriving a key cannot tell them apart
+        without an archive to decrypt. The wrongness surfaces on the next
+        backup or restore, which is the same behaviour the voice flow has
+        always had; claiming otherwise here would be a check this cannot make.
+        """
+        from ..io.backup import crypto, orchestrator
+        if not crypto.is_valid_recovery_phrase(recovery_phrase):
+            return False
+        orchestrator.set_unlocked_key(crypto.derive_key(recovery_phrase))
+        logger.info("[API] backup key unlocked for this session")
         return True
 
     async def enrollment(self) -> EnrollmentState:
