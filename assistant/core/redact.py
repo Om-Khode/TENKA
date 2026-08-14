@@ -100,13 +100,16 @@ _STRONG_LABEL_MIN_LEN = 3
 # the whole point of previewing a config file — and replaces only what sits
 # to the right of the separator.
 #
-# Three constraints keep it from eating ordinary source code:
+# Four constraints keep it from eating ordinary source code and prose:
 #   * the identifier must be UPPER_SNAKE, so `x = 1`, `count = compute()`
 #     and `self.total = 0` never match;
 #   * it must start the line (leading whitespace allowed, because YAML and
 #     INI indent their keys), so `print(x = 1)` and every mid-line
 #     assignment inside prose survive;
-#   * a comment line starts with its comment marker, not an identifier.
+#   * a comment line starts with its comment marker, not an identifier;
+#   * under a `:` separator the value must be a single unbroken token —
+#     see `_mask_assignment`, which is where the prose markers English
+#     writes with a colon ("TODO: buy cable") are let through.
 #
 # The accepted cost is a *public* UPPER_SNAKE constant in a source preview:
 # `MAX_PREVIEW_BYTES = 512_000` loses its value. That is the same trade the
@@ -171,9 +174,32 @@ def _mask_assignment(match: re.Match[str]) -> str:
     An empty value is left alone: `EMPTY_ON_PURPOSE=` has nothing to hide,
     and a `[REDACTED]` standing for nothing would read as a secret that is
     not there.
+
+    The colon form additionally requires a value with no internal
+    whitespace, because `:` is the one separator English also uses: an
+    ALL-CAPS prose marker at the start of a previewed note ("TODO: buy
+    cable", "WARNING: do not run this") is assignment-shaped by every
+    structural test this rule can apply, and blanking those lines makes a
+    `.md` preview useless while protecting nothing. A sentence is what tells
+    the two apart -- a secret in a config file is a single unbroken token by
+    necessity (`sk-abc123`, `postgres://u:p@h/db`), since neither `.env` nor
+    unquoted YAML can carry a space without quoting it.
+
+    The `=` form is deliberately not held to the same test: `=` is machine
+    syntax that prose does not reach for, so `ARGS=--foo --bar` should still
+    lose its value even though it has spaces in it. That asymmetry is the
+    point, not an oversight.
+
+    What this gives up, knowingly: a quoted multi-word value under a colon
+    (`SOME_PASSPHRASE: "two words"`) survives this rule -- though the
+    labelled mechanisms still sweep it afterwards whenever the identifier
+    contains a role noun they know, which is most of the cases that matter.
     """
     lead, name, separator, value = match.groups()
-    if not value.strip():
+    stripped = value.strip()
+    if not stripped:
+        return match.group(0)
+    if ":" in separator and any(c.isspace() for c in stripped):
         return match.group(0)
     return f"{lead}{name}{separator}{REDACTED}"
 
