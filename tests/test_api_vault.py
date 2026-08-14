@@ -1,5 +1,6 @@
 """Token vault — the only thing that decides whether a caller is real."""
 import json
+import logging
 from hashlib import sha256
 
 import pytest
@@ -309,3 +310,128 @@ def test_env_var_with_wrong_length_hex_raises_loudly(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError):
         vault.instance_secret()
+
+
+def test_env_var_that_is_not_hex_is_hashed_into_a_key(tmp_path, monkeypatch):
+    # A passphrase is not a 256-bit key, but it is unambiguously deliberate, so
+    # it is stretched into one rather than rejected. Nothing is persisted: the
+    # override lives in the environment, and writing it to disk would outlive
+    # the variable that set it.
+    monkeypatch.setenv("TENKA_SECRET", "  correct horse battery staple  ")
+    vault = TokenVault(tmp_path)
+
+    assert vault.instance_secret() == sha256(b"correct horse battery staple").digest()
+    assert not (tmp_path / "instance_secret").exists()
+
+
+def test_env_var_wins_over_both_the_stored_and_the_cached_secret(tmp_path, monkeypatch):
+    # The file read added below must not become a second source of truth that
+    # outranks an explicit operator override -- precedence stays env, file, new.
+    vault = TokenVault(tmp_path)
+    stored = vault.instance_secret()  # populates the cache and the file
+
+    monkeypatch.setenv("TENKA_SECRET", "ab" * 32)
+
+    assert vault.instance_secret() == bytes.fromhex("ab" * 32)
+    assert vault.instance_secret() != stored
+
+
+# ─── Disk is the truth; the cached secret is only a fallback ──────────────
+# `instance_secret()` re-reads the secret file on every call. The cost is one
+# ~64-byte read per HMAC, which is cheaper than the devices.json read and JSON
+# parse `verify()` already does on every call via `_load()`. What it buys: a
+# rotation performed by any other vault instance -- or any other process -- is
+# seen immediately, instead of a stale cache minting tokens nobody can verify.
+
+
+def test_issue_after_another_instance_rotated_the_secret_still_verifies(tmp_path):
+    """The blocker: a long-running vault must not mint tokens against a secret
+    that disk has already moved past.
+
+    A daemon vault caches the secret at startup; a rotation then happens
+    through a *different* vault instance on the same root (a slash command, an
+    admin route). Hashing the next issued token against the cached, superseded
+    secret produces a token that verifies for the rest of that process's life
+    and then never again -- the device works today and is silently dead after
+    the next restart, with no error anywhere.
+    """
+    daemon = TokenVault(tmp_path)
+    daemon.instance_secret()  # long-running instance caches the pre-rotation secret
+
+    TokenVault(tmp_path).reset()  # rotated out from under it
+
+    token = daemon.issue("phone", frozenset({Capability.CHAT}))
+
+    assert daemon.verify(token) is not None, "unusable the moment it was issued"
+    fresh = TokenVault(tmp_path)  # what the next daemon start sees: disk only
+    device = fresh.verify(token)
+    assert device is not None, "verified in-process, dead after a restart"
+    assert device.label == "phone"
+
+
+def test_rotation_is_visible_even_when_the_device_list_survives(tmp_path):
+    """`reset()` deletes devices.json, so revocation used to appear to work
+    cross-process even with a stale cached secret -- an empty device list
+    matches nothing regardless of which secret hashed the token. Rotate the
+    secret alone and that cover is gone: revocation now holds because the
+    secret itself is re-read, not because there is nothing left to compare
+    against.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.CHAT}))
+    assert vault.verify(token) is not None
+
+    (tmp_path / "instance_secret").write_text("ab" * 32, encoding="utf-8")
+
+    assert vault.verify(token) is None
+
+
+def test_deleted_secret_file_mid_run_does_not_revoke_issued_devices(tmp_path, caplog):
+    """Disk losing the secret is not authority to revoke every device.
+
+    Regenerating here would be a robustness regression: today's cache
+    accidentally prevents it, and a vanished file is far more likely to be a
+    backup tool, a sync client, or a stray delete than an instruction to
+    invalidate every paired device mid-run. Keep the secret already in memory,
+    say so loudly, and leave the decision to the operator.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.CHAT}))
+    (tmp_path / "instance_secret").unlink()
+
+    with caplog.at_level(logging.WARNING, logger="assistant.io.api.vault"):
+        assert vault.verify(token) is not None
+
+    assert "keeping the secret already in memory" in caplog.text
+    # No silent re-persist either: rewriting the file would hide the loss and
+    # bake whichever process noticed first in as the winner.
+    assert not (tmp_path / "instance_secret").exists()
+
+
+def test_corrupt_secret_file_mid_run_does_not_revoke_issued_devices(tmp_path, caplog):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.CHAT}))
+    (tmp_path / "instance_secret").write_text("not-hex-garbage", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="assistant.io.api.vault"):
+        assert vault.verify(token) is not None
+
+    assert "keeping the secret already in memory" in caplog.text
+    # The bad file is left exactly as found, for the operator to look at.
+    assert (tmp_path / "instance_secret").read_text(encoding="utf-8") == "not-hex-garbage"
+
+
+def test_corrupt_secret_file_with_no_cached_secret_regenerates_and_persists(tmp_path):
+    """The documented recovery path, unchanged: with nothing cached there is
+    no secret worth preserving, and raising would take the whole daemon down
+    at startup with no way back. Regenerate, persist, and revoke.
+    """
+    (tmp_path / "instance_secret").write_text("not-hex-garbage", encoding="utf-8")
+    vault = TokenVault(tmp_path)
+
+    secret = vault.instance_secret()
+
+    assert len(secret) == 32
+    on_disk = (tmp_path / "instance_secret").read_text(encoding="utf-8").strip()
+    assert bytes.fromhex(on_disk) == secret, "regenerated secret was not persisted"
+    assert vault.instance_secret() == secret  # and it is stable from then on
