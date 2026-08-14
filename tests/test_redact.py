@@ -275,10 +275,45 @@ def test_strict_leaves_a_private_upper_snake_constant_alone():
     assert redact_secrets_strict(text) == text
 
 
-def test_strict_also_redacts_an_all_caps_prose_marker():
-    """"TODO: buy cable" in a previewed .md is assignment-shaped by this
-    rule's definition. Accepted: same trade, same direction."""
-    assert redact_secrets_strict("TODO: buy cable") == "TODO: [REDACTED]"
+def test_strict_leaves_an_all_caps_prose_marker_alone():
+    """A colon is the one separator English also writes, so under `:` the
+    value has to be a single unbroken token to count. A sentence is not one,
+    and blanking these lines would make a previewed note useless while
+    protecting nothing."""
+    for line in ("TODO: buy cable", "WARNING: do not run this", "NOTE: see below",
+                 "IMPORTANT: read first"):
+        assert redact_secrets_strict(line) == line
+
+
+def test_strict_still_redacts_a_colon_separated_secret():
+    """The relaxation above must not open the shape that motivated the rule:
+    a config value under a colon is one token, so it still goes -- including
+    the short unlabelled one no entropy test would ever catch."""
+    assert redact_secrets_strict("API_KEY: sk-abc123def456") == "API_KEY: [REDACTED]"
+    assert redact_secrets_strict("DB_PASS: hunter2") == "DB_PASS: [REDACTED]"
+    assert redact_secrets_strict("TOKEN: hunter2") == "TOKEN: [REDACTED]"
+    assert redact_secrets_strict("  DATABASE_URL: postgres://u:p@h/db") == \
+        "  DATABASE_URL: [REDACTED]"
+
+
+def test_strict_ignores_whitespace_around_a_colon_value():
+    """The single-token test runs on the stripped value. Trailing spaces are
+    invisible in a file and must not decide whether a secret is redacted."""
+    assert redact_secrets_strict("API_KEY:   sk-abc123   ") == "API_KEY:   [REDACTED]"
+
+
+def test_strict_holds_the_equals_form_to_no_such_test():
+    """`=` is machine syntax prose does not reach for, so a spaced value
+    still loses itself there. The asymmetry with `:` is deliberate."""
+    assert redact_secrets_strict("ARGS=--foo --bar") == "ARGS=[REDACTED]"
+
+
+def test_strict_gives_up_a_quoted_multi_word_colon_value():
+    """The knowing cost of the prose exemption. Pinned so it is a decision
+    and not a surprise: the labelled mechanisms are what still cover the
+    cases where the identifier carries a role noun they recognise."""
+    text = 'SOME_PHRASE: "two words"'
+    assert redact_secrets_strict(text) == text
 
 
 def test_strict_leaves_a_comparison_at_line_start_alone():
