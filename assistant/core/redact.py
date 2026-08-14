@@ -1,7 +1,7 @@
-"""Redact secret-shaped substrings before text reaches a log.
+"""Redact secret-shaped substrings before text reaches a log or a reader.
 
 Generic by construction: no vendor prefixes, no brand names, no per-service
-patterns. Two mechanisms only —
+patterns. Three mechanisms, the third opt-in —
 
   1. A labelled assignment ("api key is X", "password: X", "Bearer X") keeps
      its label and loses its value. How much the value itself has to prove
@@ -13,6 +13,14 @@ patterns. Two mechanisms only —
      provided it also carries an actual entropy signal (mixed case or a
      separator) — otherwise a plain lowercase-hex identifier such as a git
      commit hash would be mistaken for a secret.
+  3. `redact_secrets_strict` only: an assignment-shaped *line* loses its
+     value whatever that value looks like. Blunt on purpose, which is why
+     it is not in the default path — see its own section below.
+
+Two entry points, and the difference between them is the audience.
+`redact_secrets` is for text on its way to a log, where over-redaction
+costs a diagnostic. `redact_secrets_strict` is for text on its way to a
+reader over a transport, where under-redaction costs a credential.
 
 Layering: core/ — imports nothing from the assistant.
 """
@@ -81,6 +89,44 @@ _BARE_MIN_LEN = 24
 _WEAK_LABEL_MIN_LEN = 8
 _STRONG_LABEL_MIN_LEN = 3
 
+# ─── Assignment-shaped lines (strict only) ───────────────────────────────
+# The two mechanisms above both ask "does this value look like a secret?".
+# On an assignment-shaped line that question is the wrong one: the value is
+# the payload by position, so `DB_PASS=hunter2` must lose "hunter2" even
+# though "hunter2" has no entropy signal, and `DATABASE_URL=postgres://...`
+# must lose a URL that no shape test would ever flag. So this rule stops
+# asking. It keeps the identifier and the separator verbatim — a preview
+# whose keys survive still tells the reader which values are set, which is
+# the whole point of previewing a config file — and replaces only what sits
+# to the right of the separator.
+#
+# Three constraints keep it from eating ordinary source code:
+#   * the identifier must be UPPER_SNAKE, so `x = 1`, `count = compute()`
+#     and `self.total = 0` never match;
+#   * it must start the line (leading whitespace allowed, because YAML and
+#     INI indent their keys), so `print(x = 1)` and every mid-line
+#     assignment inside prose survive;
+#   * a comment line starts with its comment marker, not an identifier.
+#
+# The accepted cost is a *public* UPPER_SNAKE constant in a source preview:
+# `MAX_PREVIEW_BYTES = 512_000` loses its value. That is the same trade the
+# strong-label tier already makes — over-redacting a constant is cheap,
+# disclosing a credential is not — and it is why this rule stays out of the
+# log path, where a redacted constant is a lost diagnostic instead.
+#
+# `[^\r\n]*` rather than `.*$`: it stops the value group short of a CRLF's
+# carriage return, so a Windows file's line endings come back unchanged.
+#
+# `(?!=)` after the separator keeps a comparison from being read as an
+# assignment: `MODE == "prod"` would otherwise keep its leading `=` and lose
+# `= "prod"`, mangling a line that never carried a value. Every other
+# comparison operator is excluded by construction — `!`, `<` and `>` are not
+# in `[:=]`, so `COUNT >= 3` never starts a match at all — and `==` was the
+# one shape that slipped through, because `=` leads it.
+_ASSIGNMENT = re.compile(
+    r"(?m)^([ \t]*(?:export[ \t]+)?)([A-Z][A-Z0-9_]*)([ \t]*[:=](?!=)[ \t]*)([^\r\n]*)"
+)
+
 
 def _looks_secret(candidate: str, *, min_len: int, require_entropy: bool) -> bool:
     """Shape check for the weak-label and bare paths.
@@ -119,6 +165,19 @@ def _is_plausible_value(candidate: str, *, min_len: int) -> bool:
     return len(candidate) >= min_len and any(c.isalnum() for c in candidate)
 
 
+def _mask_assignment(match: re.Match[str]) -> str:
+    """Keep the lead, the identifier and the separator; drop the value.
+
+    An empty value is left alone: `EMPTY_ON_PURPOSE=` has nothing to hide,
+    and a `[REDACTED]` standing for nothing would read as a secret that is
+    not there.
+    """
+    lead, name, separator, value = match.groups()
+    if not value.strip():
+        return match.group(0)
+    return f"{lead}{name}{separator}{REDACTED}"
+
+
 def redact_secrets(text: str) -> str:
     """Return `text` with secret-shaped substrings replaced by `[REDACTED]`."""
     if not text:
@@ -147,3 +206,23 @@ def redact_secrets(text: str) -> str:
         return REDACTED
 
     return _BARE.sub(_mask_bare, out)
+
+
+def redact_secrets_strict(text: str) -> str:
+    """Every mechanism at once, for text disclosed to a reader.
+
+    Additive, never a replacement: the assignment rule runs first so a
+    config file's values are gone before the labelled and bare rules sweep
+    whatever prose is left around them. Callers that log must keep using
+    `redact_secrets` — this variant would eat an UPPER_SNAKE constant out of
+    a traceback, a cost only worth paying when the text is leaving the
+    machine.
+
+    Callers are responsible for one thing this function cannot judge: what
+    the text *is*. Base64 in a `data:` URI is one long high-entropy run, so
+    the bare rule would shred an image preview into `[REDACTED]`. Text of
+    that shape must not be passed here at all.
+    """
+    if not text:
+        return text
+    return redact_secrets(_ASSIGNMENT.sub(_mask_assignment, text))
