@@ -2,9 +2,10 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from assistant.core.redact import redact_secrets_strict
 from assistant.io.api.app import create_app
 from assistant.io.api.vault import Capability, TokenVault
-from tests.fakes.studio_runtime import build_fake_runtime
+from tests.fakes.studio_runtime import FAKE_PNG_DATA_URI, build_fake_runtime
 
 
 @pytest.fixture()
@@ -20,13 +21,14 @@ def context(tmp_path):
 def test_listing_a_root_returns_its_entries(context):
     client, headers, _ = context
     entries = client.get("/v1/files?path=desktop", headers=headers).json()["data"]["entries"]
-    assert [e["name"] for e in entries] == ["notes.md", "captures"]
+    assert [e["name"] for e in entries] == ["notes.md", ".env", "captures"]
 
 
 def test_every_entry_is_keyed_by_its_path(context):
     client, headers, _ = context
     entries = client.get("/v1/files?path=desktop", headers=headers).json()["data"]["entries"]
-    assert [e["id"] for e in entries] == ["desktop/notes.md", "desktop/captures"]
+    assert [e["id"] for e in entries] == ["desktop/notes.md", "desktop/.env",
+                                          "desktop/captures"]
 
 
 def test_a_nested_directory_is_listable(context):
@@ -142,3 +144,50 @@ def test_roots_lists_the_configured_roots(context):
 def test_a_chat_only_device_cannot_list_roots(context):
     client, _, chat_only = context
     assert client.get("/v1/files/roots", headers=chat_only).status_code == 403
+
+
+# ─── Preview redaction ───────────────────────────────────────────────────
+# A preview is the one payload that carries file bytes off the machine
+# verbatim, and a .env on the Desktop is a listed text suffix, so it
+# previewed as plaintext credentials. Redaction sits on the route, not in
+# LiveFileRuntime: the route is the boundary Milestone 6's remote transports
+# will expose, and every FileRuntime implementation -- live, fake, or
+# whatever replaces them -- reaches the client through it.
+
+def test_a_previewed_env_file_comes_back_redacted(context):
+    client, headers, _ = context
+    body = client.get("/v1/files/content?path=desktop/.env",
+                      headers=headers).json()["data"]
+    for leaked in ("hunter2", "sk-abc123def456", "postgres://user:pw@"):
+        assert leaked not in body["content"], leaked
+    assert "[REDACTED]" in body["content"]
+
+
+def test_a_redacted_preview_still_shows_which_keys_are_set(context):
+    """Redaction takes the value, not the label -- a preview that lost its
+    keys as well would be useless for the thing a preview is for."""
+    client, headers, _ = context
+    content = client.get("/v1/files/content?path=desktop/.env",
+                         headers=headers).json()["data"]["content"]
+    for kept in ("# service credentials", "DB_PASS=", "API_KEY=", "DATABASE_URL="):
+        assert kept in content, kept
+
+
+def test_an_ordinary_text_preview_is_unchanged(context):
+    client, headers, _ = context
+    body = client.get("/v1/files/content?path=desktop/notes.md",
+                      headers=headers).json()["data"]
+    assert body["content"] == "# notes\n\nbuy cable\n"
+
+
+def test_an_image_preview_survives_byte_identical(context):
+    """The image branch hands back a `data:<mime>;base64,...` URI, whose
+    payload is exactly the long mixed-case run the bare-token rule destroys.
+    Skipping redaction for content_kind == "image" is what keeps the picture
+    renderable -- the second assertion is why the skip has to exist."""
+    client, headers, _ = context
+    body = client.get("/v1/files/content?path=desktop/captures/shot.png",
+                      headers=headers).json()["data"]
+    assert body["contentKind"] == "image"
+    assert body["content"] == FAKE_PNG_DATA_URI
+    assert redact_secrets_strict(FAKE_PNG_DATA_URI) != FAKE_PNG_DATA_URI

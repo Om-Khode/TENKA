@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from ....core.redact import redact_secrets_strict
 from ..errors import to_http_exception
 from ..payloads import DeletedPayload, FileContentPayload, FileEntryPayload, FilesListingPayload, RootsPayload
 from ..schemas import DeleteRequest, Envelope, RenameRequest
@@ -55,6 +56,30 @@ async def list_files(request: Request, path: str = Query(min_length=1, max_lengt
     return Envelope(data=FilesListingPayload(path=path, entries=[_entry(e) for e in entries]))
 
 
+def _redacted(content) -> str:
+    """Strip secret-shaped values out of a preview before it leaves the box.
+
+    Here rather than in the runtime, for two reasons. A preview is the only
+    payload that carries raw file bytes off the machine, and `.env` is a
+    listed text suffix, so the user's own credentials previewed as
+    plaintext -- bounded today only by the daemon being loopback-only with a
+    single owner token, a bound the remote transports remove. And every
+    FileRuntime implementation, present or future, reaches a client through
+    this route: redacting at the boundary covers all of them, where
+    redacting in LiveFileRuntime would cover one.
+
+    An image's `text` is a `data:<mime>;base64,...` URI, not prose. Its
+    payload is one long mixed-case run -- exactly what the bare-token rule
+    destroys -- so the whole picture would come back as `[REDACTED]` and
+    render as a broken image. Images are skipped, which is safe on its own
+    terms: the encoder produced those bytes from the file, so there is no
+    text in them for a reader to lift a credential out of.
+    """
+    if content.content_kind == "image" or not content.text:
+        return content.text
+    return redact_secrets_strict(content.text)
+
+
 @router.get("/files/content")
 async def read_file(request: Request,
                     path: str = Query(min_length=1, max_length=1_024),
@@ -66,7 +91,7 @@ async def read_file(request: Request,
     return Envelope(data=FileContentPayload(
         id=content.path,
         content_kind=content.content_kind,
-        content=content.text,
+        content=_redacted(content),
         language=content.language,
         truncated=content.truncated,
     ))

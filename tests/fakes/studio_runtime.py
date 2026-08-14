@@ -207,6 +207,29 @@ class FakePersonalityRuntime:
         return self._state
 
 
+# A real 1x1 PNG, base64-encoded exactly as _read_sync encodes one. Its
+# payload is a single 90-character run of mixed-case alphanumerics, which is
+# precisely the shape the bare-high-entropy rule in core/redact.py exists to
+# destroy -- so an image preview is the fixture that proves the route skips
+# redaction for content_kind == "image" instead of mangling the picture.
+FAKE_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg=="
+)
+
+# A previewed .env: the defect this fixture exists for. Every value here is
+# secret-shaped in a *different* way -- a plain word with no entropy, a
+# prefixed key, a URL carrying inline credentials, and an empty value that
+# must not gain a [REDACTED] standing for nothing.
+FAKE_ENV_PREVIEW = (
+    "# service credentials\n"
+    "DB_PASS=hunter2\n"
+    "API_KEY=sk-abc123def456\n"
+    "DATABASE_URL=postgres://user:pw@localhost:5432/tenka\n"
+    "EMPTY_ON_PURPOSE=\n"
+)
+
+
 class FakeFileRuntime:
     """One nested directory, because the breadcrumb and the path-keyed ids are
     the whole reason this is not a flat listing."""
@@ -216,6 +239,13 @@ class FakeFileRuntime:
             "desktop": [
                 FileEntry("desktop/notes.md", "notes.md", "file", 2_048,
                           "2026-08-06T21:24:00Z", "text"),
+                # .env is a listed text suffix in the live runtime, so it
+                # previews as plain text -- the exact file the route's
+                # redaction pass exists for. It belongs in the listing too:
+                # a readable path with no entry is a shape the live runtime
+                # cannot produce.
+                FileEntry("desktop/.env", ".env", "file", 128,
+                          "2026-08-06T21:30:00Z", "text"),
                 FileEntry("desktop/captures", "captures", "dir", 0,
                           "2026-08-01T10:00:00Z"),
             ],
@@ -232,6 +262,9 @@ class FakeFileRuntime:
         self._contents = {
             "desktop/notes.md": FileContent("desktop/notes.md", "text",
                                             "# notes\n\nbuy cable\n"),
+            "desktop/.env": FileContent("desktop/.env", "text", FAKE_ENV_PREVIEW),
+            "desktop/captures/shot.png": FileContent("desktop/captures/shot.png",
+                                                     "image", FAKE_PNG_DATA_URI),
         }
 
     async def roots(self) -> list[str]:
