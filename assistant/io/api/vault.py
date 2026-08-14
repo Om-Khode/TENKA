@@ -72,8 +72,9 @@ def _atomic_write(path: Path, content: str) -> None:
 
     A plain `write_text()` that is interrupted mid-write (power loss, a kill
     -9) leaves `path` truncated. For the instance secret specifically, a
-    truncated file reads back as corrupt and silently regenerates the secret
-    -- which revokes every device (see `TokenVault.instance_secret`'s
+    truncated file read before any secret is in memory -- i.e. at startup, the
+    read that matters -- reads back as corrupt and silently regenerates the
+    secret, which revokes every device (see `TokenVault.instance_secret`'s
     docstring). Writing to a same-directory temp file and swapping it in with
     `os.replace` makes the update atomic: a reader sees either the old
     content or the new content, never a partial write.
@@ -105,19 +106,41 @@ class TokenVault:
         Precedence: `TENKA_SECRET` env var, then the on-disk secret file,
         then a freshly generated secret persisted to that file.
 
-        Side effect a caller must know about: a stored secret file that is
-        corrupt, empty, whitespace-only, or valid hex decoding to anything
-        other than exactly 32 bytes is treated as no file at all -- this
-        method regenerates the secret and overwrites the file rather than
-        raising. (`bytes.fromhex("")` returns `b""` without raising, so the
-        length check is load-bearing, not redundant with the hex decode.)
-        Every existing device's `token_hmac` was computed against the old
-        secret, so regenerating silently revokes every device that was ever
-        issued. That is the intended recovery path (a vault that raises here
-        takes the whole daemon down at startup, with no way back), but it
-        means this call, despite reading like a pure getter, can invalidate
-        the whole device list as a side effect. `_hash`, `verify`, `issue`,
-        `revoke`, and `devices` all call this and inherit that risk.
+        Disk is the truth, `self._secret` is only a fallback. The file is
+        re-read on every call, so a rotation performed by any other vault
+        instance -- or any other process -- is picked up immediately, by
+        `verify()` and by `issue()` alike. That costs one ~64-byte read per
+        HMAC, which is deliberate: `verify()` already re-reads and JSON-parses
+        the whole of devices.json on every call via `_load()`, so the secret
+        was the one input that could go stale while everything around it
+        stayed live. A cache that can silently disagree with disk is how
+        `issue()` came to mint tokens against a superseded secret -- valid
+        until the process restarted, then permanently invalid, with no error
+        anywhere.
+
+        Side effect a caller must know about, unchanged in the case that
+        matters: a stored secret file that is corrupt, empty, whitespace-only,
+        or valid hex decoding to anything other than exactly 32 bytes is
+        treated as no file at all *when nothing is cached yet* -- this method
+        regenerates the secret and overwrites the file rather than raising.
+        (`bytes.fromhex("")` returns `b""` without raising, so the length
+        check is load-bearing, not redundant with the hex decode.) Every
+        existing device's `token_hmac` was computed against the old secret, so
+        regenerating silently revokes every device that was ever issued. That
+        is the intended recovery path -- a vault that raises here takes the
+        whole daemon down at startup, with no way back -- but it means this
+        call, despite reading like a pure getter, can invalidate the whole
+        device list. `_hash`, `verify`, `issue`, `revoke`, and `devices` all
+        call this and inherit that risk on their first read.
+
+        Once a secret *is* held in memory, a file that goes missing or corrupt
+        mid-run does not regenerate: the cached secret is kept and a warning
+        is logged instead. Every device stays valid. A vanished or mangled
+        file is far more likely to be a backup tool, a sync client, or a stray
+        delete than an instruction to invalidate every paired device, and
+        revoking them all is not a decision to make from a failed read. It
+        also stays out of the file: re-persisting the cached secret would hide
+        the loss and bake in whichever process noticed first.
 
         `TENKA_SECRET` is handled differently, because the operator chose
         that value on purpose: an empty string is treated the same as the
@@ -143,24 +166,36 @@ class TokenVault:
                 )
             return secret
 
-        if self._secret is not None:
-            return self._secret
-
         path = self._root / _SECRET_FILE
+        unusable: str | None = None  # set only when a file was there but unreadable
         if path.exists():
-            raw = path.read_text(encoding="utf-8").strip()
             try:
-                secret = bytes.fromhex(raw)
+                secret = bytes.fromhex(path.read_text(encoding="utf-8").strip())
                 if len(secret) != 32:
                     raise ValueError(f"decoded to {len(secret)} bytes, not 32")
-            except ValueError as exc:
-                logger.warning(
-                    f"[API] instance secret was unreadable; regenerated, all devices revoked ({exc})"
-                )
+            except (ValueError, OSError) as exc:
+                # OSError matters more now than it did when this was read once
+                # per process: a per-HMAC read is exposed to transient failures
+                # (a locked file, a scanner holding a handle) that a single
+                # startup read would simply never have met. `_load()` treats a
+                # bad devices.json the same way.
+                unusable = f"{exc}" or exc.__class__.__name__
             else:
                 self._secret = secret
                 return secret
 
+        if self._secret is not None:
+            logger.warning(
+                f"[API] instance secret file is unusable ({unusable or 'it is gone'}); keeping the "
+                "secret already in memory -- regenerating here would revoke every "
+                "paired device. Restore the file before the next restart."
+            )
+            return self._secret
+
+        if unusable is not None:
+            logger.warning(
+                f"[API] instance secret was unreadable; regenerated, all devices revoked ({unusable})"
+            )
         self._root.mkdir(parents=True, exist_ok=True)
         secret = secrets.token_bytes(32)
         _atomic_write(path, secret.hex())
@@ -306,32 +341,25 @@ class TokenVault:
     def reset(self) -> None:
         """Rotate the instance secret. Every existing token stops verifying.
 
-        Cross-process note: a *different* TokenVault instance -- e.g. the
-        running daemon's, while this call is made from a slash command in
-        the same process -- does not learn about the new secret. Its
-        `instance_secret()` returns the cached `self._secret` forever once
-        populated; nothing here or in `verify()` ever refreshes another
-        instance's cache. What actually makes revocation visible
-        cross-process is that `_DEVICES_FILE` is deleted: `verify()` calls
-        `_load()`, which re-reads that file from disk on every call, so
-        the daemon's stale secret still gets hashed against an empty
-        device list and matches nothing. The secret never refreshes in
-        the daemon's process; it just stops mattering because there is
-        nothing left to compare against. Single-device `revoke()` is
-        visible cross-process the same way -- the device list is never
-        cached, only the secret is.
+        Cross-process note: revocation is visible to a *different* TokenVault
+        instance -- e.g. the running daemon's, while this call is made from a
+        slash command -- twice over. `_DEVICES_FILE` is deleted, and `verify()`
+        calls `_load()`, which re-reads that file from disk on every call, so
+        even a vault that somehow held the old secret would hash it against an
+        empty device list and match nothing. Single-device `revoke()` is
+        visible the same way; the device list is never cached.
 
-        This has a sharp edge `issue()` does not guard against: calling
-        `issue()` on a vault instance whose cached secret predates a
-        rotation hashes the new token against the *stale* secret. It
-        verifies fine for the rest of that process's lifetime, then
-        silently and permanently stops verifying the next time a fresh
-        vault reads the rotated secret off disk (e.g. after a restart).
-        Today `issue()` has exactly one caller, gated on there being no
-        devices yet at daemon startup, so this can't yet occur in
-        practice -- but nothing in the vault itself enforces that, and a
-        future pairing route that calls `issue()` on a long-running
-        daemon after a rotation would reintroduce it.
+        The secret rotation itself is now visible too, independently of the
+        device list: `instance_secret()` re-reads the secret file on every
+        call, so the next `verify()` or `issue()` on any instance, in any
+        process, uses the secret written here. That closes the edge this
+        docstring used to warn about -- `issue()` on a vault whose cached
+        secret predated a rotation minted a token hashed against the stale
+        secret, which verified for the rest of that process's lifetime and
+        then silently and permanently stopped verifying once a fresh vault
+        read the rotated secret off disk. The guarantee is now positive: a
+        token that `issue()` returns after this call verifies on any vault
+        pointed at the same root, including one started after a restart.
         """
         self._secret = None
         (self._root / _SECRET_FILE).unlink(missing_ok=True)
