@@ -32,6 +32,7 @@ from .routes import chat as chat_routes
 from .routes import commands as command_routes
 from .routes import files as file_routes
 from .routes import memory as memory_routes
+from .routes import session as session_routes
 from .routes import settings as settings_routes
 from .routes import status as status_routes
 from .routes import system as system_routes
@@ -301,6 +302,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         return JSONResponse(status_code=422, content={"detail": errors})
 
     app.include_router(status_routes.router, prefix="/v1")
+    app.include_router(session_routes.router, prefix="/v1")
     app.include_router(memory_routes.router, prefix="/v1")
     app.include_router(settings_routes.router, prefix="/v1")
     app.include_router(file_routes.router, prefix="/v1")

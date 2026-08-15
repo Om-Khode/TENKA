@@ -531,6 +531,7 @@ _OBSERVATION_OPERATIONS = frozenset({
     ("GET", "/v1/settings"),      # the same, in registry form
     ("GET", "/v1/status"),
     ("GET", "/v1/telemetry"),
+    ("GET", "/v1/session"),       # who the caller is, not anything she stored
 })
 
 _STORED_DATA_OPERATIONS = frozenset({
