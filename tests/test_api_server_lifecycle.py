@@ -297,7 +297,14 @@ def test_process_text_from_queue_is_wired_to_clear_busy_for_a_studio_turn():
     source = pathlib.Path("assistant/main.py").read_text(encoding="utf-8")
     fn_start = source.index("async def process_text_from_queue(")
     finally_idx = source.index("\n    finally:", fn_start)
-    finally_block = source[finally_idx: finally_idx + 800]
+    # Bounded by the end of the function, not by a character count: the block
+    # is the last one in it, and the next top-level `async def` is
+    # _process_one_queued_item -- which contains its own mark_done() call and
+    # would satisfy this assertion for the wrong reason if the window ran on.
+    # (A fixed window instead breaks on comment edits, which is what it did
+    # when the status bracket landed beside the call.)
+    fn_end = source.index("\nasync def ", finally_idx)
+    finally_block = source[finally_idx:fn_end]
     assert "_studio_dispatch.mark_done()" in finally_block, (
         "process_text_from_queue's finally block does not clear studio's busy flag"
     )
@@ -1124,3 +1131,318 @@ async def test_studio_slash_refusal_is_not_spoken_aloud(tmp_path, monkeypatch):
 
     _reset_for_testing()
     memory_mod._repo = None
+
+
+# ─── Fix round: the refusal must also *settle* the turn it answered ─────────
+# Live-testing 6a found the two fixes above were correct and still left the
+# pane hung: Studio settles a live turn on a quiet window of `status` frames
+# (hooks/useEventStream.ts -- every frame re-arms a timer, a terminal phase
+# starts the window, settleLiveTurn() then re-reads the transcript), and the
+# only producer on a chat turn's path was `tts.speak()`, incidentally
+# (SPEAKING on entry, IDLE on exit). Exempting "studio" from speech removed
+# the turn's only end-of-turn signal along with it: the refusal was saved,
+# `mark_done()` cleared the busy flag, and the pane sat on a placeholder with
+# the composer stuck on "stop" forever.
+#
+# Fixed as a class, not as a branch: `_publish_turn_status()` brackets every
+# "studio"-sourced turn with THINKING -> IDLE from process_text_from_queue's
+# own try/finally (and mirrored in _process_one_queued_item, the same way
+# mark_done() is), so every early return that answers without speaking --
+# today's and tomorrow's -- settles.
+
+
+@pytest.fixture()
+def status_frames(monkeypatch):
+    """Capture what actually reaches the event socket's producer.
+
+    Subscribes to the real `status_broadcaster` singleton rather than
+    stubbing it, because the two behaviours under test are the
+    broadcaster's own: identical consecutive events are DEDUPED (which is
+    why a lone terminal frame is not enough), and every frame is fanned out
+    to the subscriber `main.py` hands the EventHub. `subscribe()` has no
+    unsubscribe, so the list is swapped out via monkeypatch instead --
+    otherwise a captor here would keep firing for the rest of the session.
+
+    The dedupe/rate-limit state is reset too: it is module-global, and a
+    frame published by an earlier test in this file would otherwise decide
+    whether this one's first frame survives.
+    """
+    from assistant.io.status_broadcaster import status as bus
+
+    frames: list[dict] = []
+    monkeypatch.setattr(bus, "_subscribers", [frames.append])
+    monkeypatch.setattr(bus, "_last_event", None)
+    monkeypatch.setattr(bus, "_last_ts_per_phase", {})
+    return frames
+
+
+@pytest.fixture()
+def studio_pipeline(tmp_path, monkeypatch):
+    """A real pipeline turn against a tmp DB, with audio and telemetry off.
+
+    Same scaffolding the refusal tests above build inline: an isolated
+    SQLite file (never the developer's own ~/TENKA/memory/tenka.db), no
+    wake listener, no TurnTracker write, no Kokoro/sounddevice.
+    """
+    import assistant.config as config
+    import assistant.main as m
+    import assistant.memory as memory_mod
+    from assistant.storage.db import _reset_for_testing, init_db
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    _reset_for_testing()
+    memory_mod._repo = None
+    init_db(tmp_path / "test.db")
+
+    monkeypatch.setattr(m, "_wake_listener", None)
+    monkeypatch.setattr(m._telemetry.TurnTracker, "save", lambda self: None)
+
+    spoken: list[str] = []
+
+    async def _fake_speak(text, bridge, emotion="neutral"):
+        spoken.append(text)
+        return True
+    monkeypatch.setattr(m.tts, "speak", _fake_speak)
+
+    yield spoken
+
+    _reset_for_testing()
+    memory_mod._repo = None
+
+
+TERMINAL_PHASES = {"IDLE", "DONE", "STOPPED"}  # useEventStream.ts's own set
+
+
+@pytest.mark.asyncio
+async def test_studio_slash_refusal_publishes_a_status_transition(
+    studio_pipeline, status_frames,
+):
+    """The bug the user saw: no reply, composer stuck on "stop". The pane
+    needs frames, and it needs the last of them to be terminal -- that is
+    what arms SETTLE_QUIET_MS and eventually calls settleLiveTurn()."""
+    import assistant.main as m
+
+    await m.process_text_from_queue("studio", "/help", _FakeBridge())
+
+    phases = [f["phase"] for f in status_frames]
+    assert phases, "a studio-sourced refusal published no status frame at all"
+    assert phases[-1] in TERMINAL_PHASES, (
+        f"the turn never ended for a settle-on-quiet client, phases: {phases}"
+    )
+    assert any(p not in TERMINAL_PHASES for p in phases), (
+        "the pane must see the turn begin as well as end -- a terminal-only "
+        f"sequence cannot survive the broadcaster's dedupe, phases: {phases}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_after_a_completed_turn_still_publishes_its_end(
+    studio_pipeline, status_frames,
+):
+    """The case a single closing frame would silently lose. Every completed
+    turn leaves the bus resting at bare IDLE (tts.speak's exit, every
+    da_handler's exit), and `StatusBroadcaster.set()` drops an event
+    identical to the last one -- so a refusal that published only IDLE would
+    publish nothing at all in the ordinary case of typing a slash command
+    after a normal reply. Primed here exactly that way."""
+    import assistant.main as m
+    from assistant.io.status_broadcaster import StatusPhase, status as bus
+
+    bus.set(StatusPhase.IDLE)          # a previous turn just finished
+    assert status_frames, "sanity: the priming frame itself must have landed"
+    status_frames.clear()
+
+    await m.process_text_from_queue("studio", "/set studio false", _FakeBridge())
+
+    phases = [f["phase"] for f in status_frames]
+    assert phases, (
+        "the refusal published nothing -- a lone terminal frame was deduped "
+        "against the resting IDLE the previous turn left behind"
+    )
+    assert phases[-1] in TERMINAL_PHASES, f"phases: {phases}"
+
+
+@pytest.mark.asyncio
+async def test_the_terminal_frame_arrives_after_the_transcript_is_written(
+    studio_pipeline, status_frames,
+):
+    """Ordering, not just presence. The terminal frame is what sends the
+    client back to `GET /v1/conversations/{id}`, so the refusal has to be in
+    the transcript BEFORE it fires -- otherwise the pane re-reads a
+    conversation that does not contain the reply yet and settles on the
+    previous turn, which is the exact stale-bubble failure the save above
+    was added to fix. Asserted by reading the store from inside the
+    subscriber, at the instant the frame is published."""
+    import assistant.main as m
+    import assistant.memory as memory_mod
+    import assistant.session as session_mod
+    from assistant.io.status_broadcaster import status as bus
+
+    seen_at_publish: list[tuple[str, list]] = []
+
+    def _capture(event: dict) -> None:
+        status_frames.append(event)
+        seen_at_publish.append((
+            event["phase"],
+            memory_mod.get_recent(5, session_id=session_mod.get_current_session_id()),
+        ))
+    bus._subscribers[:] = [_capture]
+
+    command = "/studio revoke all confirm"
+    await m.process_text_from_queue("studio", command, _FakeBridge())
+
+    terminal = [turns for phase, turns in seen_at_publish if phase in TERMINAL_PHASES]
+    assert terminal, "no terminal frame was published"
+    turns = terminal[-1]
+    assert turns, "the terminal frame fired before anything was written"
+    last = turns[-1]
+    assert last["user_input"] == command
+    assert "Slash commands aren't available" in last["response"], (
+        "the transcript a settle would re-read does not hold this turn's reply"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_status_frames_carry_no_user_content(
+    studio_pipeline, status_frames,
+):
+    """`detail` is RECALL-class and blanked per-socket (io/api/events.py), so
+    a device paired only to watch would never see whatever is put there --
+    and the refusal sentence is content, not status: it already reaches the
+    pane as a transcript message. Echoing it here would render it twice for
+    one device class and as an empty pill for the other."""
+    import assistant.main as m
+
+    await m.process_text_from_queue("studio", "/set followup_timer 999", _FakeBridge())
+
+    assert status_frames, "sanity: frames must have been published"
+    for frame in status_frames:
+        assert frame["detail"] == "", (
+            f"a turn-lifecycle frame carried a detail: {frame['detail']!r}"
+        )
+        assert frame["step"] is None and frame["tier"] is None
+
+
+@pytest.mark.asyncio
+async def test_settling_the_turn_did_not_reopen_the_slash_surface(
+    studio_pipeline, status_frames, tmp_path, monkeypatch,
+):
+    """The security property the settle fix must not spend: still refused,
+    still nothing executed, still not spoken. Proved against the real vault
+    and the real pair store rather than the refusal text."""
+    import assistant.main as m
+    from assistant.io.api.pairing import PairCodeStore
+    from assistant.io.api.vault import Capability, TokenVault
+
+    spoken = studio_pipeline
+    store = PairCodeStore()
+    monkeypatch.setattr(m, "_studio_pair_store", store)
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+
+    handled: list[str] = []
+    real_handle = m.slash_commands.handle
+    monkeypatch.setattr(
+        m.slash_commands, "handle",
+        lambda text: (handled.append(text), real_handle(text))[1],
+    )
+
+    await m.process_text_from_queue("studio", "/studio pair evilphone", _FakeBridge())
+
+    assert status_frames, "sanity: the settle frames under test must have fired"
+    assert handled == [], f"slash_commands.handle ran for the studio source: {handled}"
+    assert store.current() is None, "a code was minted through the chat source"
+    assert len(TokenVault(tmp_path).devices()) == 1
+    assert spoken == [], f"the refusal was spoken aloud: {spoken}"
+
+
+# ─── The siblings: every other early return that answers without speaking ──
+# Same defect, same cause. The bracket covers them because it lives in the
+# turn's own try/finally rather than in the branch that was reported.
+
+
+@pytest.mark.asyncio
+async def test_a_turn_ignored_during_recording_still_ends_for_studio(
+    studio_pipeline, status_frames, monkeypatch,
+):
+    """The recording-mode guard is the one sibling that returns without
+    speaking AND without saving: input is deliberately dropped while a
+    recording session is live. Silent is fine locally; for a remote caller
+    it meant the pane hung on a placeholder with no way out. It must still
+    settle -- Studio drops an empty placeholder on settle, so the user gets
+    an unanswered message rather than a permanent "stop" button."""
+    import assistant.main as m
+    from assistant.intent import IntentResult
+
+    monkeypatch.setattr(m.recording, "is_active", lambda: True)
+
+    # The guard sits downstream of intent classification, so the classifier
+    # and the spaCy-backed topic tracker are stubbed out: neither is under
+    # test here, and this suite makes no network calls and loads no models.
+    async def _fake_intent(*args, **kwargs):
+        return IntentResult(intent="get_time", response="", params={})
+    monkeypatch.setattr(m, "detect_intent", _fake_intent)
+
+    class _NoTopics:
+        def resolve_query(self, text):
+            return text
+
+        def get_topic_hint(self):
+            return ""
+
+        def push_turn(self, text, turn_number):
+            return None
+    monkeypatch.setattr(m, "_get_topic_tracker", lambda: _NoTopics())
+
+    await m.process_text_from_queue("studio", "what is the time", _FakeBridge())
+
+    phases = [f["phase"] for f in status_frames]
+    assert phases and phases[-1] in TERMINAL_PHASES, (
+        f"a studio turn dropped by the recording guard never ended: {phases}"
+    )
+    assert studio_pipeline == [], "the recording guard must stay silent"
+
+
+@pytest.mark.asyncio
+async def test_a_raise_before_the_pipelines_own_try_still_ends_the_turn(
+    status_frames, monkeypatch,
+):
+    """The mirror of the busy-flag test above. Three things run before
+    process_text_from_queue's own `try:` (TurnTracker construction,
+    set_current_tracker, pausing the wake listener); a raise in any of them
+    skips that function's `finally` entirely. `_process_one_queued_item`
+    already exists to clear the busy flag on that path -- the turn's end has
+    to reach the pane the same way, or the composer unblocks against a
+    bubble that never resolves."""
+    import assistant.main as m
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("tracker construction failed")
+    monkeypatch.setattr(m._telemetry, "TurnTracker", _boom)
+
+    with pytest.raises(RuntimeError):
+        await m._process_one_queued_item(("studio", "hello"), _FakeBridge())
+
+    phases = [f["phase"] for f in status_frames]
+    assert phases and phases[-1] in TERMINAL_PHASES, (
+        f"a raise before the inner try left the turn open forever: {phases}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_local_sources_gain_no_frames_from_the_bracket(
+    studio_pipeline, status_frames,
+):
+    """Scoped to the channel that has a settle model. The desktop overlay
+    reads the same bus and renders whatever pill the running handler
+    publishes; a second producer on every voice turn would only risk a
+    spurious "Done" flash on transitions that did no work. Driven through
+    the "chat" source's slash path, which executes and prints rather than
+    refusing."""
+    import assistant.main as m
+
+    await m.process_text_from_queue("chat", "/set followup_timer 7", _FakeBridge())
+
+    assert status_frames == [], (
+        f"the bracket must not fire for a local source, got: {status_frames}"
+    )

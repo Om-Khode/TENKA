@@ -815,6 +815,61 @@ async def run_pipeline(bridge: UnityBridge, from_wake_word: bool = False):
 # ─── Pipeline Processing ────────────────────────────────────────────────────────
 
 
+def _publish_turn_status(source: str, phase: StatusPhase) -> None:
+    """Bracket a remote-sourced turn with a lifecycle status transition.
+
+    Studio settles a live turn on a *quiet window of status frames*: every
+    frame re-arms a timer (`hooks/useEventStream.ts`), a terminal phase
+    starts the window, and `settleLiveTurn()` then re-reads the transcript
+    and renders the reply. Nothing on that wire names a turn or a
+    conversation, so the frames themselves are the only end-of-turn signal a
+    remote pane has -- `POST /v1/chat` is 202 Accepted with no body, and this
+    function's return value never leaves the process.
+
+    Until now the only producer on an ordinary chat turn's path was
+    `tts.speak()`, and only incidentally: `SPEAKING` on entry, `IDLE` on
+    exit (io/audio/tts.py). So every branch of this pipeline that *answers
+    without speaking* left a Studio caller's pane pending forever -- no
+    reply rendered, composer stuck on "stop" -- which is exactly what
+    exempting the "studio" source from speech turned into a visible bug.
+    Bracketing the turn here, rather than patching whichever branch was
+    reported, is what makes the whole class impossible: the pair fires
+    however the turn exits, including through routes nobody has written yet.
+
+    Both ends are needed; one terminal frame is not enough. `StatusBroadcaster
+    .set()` drops an event identical to the previous one, and a bare `IDLE`
+    with default fields is precisely the resting state every completed turn
+    already leaves behind -- so a lone closing frame would be silently
+    swallowed in the common case (a refusal typed right after any normal
+    turn). The opening `THINKING` both tells the pane she picked the turn up
+    and guarantees the closing `IDLE` is a real transition rather than a
+    duplicate.
+
+    `detail` is left empty deliberately. The field is RECALL-class and
+    blanked per-socket (`io/api/events.py`), so anything put there is
+    invisible to an observe-only device -- a signal half the clients cannot
+    see is not the one to hang end-of-turn on. And a refusal sentence is
+    content, not status: it already reaches the pane as a transcript
+    message, so echoing it here would render it twice for a device that may
+    read it and as an empty pill for one that may not. `stt.py` publishes
+    `LISTENING, detail=""` for the same reason -- a pure lifecycle
+    transition describes her, not what was said.
+
+    Local sources are deliberately untouched. The desktop overlay reads the
+    same bus but has no settle model -- it renders whatever pill the running
+    handler publishes -- so a second producer on every voice turn would buy
+    nothing and risk a spurious "Done" flash on transitions that did no work.
+    """
+    if source != "studio":
+        return
+    try:
+        status.set(phase)
+    except Exception:
+        # The contract every other producer honours (see stt.py, tts.py):
+        # the status bus must never take down the turn it describes.
+        pass
+
+
 async def process_text_from_queue(source: str, transcription: str, bridge: UnityBridge, stt_ms: int | None = None):
     """
     Run Intent → Policy → Action/LLM → TTS → Unity animations
@@ -839,6 +894,11 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             logger.info(f'Transcription (STT): "{redact_secrets(transcription)}"')
         else:
             logger.info(f'Transcription (Chat): "{redact_secrets(transcription)}"')
+
+        # The turn has begun. See _publish_turn_status: this is a no-op for
+        # every local source, and for "studio" it is the frame that replaces
+        # what tts.speak() used to provide by accident.
+        _publish_turn_status(source, StatusPhase.THINKING)
 
         await bridge.send_command("show_subtitle", text=f"You: {transcription}")
 
@@ -1568,6 +1628,10 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # `finally`. Clearing the busy flag here, not at the instant
         # _StudioDispatch.submit() enqueued it, is what makes the flag mean
         # "a turn is in flight" rather than "an enqueue just happened".
+        # Closing half of the turn bracket (see _publish_turn_status), before
+        # the flag is released so a pane is never told it may send again
+        # ahead of being told the last turn ended.
+        _publish_turn_status(source, StatusPhase.IDLE)
         if source == "studio" and _studio_dispatch is not None:
             _studio_dispatch.mark_done()
         # Resume wake word detection after pipeline completes
@@ -1604,9 +1668,18 @@ async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
     """
     source, text = item[0], item[1]
     stt_ms = item[2] if len(item) > 2 else None
+    # The status bracket is mirrored here for the same reason mark_done() is,
+    # and it has to be *both* halves: a raise before the inner try: leaves the
+    # bus at whatever the previous turn ended on, and a lone closing IDLE
+    # against that resting state dedupes to nothing (see
+    # _publish_turn_status). On the ordinary path the inner pair fires first
+    # and these two dedupe away -- the same harmless doubling mark_done()
+    # already documents.
+    _publish_turn_status(source, StatusPhase.THINKING)
     try:
         await process_text_from_queue(source, text, bridge, stt_ms=stt_ms)
     finally:
+        _publish_turn_status(source, StatusPhase.IDLE)
         if source == "studio" and _studio_dispatch is not None:
             _studio_dispatch.mark_done()
 
