@@ -845,7 +845,18 @@ STUDIO_API_PORT: int = _runtime_setting(
 
 STUDIO_API_ORIGINS: str = _runtime_setting(
     "studio_api_origins", "http://localhost:3000",
-    description="Comma-separated browser origins allowed to call the Studio daemon.",
+    # This became a security setting when the daemon started reading it as a
+    # trusted-origin list and not only as a CORS allow-list. An origin named
+    # here is one the loopback listener's own cross-site checks will accept,
+    # so a page served from it may drive every route a paired device's session
+    # reaches. It is edited by hand through the settings UI, so the
+    # description has to say that out loud. Studio is served same-origin in
+    # normal use and needs nothing here; the default exists for the Next.js
+    # development server only, and is ignored on any non-loopback listener.
+    description=("Comma-separated browser origins trusted to drive the Studio "
+                 "daemon cross-origin. Security-sensitive: a page on a listed "
+                 "origin can use a paired device's session. Loopback listener "
+                 "only -- leave empty unless running the Studio dev server."),
     needs_restart=True,
 )
 

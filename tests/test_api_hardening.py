@@ -1,6 +1,5 @@
 """Rate limiting, lockout, audit, and a kill switch that actually kills."""
 import pytest
-from fastapi.testclient import TestClient
 
 from assistant.io.api.security import RateLimiter
 from assistant.io.api.vault import Capability, TokenVault

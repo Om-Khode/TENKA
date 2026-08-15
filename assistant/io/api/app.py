@@ -37,11 +37,11 @@ from .routes import status as status_routes
 from .routes import system as system_routes
 from .runtime import StudioRuntime
 from .security import (
-    COOKIE_NAME,
     CSRF_HEADER,
     AuditEntry,
     AuthState,
     accepting_port,
+    cookie_credential,
     device_key,
     host_is_allowed,
     origin_is_known,
@@ -374,7 +374,10 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             await websocket.close(code=1008)
             return
 
-        token = websocket.cookies.get(COOKIE_NAME, "")
+        # `cookie_credential`, not a second `websocket.cookies.get(...)` of
+        # its own: two spellings of "the credential is this cookie" is how the
+        # HTTP gate and the socket gate drift apart.
+        token = cookie_credential(websocket)
         device = auth.vault.verify(token)
         if device is not None:
             # Same intersection `authenticate()` applies, for the same

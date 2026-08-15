@@ -55,25 +55,45 @@ def test_forget_all_empties_every_scope(context):
                       headers=headers).json()["data"]["procedures"] == []
 
 
-def test_forget_all_demands_system_control_not_just_chat(tmp_path):
+def test_forget_all_demands_system_control_not_just_a_sending_device(tmp_path):
     """Wiping every entity, fact, preference and procedure is not ordinary use.
 
-    Single-item forget stays on `chat` -- a phone paired for conversation can
-    delete one thing it was told about. The wipe is different: in Milestone 6
-    a chat-only device must not be able to erase her memory outright, so it
-    demands `system_control` while single-item forget does not.
+    The two deletes stay on different grants, but both moved up a tier once
+    `CHAT` came to mean "may read" and nothing more. Single-item forget is
+    `chat_send`: deleting one thing she was told about is the same class of
+    act as saying "forget that" in a turn, so a device trusted to drive her is
+    trusted to do it. The wipe is different in kind, not degree -- erasing her
+    memory outright still demands `system_control`, so even a sending device
+    cannot reach it.
     """
     vault = TokenVault(tmp_path)
-    chat_token = vault.issue("phone", frozenset({Capability.CHAT}))
+    sender = vault.issue("phone", frozenset({Capability.CHAT, Capability.CHAT_SEND}))
     runtime = build_fake_runtime()
     client = build_api_client(runtime, vault)
-    headers = {"Authorization": f"Bearer {chat_token}"}
+    headers = {"Authorization": f"Bearer {sender}"}
 
     wipe = client.delete("/v1/memory", headers=headers)
     assert wipe.status_code == 403
 
     single = client.delete("/v1/memory/preferences/reading_pace", headers=headers)
     assert single.status_code == 200
+
+
+def test_a_read_only_device_cannot_forget_even_one_item(tmp_path):
+    """The regression this closes: `CHAT` alone used to carry a memory delete,
+    so a device deliberately issued read-only could erase what she knows one
+    item at a time -- and on the `quick` listener, whose entire ceiling is
+    `{CHAT}`, that was the only grant any device could hold at all."""
+    vault = TokenVault(tmp_path)
+    reader = vault.issue("reader", frozenset({Capability.CHAT}))
+    client = build_api_client(build_fake_runtime(), vault)
+    headers = {"Authorization": f"Bearer {reader}"}
+
+    assert client.delete("/v1/memory/preferences/reading_pace",
+                         headers=headers).status_code == 403
+    # ...and the read it *is* entitled to still answers, so this narrowed the
+    # write side only.
+    assert client.get("/v1/memory/preferences", headers=headers).status_code == 200
 
 
 # ─── capability tier: writing settings needs system_control ──────────────

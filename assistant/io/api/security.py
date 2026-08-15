@@ -38,9 +38,12 @@ COOKIE_NAME = "tenka_device"
 
 # A header a cross-site form post or an <img> cannot set. A browser will only
 # attach a custom header to a request its own JavaScript built, and doing that
-# cross-origin costs a CORS preflight this daemon never approves -- so the mere
-# presence of this header proves the request came from a page allowed to talk
-# to us, whatever its value is. That is why nothing checks the value.
+# cross-origin costs a CORS preflight this daemon never approves -- so a
+# non-empty value here proves the request came from a page allowed to talk to
+# us, whatever that value happens to say. The value is never *interpreted*;
+# it is required only to be present and non-empty, since a header a client
+# had to decide to send is the whole signal and an empty one is more likely a
+# proxy artefact than a deliberate act.
 CSRF_HEADER = "X-TENKA-Request"
 
 # Methods that change something. A GET is not required to carry the CSRF
@@ -364,6 +367,14 @@ async def authenticate(request: Request) -> Device:
         raise _UNAUTHORIZED
     request.state.policy = policy
 
+    # Before `verify()`, deliberately, and matching the order the event socket
+    # already used. Run afterwards, these two checks answered 403 to a
+    # cross-site request holding a valid cookie and 401 to the same request
+    # without one -- a "does this browser hold a working credential for this
+    # daemon?" oracle that any page could query. Neither check needs to know
+    # whether the credential is good, so neither should be able to reveal it.
+    _refuse_cross_site(request, policy)
+
     token = credential_from(request, policy) or ""
     device = state.vault.verify(token)
 
@@ -386,7 +397,6 @@ async def authenticate(request: Request) -> Device:
             raise _UNAUTHORIZED
         device = replace(device, grants=grants)
         request.state.device = device
-        _refuse_cross_site(request, policy)
         return device
 
     if not state.limiter.check(source):
@@ -398,7 +408,7 @@ async def authenticate(request: Request) -> Device:
 
 
 def _refuse_cross_site(request: Request, policy: ListenerPolicy) -> None:
-    """The price of an ambient credential, paid on every verified request.
+    """The price of an ambient credential, paid before the credential is read.
 
     A cookie is attached by the browser to *any* request *any* page makes to
     this host. Two checks make that safe, and they cover different gaps:
@@ -418,6 +428,11 @@ def _refuse_cross_site(request: Request, policy: ListenerPolicy) -> None:
     is never attached automatically, so a cross-site page cannot produce one
     at all -- there is no forgeable request to defend against. Bearer is
     loopback-only besides. Demanding the header there would only break `curl`.
+
+    Neither check consults the vault: "did this request come from somewhere
+    allowed to make it?" is answerable without knowing whose request it is,
+    which is what lets both run ahead of verification and keeps the refusal
+    from doubling as a credential oracle.
     """
     port = accepting_port(request.scope)
     origin = request.headers.get("Origin")

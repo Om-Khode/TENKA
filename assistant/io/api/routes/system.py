@@ -37,11 +37,11 @@ router = APIRouter()
 # framework, not a 404 this handler would have to construct by hand.
 EnrollmentKind = Literal["voice", "face"]
 
-# run_backup writes to real cloud storage on every call. The shared limiter
-# (120/60s, the same budget a status poll spends) would let a CHAT-only
-# device -- a phone that has never held SYSTEM_CONTROL -- trigger dozens of
-# real uploads a minute. A short, route-scoped budget on top of the shared
-# one bounds that without touching what any other CHAT route may do.
+# run_backup writes to real cloud storage on every call. The budget below is
+# a second bound on top of the SYSTEM_CONTROL grant it now demands: the
+# shared limiter (120/60s, the same budget a status poll spends) would let one
+# authorised device trigger dozens of real uploads a minute, which is a cost
+# and a quota question rather than a permission one. Both bounds are wanted.
 _BACKUP_RUN_MAX_PER_WINDOW = 5
 _BACKUP_RUN_WINDOW_SECONDS = 60.0
 
@@ -96,7 +96,18 @@ async def backup_state(request: Request,
 
 @router.post("/backup/run")
 async def run_backup(request: Request,
-                     _=Depends(throttle(Capability.CHAT, "backup_run",
+                     # SYSTEM_CONTROL, not CHAT. This was the worst of the
+                     # four routes a read-only listener could still reach:
+                     # it encrypts the whole memory database and pushes it to
+                     # a third-party cloud provider, spending the user's
+                     # storage quota and putting every fact she owns onto
+                     # someone else's disk. Reading /backup's *state* is a
+                     # read and stays on CHAT; causing an upload is the
+                     # single most consequential act in this module, and its
+                     # two siblings (/backup/restore, /backup/unlock) already
+                     # demanded SYSTEM_CONTROL -- it was the odd one out, not
+                     # the precedent.
+                     _=Depends(throttle(Capability.SYSTEM_CONTROL, "backup_run",
                                         max_per_window=_BACKUP_RUN_MAX_PER_WINDOW,
                                         window_seconds=_BACKUP_RUN_WINDOW_SECONDS))
                      ) -> Envelope[BackupStatePayload]:
