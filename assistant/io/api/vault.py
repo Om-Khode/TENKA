@@ -33,6 +33,14 @@ class Capability(str, enum.Enum):
     """What a device is allowed to ask for. Granted per device, never implied."""
 
     CHAT = "chat"
+    # POST /v1/chat hands text to the same pipeline voice uses, so it reaches
+    # every intent -- code_executor, file_task, shutdown, manage_backup --
+    # not just conversation. CHAT alone must not carry that: it also gates
+    # read routes (history, the /v1/events socket) that a device should be
+    # able to hold without being able to drive her. Split so a device can be
+    # trusted to read a transcript without being trusted to act on the
+    # machine through one.
+    CHAT_SEND = "chat_send"
     SCREEN = "screen"
     FILES = "files"
     SYSTEM_CONTROL = "system_control"

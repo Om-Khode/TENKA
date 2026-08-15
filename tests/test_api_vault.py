@@ -19,6 +19,11 @@ def test_instance_secret_is_256_bits_and_stable(vault):
     assert vault.instance_secret() == first
 
 
+def test_chat_send_is_a_distinct_capability():
+    assert Capability.CHAT_SEND.value == "chat_send"
+    assert Capability.CHAT_SEND is not Capability.CHAT
+
+
 def test_two_installations_get_different_secrets(tmp_path):
     a = TokenVault(tmp_path / "a").instance_secret()
     b = TokenVault(tmp_path / "b").instance_secret()

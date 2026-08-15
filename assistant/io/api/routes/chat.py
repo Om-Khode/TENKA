@@ -22,7 +22,7 @@ router = APIRouter()
 # ─── Sending a turn ──────────────────────────────────────────────────────
 @router.post("/chat", status_code=status.HTTP_202_ACCEPTED)
 async def send_chat(body: ChatRequest, request: Request,
-                    _=Depends(require(Capability.CHAT))) -> Envelope[ChatSendPayload]:
+                    _=Depends(require(Capability.CHAT_SEND))) -> Envelope[ChatSendPayload]:
     ref = await request.app.state.runtime.chat.send(body.text)
     if not ref.accepted:
         # Deliberately generic: a caller that cannot authenticate any further
@@ -74,6 +74,6 @@ async def get_conversation(conversation_id: str, request: Request,
 # ─── Abort ────────────────────────────────────────────────────────────────
 @router.post("/abort")
 async def abort(request: Request,
-                _=Depends(require(Capability.CHAT))) -> Envelope[AbortPayload]:
+                _=Depends(require(Capability.CHAT_SEND))) -> Envelope[AbortPayload]:
     stopped = await request.app.state.runtime.chat.abort()
     return Envelope(data=AbortPayload(aborted=stopped))
