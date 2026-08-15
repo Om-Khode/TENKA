@@ -15,6 +15,7 @@ Or via start_assistant.bat
 
 import asyncio
 import logging
+import pathlib
 import re
 import signal
 import sys
@@ -313,6 +314,67 @@ _studio_pair_store: "PairCodeStore | None" = None
 # slash command must say so plainly rather than mint anyway.
 
 
+_VENDORED_UI_ZIP = pathlib.Path(__file__).resolve().parent / "io" / "api" / "studio_ui.zip"
+# The bundle `tools/package_studio_ui.py` writes on a release. A module-level
+# constant rather than a path built inside the function below, so that a test
+# can point it somewhere else -- "there is no vendored bundle" is a state this
+# has to behave well in and one that cannot otherwise be reached from a
+# checkout that has one.
+
+
+def _resolve_studio_ui() -> "UiBundle | None":
+    """Decide which Studio build the daemon serves, if any.
+
+    This function exists because of a layering rule, not a design preference.
+    `UiBundle` knows how to *open* a bundle and deliberately knows nothing
+    about where one lives: `io/api` may not import `config` (a single lazy
+    import there would drag in `assistant.llm` and `assistant.storage` and
+    break two import-linter contracts -- see the closing comment in ui.py). So
+    the path decision is main.py's, and the opened bundle is injected the same
+    way `runtime`, `vault` and `origins` already are.
+
+    Two sources, in the order `UiBundle.open` applies them:
+
+    * `studio_ui_path`, a developer's own `next build` output. It wins so that
+      iterating on Studio needs no re-vendoring.
+    * the vendored `assistant/io/api/studio_ui.zip`, written by
+      `tools/package_studio_ui.py` on a release.
+
+    Neither one is required. A daemon with no bundle serves its API and no
+    pages -- which is the correct outcome for a fork that has not vendored a
+    build, and the only safe one for a bundle that turns out to be unreadable.
+    The UI is a convenience; the API is the product.
+    """
+    from pathlib import Path
+
+    from .io.api.ui import MARKER_NAME, UiBundle
+
+    configured = (config.STUDIO_UI_PATH or "").strip()
+    dir_path = Path(configured).expanduser() if configured else None
+    zip_path = _VENDORED_UI_ZIP
+
+    if dir_path is not None and not (dir_path / MARKER_NAME).is_file():
+        # Said out loud, because the failure is otherwise invisible: the
+        # directory silently loses to the vendored zip and the developer sees a
+        # stale UI with no explanation. A raw export has no marker in it --
+        # `next build` does not write one -- so this is the expected state of a
+        # freshly built `out/`, not an exotic one.
+        logger.warning(
+            f"[UI] studio_ui_path is set to {dir_path} but there is no "
+            f"{MARKER_NAME} in it, so it cannot be served; falling back to the "
+            f"vendored bundle. Run tools/package_studio_ui.py --marker to write "
+            f"one into that directory.")
+
+    bundle = UiBundle.open(zip_path=zip_path if zip_path.is_file() else None,
+                           dir_path=dir_path)
+    if bundle is None:
+        logger.warning(
+            "[UI] no Studio UI bundle -- the daemon will serve its API and "
+            "nothing at `/`. Set studio_ui_path to a local export, or run "
+            "tools/package_studio_ui.py to vendor one.")
+    return bundle
+
+
 async def _start_studio_daemon() -> "asyncio.Task | None":
     """Build and start the Studio daemon. Returns the running task, or
     None if anything failed -- the daemon is an optional side channel and
@@ -387,6 +449,12 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
             port=config.STUDIO_API_PORT,
             origins=[o.strip() for o in config.STUDIO_API_ORIGINS.split(",") if o.strip()],
             hub=_studio_hub,
+            # Resolved here rather than inside the app, because choosing the
+            # path means reading config and `io/api` may not. Resolved
+            # *before* serve() so an unreadable bundle is one WARNING and a
+            # UI-less daemon, never a daemon that failed to start: the API is
+            # the product and the pages are a convenience.
+            ui_bundle=_resolve_studio_ui(),
             pair_store=_pair_store,
         )
         _studio_pair_store = _pair_store
