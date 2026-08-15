@@ -14,6 +14,12 @@ can execute arbitrary code on the machine, so its properties are load-bearing:
 - At most one live code. Minting a new one invalidates the previous, so a
   forgotten QR screen from an hour ago is not still a working credential
   path.
+- `mint()` refuses an empty grant set. A zero-grant credential can still
+  authenticate, which turns any route gated by authentication alone into an
+  oracle (see `TokenVault.issue()` for the same refusal, same reasoning).
+- `consume()` never raises on untrusted input, including a non-`str` `code`
+  or one far longer than any real code could be. Wrong, expired,
+  already-used, and malformed all collapse to the same `None`.
 
 Layering: io/api -- core + config only.
 """

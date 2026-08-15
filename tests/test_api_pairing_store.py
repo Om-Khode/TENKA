@@ -9,6 +9,7 @@ untrusted input.
 """
 from __future__ import annotations
 
+import hmac
 import threading
 
 import pytest
@@ -100,22 +101,62 @@ def test_mint_refuses_an_empty_grant_set():
         PairCodeStore().mint("phone", frozenset())
 
 
-def test_concurrent_consumers_race_for_one_code():
-    """The whole read-compare-clear sits inside one lock acquisition. A
-    regression that released the lock between the compare and the clear
-    would let two threads both see a match before either clears the slot --
-    a single-threaded exactly-once test cannot catch that; only a real race
-    can."""
+def test_the_critical_section_is_one_unbroken_lock_hold(monkeypatch):
+    """A barrier only synchronises when threads *start* -- CPython's GIL
+    serialises consume()'s few bytecodes so tightly that a plain N-thread
+    race passes whether or not the lock is actually held across the whole
+    read-compare-clear sequence. This test forces the interleaving instead
+    of hoping for it, by making the deepest point in that sequence --
+    `hmac.compare_digest` -- pause and wait for a second concurrent caller
+    to reach the same point.
+
+    If `consume()` holds one lock across the entire read-compare-clear
+    sequence (the correct implementation), a second concurrent call cannot
+    get anywhere near `compare_digest` until the first has already cleared
+    the slot and released the lock -- so the wait below times out, and
+    exactly one call succeeds. If the critical section is split into
+    separate `with self._lock:` blocks around the read, the compare, and
+    the clear (the regression this guards against), both threads reach
+    `compare_digest` while the slot is still populated, and both succeed.
+
+    Verified this actually catches that regression: temporarily splitting
+    `consume()`'s single `with self._lock:` into three separate
+    acquire/release blocks (read, compare, clear) makes this test fail with
+    2 successes instead of 1; restoring the single block makes it pass
+    again. See the fix-round-2 entry in task-4-report.md for the transcript.
+    """
     store = PairCodeStore()
     code = store.mint("phone", frozenset({Capability.CHAT})).code
-    results: list[object] = [None] * 50
-    barrier = threading.Barrier(50)
+
+    order_lock = threading.Lock()
+    calls: list[int] = []
+    second_arrived = threading.Event()
+    real_compare_digest = hmac.compare_digest
+
+    def racing_compare_digest(a: bytes, b: bytes) -> bool:
+        with order_lock:
+            is_first = not calls
+            calls.append(1)
+        if is_first:
+            # Bounded, not indefinite: a correct implementation never lets a
+            # second caller arrive here at all (it blocks on the lock
+            # instead), so timing out is the expected outcome for the
+            # correct code, not a flake.
+            second_arrived.wait(timeout=0.3)
+        else:
+            second_arrived.set()
+        return real_compare_digest(a, b)
+
+    monkeypatch.setattr(hmac, "compare_digest", racing_compare_digest)
+
+    results: list[object] = [None, None]
+    barrier = threading.Barrier(2)
 
     def attempt(i: int) -> None:
         barrier.wait()
         results[i] = store.consume(code)
 
-    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(50)]
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(2)]
     for t in threads:
         t.start()
     for t in threads:
