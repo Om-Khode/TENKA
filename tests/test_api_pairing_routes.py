@@ -486,3 +486,35 @@ def test_pairing_answers_503_and_survives_when_the_vault_cannot_be_read(tmp_path
 
     assert r.status_code == 503
     assert {d.label for d in vault.devices()} == {"existing"}
+
+
+def test_pairing_answers_503_not_403_when_the_vault_cannot_be_written(tmp_path, monkeypatch):
+    """The other half of the same lock. `_save()`'s underlying write raises
+    `PermissionError` under the identical Windows contention that breaks
+    reads -- and an uncaught `PermissionError` is mapped by `errors.py` to
+    403 "protected path", which the review proved this route actually
+    answered before `VaultWriteError` existed: a caller presenting a
+    perfectly good, single-use code would be told it was not allowed,
+    when the truth was "the vault could not be saved to right now".
+    """
+    from assistant.io.api import vault as vault_module
+
+    vault = TokenVault(tmp_path)
+    vault.issue("existing", frozenset({Capability.OBSERVE}))  # must survive
+    store = _store()
+    code = store.mint("phone", frozenset({Capability.OBSERVE})).code
+    client = _client(vault, policies={LOCAL_PORT: "local"}, store=store)
+
+    original_atomic_write = vault_module._atomic_write
+
+    def broken(path, content):
+        if path.name == "devices.json":
+            raise PermissionError("simulated lock")
+        return original_atomic_write(path, content)
+
+    monkeypatch.setattr(vault_module, "_atomic_write", broken)
+    r = client.post("/v1/pair", json={"code": code})
+    monkeypatch.setattr(vault_module, "_atomic_write", original_atomic_write)
+
+    assert r.status_code == 503
+    assert {d.label for d in vault.devices()} == {"existing"}

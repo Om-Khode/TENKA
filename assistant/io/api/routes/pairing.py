@@ -62,7 +62,7 @@ from ..security import (
     refuse_unknown_origin,
     require_admin,
 )
-from ..vault import Capability, Device, VaultReadError
+from ..vault import Capability, Device, VaultUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -240,9 +240,9 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     Every refusal is the same `UNAUTHORIZED` the rest of the API uses, with
     two exceptions, both load-bearing: 429 when the pairing budget is spent
     (a caller has to be able to tell that retrying immediately is pointless),
-    and 503 when the vault itself could not be read (a caller has to be able
-    to tell that retrying *at all* might still work -- unlike a wrong code,
-    this one was never the caller's fault).
+    and 503 when the vault itself could not be read or written (a caller has
+    to be able to tell that retrying *at all* might still work -- unlike a
+    wrong code, this one was never the caller's fault).
     """
     policy = policy_for_scope(request.scope, request.app.state.listener_policies)
     if policy is None:
@@ -297,10 +297,16 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
         # that and burned it as single-use -- but this listener cannot carry
         # a single one of the capabilities it was minted with (e.g. a code
         # minted without OBSERVE, redeemed over `quick`, whose ceiling is
-        # OBSERVE alone). Answered exactly like a wrong code: the caller
-        # learns nothing this route doesn't already tell a guesser, and
-        # `TokenVault.issue()` itself refuses to be handed an empty grant set
-        # for the same reason `mint_pair_code` does above. Not counted as a
+        # OBSERVE alone). Answered exactly like a wrong code, and guarded
+        # explicitly rather than left to reach `TokenVault.issue()`'s own
+        # refusal of an empty grant set: that refusal is a `ValueError`,
+        # which `errors.py`'s app-wide mapping turns into 400 "invalid
+        # request" -- a status distinct from this route's uniform 401,
+        # which would let a caller distinguish "this code was real, single-
+        # use, and got this far" from "wrong/expired/reused" by status code
+        # alone. That is a valid-code oracle over an unauthenticated route,
+        # the same class of leak `consume()` already collapses wrong,
+        # expired and reused into one answer to prevent. Not counted as a
         # guessing failure (`record_failure`) -- this caller presented a real
         # code, so charging the pairing budget for a channel limitation would
         # punish correct use of a transport that was always going to end this
@@ -320,16 +326,19 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     # instead of a 422 it could route around by dropping the key.
     try:
         token = request.app.state.auth.vault.issue(pair_code.label, grants)
-    except VaultReadError as exc:
+    except VaultUnavailableError as exc:
         # The code is already consumed and gone -- single-use, and
         # `consume()` never puts it back -- so this is not a "retry with the
         # same code" situation. `issue()` refused to write from a
-        # devices.json it could not read rather than guess an empty vault and
-        # silently destroy every other device (see `VaultReadError`'s
-        # docstring). Whoever is at the laptop mints a fresh code once
-        # whatever is holding the file -- a scanner, a backup tool, a second
-        # TENKA process -- releases it.
-        logger.warning(f"[API] pairing failed: vault unreadable ({exc})")
+        # devices.json it could not read, or a write that could not land,
+        # rather than guess an empty vault and silently destroy every other
+        # device, or leave a `PermissionError` to surface as `errors.py`'s
+        # 403 "protected path" -- a status that would say "this code is not
+        # allowed" when the truth is "the vault is temporarily unavailable"
+        # (see `VaultUnavailableError`'s docstring). Whoever is at the laptop
+        # mints a fresh code once whatever is holding the file -- a scanner,
+        # a backup tool, a second TENKA process -- releases it.
+        logger.warning(f"[API] pairing failed: vault unavailable ({exc})")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="try again")
     state.limiter.record_success(_PAIR_BUDGET_KEY)

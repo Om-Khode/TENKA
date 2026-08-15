@@ -52,7 +52,7 @@ from .security import (
     policy_for_scope,
 )
 from .ui import UiBundle, mount_ui
-from .vault import Capability, TokenVault, VaultReadError
+from .vault import Capability, TokenVault, VaultUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -463,12 +463,14 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             #
             # Best-effort, same reasoning as `authenticate()`'s call to this:
             # the handshake has already verified the device and passed every
-            # other gate above, so a transient devices.json lock must not
-            # tear down a connection that would otherwise succeed, just
-            # because a bookkeeping write couldn't land this time.
+            # other gate above, so a transient devices.json lock -- on either
+            # the read or the write half, `VaultUnavailableError` covers both
+            # -- must not tear down a connection that would otherwise
+            # succeed, just because a bookkeeping write couldn't land this
+            # time.
             try:
                 auth.vault.touch(device.device_id)
-            except VaultReadError as exc:
+            except VaultUnavailableError as exc:
                 logger.warning(f"[API] could not record last-seen for "
                                f"{device.device_id}: {exc}")
         else:

@@ -8,7 +8,7 @@ work under duress, so it must not depend on anything expiring.
 from __future__ import annotations
 
 from assistant.io.api.security import COOKIE_NAME, CSRF_HEADER
-from assistant.io.api.vault import Capability, TokenVault, VaultReadError
+from assistant.io.api.vault import Capability, TokenVault, VaultReadError, VaultWriteError
 from tests.fakes.api_client import LOCAL_PORT, ApiTestClient, build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
@@ -169,6 +169,34 @@ def test_revoke_answers_503_not_404_when_the_vault_cannot_be_read(tmp_path, monk
     assert {d.label for d in vault.devices()} == {"phone"}
 
 
+# ─── F-1: the write half of the same lock must not answer 403 either ──────
+def test_revoke_answers_503_not_403_when_the_vault_cannot_be_written(tmp_path, monkeypatch):
+    """Before `VaultWriteError` existed, a failed *write* here escaped as a
+    raw `PermissionError`, which `errors.py`'s app-wide mapping turns into
+    403 "protected path" -- read by the one person trying to cut a device
+    off as "you are not allowed to revoke this device", the exact lie the
+    404 case above already argues against, arrived at from the other
+    direction. Patched at `TokenVault.revoke` itself, same reasoning as the
+    read-side test above: `authenticate()`'s own `verify()` call must not be
+    disturbed, only the mutation this route performs.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, token)
+    device_id = vault.devices()[0].device_id
+
+    def broken_revoke(self, device_id):
+        raise VaultWriteError("simulated lock")
+
+    monkeypatch.setattr(TokenVault, "revoke", broken_revoke)
+    r = client.delete(f"/v1/devices/{device_id}", headers={CSRF_HEADER: "1"})
+    monkeypatch.undo()
+
+    assert r.status_code == 503
+    assert {d.label for d in vault.devices()} == {"phone"}
+
+
 # ─── last seen ───────────────────────────────────────────────────────────
 def test_a_successful_call_updates_last_seen(tmp_path):
     vault = TokenVault(tmp_path)
@@ -189,4 +217,36 @@ def test_a_refused_call_does_not_update_last_seen(tmp_path):
     client = _client(vault, policies={LOCAL_PORT: "local"})
     client.cookies.set(COOKIE_NAME, "not-a-real-token")
     client.get("/v1/status")
+    assert vault.devices()[0].last_seen_at is None
+
+
+def test_a_locked_touch_write_does_not_turn_an_authenticated_request_into_403(tmp_path, monkeypatch):
+    """The review's sharpest proof: under a write lock, `touch()` used to
+    turn *every* authenticated request into 403 "protected path", because the
+    bookkeeping write's `PermissionError` escaped uncaught from
+    `authenticate()`. `GET /v1/status` never calls `issue()` or `revoke()` --
+    this exercises the real `authenticate() -> touch()` path end to end, with
+    only `_atomic_write` broken, proving the request still succeeds and the
+    failure is swallowed rather than surfaced.
+    """
+    from assistant.io.api import vault as vault_module
+
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, token)
+
+    original_atomic_write = vault_module._atomic_write
+
+    def broken(path, content):
+        if path.name == "devices.json":
+            raise PermissionError("simulated lock")
+        return original_atomic_write(path, content)
+
+    monkeypatch.setattr(vault_module, "_atomic_write", broken)
+    r = client.get("/v1/status")
+    monkeypatch.setattr(vault_module, "_atomic_write", original_atomic_write)
+
+    assert r.status_code == 200
+    # The write never landed -- there is nothing to show for it.
     assert vault.devices()[0].last_seen_at is None

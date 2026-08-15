@@ -28,7 +28,7 @@ from fastapi import Depends, HTTPException, Request, status
 from starlette.requests import HTTPConnection
 
 from .policy import ListenerPolicy, effective, policy_for_port
-from .vault import Capability, Device, TokenVault, VaultReadError
+from .vault import Capability, Device, TokenVault, VaultUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -488,22 +488,30 @@ async def authenticate(request: Request) -> Device:
         # the request path by design rather than hidden behind a second cache
         # here that could disagree with the vault's own window.
         #
-        # `touch()` now raises `VaultReadError` instead of silently no-op'ing
-        # when devices.json is unreadable (a lock held by a scanner, a
-        # backup tool, a second TENKA process) -- see TokenVault.touch's own
-        # docstring. That is the right behaviour for the vault itself, which
-        # must never guess at a document it cannot read, but this call site
-        # is not the place to turn that into a failed request: the device
-        # already verified above, off a devices.json read that plainly
-        # succeeded moments earlier, and every one of the checks that must
-        # not be bypassed (capability, listener ceiling, rate limit) has
-        # already passed. Failing an otherwise-fully-authenticated request
+        # `touch()` now raises `VaultUnavailableError` (either half: a read
+        # that could not determine the document's real content, or a write
+        # that could not land) instead of silently no-op'ing when devices.json
+        # is locked by a scanner, a backup tool, or a second TENKA process --
+        # see `TokenVault.touch`'s own docstring. That is the right behaviour
+        # for the vault itself, which must never guess at a document it
+        # cannot read or silently swallow a write that did not happen, but
+        # this call site is not the place to turn either into a failed
+        # request: the device already verified above, off a devices.json read
+        # that plainly succeeded moments earlier, and every one of the checks
+        # that must not be bypassed (capability, listener ceiling, rate limit)
+        # has already passed. Failing an otherwise-fully-authenticated request
         # because a best-effort "last seen" bookkeeping write hit a transient
         # lock would make the revoke-list column more expensive to maintain
-        # than the thing it protects. Best-effort: log it, keep going.
+        # than the thing it protects -- and letting the write half propagate
+        # unwrapped would be worse than a failed request: `PermissionError`
+        # (`VaultWriteError`'s underlying cause) is mapped by `errors.py` to
+        # 403 "protected path", so an uncaught write failure here would answer
+        # 403 -- "you are not allowed" -- to every authenticated request for
+        # as long as the lock held, which is a lie this call site must not
+        # tell. Best-effort either way: log it, keep going.
         try:
             state.vault.touch(device.device_id)
-        except VaultReadError as exc:
+        except VaultUnavailableError as exc:
             logger.warning(f"[API] could not record last-seen for "
                            f"{device.device_id}: {exc}")
         return device

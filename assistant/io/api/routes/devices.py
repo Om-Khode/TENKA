@@ -26,7 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from ..payloads import DevicePayload, DevicesPayload, RevokedPayload
 from ..schemas import Envelope
 from ..security import require_admin
-from ..vault import Capability, Device, VaultReadError
+from ..vault import Capability, Device, VaultUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +74,23 @@ async def revoke_device(
     straight off `GET /v1/devices` a line earlier.
 
     A third outcome, 503, is what `TokenVault.revoke()` raising
-    `VaultReadError` becomes: devices.json could not be read at all, so
-    whether `device_id` exists is genuinely unknown. Answering 404 there would
-    tell the one person trying to cut a device off that it is already gone
-    when the truth is "ask again once the file is readable" -- exactly the
-    control that must not lie under duress.
+    `VaultUnavailableError` becomes -- either half of it. If the read fails,
+    devices.json could not be read at all, so whether `device_id` exists is
+    genuinely unknown; answering 404 there would tell the one person trying
+    to cut a device off that it is already gone when the truth is "ask again
+    once the file is readable" -- exactly the control that must not lie
+    under duress. If the *write* fails instead (the same Windows lock
+    contention, on the save half), the underlying `PermissionError` would
+    otherwise reach `errors.py`'s app-wide mapping and answer 403 "protected
+    path" -- which here would read as "you are not allowed to revoke this
+    device", the same lie the 404 case argues against, just from the other
+    direction. Both halves become 503: unavailable, not unauthorised and not
+    already gone.
     """
     try:
         revoked = request.app.state.auth.vault.revoke(device_id)
-    except VaultReadError as exc:
-        logger.warning(f"[API] revoke failed: vault unreadable ({exc})")
+    except VaultUnavailableError as exc:
+        logger.warning(f"[API] revoke failed: vault unavailable ({exc})")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                             detail="try again")
     if not revoked:

@@ -8,7 +8,15 @@ from pathlib import Path
 
 import pytest
 
-from assistant.io.api.vault import Capability, Device, TokenVault, VaultReadError
+from assistant.io.api import vault as vault_module
+from assistant.io.api.vault import (
+    Capability,
+    Device,
+    TokenVault,
+    VaultReadError,
+    VaultUnavailableError,
+    VaultWriteError,
+)
 
 
 @pytest.fixture()
@@ -139,6 +147,12 @@ def test_corrupt_secret_file_regenerates_and_revokes_everything(tmp_path):
 
 
 def test_devices_json_as_bare_array_is_rejected_wholesale(tmp_path):
+    """`verify()`/`devices()` still fail closed (unchanged): there is nothing
+    to overwrite on a read. `revoke()` no longer reports a false `False`,
+    though -- a wrong-shape document is not the same as "device not found",
+    and this method must not guess which one it is (see the F-2 fix on
+    `_load()`: a bare array used to be silently treated as an empty vault).
+    """
     vault = TokenVault(tmp_path)
     token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     device_id = vault.verify(token).device_id
@@ -146,7 +160,8 @@ def test_devices_json_as_bare_array_is_rejected_wholesale(tmp_path):
 
     assert vault.verify(token) is None
     assert vault.devices() == []
-    assert vault.revoke(device_id) is False
+    with pytest.raises(VaultReadError):
+        vault.revoke(device_id)
 
 
 def test_devices_field_as_string_is_rejected_wholesale(tmp_path):
@@ -159,7 +174,8 @@ def test_devices_field_as_string_is_rejected_wholesale(tmp_path):
 
     assert vault.verify(token) is None
     assert vault.devices() == []
-    assert vault.revoke(device_id) is False
+    with pytest.raises(VaultReadError):
+        vault.revoke(device_id)
 
 
 def test_entry_that_is_not_a_dict_is_skipped(tmp_path):
@@ -752,6 +768,117 @@ def test_touch_raises_rather_than_silently_skipping(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "read_text", original)
     assert vault.devices()[0].last_seen_at is None, "no write happened while the read was failing"
+
+
+# ─── F-2: a wrong-shape document is not the same as an empty one ──────────
+# `_load()` raised on `OSError`/`JSONDecodeError` but still silently emptied
+# a document that parsed fine as JSON yet was not a version-1 devices
+# document -- and still logged "...starting empty", the exact phrasing the
+# I-3 fix removed for the other two cases. Proved to matter at boot: a
+# devices.json written by a newer build (version bumped) read by a
+# rolled-back one made `devices()` report `[]`, which `main.py`'s bootstrap
+# treats as "nothing has ever been issued" and re-issues a fresh `'studio'`
+# device -- silently discarding every real device on disk.
+
+
+@pytest.mark.parametrize("raw", [
+    '{"version": 2, "devices": []}',    # a schema version this build has never seen
+    '{"version": 1, "devices": {}}',    # devices present but not a list
+    "[1, 2, 3]",                        # not even a JSON object
+    '"hello"',                          # a bare string
+])
+def test_load_raises_on_a_wrong_shape_document_rather_than_starting_empty(tmp_path, raw):
+    vault = TokenVault(tmp_path)
+    (tmp_path / "devices.json").write_text(raw, encoding="utf-8")
+
+    with pytest.raises(VaultReadError):
+        vault._load()
+
+
+def test_issue_against_a_wrong_shape_document_raises_and_does_not_overwrite_it(tmp_path):
+    """The composed, boot-time scenario the review traced through
+    `main.py:309-310`. Before this fix: `devices()` reports `[]`, the
+    bootstrap re-issues `'studio'`, and `issue()` writes a document
+    containing only that one device -- every pre-existing device gone,
+    silently, at startup. `issue()` must refuse instead, and the file on
+    disk must survive completely untouched.
+    """
+    raw = json.dumps({
+        "version": 2,
+        "devices": [{"device_id": "future", "label": "from-a-newer-build"}],
+    })
+    (tmp_path / "devices.json").write_text(raw, encoding="utf-8")
+    vault = TokenVault(tmp_path)
+
+    assert vault.devices() == [], "still fails closed to an empty listing on the read side"
+
+    with pytest.raises(VaultReadError):
+        vault.issue("studio", frozenset({Capability.OBSERVE}))
+
+    assert (tmp_path / "devices.json").read_text(encoding="utf-8") == raw, (
+        "the newer build's document must survive completely untouched"
+    )
+
+
+# ─── F-1: a write failure must not become 403 "protected path" ────────────
+# `_save()`'s underlying `_atomic_write` raises `PermissionError` under the
+# same Windows lock contention that made `_load()` need `VaultReadError` --
+# and an uncaught `PermissionError` is mapped by `errors.py` to 403
+# "protected path". `touch()` runs on every authenticated request, so an
+# unwrapped write failure there answered 403 -- "you are not allowed" -- to
+# every request while the lock held. `_save()` now wraps it in
+# `VaultWriteError` instead, so every caller sees one exception family
+# (`VaultUnavailableError`) regardless of which half of the sequence failed.
+
+
+def _break_devices_json_writes(monkeypatch):
+    """Make the next write of *any* devices.json raise `PermissionError`,
+    simulating the write-side half of the same Windows lock contention
+    `_break_devices_json_reads` simulates for reads. Patched at the
+    module-level `_atomic_write` function `_save()` calls, not at `os`
+    directly, so this cannot affect an unrelated file written by some other
+    part of a test (the instance secret, for one) that happens to run first.
+    """
+    original = vault_module._atomic_write
+
+    def broken(path, content):
+        if path.name == "devices.json":
+            raise PermissionError("simulated lock")
+        return original(path, content)
+
+    monkeypatch.setattr(vault_module, "_atomic_write", broken)
+    return original
+
+
+def test_save_raises_vault_write_error_not_a_raw_permission_error(tmp_path, monkeypatch):
+    vault = TokenVault(tmp_path)
+    _break_devices_json_writes(monkeypatch)
+
+    with pytest.raises(VaultWriteError):
+        vault.issue("phone", frozenset({Capability.OBSERVE}))
+
+
+def test_touch_write_failure_is_a_vault_unavailable_error_and_writes_nothing(tmp_path, monkeypatch):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    _break_devices_json_writes(monkeypatch)
+
+    with pytest.raises(VaultUnavailableError):
+        vault.touch(device_id)
+
+
+def test_revoke_write_failure_does_not_report_success_or_a_false_not_found(tmp_path, monkeypatch):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.verify(token).device_id
+    _break_devices_json_writes(monkeypatch)
+
+    with pytest.raises(VaultUnavailableError):
+        vault.revoke(device_id)
+
+    monkeypatch.undo()
+    assert vault.verify(token) is not None, "not actually revoked -- the write never landed"
 
 
 @pytest.mark.parametrize("bad_value", ["2026-01-01T00:00:00", "not-a-timestamp"])

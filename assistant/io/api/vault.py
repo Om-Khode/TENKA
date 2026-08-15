@@ -106,25 +106,79 @@ def _restrict_to_current_user(path: Path) -> None:
         logger.warning(f"[API] icacls failed for {path.name}: {exc}")
 
 
-class VaultReadError(RuntimeError):
-    """`devices.json` exists but could not be read or parsed -- its state is
-    unknown, not empty.
+class VaultUnavailableError(RuntimeError):
+    """Base for `VaultReadError` and `VaultWriteError`: devices.json could not
+    be read or written for a reason that has nothing to do with what the
+    caller asked for -- a lock, a transient filesystem failure -- as opposed
+    to a request that was actually wrong (an unknown device, a bad token).
+
+    Exists so a caller that wants to treat both halves of the read-then-write
+    sequence the same way can catch this one type instead of listing both
+    subclasses everywhere. Every HTTP route that reaches the vault does
+    exactly that: unavailable is unavailable regardless of which half failed,
+    and none of them should answer 403 or 404 for it (see `VaultWriteError`'s
+    docstring for why the write half specifically used to).
+    """
+
+
+class VaultReadError(VaultUnavailableError):
+    """`devices.json` exists but could not be read, parsed, or understood --
+    its state is unknown, not empty.
 
     Distinct from an absent file, which `_load()` treats as a legitimate
     "nothing has ever been issued" without ever reaching this branch. Raised
-    by `_load()` so that a mutating method (`issue`, `revoke`, `touch`) that
-    is about to write the *entire* document back cannot mistake "I could not
-    read this" for "there is nothing here" and silently overwrite whatever is
-    actually on disk with a synthetic empty one -- the fix for a review
-    finding that proved exactly that on Windows: a file locked by a scanner,
-    a backup tool, or a second TENKA process raises `PermissionError`, and
-    `issue()` used to treat that identically to a fresh install and save a
-    document containing only the one device it was asked to add, destroying
-    every other record.
+    by `_load()` for three distinct reasons, all collapsed to one type because
+    a mutating caller must react to all three identically:
+
+    - `OSError` -- a file locked by a scanner, a backup tool, or a second
+      TENKA process.
+    - `json.JSONDecodeError` -- not parseable as JSON at all (a torn read, or
+      genuine corruption).
+    - parses cleanly but is not shaped like a version-`_SCHEMA_VERSION`
+      devices document -- wrong `version`, `devices` not a list, or not even
+      a JSON object. This one is not a corrupt file: it is what a newer
+      build's schema looks like to an older one, or what a hand-edited file
+      looks like before someone finished editing it. A file this build has
+      never seen the shape of is not evidence that nothing has ever been
+      issued, and "unrecognised" must not become "empty" any more than
+      "unreadable" does.
+
+    Raised so that a mutating method (`issue`, `revoke`, `touch`) that is
+    about to write the *entire* document back cannot mistake any of the three
+    for "there is nothing here" and silently overwrite whatever is actually
+    on disk with a synthetic empty one -- the fix for a review finding that
+    proved exactly that on Windows for the `OSError` case: `issue()` used to
+    treat a locked file identically to a fresh install and save a document
+    containing only the one device it was asked to add, destroying every
+    other record. A second review pass proved the wrong-shape case did the
+    same thing through a different door -- `_load()` raised on `OSError` and
+    `JSONDecodeError` but still silently emptied a well-formed-JSON,
+    wrong-shape document, which is exactly the shape a version bump or a
+    rollback produces.
 
     A caller that only *reads* (`verify`, `devices`) is not obligated to fail
     the same way -- there is nothing to overwrite -- so each decides for
     itself, and documents why, at its own call site.
+    """
+
+
+class VaultWriteError(VaultUnavailableError):
+    """`devices.json` could not be written -- the mutation the caller asked
+    for did not happen.
+
+    Raised by `_save()` when the underlying write raises `OSError`
+    (`PermissionError` on the same Windows file-locking contention that
+    motivates `VaultReadError` -- a scanner, a backup tool, a second TENKA
+    process holding the file open). Wrapped rather than left to propagate as
+    a raw `PermissionError`, because `app.py`'s app-wide exception mapping
+    (`errors.py`) turns an uncaught `PermissionError` into 403 "protected
+    path" -- and `touch()` runs on every authenticated request via
+    `authenticate()`, so an unwrapped write failure there answered 403 to
+    *every* request while the lock held, including `DELETE
+    /v1/devices/{id}`, where 403 reads as "you are not allowed to revoke
+    this device" -- precisely the lie `revoke_device`'s own docstring argues
+    against for the 404 case. `VaultWriteError` gives every call site one
+    thing to catch and answer honestly: unavailable, not unauthorised.
     """
 
 
@@ -203,13 +257,16 @@ class TokenVault:
     dominant failure was `PermissionError [WinError 5]` -- Windows refuses a
     second handle on a file another process has open, so a write racing
     another process's read (or write) is far more likely to fail loudly than
-    to succeed and silently clobber. `_load()` raising `VaultReadError` on
-    exactly that failure (rather than swallowing it into a synthetic empty
-    document, which is what made `issue()` dangerous under this same
-    contention -- see `VaultReadError`'s own docstring) is what turns a cross-
-    process collision into a request the caller sees fail and can retry,
-    instead of a device list that quietly loses everything but the record
-    just written. It does not make cross-process writes safe in general --
+    to succeed and silently clobber. `_load()` raising `VaultReadError` and
+    `_save()` raising `VaultWriteError` on exactly that failure (rather than
+    the read swallowing it into a synthetic empty document, which is what
+    made `issue()` dangerous under this same contention, or the write
+    escaping uncaught as a raw `PermissionError` that `app.py`'s own mapping
+    turns into a misleading 403 -- see `VaultUnavailableError`'s own
+    docstring) is what turns a cross-process collision into a request the
+    caller sees fail and can retry, instead of a device list that quietly
+    loses everything but the record just written. It does not make
+    cross-process writes safe in general --
     a true interleaved lost update remains possible in principle, and nothing
     here adds real mutual exclusion across processes -- but "fails loudly" is
     the practical, observed Windows behaviour this pass leaves in place.
@@ -301,8 +358,18 @@ class TokenVault:
                 # OSError matters more now than it did when this was read once
                 # per process: a per-HMAC read is exposed to transient failures
                 # (a locked file, a scanner holding a handle) that a single
-                # startup read would simply never have met. `_load()` treats a
-                # bad devices.json the same way.
+                # startup read would simply never have met. This is no longer
+                # what `_load()` does with the identical condition on a file in
+                # the same directory, though -- a review pass made that
+                # divergence explicit rather than accidental. This method
+                # regenerates on an unreadable *cold* file (nothing cached yet;
+                # see below) because there is nothing to regenerate a secret
+                # *from*, and a vault that raises here takes the whole daemon
+                # down at startup with no way back. `_load()` raises instead,
+                # because devices.json is not a single opaque value with one
+                # failure mode -- there is always something real underneath a
+                # read failure, and guessing "empty" risks discarding it. Two
+                # opposite responses to the same OSError, on purpose.
                 unusable = f"{exc}" or exc.__class__.__name__
             else:
                 self._secret = secret
@@ -337,18 +404,21 @@ class TokenVault:
 
         Absent is not the same as unreadable: a file that has never existed
         (fresh install, or `reset()` just deleted it) is a legitimate, known
-        empty vault, handled below without ever reaching the `try`. A file
-        that exists but raises `OSError` (locked by another process) or
-        `json.JSONDecodeError` (not parseable as JSON at all -- a torn read,
-        or genuine corruption) is a state this method does not actually know,
-        and is no longer treated as "empty" the way it used to be: a mutator
-        that received a synthetic empty document here could not tell it apart
-        from a real one and would save straight over whatever is genuinely on
-        disk. See `VaultReadError`'s docstring for what that cost in
-        practice. A read-only caller may still choose to treat this the same
-        way `verify()` and `devices()` do -- fail closed to "nothing verifies"
-        or "nothing is listed" -- but that is now a decision each of them
-        makes and documents for itself, not something this method decides
+        empty vault, handled below without ever reaching the `try`. Anything
+        that *is* present but is not a version-`_SCHEMA_VERSION` devices
+        document -- unreadable at the OS level, unparseable as JSON, or
+        parseable but the wrong shape -- is a state this method does not
+        actually know, and none of the three is treated as "empty" the way an
+        earlier version of this method treated all of them: a mutator that
+        received a synthetic empty document here could not tell it apart from
+        a real one and would save straight over whatever is genuinely on
+        disk. See `VaultReadError`'s docstring for what that cost in practice
+        for both the OS-failure case and the wrong-shape case -- a version
+        bump or a rollback produces exactly the latter, and it is not
+        corruption. A read-only caller may still choose to treat any of this
+        the same way `verify()` and `devices()` do -- fail closed to "nothing
+        verifies" or "nothing is listed" -- but that is now a decision each of
+        them makes and documents for itself, not something this method decides
         for all of them by handing back a lie.
         """
         path = self._root / _DEVICES_FILE
@@ -358,20 +428,54 @@ class TokenVault:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             raise VaultReadError(f"devices.json unreadable: {exc}") from exc
-        if (
+        # Not `isinstance(data, dict) and ...`, short-circuited the other way:
+        # `data.get(...)` below would raise `AttributeError` if `data` parsed
+        # to a list or a string, so the "is it even a dict" check has to run
+        # -- and short-circuit -- first.
+        wrong_shape = (
             not isinstance(data, dict)
             or data.get("version") != _SCHEMA_VERSION
             or not isinstance(data.get("devices"), list)
-        ):
-            logger.warning("[API] devices.json is malformed or has an unexpected schema; starting empty")
-            return {"version": _SCHEMA_VERSION, "devices": []}
+        )
+        if wrong_shape:
+            # Raised, not silently emptied -- this used to log "...starting
+            # empty" and hand back a synthetic document, which a mutator could
+            # not tell apart from a real fresh install (see `VaultReadError`'s
+            # docstring: this is exactly the boot-time data-loss path a review
+            # pass proved -- a devices.json written by a newer build, read by
+            # a rolled-back one, silently emptied and then overwritten with
+            # only whatever `main.py`'s bootstrap re-issues). A version this
+            # build does not recognise is not evidence that nothing has ever
+            # been issued.
+            version = data.get("version") if isinstance(data, dict) else None
+            raise VaultReadError(
+                f"devices.json parsed but its shape is not understood "
+                f"(version={version!r})"
+            )
         return data
 
     def _save(self, data: dict) -> None:
-        self._root.mkdir(parents=True, exist_ok=True)
-        path = self._root / _DEVICES_FILE
-        _atomic_write(path, json.dumps(data, indent=2))
-        _restrict_to_current_user(path)
+        """Persist the whole devices document, or raise `VaultWriteError` if
+        it could not be written.
+
+        Mirrors `_load()`'s `VaultReadError` on the write side: the same
+        Windows file-locking contention that makes a read fail with `OSError`
+        makes a write fail with `PermissionError` just as readily, and a
+        caller must not be left to discover that as a raw exception that
+        `app.py`'s app-wide mapping turns into 403 "protected path" -- a
+        status that means "you are not allowed", not "this could not be
+        saved right now". See `VaultWriteError`'s docstring for what that
+        cost in practice: `touch()` runs on every authenticated request, so
+        an unwrapped write failure there answered 403 to every request while
+        the lock held.
+        """
+        try:
+            self._root.mkdir(parents=True, exist_ok=True)
+            path = self._root / _DEVICES_FILE
+            _atomic_write(path, json.dumps(data, indent=2))
+            _restrict_to_current_user(path)
+        except OSError as exc:
+            raise VaultWriteError(f"devices.json could not be written: {exc}") from exc
 
     def _parse_device(self, entry: object) -> Device | None:
         """Fail closed: a malformed record is treated as absent, not trusted.
@@ -441,12 +545,17 @@ class TokenVault:
         # saves its own copy back -- the new device would survive, but the
         # revocation that raced it would silently vanish.
         with self._lock:
-            # Not caught here: a `VaultReadError` means the current document
-            # is unknown, and appending to a synthetic empty one and saving
-            # would destroy every other device on disk the moment the lock
-            # releases. Propagating lets the caller (a route) answer "try
-            # again" instead of the vault silently doing that. See
-            # `VaultReadError`'s docstring.
+            # Neither `_load()`'s `VaultReadError` nor `_save()`'s
+            # `VaultWriteError` is caught here. A `VaultReadError` means the
+            # current document is unknown, and appending to a synthetic empty
+            # one and saving would destroy every other device on disk the
+            # moment the lock releases. A `VaultWriteError` means the append
+            # above happened only in memory -- the caller asked for a new
+            # device and did not get one, and must be told that rather than
+            # handed a token for a device that was never actually persisted.
+            # Propagating either lets the caller (a route) answer "try again"
+            # instead of the vault silently guessing or silently lying. See
+            # `VaultUnavailableError`'s docstring.
             data = self._load()
             data["devices"].append({
                 "device_id": secrets.token_hex(8),
@@ -513,12 +622,16 @@ class TokenVault:
         # touch()/issue() needs to observe a stale snapshot is *between*
         # those two calls, not during either one alone.
         with self._lock:
-            # Not caught here either. A synthetic empty document would make
-            # `device_id` look absent -- `revoke()` would return `False`,
-            # "nothing was revoked", when the truth is "the vault could not
-            # be read" -- and a caller relying on that boolean (an operator
-            # trying to cut a device off) must not be told the device is
-            # already gone when its actual state is unknown.
+            # Not caught here either, on either side. A synthetic empty
+            # document from a failed *read* would make `device_id` look
+            # absent -- `revoke()` would return `False`, "nothing was
+            # revoked", when the truth is "the vault could not be read" -- and
+            # a caller relying on that boolean (an operator trying to cut a
+            # device off) must not be told the device is already gone when its
+            # actual state is unknown. A failed *write* is worse to hide: the
+            # filter above found and removed the device in memory, so the
+            # caller has every reason to believe it worked, right up until
+            # `_save()` raises and the device was never actually gone.
             data = self._load()
             devices = data["devices"]
             remaining = [
@@ -538,14 +651,16 @@ class TokenVault:
         showing up on the request path is ordinary, not exceptional, and a
         vault method must not hand a caller a reason to surface an error for
         it. That silence covers "the device is not in the document" only.
-        "The document could not be read at all" is a different fact --
-        `_load()` raises `VaultReadError` for it instead of handing back a
-        synthetic empty document, and this method does not catch that,
-        because a target genuinely found in a stale-but-readable snapshot
-        could otherwise be silently skipped as if it were merely unknown.
+        "The document could not be read or written at all" is a different
+        fact -- `_load()` raises `VaultReadError` and `_save()` raises
+        `VaultWriteError` for it instead of handing back a synthetic empty
+        document or swallowing a failed write, and this method does not catch
+        either, because a target genuinely found in a stale-but-readable
+        snapshot could otherwise be silently skipped as if it were merely
+        unknown, or a write that never landed could be reported as if it had.
         `authenticate()` and the event socket, the only two callers, treat a
-        failed touch as best-effort and do not fail the request over it --
-        see their own call sites for why.
+        failed touch (either kind) as best-effort and do not fail the request
+        over it -- see their own call sites for why.
 
         Throttled to one disk write per `_TOUCH_THROTTLE` per device: this
         sits on the authenticated request path, and `_save` is not free (a
@@ -614,11 +729,31 @@ class TokenVault:
 
     def devices(self) -> list[Device]:
         # Decision: fail closed to an empty listing, matching `verify()`.
-        # This is an admin-only read (`GET /v1/devices`, `/studio devices`),
-        # not a security decision -- reporting "none" while a lock clears is
-        # a stale UI, not a privilege granted to anyone who shouldn't have
-        # had it, so there is nothing here worth raising into a caller that
-        # almost certainly cannot do anything about a locked file anyway.
+        # Two of this method's three callers are display-only
+        # (`GET /v1/devices`, `/studio devices`), where reporting "none" while
+        # a lock clears is a stale UI, not a privilege granted to anyone who
+        # shouldn't have had it -- there is nothing worth raising into a
+        # caller that almost certainly cannot do anything about a locked file
+        # anyway.
+        #
+        # The third caller is not display-only: `main.py`'s Studio bootstrap
+        # uses the return value as control flow -- `if not vault.devices():
+        # issue("studio", ...)` -- to decide "has anything ever been issued?"
+        # That is the identical fresh-install question `_load()` was fixed to
+        # stop answering wrongly (see `VaultReadError`'s docstring on the
+        # wrong-shape case: a newer build's devices.json read by a rolled-back
+        # one). A `[]` from a genuine read failure looks, to that caller,
+        # exactly like a vault nothing has ever touched. What keeps this
+        # composition from being destructive today is that `issue()` does not
+        # trust its own inputs either: it re-runs `_load()` for itself and
+        # raises the same `VaultReadError` before it would ever save, so the
+        # bootstrap now fails to start the daemon (logged, non-fatal) rather
+        # than silently overwriting every existing device with one freshly
+        # issued `"studio"` record. That safety is a property of `issue()`,
+        # not of this method -- any *other* future caller that treats an empty
+        # list from here as license to write, without re-validating through a
+        # mutator first, would reproduce the exact data-loss path this file's
+        # review round exists to close.
         try:
             loaded = self._load()
         except VaultReadError as exc:
