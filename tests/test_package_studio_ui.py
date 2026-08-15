@@ -263,6 +263,69 @@ def test_the_vendored_bundle_was_built_for_this_api():
 
 
 @vendored_only
+def test_the_real_bundle_is_refused_when_its_contract_disagrees(tmp_path):
+    """The negative half of the guard, on the artefact that ships.
+
+    `test_a_contract_mismatch_refuses_to_serve` already pins this against a
+    synthetic fixture, and that is not the same claim: a fixture is whatever
+    this suite says it is, while a guard that has only ever been watched
+    *accept* is a guard nobody has seen work. So the vendored zip is copied,
+    its marker alone rewritten to a hash the daemon does not serve, and the
+    refusal observed over HTTP -- naming both sides, because "stale" with no
+    hashes is a dead end for whoever has to fix it.
+    """
+    stale = tmp_path / "stale.zip"
+    with zipfile.ZipFile(VENDORED) as source, \
+            zipfile.ZipFile(stale, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            body = source.read(info.filename)
+            if info.filename == MARKER_NAME:
+                marker = json.loads(body)
+                marker["contract"] = "0" * 64
+                body = json.dumps(marker).encode("utf-8")
+            target.writestr(info, body)
+
+    client = build_api_client(build_fake_runtime(),
+                              TokenVault(Path(tempfile.mkdtemp())),
+                              ui_bundle=UiBundle.open(zip_path=stale, dir_path=None))
+    response = client.get("/")
+    assert response.status_code == 503
+    assert "0" * 64 in response.text, "the bundle's own contract is not named"
+    assert _reference_contract() in response.text, "the daemon's contract is not named"
+    # And the whole bundle goes dark, not only its documents: stale JS against
+    # a new API is the actual breakage.
+    with zipfile.ZipFile(stale) as archive:
+        chunk = next(n for n in archive.namelist()
+                     if n.startswith("_next/static/chunks/") and n.endswith(".js"))
+    assert client.get(f"/{chunk}").status_code == 503
+    # ...while the API itself is untouched.
+    assert client.get("/v1/status").status_code == 401
+
+
+# ─── the developer override ──────────────────────────────────────────────
+def test_the_marker_mode_makes_a_raw_export_servable(tmp_path):
+    """`studio_ui_path` is unusable without this. `UiBundle` recognises a
+    directory as a bundle by the marker, and `next build` writes no such
+    thing, so a freshly built `out/` loses silently to the vendored zip."""
+    from tools.package_studio_ui import write_dev_marker
+
+    out = _fake_export(tmp_path)
+    assert UiBundle.open(zip_path=None, dir_path=out) is None
+    write_dev_marker(out)
+    bundle = UiBundle.open(zip_path=None, dir_path=out)
+    assert bundle is not None
+    assert bundle.manifest()["contract"] == _reference_contract()
+
+
+def test_the_marker_mode_refuses_a_directory_that_is_not_an_export(tmp_path):
+    from tools.package_studio_ui import write_dev_marker
+
+    (tmp_path / "empty").mkdir()
+    with pytest.raises(ValueError):
+        write_dev_marker(tmp_path / "empty")
+
+
+@vendored_only
 def test_the_vendored_bundle_carries_a_real_export_not_a_placeholder():
     """A one-file zip would pass every other test here."""
     with zipfile.ZipFile(VENDORED) as archive:

@@ -790,6 +790,128 @@ async def test_a_successful_start_leaves_a_pair_store_the_routes_actually_hold(
         await task
 
 
+# ─── the UI bundle reaches the running daemon ──────────────────────────────
+# Task 7 built `UiBundle` and `mount_ui()` and left the path decision to
+# main.py, because `io/api` may not import `config`. Task 16 built the
+# artefact. Between the two, nothing actually resolved a bundle at startup:
+# every `mount_ui` call site outside the tests passed `None`, `studio_ui_path`
+# was a setting nothing read, and the daemon served no `/` at all while every
+# unit test in the milestone stayed green. These are the tests that would have
+# caught that, so they assert the wiring rather than the loader.
+
+
+def _fake_serve_capturing(captured: dict):
+    import asyncio
+
+    async def _noop() -> None:
+        return None
+
+    def _serve(*args, **kwargs):
+        captured.update(kwargs)
+        return asyncio.create_task(_noop())
+
+    return _serve
+
+
+@pytest.mark.asyncio
+async def test_startup_serves_a_local_export_when_studio_ui_path_is_set(
+    tmp_path, monkeypatch,
+):
+    """The developer override. It wins over the vendored zip so that iterating
+    on Studio needs no re-packaging."""
+    import assistant.config as config
+    import assistant.main as m
+    from tests.fakes.studio_ui import write_ui_dir
+
+    export = write_ui_dir(tmp_path / "out", "does-not-have-to-match")
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    monkeypatch.setattr(config, "STUDIO_UI_PATH", str(export))
+
+    captured: dict = {}
+    monkeypatch.setattr("assistant.io.api.server.serve",
+                        _fake_serve_capturing(captured))
+
+    task = await m._start_studio_daemon()
+    try:
+        assert "ui_bundle" in captured, (
+            "_start_studio_daemon() never passed ui_bundle= to serve() -- the "
+            "daemon serves no UI at all"
+        )
+        bundle = captured["ui_bundle"]
+        assert bundle is not None
+        assert bundle.read("index.html") is not None
+        # From the directory, not from the vendored zip: the marker written
+        # above is the one that came back.
+        assert bundle.manifest()["contract"] == "does-not-have-to-match"
+    finally:
+        await task
+
+
+@pytest.mark.asyncio
+async def test_startup_falls_back_to_the_vendored_zip(tmp_path, monkeypatch):
+    import assistant.config as config
+    import assistant.main as m
+
+    if not m._VENDORED_UI_ZIP.is_file():
+        pytest.skip("no vendored bundle in this checkout")
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    monkeypatch.setattr(config, "STUDIO_UI_PATH", "")
+
+    captured: dict = {}
+    monkeypatch.setattr("assistant.io.api.server.serve",
+                        _fake_serve_capturing(captured))
+
+    task = await m._start_studio_daemon()
+    try:
+        bundle = captured.get("ui_bundle")
+        assert bundle is not None, "the vendored zip was not picked up"
+        assert bundle.read("index.html") is not None
+    finally:
+        await task
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_bundle_leaves_the_daemon_running_without_a_ui(
+    tmp_path, monkeypatch, caplog,
+):
+    """The packaged-wrong case. A corrupt or absent bundle must cost the pages
+    and nothing else -- the API is the product, the UI is a convenience, and a
+    daemon that refuses to boot because a zip is truncated is strictly worse
+    than one that boots and says so."""
+    import logging
+
+    import assistant.config as config
+    import assistant.main as m
+
+    # An export with no marker in it -- the shape a raw `next build` leaves,
+    # and the one `UiBundle` refuses because it cannot tell a bundle from any
+    # other directory without one.
+    unreadable = tmp_path / "broken"
+    unreadable.mkdir()
+    (unreadable / "index.html").write_text("<html></html>", encoding="utf-8")
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    monkeypatch.setattr(config, "STUDIO_UI_PATH", str(unreadable))
+    # And a truncated vendored zip, so there is nothing to fall back to either.
+    corrupt_zip = tmp_path / "studio_ui.zip"
+    corrupt_zip.write_bytes(b"not a zip at all")
+    monkeypatch.setattr(m, "_VENDORED_UI_ZIP", corrupt_zip)
+
+    captured: dict = {}
+    monkeypatch.setattr("assistant.io.api.server.serve",
+                        _fake_serve_capturing(captured))
+
+    with caplog.at_level(logging.WARNING):
+        task = await m._start_studio_daemon()
+    try:
+        assert task is not None, "the daemon must still start"
+        assert captured.get("ui_bundle") is None
+        assert any("no Studio UI bundle" in r.message for r in caplog.records)
+    finally:
+        await task
+
+
 @pytest.mark.asyncio
 async def test_stop_studio_daemon_clears_the_pair_store():
     """Fix 3: a stale store left set after stop is the "prints a code

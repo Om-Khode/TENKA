@@ -15,6 +15,7 @@ from .app import create_app
 from .events import EventHub
 from .pairing import PairCodeStore
 from .runtime import StudioRuntime
+from .ui import UiBundle
 from .vault import TokenVault
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ _HOST = "127.0.0.1"
 def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
           port: int = 8787, origins: list[str],
           hub: EventHub | None = None,
+          ui_bundle: UiBundle | None = None,
           pair_store: PairCodeStore | None = None) -> asyncio.Task:
     """Start uvicorn as a task on the running loop. Cancel the task to stop.
 
@@ -32,6 +34,13 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     EventHub instance this app will use, before the socket route ever sees a
     connection. Left unset -- every existing caller (tests, the exporter) --
     `create_app` builds its own, private to that one app, exactly as before.
+
+    `ui_bundle` is the third of these, and the one that has to be threaded
+    rather than resolved here: deciding *which* bundle means reading
+    `studio_ui_path`, and nothing under `io/api` may import `config` (see the
+    closing comment in ui.py). So main.py resolves it and hands it in, exactly
+    as it already does for `origins`. Left unset -- tests, the exporter -- the
+    app mounts no UI route at all and is otherwise unchanged.
 
     `pair_store` is the same shape of escape hatch, for the same reason:
     main.py threads its own module-level `PairCodeStore` through here so
@@ -48,7 +57,8 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     # nothing at all. A later transport adds its own entry here rather than
     # relying on any property of the traffic itself.
     app = create_app(runtime, vault, origins=origins, hub=hub,
-                     listener_policies={port: "local"}, pair_store=pair_store)
+                     listener_policies={port: "local"}, ui_bundle=ui_bundle,
+                     pair_store=pair_store)
     config = uvicorn.Config(app, host=host, port=port, log_level="warning",
                             access_log=False, lifespan="on")
     server = uvicorn.Server(config)

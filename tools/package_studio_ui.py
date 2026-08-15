@@ -14,6 +14,12 @@ app was rewritten. Day-to-day Studio work does not need it at all: point the
 instead, live, with no packaging step in the loop. Do not wire this into a
 build script.
 
+    py -3.11 tools/package_studio_ui.py ../tenka-studio/out --marker
+
+writes just the marker into that directory, which is what makes the override
+work -- `UiBundle` recognises a directory as a bundle by the marker, and
+`next build` has no reason to write one.
+
 Three things the zip must carry, and why each is checked rather than assumed:
 
 * **The marker** (`MARKER_NAME`, imported -- never spelled here). A bundle
@@ -236,6 +242,32 @@ def package(source: Path | str, destination: Path | str, *,
     return destination
 
 
+def write_dev_marker(source: Path | str, *, contract: str | None = None) -> Path:
+    """Write the marker into an export directory, and package nothing.
+
+    The developer override (`studio_ui_path`) is worth having and does not work
+    without this. `UiBundle._from_dir` requires the marker -- it is how a
+    directory is recognised as a bundle at all -- and `next build` has no
+    reason to write one, so a freshly built `out/` loses silently to the
+    vendored zip and the developer sees a stale UI with no explanation. This
+    costs nothing to offer: `out/` is gitignored in Studio, so the marker never
+    leaves the machine that wrote it.
+
+    Nothing here is scanned. A dev directory is not an artefact anyone ships,
+    and the checks in `package()` are about what leaves this machine.
+    """
+    source = Path(source)
+    if not (source / "index.html").is_file():
+        raise ValueError(f"{source} has no index.html; it is not a Studio export")
+    marker = source / MARKER_NAME
+    marker.write_text(json.dumps({
+        "version": UI_MANIFEST_VERSION,
+        "contract": live_contract_hash() if contract is None else contract,
+        "builtAt": datetime.now(timezone.utc).isoformat(),
+    }, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    return marker
+
+
 def _write(archive: zipfile.ZipFile, member: str, body: bytes) -> None:
     info = zipfile.ZipInfo(member, date_time=_FIXED_TIMESTAMP)
     info.compress_type = zipfile.ZIP_DEFLATED
@@ -306,7 +338,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="Studio's export directory (`out/`)")
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_DESTINATION,
                         help=f"where to write the zip (default: {DEFAULT_DESTINATION})")
+    parser.add_argument("--marker", action="store_true",
+                        help="write the marker into SOURCE and package nothing, "
+                             "so `studio_ui_path` can serve that directory live")
     args = parser.parse_args(argv)
+
+    if args.marker:
+        try:
+            marker = write_dev_marker(args.source)
+        except ValueError as exc:
+            print(f"refused: {exc}", file=sys.stderr)
+            return 1
+        print(f"wrote {marker} — point studio_ui_path at {args.source}")
+        return 0
 
     try:
         written = package(args.source, args.output)
