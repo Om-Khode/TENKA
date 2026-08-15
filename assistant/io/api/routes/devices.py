@@ -26,7 +26,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from ..payloads import DevicePayload, DevicesPayload, RevokedPayload
 from ..schemas import Envelope
 from ..security import require_admin
-from ..vault import Capability, Device
+from ..vault import Capability, Device, VaultReadError
 
 logger = logging.getLogger(__name__)
 
@@ -72,8 +72,21 @@ async def revoke_device(
     distinguishable from "it is gone now". The distinction discloses nothing a
     caller holding SYSTEM_CONTROL on the loopback listener could not read
     straight off `GET /v1/devices` a line earlier.
+
+    A third outcome, 503, is what `TokenVault.revoke()` raising
+    `VaultReadError` becomes: devices.json could not be read at all, so
+    whether `device_id` exists is genuinely unknown. Answering 404 there would
+    tell the one person trying to cut a device off that it is already gone
+    when the truth is "ask again once the file is readable" -- exactly the
+    control that must not lie under duress.
     """
-    if not request.app.state.auth.vault.revoke(device_id):
+    try:
+        revoked = request.app.state.auth.vault.revoke(device_id)
+    except VaultReadError as exc:
+        logger.warning(f"[API] revoke failed: vault unreadable ({exc})")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="try again")
+    if not revoked:
         # `detail=` is dead on a 404: app.py's own 404 handler dispatches on
         # the status code alone and always answers a fixed body.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)

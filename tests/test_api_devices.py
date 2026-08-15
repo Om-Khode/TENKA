@@ -8,7 +8,7 @@ work under duress, so it must not depend on anything expiring.
 from __future__ import annotations
 
 from assistant.io.api.security import COOKIE_NAME, CSRF_HEADER
-from assistant.io.api.vault import Capability, TokenVault
+from assistant.io.api.vault import Capability, TokenVault, VaultReadError
 from tests.fakes.api_client import LOCAL_PORT, ApiTestClient, build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
@@ -130,6 +130,43 @@ def test_a_cookie_revoke_still_needs_the_csrf_header(tmp_path):
     device_id = vault.devices()[0].device_id
     assert client.delete(f"/v1/devices/{device_id}").status_code == 403
     assert len(vault.devices()) == 1
+
+
+# ─── I-3: revoke must not confuse "could not read" with "not found" ───────
+def test_revoke_answers_503_not_404_when_the_vault_cannot_be_read(tmp_path, monkeypatch):
+    """`TokenVault.revoke()` raising `VaultReadError` used to be indistinguishable
+    from the device simply not existing, because `_load()` silently handed
+    back a synthetic empty document. Whether `device_id` exists is genuinely
+    unknown when the read fails -- answering 404 would tell the one person
+    trying to cut a device off that it is already gone, when the truth is
+    "ask again once the file is readable."
+
+    `TokenVault.revoke` itself is patched to raise, rather than breaking the
+    file read underneath it: `authenticate()` calls `verify()` -- also a
+    devices.json read -- on this very request, so breaking the read at the
+    file level would make the request fail *authentication*, not exercise
+    the route's handling of the mutation failing. This models a lock that
+    clears between `verify()`'s read a moment earlier and `revoke()`'s own
+    fresh one -- exactly the vault-level behaviour
+    `test_revoke_raises_rather_than_reporting_a_false_not_found` in
+    `test_api_vault.py` proves directly.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, token)
+    device_id = vault.devices()[0].device_id
+
+    def broken_revoke(self, device_id):
+        raise VaultReadError("simulated lock")
+
+    monkeypatch.setattr(TokenVault, "revoke", broken_revoke)
+    r = client.delete(f"/v1/devices/{device_id}", headers={CSRF_HEADER: "1"})
+    monkeypatch.undo()
+
+    assert r.status_code == 503
+    # The real revoke() never ran, so nothing was written -- still there.
+    assert {d.label for d in vault.devices()} == {"phone"}
 
 
 # ─── last seen ───────────────────────────────────────────────────────────

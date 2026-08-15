@@ -4,10 +4,11 @@ import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
-from assistant.io.api.vault import Capability, Device, TokenVault
+from assistant.io.api.vault import Capability, Device, TokenVault, VaultReadError
 
 
 @pytest.fixture()
@@ -631,6 +632,126 @@ def test_a_garbage_stored_timestamp_does_not_raise_and_overwrites(tmp_path):
 
     assert path.read_bytes() != before
     assert vault.devices()[0].last_seen_at != "not-a-timestamp"
+
+
+# ─── I-3: a read failure is not the same as an empty vault ────────────────
+# `_load()` used to swallow `OSError`/`json.JSONDecodeError` into a
+# synthetic empty document -- indistinguishable from a fresh install. That
+# made every mutator unsafe: `issue()` appended to the fake-empty list and
+# saved, destroying every other device the moment a lock (a scanner, a
+# backup tool, a second TENKA process) coincided with a write. Proved on
+# Windows under real contention (`PermissionError [WinError 5]`); simulated
+# here deterministically by breaking reads of exactly this vault's
+# `devices.json`, nothing else -- not the instance secret file, which lives
+# in the same directory and must stay readable throughout.
+
+
+def _break_devices_json_reads(monkeypatch, tmp_path):
+    target = tmp_path / "devices.json"
+    original_read_text = Path.read_text
+
+    def broken(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError("simulated lock")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", broken)
+    return original_read_text
+
+
+def test_verify_fails_closed_on_a_genuine_read_failure(tmp_path, monkeypatch, caplog):
+    """Decision: `verify()` treats an unreadable devices.json the same way it
+    treats an unknown or revoked token -- refuse. This is the call
+    `authenticate()` makes on every request specifically so a revocation is
+    never stale, so the alternative (verify whatever was last cached) is not
+    a thing this vault does anywhere else. The cost is real -- every device
+    is refused for as long as the lock holds -- and accepted on purpose.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="assistant.io.api.vault"):
+        assert vault.verify(token) is None
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert "could not read devices.json" in caplog.text
+    assert vault.verify(token) is not None, (
+        "the device must still be there once the read recovers -- verify() "
+        "must not have treated the failure as a revocation"
+    )
+
+
+def test_devices_reports_none_on_a_genuine_read_failure(tmp_path, monkeypatch):
+    """Decision: `devices()` also fails closed to an empty listing. This is an
+    admin-only read (`GET /v1/devices`, `/studio devices`), not a security
+    decision -- a stale "none issued" while a lock clears costs a confusing
+    UI, not a privilege handed to someone who should not have had it.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    assert vault.devices() == []
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert len(vault.devices()) == 1, "the device must still be there once the read recovers"
+
+
+def test_issue_raises_rather_than_destroying_every_other_device(tmp_path, monkeypatch):
+    """The finding, reproduced directly: `issue()` used to overwrite
+    devices.json with a document containing only the new device, silently
+    destroying everything else, whenever the read that should have loaded
+    the real document failed instead. It must now raise and write nothing.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("existing", frozenset({Capability.OBSERVE}))
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    with pytest.raises(VaultReadError):
+        vault.issue("new", frozenset({Capability.OBSERVE}))
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert {d.label for d in vault.devices()} == {"existing"}, (
+        "issue() must not have written anything while the read was failing"
+    )
+
+
+def test_revoke_raises_rather_than_reporting_a_false_not_found(tmp_path, monkeypatch):
+    """`revoke()` returning `False` under a read failure would tell the one
+    person trying to cut a device off that it is already gone, when the
+    truth is "the vault could not be read." That is worse than an error.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.verify(token).device_id
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    with pytest.raises(VaultReadError):
+        vault.revoke(device_id)
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert vault.verify(token) is not None, "not actually revoked -- the write never happened"
+
+
+def test_touch_raises_rather_than_silently_skipping(tmp_path, monkeypatch):
+    """`touch()`'s existing silence covers "the device is not in the
+    document" -- a stale or revoked credential on the request path is
+    ordinary. "The document could not be read at all" is a different fact
+    and must not collapse into that same silence, or a target that is
+    genuinely present in a stale-but-readable snapshot could be skipped as if
+    it were merely unknown.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    with pytest.raises(VaultReadError):
+        vault.touch(device_id)
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert vault.devices()[0].last_seen_at is None, "no write happened while the read was failing"
 
 
 @pytest.mark.parametrize("bad_value", ["2026-01-01T00:00:00", "not-a-timestamp"])

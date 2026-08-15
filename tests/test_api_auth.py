@@ -185,6 +185,21 @@ def test_the_one_anonymous_route_really_is_reachable_without_a_credential(client
     assert client.post("/v1/pair", json={}).status_code == 422
 
 
+def test_the_anonymous_exemption_count_is_pinned():
+    """`checked > 0` above only proves *something* was swept -- it says
+    nothing about how many routes are exempt from the sweep in the first
+    place. A future task could add a second entry to `_ANONYMOUS_OPERATIONS`
+    for a route that should never have been exempt, and every existing guard
+    here would still pass: the new route is real (satisfies "names only real
+    operations" above) and the sweep still finds plenty of other routes to
+    check (satisfies `checked > 0`). Pinning the exact count means growing
+    this set is a deliberate, reviewable one-line diff -- justified with the
+    same rigor (a named test file, not silent trust) as
+    `("POST", "/v1/pair")` was.
+    """
+    assert len(_ANONYMOUS_OPERATIONS) == 1
+
+
 def test_the_sweep_catches_a_route_registered_without_auth(vault):
     """Guard for the sweep itself, not for the app.
 

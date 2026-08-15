@@ -4,19 +4,33 @@
 `POST /v1/pair` is the only unauthenticated write in this API. From Milestone
 6b it is reachable from the open internet, and it sits beside a `POST /v1/chat`
 that reaches `code_executor` -- so what this module refuses matters more than
-what it serves. Four properties carry that weight, and each one has a test:
+what it serves. These properties carry that weight, and each one has a test:
 
 - **Enrollment is loopback-only.** `POST /v1/pair/code` is gated on
   `require_admin(SYSTEM_CONTROL)`: a remote listener is never `policy.admin`,
-  so a compromised phone cannot mint itself a second, wider credential, and a
-  loopback device paired only to watch cannot either.
+  so a compromised phone cannot mint itself a second, wider credential at all.
+- **A minted code can never carry more than the minting device already holds.**
+  `require_admin` proves SYSTEM_CONTROL and a loopback listener, and nothing
+  else -- it says nothing about whether this device also holds, say, RECALL or
+  FILES. A device issued only SYSTEM_CONTROL used to be able to mint a code
+  carrying every other capability there is, a second credential wider than the
+  one it was issued, through the one route that exists specifically to prevent
+  that escalation. Requested grants are intersected with the minting device's
+  own before the code is minted, never unioned with them.
+- **Grants that survive to `issue()` are also capped by the redeeming
+  listener.** The code carries what the laptop authorised; `pair_device` below
+  narrows that further to `effective(pair_code.grants, policy)` before it ever
+  reaches the vault, so a code redeemed over a distrusted transport
+  (Cloudflare's `quick` tunnel) can never mint a device wider than that
+  transport is trusted to carry. See that route's own docstring for what this
+  means for a phone that pairs over `quick`.
 - **Grants ride on the code.** They are chosen on the laptop before the QR is
   drawn and stored on the `PairCode`; the redeeming request never supplies
   them. That is what turns the checkbox row into a boundary rather than a
   suggestion.
 - **Wrong, expired and already-used codes are one response.** `consume()`
   already collapses all three to `None`; this module collapses them to one
-  `_UNAUTHORIZED` after the same work, exactly as `verify()` does for
+  `UNAUTHORIZED` after the same work, exactly as `verify()` does for
   unknown-vs-revoked tokens.
 - **No log line ever carries a code.** Not at DEBUG, not in an audit entry.
   The code appears in exactly one place, the response body that the laptop
@@ -35,10 +49,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from ..pairing import PairCodeStore
 from ..payloads import PairCodePayload
+from ..policy import effective
 from ..qr import qr_svg
 from ..schemas import Envelope, PairCodeRequest, PairRequest
 from ..security import (
-    _UNAUTHORIZED,
+    UNAUTHORIZED,
     COOKIE_NAME,
     AuthState,
     accepting_port,
@@ -47,7 +62,7 @@ from ..security import (
     refuse_unknown_origin,
     require_admin,
 )
-from ..vault import Capability, Device
+from ..vault import Capability, Device, VaultReadError
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +117,7 @@ def _endpoints(request: Request) -> list[str]:
         # Unreachable: `authenticate()` resolves policy from this same port
         # and refuses when it cannot. Guarded anyway rather than formatting
         # `None` into a URL a QR would then encode.
-        raise _UNAUTHORIZED
+        raise UNAUTHORIZED
     return [f"http://127.0.0.1:{port}"]
 
 
@@ -110,7 +125,7 @@ def _endpoints(request: Request) -> list[str]:
 @router.post("/pair/code")
 async def mint_pair_code(
     body: PairCodeRequest, request: Request,
-    _: Device = Depends(require_admin(Capability.SYSTEM_CONTROL)),
+    device: Device = Depends(require_admin(Capability.SYSTEM_CONTROL)),
 ) -> Envelope[PairCodePayload]:
     """Put a code, and a QR for it, in front of the person at the keyboard.
 
@@ -121,6 +136,17 @@ async def mint_pair_code(
     SYSTEM_CONTROL -- precisely the person being denied. It is not a way in
     for the attacker, because reaching this line at all already required
     everything the attacker does not have.
+
+    **Requested grants are capped at what this device already holds.**
+    `require_admin` proves this device holds SYSTEM_CONTROL and is on a
+    loopback listener -- it proves nothing about whether it also holds any
+    *other* capability being asked for. Without the intersection below, a
+    device paired with only SYSTEM_CONTROL could mint a code carrying RECALL,
+    FILES and CHAT_SEND -- none of which it was ever issued -- and redeem that
+    code itself for a second credential wider than the one it holds.
+    `Capability`'s own docstring is explicit that grants are "granted per
+    device, never implied": SYSTEM_CONTROL does not subsume anything else, so
+    neither does minting with it.
     """
     try:
         grants = frozenset(Capability(name) for name in body.grants)
@@ -132,9 +158,21 @@ async def mint_pair_code(
         # and deprecated the old spelling, and this is not a number that moves.
         raise HTTPException(status_code=422, detail="unknown capability")
 
+    # Intersected, never unioned, with the minting device's own grants -- the
+    # same shape as `effective()` narrowing a listener's ceiling, applied here
+    # to a *device's* ceiling instead of a transport's. `PairCodeRequest`
+    # bounds the requested list at min_length=1, but the intersection can
+    # still land empty if none of what was asked for is actually held, so
+    # that case gets its own 422 rather than reaching `store.mint()`'s
+    # (unreachable-from-the-wire, until now) empty-grant refusal.
+    grants = grants & device.grants
+    if not grants:
+        raise HTTPException(
+            status_code=422,
+            detail="none of the requested capabilities are held by this device",
+        )
+
     store = _store(request)
-    # `mint` refuses an empty grant set, but `PairCodeRequest` already bounds
-    # the list at min_length=1, so the ValueError is unreachable from the wire.
     pair_code = store.mint(body.label, grants)
 
     state: AuthState = request.app.state.auth
@@ -183,17 +221,35 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     nothing else a caller needs back -- it learns what it may do by calling
     `GET /v1/session` with the credential it now holds.
 
-    Every refusal is the same `_UNAUTHORIZED` the rest of the API uses. The
-    one status that differs is the 429, and it has to: a caller that is being
-    throttled must be able to tell that retrying immediately is pointless,
-    and it learns nothing about any code by being told so.
+    **Grants are narrowed to this listener before they ever reach the vault.**
+    `effective(pair_code.grants, policy)`, never the code's own unnarrowed
+    set -- the same intersection `authenticate()` applies to every later
+    request, just applied once here, at issue time, instead of on every
+    request after. The consequence is real and worth spelling out: a code
+    minted with every capability, redeemed over Cloudflare's `quick` tunnel
+    (ceiling: OBSERVE alone, because Cloudflare terminates TLS and reads the
+    plaintext), mints a device that can only ever watch -- **permanently**,
+    even if that same device later connects over `funnel` or `tailnet`,
+    because the vault only remembers what `issue()` was actually asked to
+    store, not what the code could have carried on a better transport. That
+    will surprise someone: pairing over `quick` is the expected path for a
+    phone with no Tailscale, not a mistake, and there is no way to tell
+    afterward that a device "could have" held more. 6b's pairing UI needs to
+    say so before the QR is scanned, not after.
+
+    Every refusal is the same `UNAUTHORIZED` the rest of the API uses, with
+    two exceptions, both load-bearing: 429 when the pairing budget is spent
+    (a caller has to be able to tell that retrying immediately is pointless),
+    and 503 when the vault itself could not be read (a caller has to be able
+    to tell that retrying *at all* might still work -- unlike a wrong code,
+    this one was never the caller's fault).
     """
     policy = policy_for_scope(request.scope, request.app.state.listener_policies)
     if policy is None:
         # Nobody declared what this socket is. Same answer `authenticate()`
         # gives, for the same reason: a listener added later and forgotten in
         # the registry must not inherit loopback's rights by silence.
-        raise _UNAUTHORIZED
+        raise UNAUTHORIZED
 
     # Before the budget, and unmetered -- the same ordering and the same
     # reasoning as `authenticate()`. It costs one header lookup and a set
@@ -231,7 +287,27 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
         # `None` for all four and this route must not tell them apart.
         state.limiter.record_failure(_PAIR_BUDGET_KEY)
         logger.info("[API] a pair attempt was refused")
-        raise _UNAUTHORIZED
+        raise UNAUTHORIZED
+
+    # Narrowed to what THIS listener may carry -- see the docstring above.
+    # Never the code's own, unnarrowed `pair_code.grants`.
+    grants = effective(pair_code.grants, policy)
+    if not grants:
+        # The code was genuinely correct -- `consume()` above already proved
+        # that and burned it as single-use -- but this listener cannot carry
+        # a single one of the capabilities it was minted with (e.g. a code
+        # minted without OBSERVE, redeemed over `quick`, whose ceiling is
+        # OBSERVE alone). Answered exactly like a wrong code: the caller
+        # learns nothing this route doesn't already tell a guesser, and
+        # `TokenVault.issue()` itself refuses to be handed an empty grant set
+        # for the same reason `mint_pair_code` does above. Not counted as a
+        # guessing failure (`record_failure`) -- this caller presented a real
+        # code, so charging the pairing budget for a channel limitation would
+        # punish correct use of a transport that was always going to end this
+        # way for this particular code.
+        logger.info("[API] a pair attempt succeeded but this listener could "
+                    "carry none of the code's grants")
+        raise UNAUTHORIZED
 
     # The label comes from the code, and `PairRequest` carries no label field
     # at all for it to come from anywhere else. It is what the person at the
@@ -242,7 +318,20 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     # rather than rejected (`PairRequest` does not forbid extras) so that a
     # client which tries still ends up with the name the laptop authorised,
     # instead of a 422 it could route around by dropping the key.
-    token = request.app.state.auth.vault.issue(pair_code.label, pair_code.grants)
+    try:
+        token = request.app.state.auth.vault.issue(pair_code.label, grants)
+    except VaultReadError as exc:
+        # The code is already consumed and gone -- single-use, and
+        # `consume()` never puts it back -- so this is not a "retry with the
+        # same code" situation. `issue()` refused to write from a
+        # devices.json it could not read rather than guess an empty vault and
+        # silently destroy every other device (see `VaultReadError`'s
+        # docstring). Whoever is at the laptop mints a fresh code once
+        # whatever is holding the file -- a scanner, a backup tool, a second
+        # TENKA process -- releases it.
+        logger.warning(f"[API] pairing failed: vault unreadable ({exc})")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail="try again")
     state.limiter.record_success(_PAIR_BUDGET_KEY)
     logger.info(f"[API] paired a new device: {pair_code.label!r}")
 

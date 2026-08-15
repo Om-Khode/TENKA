@@ -17,6 +17,8 @@ are not conveniences:
 from __future__ import annotations
 
 import logging
+import time
+from pathlib import Path
 
 from assistant.io.api.pairing import PairCodeStore
 from assistant.io.api.security import COOKIE_NAME, CSRF_HEADER
@@ -91,6 +93,62 @@ def test_minting_needs_more_than_a_watching_grant(tmp_path):
     r = client.post("/v1/pair/code", json={"label": "x", "grants": ["system_control"]},
                     headers={CSRF_HEADER: "1"})
     assert r.status_code == 403
+
+
+# ─── I-1: a minted code can never exceed the minting device's own grants ──
+def test_minting_is_capped_at_what_the_device_holds(tmp_path):
+    """A device issued only SYSTEM_CONTROL used to be able to mint a code
+    carrying every other capability there is -- a second credential wider
+    than the one it was ever granted, through the one route that exists
+    specifically to prevent that escalation. `Capability`'s own docstring
+    says grants are "granted per device, never implied": SYSTEM_CONTROL does
+    not subsume RECALL, FILES, or CHAT_SEND, so none of the three should have
+    ended up on a code this device mints.
+    """
+    vault = TokenVault(tmp_path)
+    admin = vault.issue("laptop", frozenset({Capability.SYSTEM_CONTROL}))
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, admin)
+    r = client.post("/v1/pair/code",
+                    json={"label": "phone", "grants": ["recall", "files", "chat_send"]},
+                    headers={CSRF_HEADER: "1"})
+    assert r.status_code == 422
+
+
+def test_minting_narrows_to_the_intersection_not_all_or_nothing(tmp_path):
+    """The cap is an intersection, not a blanket refusal the moment any
+    requested grant is missing: a device holding SYSTEM_CONTROL and OBSERVE,
+    asking for {OBSERVE, RECALL}, gets a code carrying OBSERVE alone -- not a
+    422, and not a code that quietly grew RECALL back in.
+    """
+    vault = TokenVault(tmp_path)
+    admin = vault.issue("laptop", frozenset({Capability.SYSTEM_CONTROL, Capability.OBSERVE}))
+    store = _store()
+    client = _client(vault, policies={LOCAL_PORT: "local"}, store=store)
+    client.cookies.set(COOKIE_NAME, admin)
+    r = client.post("/v1/pair/code",
+                    json={"label": "phone", "grants": ["observe", "recall"]},
+                    headers={CSRF_HEADER: "1"})
+    assert r.status_code == 200
+    assert store.current().grants == frozenset({Capability.OBSERVE})
+
+
+def test_a_device_holding_everything_can_still_mint_everything(tmp_path):
+    """The intersection must not become a hidden ceiling for the ordinary
+    case: the usual admin device (issued every capability, per `main.py`'s
+    bootstrap) still mints exactly what it asks for.
+    """
+    vault = TokenVault(tmp_path)
+    admin = vault.issue("laptop", frozenset(Capability))
+    store = _store()
+    client = _client(vault, policies={LOCAL_PORT: "local"}, store=store)
+    client.cookies.set(COOKIE_NAME, admin)
+    r = client.post("/v1/pair/code",
+                    json={"label": "phone", "grants": ["recall", "files", "chat_send"]},
+                    headers={CSRF_HEADER: "1"})
+    assert r.status_code == 200
+    assert store.current().grants == frozenset(
+        {Capability.RECALL, Capability.FILES, Capability.CHAT_SEND})
 
 
 def test_an_unknown_capability_is_422(tmp_path):
@@ -188,6 +246,63 @@ def test_the_pairing_request_cannot_rename_the_device(tmp_path):
     assert sorted(d.label for d in vault.devices()) == ["Pixel 8", "laptop"]
 
 
+# ─── I-2: grants are also capped by the redeeming listener ────────────────
+def test_pairing_over_quick_narrows_grants_to_the_listeners_ceiling(tmp_path):
+    """A code minted with every capability, redeemed over Cloudflare's `quick`
+    tunnel (ceiling: OBSERVE alone), must mint a device that can only ever
+    watch -- exactly `effective(pair_code.grants, policy)`, never the code's
+    own, unnarrowed set.
+    """
+    vault = TokenVault(tmp_path)
+    store = _store()
+    code = store.mint("phone", frozenset(Capability)).code
+    client = _client(vault, policies={LOCAL_PORT: "quick"}, store=store)
+    r = client.post("/v1/pair", json={"code": code})
+    assert r.status_code == 204
+    paired = [d for d in vault.devices() if d.label == "phone"][0]
+    assert paired.grants == frozenset({Capability.OBSERVE})
+
+
+def test_pairing_over_quick_permanently_limits_the_device_even_on_a_wider_listener(tmp_path):
+    """The narrowing at issue time is not a per-request ceiling that lifts on
+    a better connection later -- it changes what the vault actually stored.
+    A device that paired over `quick` and ended up with OBSERVE alone stays
+    OBSERVE-only when it later connects over `funnel`, because
+    `GET /v1/session` reports the issued grants the vault has on file, and
+    `quick` never let anything but OBSERVE reach `issue()` in the first
+    place. This is the surprising consequence the route's docstring calls
+    out explicitly.
+    """
+    vault = TokenVault(tmp_path)
+    store = _store()
+    code = store.mint("phone", frozenset(Capability)).code
+    quick_client = _client(vault, policies={LOCAL_PORT: "quick"}, store=store)
+    r = quick_client.post("/v1/pair", json={"code": code})
+    assert r.status_code == 204
+    cookie_value = r.cookies[COOKIE_NAME]
+
+    funnel_client = _client(vault, policies={LOCAL_PORT: "funnel"})
+    funnel_client.cookies.set(COOKIE_NAME, cookie_value)
+    data = funnel_client.get("/v1/session").json()["data"]
+    assert data["grants"] == ["observe"]
+
+
+def test_pairing_with_nothing_the_listener_can_carry_is_refused(tmp_path):
+    """A code minted without OBSERVE, redeemed over `quick` (ceiling: OBSERVE
+    alone), has nothing left after the intersection. Refused exactly like a
+    wrong code -- the alternative is `TokenVault.issue()` raising on an empty
+    grant set, which must never reach a caller as a raw exception. The code
+    is still burned (single-use): this is not a retryable failure.
+    """
+    vault = TokenVault(tmp_path)
+    store = _store()
+    code = store.mint("phone", frozenset({Capability.FILES, Capability.SYSTEM_CONTROL})).code
+    client = _client(vault, policies={LOCAL_PORT: "quick"}, store=store)
+    r = client.post("/v1/pair", json={"code": code})
+    assert r.status_code == 401
+    assert vault.devices() == []
+
+
 def test_pair_needs_no_authentication(tmp_path):
     """It is how a device gets a credential -- and therefore the only
     unauthenticated write in the API."""
@@ -209,13 +324,26 @@ def test_a_code_is_single_use(tmp_path):
 
 
 def test_wrong_expired_and_reused_codes_are_indistinguishable(tmp_path):
+    """Four failure modes, one response: reused, expired, wrong, and
+    malformed. The property was previously pinned for three of the four --
+    no expired code was ever actually tried against the route, so the fourth
+    was proved by reasoning about `consume()`, not by execution.
+    """
     vault = TokenVault(tmp_path)
     store = _store()
     code = store.mint("p", frozenset({Capability.CHAT_SEND})).code
     client = _client(vault, policies={LOCAL_PORT: "local"}, store=store)
     client.post("/v1/pair", json={"code": code})           # consume it
+
+    # Minted with `now` already past its own TTL, so it is born expired --
+    # deterministic, no sleep, no flake. Minting also replaces whatever code
+    # was live, but `code` above is already consumed and gone from the store
+    # regardless, so this does not disturb it.
+    expired = store.mint("q", frozenset({Capability.CHAT_SEND}),
+                         now=time.monotonic() - 1000).code
+
     bodies, statuses = set(), set()
-    for attempt in (code, "AAAA-AAAA", "garbage"):
+    for attempt in (code, expired, "AAAA-AAAA", "garbage"):
         r = client.post("/v1/pair", json={"code": attempt})
         statuses.add(r.status_code)
         bodies.add(r.text)
@@ -326,3 +454,35 @@ def test_the_audit_trail_records_the_attempt_without_the_code(tmp_path):
     entries = client.app.state.auth.audit.entries()
     assert ("POST", "/v1/pair", "401") in {(e.method, e.path, e.outcome) for e in entries}
     assert all("ZZZZ-ZZZZ" not in e.path for e in entries)
+
+
+# ─── I-3: a read failure during issue() must not destroy other devices ────
+def test_pairing_answers_503_and_survives_when_the_vault_cannot_be_read(tmp_path, monkeypatch):
+    """The code is real and gets consumed -- `TokenVault.issue()` refusing to
+    write from a devices.json it could not read must not surface as a raw
+    500, and must not destroy the device that was already there. Proved
+    under real Windows contention by the review (`PermissionError
+    [WinError 5]` from concurrent readers/writers); simulated here
+    deterministically by breaking reads of exactly this vault's
+    `devices.json`, nothing else.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("existing", frozenset({Capability.OBSERVE}))  # must survive
+    store = _store()
+    code = store.mint("phone", frozenset({Capability.OBSERVE})).code
+    client = _client(vault, policies={LOCAL_PORT: "local"}, store=store)
+
+    devices_json = tmp_path / "devices.json"
+    original_read_text = Path.read_text
+
+    def broken(self, *args, **kwargs):
+        if self == devices_json:
+            raise PermissionError("simulated lock")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", broken)
+    r = client.post("/v1/pair", json={"code": code})
+    monkeypatch.setattr(Path, "read_text", original_read_text)
+
+    assert r.status_code == 503
+    assert {d.label for d in vault.devices()} == {"existing"}

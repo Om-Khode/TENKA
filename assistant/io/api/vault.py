@@ -106,6 +106,28 @@ def _restrict_to_current_user(path: Path) -> None:
         logger.warning(f"[API] icacls failed for {path.name}: {exc}")
 
 
+class VaultReadError(RuntimeError):
+    """`devices.json` exists but could not be read or parsed -- its state is
+    unknown, not empty.
+
+    Distinct from an absent file, which `_load()` treats as a legitimate
+    "nothing has ever been issued" without ever reaching this branch. Raised
+    by `_load()` so that a mutating method (`issue`, `revoke`, `touch`) that
+    is about to write the *entire* document back cannot mistake "I could not
+    read this" for "there is nothing here" and silently overwrite whatever is
+    actually on disk with a synthetic empty one -- the fix for a review
+    finding that proved exactly that on Windows: a file locked by a scanner,
+    a backup tool, or a second TENKA process raises `PermissionError`, and
+    `issue()` used to treat that identically to a fresh install and save a
+    document containing only the one device it was asked to add, destroying
+    every other record.
+
+    A caller that only *reads* (`verify`, `devices`) is not obligated to fail
+    the same way -- there is nothing to overwrite -- so each decides for
+    itself, and documents why, at its own call site.
+    """
+
+
 def _atomic_write(path: Path, content: str) -> None:
     """Write `content` to `path` without ever leaving it truncated.
 
@@ -168,12 +190,29 @@ class TokenVault:
     Cross-process concurrency is explicitly out of scope for this lock. Two
     separate TENKA processes -- the uvicorn daemon and, say, a `/studio
     revoke` invocation that opens its own `TokenVault` on the same root --
-    can still interleave `_load()` and `_save()` calls across the OS process
-    boundary, and a `threading.Lock` only ever serialises threads *within
-    one process*; it cannot see, let alone block, a write from another
-    process. That hazard is real and unfixed by anything here -- it would
-    need a file lock (`msvcrt.locking` / `fcntl.flock`) or a single-writer
-    process design, neither of which this pass adds.
+    are not serialised by a `threading.Lock` at all; it only ever coordinates
+    threads *within one process*. That hazard is real and unfixed by anything
+    here -- it would need a file lock (`msvcrt.locking` / `fcntl.flock`) or a
+    single-writer process design, neither of which this pass adds.
+
+    What that hazard actually looks like on Windows is not the same shape as
+    the same-process race above, and an earlier version of this docstring
+    named it as one: a silent lost update, one process's complete write
+    overwriting another's. Measured under real contention (six concurrent
+    readers, two concurrent writers, all against one `devices.json`), the
+    dominant failure was `PermissionError [WinError 5]` -- Windows refuses a
+    second handle on a file another process has open, so a write racing
+    another process's read (or write) is far more likely to fail loudly than
+    to succeed and silently clobber. `_load()` raising `VaultReadError` on
+    exactly that failure (rather than swallowing it into a synthetic empty
+    document, which is what made `issue()` dangerous under this same
+    contention -- see `VaultReadError`'s own docstring) is what turns a cross-
+    process collision into a request the caller sees fail and can retry,
+    instead of a device list that quietly loses everything but the record
+    just written. It does not make cross-process writes safe in general --
+    a true interleaved lost update remains possible in principle, and nothing
+    here adds real mutual exclusion across processes -- but "fails loudly" is
+    the practical, observed Windows behaviour this pass leaves in place.
     """
 
     def __init__(self, root: Path) -> None:
@@ -293,14 +332,32 @@ class TokenVault:
         return hmac.new(self.instance_secret(), token.encode("utf-8"), sha256).hexdigest()
 
     def _load(self) -> dict:
+        """Load the devices document, or raise `VaultReadError` if its actual
+        content could not be determined.
+
+        Absent is not the same as unreadable: a file that has never existed
+        (fresh install, or `reset()` just deleted it) is a legitimate, known
+        empty vault, handled below without ever reaching the `try`. A file
+        that exists but raises `OSError` (locked by another process) or
+        `json.JSONDecodeError` (not parseable as JSON at all -- a torn read,
+        or genuine corruption) is a state this method does not actually know,
+        and is no longer treated as "empty" the way it used to be: a mutator
+        that received a synthetic empty document here could not tell it apart
+        from a real one and would save straight over whatever is genuinely on
+        disk. See `VaultReadError`'s docstring for what that cost in
+        practice. A read-only caller may still choose to treat this the same
+        way `verify()` and `devices()` do -- fail closed to "nothing verifies"
+        or "nothing is listed" -- but that is now a decision each of them
+        makes and documents for itself, not something this method decides
+        for all of them by handing back a lie.
+        """
         path = self._root / _DEVICES_FILE
         if not path.exists():
             return {"version": _SCHEMA_VERSION, "devices": []}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
-            logger.warning(f"[API] devices.json unreadable, starting empty: {exc}")
-            return {"version": _SCHEMA_VERSION, "devices": []}
+            raise VaultReadError(f"devices.json unreadable: {exc}") from exc
         if (
             not isinstance(data, dict)
             or data.get("version") != _SCHEMA_VERSION
@@ -384,6 +441,12 @@ class TokenVault:
         # saves its own copy back -- the new device would survive, but the
         # revocation that raced it would silently vanish.
         with self._lock:
+            # Not caught here: a `VaultReadError` means the current document
+            # is unknown, and appending to a synthetic empty one and saving
+            # would destroy every other device on disk the moment the lock
+            # releases. Propagating lets the caller (a route) answer "try
+            # again" instead of the vault silently doing that. See
+            # `VaultReadError`'s docstring.
             data = self._load()
             data["devices"].append({
                 "device_id": secrets.token_hex(8),
@@ -408,8 +471,27 @@ class TokenVault:
             # UnicodeEncodeError -- a ValueError subclass. Untrusted input
             # must never raise out of verify().
             return None
+        try:
+            loaded = self._load()
+        except VaultReadError as exc:
+            # Decision: fail closed, same as an unknown or revoked token.
+            # This is the call `authenticate()` makes on every single
+            # request specifically so a revocation is never stale (see this
+            # method's own docstring above) -- so the honest options are
+            # "refuse everyone until the read recovers" or "let a locked
+            # file quietly authenticate as whatever was last cached", and
+            # the second one is not a thing this vault does anywhere else.
+            # The cost is real: a transient lock (a scanner, a backup tool,
+            # a second TENKA process) refuses every device for as long as it
+            # holds the file, with no partial credit for "some devices would
+            # still have matched." That is the trade-off deliberately taken
+            # here rather than risk verifying a token that a stale or
+            # partial read would have rejected.
+            logger.warning(f"[API] verify() could not read devices.json, "
+                           f"refusing every device until it recovers: {exc}")
+            return None
         match: dict | None = None
-        for entry in self._load()["devices"]:
+        for entry in loaded["devices"]:
             # compare_digest on every well-formed entry: no early exit, no
             # timing signal between "unknown" and "revoked".
             if not isinstance(entry, dict):
@@ -431,6 +513,12 @@ class TokenVault:
         # touch()/issue() needs to observe a stale snapshot is *between*
         # those two calls, not during either one alone.
         with self._lock:
+            # Not caught here either. A synthetic empty document would make
+            # `device_id` look absent -- `revoke()` would return `False`,
+            # "nothing was revoked", when the truth is "the vault could not
+            # be read" -- and a caller relying on that boolean (an operator
+            # trying to cut a device off) must not be told the device is
+            # already gone when its actual state is unknown.
             data = self._load()
             devices = data["devices"]
             remaining = [
@@ -449,7 +537,15 @@ class TokenVault:
         Silent on an unknown id: a stale or already-revoked credential
         showing up on the request path is ordinary, not exceptional, and a
         vault method must not hand a caller a reason to surface an error for
-        it.
+        it. That silence covers "the device is not in the document" only.
+        "The document could not be read at all" is a different fact --
+        `_load()` raises `VaultReadError` for it instead of handing back a
+        synthetic empty document, and this method does not catch that,
+        because a target genuinely found in a stale-but-readable snapshot
+        could otherwise be silently skipped as if it were merely unknown.
+        `authenticate()` and the event socket, the only two callers, treat a
+        failed touch as best-effort and do not fail the request over it --
+        see their own call sites for why.
 
         Throttled to one disk write per `_TOUCH_THROTTLE` per device: this
         sits on the authenticated request path, and `_save` is not free (a
@@ -517,8 +613,20 @@ class TokenVault:
             self._save(data)
 
     def devices(self) -> list[Device]:
+        # Decision: fail closed to an empty listing, matching `verify()`.
+        # This is an admin-only read (`GET /v1/devices`, `/studio devices`),
+        # not a security decision -- reporting "none" while a lock clears is
+        # a stale UI, not a privilege granted to anyone who shouldn't have
+        # had it, so there is nothing here worth raising into a caller that
+        # almost certainly cannot do anything about a locked file anyway.
+        try:
+            loaded = self._load()
+        except VaultReadError as exc:
+            logger.warning(f"[API] devices() could not read devices.json, "
+                           f"reporting none: {exc}")
+            return []
         result = []
-        for entry in self._load()["devices"]:
+        for entry in loaded["devices"]:
             device = self._parse_device(entry)
             if device is not None:
                 result.append(device)

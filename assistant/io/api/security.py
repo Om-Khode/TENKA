@@ -28,7 +28,7 @@ from fastapi import Depends, HTTPException, Request, status
 from starlette.requests import HTTPConnection
 
 from .policy import ListenerPolicy, effective, policy_for_port
-from .vault import Capability, Device, TokenVault
+from .vault import Capability, Device, TokenVault, VaultReadError
 
 logger = logging.getLogger(__name__)
 
@@ -56,13 +56,13 @@ _AMBIENT_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 # request is allowed to do.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
 
-_UNAUTHORIZED = HTTPException(
+UNAUTHORIZED = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED,
     detail="unauthorized",
     headers={"WWW-Authenticate": "Bearer"},
 )
 
-# Unlike `_UNAUTHORIZED`, these two may say which one tripped -- and the reason
+# Unlike `UNAUTHORIZED`, these two may say which one tripped -- and the reason
 # is NOT that a credential has already verified by the time they are raised. It
 # is the opposite: `_refuse_cross_site()` runs *before* `credential_from()` and
 # `verify()` (see `authenticate()`), and neither of its checks ever consults the
@@ -429,7 +429,7 @@ async def authenticate(request: Request) -> Device:
         if not state.limiter.check(source):
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                                 detail="too many requests")
-        raise _UNAUTHORIZED
+        raise UNAUTHORIZED
     request.state.policy = policy
 
     # Before `verify()`, deliberately, and matching the order the event socket
@@ -467,7 +467,7 @@ async def authenticate(request: Request) -> Device:
             # `TokenVault.issue()` refuses an empty grant set at the source
             # for exactly this reason; the ceiling is the other way to arrive
             # at one, and it is closed the same way.
-            raise _UNAUTHORIZED
+            raise UNAUTHORIZED
         device = replace(device, grants=grants)
         request.state.device = device
         request.state.issued_grants = issued
@@ -487,7 +487,25 @@ async def authenticate(request: Request) -> Device:
         # above already did. That is the standing cost of the column, paid on
         # the request path by design rather than hidden behind a second cache
         # here that could disagree with the vault's own window.
-        state.vault.touch(device.device_id)
+        #
+        # `touch()` now raises `VaultReadError` instead of silently no-op'ing
+        # when devices.json is unreadable (a lock held by a scanner, a
+        # backup tool, a second TENKA process) -- see TokenVault.touch's own
+        # docstring. That is the right behaviour for the vault itself, which
+        # must never guess at a document it cannot read, but this call site
+        # is not the place to turn that into a failed request: the device
+        # already verified above, off a devices.json read that plainly
+        # succeeded moments earlier, and every one of the checks that must
+        # not be bypassed (capability, listener ceiling, rate limit) has
+        # already passed. Failing an otherwise-fully-authenticated request
+        # because a best-effort "last seen" bookkeeping write hit a transient
+        # lock would make the revoke-list column more expensive to maintain
+        # than the thing it protects. Best-effort: log it, keep going.
+        try:
+            state.vault.touch(device.device_id)
+        except VaultReadError as exc:
+            logger.warning(f"[API] could not record last-seen for "
+                           f"{device.device_id}: {exc}")
         return device
 
     if not state.limiter.check(source):
@@ -495,7 +513,7 @@ async def authenticate(request: Request) -> Device:
                             detail="too many requests")
     if token:
         state.limiter.record_failure(source)
-    raise _UNAUTHORIZED
+    raise UNAUTHORIZED
 
 
 def _refuse_cross_site(request: Request, policy: ListenerPolicy) -> None:
