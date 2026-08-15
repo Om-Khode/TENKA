@@ -303,6 +303,39 @@ def test_a_withheld_detail_is_blanked_not_dropped(tmp_path):
     assert frame["tier"] == "vision"
 
 
+def test_every_frame_the_socket_sends_goes_through_the_classifier(tmp_path, monkeypatch):
+    """`_safe_send` is the socket's other send path -- the connect frame and
+    the `error`/`ack` replies `app.py` builds itself -- and `build_error_frame`
+    emits a field also named `detail`. Its four values are protocol literals
+    today, so this is not a live leak; the point is that the path must not be
+    the one place that escapes the classifier, because "classify the field
+    once, not per call site" is the rule the original leak came from breaking.
+
+    Proved structurally: add `error` to the table and an error frame's
+    `detail` must come back blanked for a device without RECALL. If
+    `_safe_send` ever stops going through `visible_frame`, this fails.
+    """
+    from assistant.io.api import events as events_module
+
+    monkeypatch.setattr(events_module, "_USER_CONTENT_FIELDS",
+                        {"status": ("detail",), "error": ("detail",)})
+
+    vault = TokenVault(tmp_path)
+    watcher = vault.issue("wall display", frozenset({Capability.OBSERVE}))
+    client = build_api_client(build_fake_runtime(), vault)
+    client.cookies.set(COOKIE_NAME, watcher)
+
+    with client.websocket_connect("/v1/events") as socket:
+        socket.receive_json()                       # connect frame
+        socket.send_json({"type": "not-a-verb"})
+        frame = socket.receive_json()
+
+    assert frame["type"] == "error"
+    assert frame["detail"] == "", (
+        "an error frame reached the client without passing through "
+        "visible_frame -- _safe_send is bypassing the classifier")
+
+
 # ─── Finding 3: the rate limiter's documented safety argument ────────────
 # The header-rotation half is copied from sec/lens-accesscontrol; the growth
 # half from sec/lens-avail.
@@ -452,7 +485,18 @@ def test_a_locked_out_key_is_never_evicted():
 
 def test_rate_limiter_memory_cost_per_distinct_key():
     """A concrete bytes/key number, via tracemalloc rather than a guess --
-    kept from the lens as the measurement that made the growth a finding."""
+    the measurement that made the growth a finding (~862 bytes/key, never
+    reclaimed).
+
+    The lens's version printed the number and asserted nothing, so it could
+    not fail. It asserts two things now. The per-key cost is bounded, so a
+    future `RateLimiter` that starts remembering per-key history (a list of
+    outcomes, a source label, a timestamp ring) trips a test rather than
+    quietly multiplying the ceiling `_MAX_TRACKED_KEYS` was sized against.
+    And the total live footprint at that ceiling stays inside a budget worth
+    naming out loud, since the whole point of the eviction work is that this
+    number has a roof.
+    """
     limiter = RateLimiter()
     n = 50_000
     tracemalloc.start()
@@ -463,8 +507,17 @@ def test_rate_limiter_memory_cost_per_distinct_key():
     stats = after.compare_to(before, "lineno")
     total = sum(s.size_diff for s in stats if s.size_diff > 0)
     tracemalloc.stop()
+    per_key = total / n
     print(f"\n[6a] {n} distinct RateLimiter keys cost ~{total/1024:.0f} KiB total, "
-          f"~{total/max(n, 1):.0f} bytes/key while live")
+          f"~{per_key:.0f} bytes/key while live")
+
+    assert 0 < per_key < 2_048, (
+        f"~{per_key:.0f} bytes per RateLimiter key -- the measured cost when "
+        "this was a finding was ~862, and _MAX_TRACKED_KEYS was sized against "
+        "that. Something started storing per-key history.")
+    # The roof the eviction work buys: worst case is every tracked key live at
+    # once, and that has to stay a number nobody minds a daemon holding.
+    assert per_key * _MAX_TRACKED_KEYS < 128 * 1024 * 1024
 
 
 # ─── Finding 4: request bodies are bounded, before authentication ────────
@@ -550,6 +603,92 @@ def test_a_body_under_the_cap_is_untouched(tmp_path):
                            headers={"X-TENKA-Request": "1"})
     assert response.status_code == 202
     assert MAX_BODY_BYTES >= 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_a_declared_oversized_body_that_never_arrives_is_answered_anyway(tmp_path):
+    """The slowloris primitive the first draft of `BodyLimit` introduced.
+
+    Its `_refuse()` drained unconditionally, including on the declared-
+    `Content-Length` path where nothing had been read yet -- so headers
+    announcing a two-megabyte body followed by *nothing* left the server
+    sitting in `await receive()` for a body that never came. uvicorn has no
+    body-read timeout, so a ~150-byte unauthenticated request pinned a server
+    task indefinitely: measured at 12+ seconds with no response at all, on the
+    middleware added for availability, reachable without a credential.
+
+    Raw sockets rather than httpx, because the whole point is to send the
+    headers and then stop.
+    """
+    port = 8964
+    vault = TokenVault(tmp_path)
+    task = server.serve(build_fake_runtime(), vault, host="127.0.0.1", port=port,
+                        origins=["http://localhost:3000"])
+    await asyncio.sleep(0.3)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        writer.write(
+            b"POST /v1/chat HTTP/1.1\r\n"
+            b"Host: 127.0.0.1:%d\r\n"
+            b"Content-Type: application/json\r\n"
+            b"X-TENKA-Request: 1\r\n"
+            b"Content-Length: %d\r\n"
+            b"\r\n" % (port, 2 * 1024 * 1024)
+        )
+        await writer.drain()
+        # Not one byte of body follows. The answer must not wait on it.
+        start = time.perf_counter()
+        try:
+            head = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        except asyncio.TimeoutError:
+            head = b""
+        elapsed = time.perf_counter() - start
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    print(f"\n[6a] headers declaring 2MiB then silence -> {head!r} "
+          f"after {elapsed*1000:.0f}ms")
+    assert head.startswith(b"HTTP/1.1 413"), (
+        "a request that declared an oversized body and then sent nothing was "
+        f"not answered ({head!r}) -- the server is waiting on a body that "
+        "will never arrive, which is a slowloris primitive on an "
+        "unauthenticated route")
+
+
+def test_a_cross_origin_413_is_readable_by_the_browser_that_asked(tmp_path):
+    """`BodyLimit` was registered between CORS and `HostGate`, and the comment
+    there claimed it sat *inside* CORS so a 413 would carry the CORS headers a
+    browser needs. `add_middleware` inserts at index 0, so it sat outside: a
+    cross-origin 413 carried no `Access-Control-Allow-Origin` while a 401
+    under the same cap did, and the browser reports that as "could not reach
+    her" rather than as a refusal -- the exact trap the `BackupProviderError`
+    handler was added for. The ordering moved rather than the comment.
+    """
+    vault = TokenVault(tmp_path)
+    client = build_api_client(build_fake_runtime(), vault)
+    dev_origin = "http://localhost:3000"
+
+    over = client.post("/v1/chat", content=b"x" * (MAX_BODY_BYTES + 1),
+                       headers={"Content-Type": "application/json",
+                                "X-TENKA-Request": "1",
+                                "Origin": dev_origin})
+    under = client.post("/v1/chat", json={"text": "hi"},
+                        headers={"X-TENKA-Request": "1", "Origin": dev_origin})
+
+    assert over.status_code == 413
+    assert under.status_code == 401
+    assert over.headers.get("access-control-allow-origin") == dev_origin, (
+        "the 413 skipped CORS entirely, so the page that asked cannot read it")
+    assert under.headers.get("access-control-allow-origin") == dev_origin
 
 
 def test_a_lying_content_length_does_not_get_past_the_cap(tmp_path):
@@ -756,13 +895,18 @@ def test_a_withdrawn_host_no_longer_grants_the_event_socket(tmp_path):
         assert ws is not None
 
     client.app.state.published_hosts.unpublish("tunnel-2")
-    with pytest.raises(Exception):
+    # `WebSocketDisconnect`, not a bare `Exception`: `HostGate` answers the
+    # handshake with `websocket.close(1008)` before `accept()`, and that is
+    # the refusal this test is about. A bare `Exception` would be satisfied by
+    # an `AttributeError` from a typo in the lines above it.
+    with pytest.raises(WebSocketDisconnect) as refusal:
         with client.websocket_connect(
             "/v1/events",
             headers={"Host": stale_host,
                      "Origin": f"http://127.0.0.1:{LOCAL_PORT}"},
         ):
             pass
+    assert refusal.value.code == 1008
 
 
 def test_one_transports_withdrawal_does_not_take_anothers_hostname(tmp_path):
@@ -782,7 +926,17 @@ def test_one_transports_withdrawal_does_not_take_anothers_hostname(tmp_path):
 def test_pairing_endpoints_still_ignore_published_hosts(tmp_path):
     """Carried control, re-pinned: `_endpoints()` is hard-coded to the
     loopback origin and does not read `published_hosts`, so minting a code
-    while a tunnel hostname is published does not leak it into the QR."""
+    while a tunnel hostname is published does not leak it.
+
+    Both halves are asserted, because the endpoint list and the QR are
+    rendered separately by the same route and **the QR is the thing a phone
+    actually scans** -- a tunnel host leaking into the SVG while `endpoints`
+    stayed clean would otherwise go unnoticed. Precondition flagged for 6b:
+    the day `_endpoints()` does start reading `published_hosts`, it must not
+    keep offering the bare `http://127.0.0.1:<port>` candidate alongside (or
+    ahead of) an `https://<tunnel-host>` one to a phone that is not on this
+    LAN segment.
+    """
     vault = TokenVault(tmp_path)
     token = vault.issue("laptop", frozenset(Capability))
     store = PairCodeStore()
@@ -794,6 +948,12 @@ def test_pairing_endpoints_still_ignore_published_hosts(tmp_path):
     response = client.post("/v1/pair/code", json={"label": "phone",
                                                   "grants": ["observe"]},
                            headers={"X-TENKA-Request": "1"})
-    assert response.status_code == 200
-    endpoints = response.json()["data"]["endpoints"]
-    assert endpoints == [f"http://127.0.0.1:{LOCAL_PORT}"]
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["endpoints"] == [f"http://127.0.0.1:{LOCAL_PORT}"]
+    assert "trycloudflare.com" not in str(data["endpoints"])
+    assert "trycloudflare.com" not in data["qrSvg"], (
+        "the QR now encodes the published tunnel host -- re-check it is "
+        "https:// and that the loopback http:// candidate was not left "
+        "alongside it for an off-LAN phone to fall back to"
+    )

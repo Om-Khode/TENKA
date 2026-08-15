@@ -122,6 +122,16 @@ class HostGate:
 # knowing which route was hit is a limit that cannot.
 MAX_BODY_BYTES = 1024 * 1024
 
+# How long the streaming refusal below is willing to keep reading a body it has
+# already decided to throw away. The drain exists so a client that is genuinely
+# mid-upload can finish writing and then read its 413 instead of seeing a
+# broken connection -- but a client that stops sending must not be able to hold
+# a server task open by simply going quiet, which is slowloris with extra
+# steps. Five seconds matches uvicorn's own `timeout_keep_alive` default, and
+# is far more than a loopback or LAN client needs to finish pushing the
+# byte-bounded remainder.
+DRAIN_TIMEOUT_SECONDS = 5.0
+
 
 class BodyLimit:
     """Refuse an oversized request body. 413, before anything reads it.
@@ -139,15 +149,33 @@ class BodyLimit:
     assistant's event loop -- buffering and parsing a large body is her time,
     not just the API's.
 
-    Two halves, because a client picks which one applies:
+    Two halves, because a client picks which one applies, and they answer
+    differently on purpose:
 
-    - A declared `Content-Length` over the cap is refused outright, without
-      reading a byte of the body. The connection is answered and dropped.
-    - A chunked body (no `Content-Length`, or a lying one) is counted as it
-      streams, through a wrapped `receive`. The moment the running total
-      crosses the cap the request is answered 413 and the downstream app
-      never sees the rest. A header cannot be trusted to be the truth, so it
-      is used only to refuse early, never to permit.
+    - **A declared `Content-Length` over the cap is answered 413 immediately,
+      without calling `receive()` at all.** Not one byte is read, and nothing
+      is awaited. The first draft of this gate drained here too, out of the
+      same courtesy the streaming half extends -- and that turned it into a
+      slowloris primitive on the middleware added for availability: headers
+      declaring two megabytes followed by *nothing* got no response and pinned
+      a server task indefinitely, because uvicorn has no body-read timeout and
+      the drain sat in `await receive()` for a body that never came. A ~150
+      byte request should not be able to do that, least of all on the route
+      that goes public in 6b. The client's own header already said the request
+      is too big, so reading any of it is work done for a request that is
+      already refused, and waiting for it is worse than useless.
+    - **A chunked body (no `Content-Length`, or a lying one) is counted as it
+      streams**, through a wrapped `receive`. The moment the running total
+      crosses the cap the downstream app is cut off and the request is
+      answered 413. Here the drain *does* run -- this client is demonstrably
+      mid-upload, and letting it finish writing is what lets it read the 413
+      rather than a reset connection -- but it is bounded twice over: by bytes
+      (8x the cap) and by `DRAIN_TIMEOUT_SECONDS`, so a client that goes quiet
+      mid-body is dropped rather than waited on.
+
+    A header cannot be trusted to be the truth, so it is used only to refuse
+    early, never to permit: a body arriving under a small (or absent)
+    `Content-Length` is still counted on the way in.
 
     Raw ASGI for the same reason `HostGate` is: it must cover routes that
     never authenticate, it must not be something a route can forget to opt
@@ -168,7 +196,9 @@ class BodyLimit:
         if declared is not None:
             try:
                 if int(declared) > self.max_bytes:
-                    await self._refuse(receive, send)
+                    # No `receive()`, no drain, no await on anything the
+                    # client controls -- see the class docstring.
+                    await self._refuse(send)
                     return
             except ValueError:
                 # A malformed Content-Length is h11's problem, not this
@@ -179,11 +209,11 @@ class BodyLimit:
 
         read = 0
         refused = False
-        # Whether the body has already been read to its end. `_refuse` must
-        # not call `receive()` again once it has: an ASGI server is entitled
-        # to block that call until the response is complete, and the response
-        # is what this gate is on its way to send -- so a drain past the end
-        # of the body is a deadlock, not a courtesy.
+        # Whether the body has already been read to its end. `_drain` must not
+        # call `receive()` again once it has: an ASGI server is entitled to
+        # block that call until the response is complete, and the response is
+        # what this gate is on its way to send -- so a drain past the end of
+        # the body is a deadlock, not a courtesy.
         body_done = False
 
         async def counting_receive():
@@ -221,32 +251,57 @@ class BodyLimit:
             if not refused:
                 raise
         if refused:
-            await self._refuse(receive, send, drain=not body_done)
+            if not body_done:
+                await self._drain(receive)
+            await self._refuse(send)
 
-    async def _refuse(self, receive, send, *, drain: bool = True) -> None:
-        """Answer 413, after draining whatever is still in flight.
+    async def _drain(self, receive) -> None:
+        """Read and discard what is left of a body already being refused.
 
-        The drain is not politeness. A client that is still writing a body
-        nobody is reading fills the socket buffer and blocks, so it never
-        reaches the point of reading this answer -- it sees a broken
-        connection and cannot tell "too large" from "the daemon fell over".
-        Draining discards each chunk as it arrives, so the memory this gate
-        exists to protect is never allocated; only the transfer time is paid,
-        and the sender pays it too.
+        Not politeness. A client still writing a body nobody is reading fills
+        the socket buffer and blocks, so it never reaches the point of reading
+        the answer -- it sees a broken connection and cannot tell "too large"
+        from "the daemon fell over". Each chunk is discarded as it arrives, so
+        the memory this gate exists to protect is never allocated; only
+        transfer time is paid, and the sender pays it too.
 
-        Bounded, because an unbounded drain is the same denial of service by
-        another name: past `_DRAIN_LIMIT` the connection is simply left to
-        break, which is the honest answer to a client that will not stop.
+        Bounded twice, because an unbounded drain is the same denial of
+        service by another name. By bytes: past 8x the cap the connection is
+        left to break, which is the honest answer to a client that will not
+        stop. And by time: `DRAIN_TIMEOUT_SECONDS` caps how long a client can
+        keep this task alive by trickling, or by simply going silent
+        mid-body -- uvicorn has no body-read timeout of its own, so this is
+        the only thing standing between a half-sent body and a pinned task.
+
+        Only ever called when the body is known *not* to be finished. Calling
+        `receive()` after the last chunk is a deadlock, not a courtesy: an
+        ASGI server is entitled to block that call until the response is
+        complete, and the response is what this gate is on its way to send.
         """
-        drained = 0
-        limit = self.max_bytes * 8
-        while drain and drained < limit:
-            message = await receive()
-            if message["type"] != "http.request":
-                break
-            drained += len(message.get("body", b"") or b"")
-            if not message.get("more_body", False):
-                break
+        async def _pull() -> None:
+            drained = 0
+            limit = self.max_bytes * 8
+            while drained < limit:
+                message = await receive()
+                if message["type"] != "http.request":
+                    return
+                drained += len(message.get("body", b"") or b"")
+                if not message.get("more_body", False):
+                    return
+
+        try:
+            await asyncio.wait_for(_pull(), timeout=DRAIN_TIMEOUT_SECONDS)
+        except Exception:
+            # Timed out, disconnected, or the transport failed underneath.
+            # (`CancelledError` is a `BaseException` and is deliberately not
+            # caught -- a shutdown is not a slow client.)
+            # The 413 is sent either way; whether it arrives is now the
+            # client's problem, and it stopped being ours the moment it went
+            # quiet holding a body it said it would send.
+            pass
+
+    async def _refuse(self, send) -> None:
+        """Answer 413. Nothing is read and nothing is awaited on the client."""
         await send({"type": "http.response.start", "status": 413,
                     "headers": [(b"content-type", b"application/json"),
                                 (b"content-length", b"27")]})
@@ -348,6 +403,26 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # not a "credential" in the CORS sense -- so the dev server's bearer flow
     # keeps working.
     serves_local = any(name == "local" for name in app.state.listener_policies.values())
+
+    # Added FIRST, so it ends up INNERMOST of the three. `add_middleware`
+    # inserts at index 0, so the last one added is the outermost -- which is
+    # the whole reason the ordering above reads backwards, and the reason an
+    # earlier revision of this block put `BodyLimit` between CORS and HostGate
+    # while its comment claimed it sat inside CORS. It sat outside, and a
+    # cross-origin 413 carried no `Access-Control-Allow-Origin` while a 401
+    # under the same cap did.
+    #
+    # Inside is the side worth being on, so the ordering moved rather than the
+    # comment: a response that skips CORS is reported by the browser as "could
+    # not reach her" rather than as a refusal -- exactly the trap the
+    # `BackupProviderError` handler further down was added for -- and a 413 a
+    # developer cannot see is a 413 they will debug as a network fault. It
+    # costs nothing: `CORSMiddleware` never touches a request body, so putting
+    # it outside adds one cheap frame and no buffering. `BodyLimit` still runs
+    # before routing, before authentication and before anything reads a byte,
+    # which is the property that actually matters.
+    app.add_middleware(BodyLimit)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins if serves_local else [],
@@ -355,14 +430,6 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Authorization", "Content-Type", CSRF_HEADER],
     )
-
-    # Between CORS and HostGate. Inside CORS so a 413 still carries the CORS
-    # headers a browser needs to report it as a refusal rather than as "could
-    # not reach her" (the same trap the BackupProviderError handler below was
-    # added for); outside everything else, because the whole point is to run
-    # before routing, before authentication, and before anything buffers a
-    # byte.
-    app.add_middleware(BodyLimit)
 
     app.add_middleware(HostGate, published=published_hosts)
 
@@ -709,11 +776,29 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             return current.grants if current is not None else None
 
         async def _safe_send(payload: dict) -> None:
+            # Through `visible_frame`, like every frame the hub delivers.
+            # This is the socket's *other* send path -- the connect frame and
+            # the `error`/`ack` replies app.py builds itself -- and routing it
+            # around the classifier would be the one exception to "classify
+            # the field once, not per call site", which is exactly the rule
+            # the `detail` leak came from breaking. `build_error_frame` even
+            # emits a field named `detail`; its four values are all protocol
+            # literals ("malformed frame", "unknown frame", "not permitted",
+            # "unauthorized") and `_USER_CONTENT_FIELDS` says so by not
+            # listing the `error` type -- but that is now a decision recorded
+            # in the table, enforceable from one place, rather than a call
+            # site that happens to be harmless today.
+            #
+            # `device.grants` is the live narrowed set: the receive loop below
+            # reassigns `device` from `_reverify()` on every inbound frame, so
+            # a grant narrowed mid-connection reaches this the same way it
+            # reaches the hub.
+            #
             # A socket that already broke between the failed receive/abort
             # and this reply must end cleanly through the finally below, not
             # on a second, unhandled exception raised by the reply itself.
             try:
-                await websocket.send_json(payload)
+                await websocket.send_json(visible_frame(payload, device.grants))
             except Exception:
                 pass
 
@@ -732,17 +817,16 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             # from a silent one. Device id only -- never the credential.
             logger.info(f"[API] Studio client attached to /v1/events "
                         f"(device={device.device_id})")
-            # Through `visible_frame` like every hub-delivered frame, not
-            # around it. `detail` on a status frame is withheld from a device
-            # without RECALL (see events.py for the argument), and the
-            # connect frame is a status frame -- exempting it because *this*
-            # producer happens to pass something harmless is how a field
-            # ends up classified per call site instead of once. Nothing is
-            # lost: the active model rides the OBSERVE-gated telemetry frame
-            # and `GET /v1/status` already.
-            await _safe_send(visible_frame(
-                build_status_frame(phase="connected", detail=info.active_model),
-                device.grants))
+            # `_safe_send` puts this through `visible_frame` like every
+            # hub-delivered frame. `detail` on a status frame is withheld from
+            # a device without RECALL (see events.py for the argument), and
+            # the connect frame is a status frame -- exempting it because
+            # *this* producer happens to pass something harmless is how a
+            # field ends up classified per call site instead of once. Nothing
+            # is lost: the active model rides the OBSERVE-gated telemetry
+            # frame and `GET /v1/status` already.
+            await _safe_send(build_status_frame(phase="connected",
+                                                 detail=info.active_model))
             while True:
                 try:
                     frame = await websocket.receive_json()

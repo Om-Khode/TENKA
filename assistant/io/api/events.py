@@ -103,6 +103,18 @@ _REVALIDATE_INTERVAL_SECONDS = 2.0
 # `GET /v1/telemetry`) and `GET /v1/status`, all of them OBSERVE-gated
 # already, so it reaches a watching device by the routes that were always
 # meant to carry it.
+#
+# Absence from this table is a decision, not an oversight, and the two absent
+# types are worth naming because one of them is a trap. `telemetry` carries
+# cpu, ram, battery, active model and uptime -- facts about the machine, none
+# of them anything the user said. `error` carries a field *also* called
+# `detail` (`build_error_frame`), which is exactly the coincidence that gets a
+# field classified per call site instead of once: its values are four protocol
+# literals ("malformed frame", "unknown frame", "not permitted",
+# "unauthorized") and they describe the socket, not the person using it. Both
+# types still pass through `visible_frame` -- `app.py`'s `_safe_send` sends
+# nothing that does not -- so if either ever grows a user-derived field, the
+# fix is one row here and the enforcement is already wired.
 _USER_CONTENT_FIELDS: dict[str, tuple[str, ...]] = {
     "status": ("detail",),
 }
