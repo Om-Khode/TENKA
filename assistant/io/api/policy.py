@@ -13,7 +13,7 @@ the ASGI scope's own server address, which the client cannot influence -- and
 not on anything the client sends. Two alternatives were considered and
 rejected:
 
-- The client address. `cloudflared` and `tailscale serve` both connect to the
+- The client address. `cloudflared` and `tailscale funnel` both connect to the
   daemon from 127.0.0.1, so tunnelled traffic arrives with a loopback source
   address indistinguishable from a truly local caller. An "is the peer local?"
   check would hand every tunnel full admin rights.
@@ -28,8 +28,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from assistant.io.api.vault import Capability
+from .vault import Capability
 
+# `local`, `tailnet`, and `funnel` derive their ceiling from the enum itself,
+# so a capability added to `Capability` later flows into all three
+# automatically -- appropriate for transports already trusted with
+# everything. `quick` spells its ceiling out as an explicit literal instead
+# (see below) precisely so that inheritance does NOT happen there: a
+# disclosure-limited transport must never silently gain a capability nobody
+# vetted for it just because the enum grew.
 _ALL_CAPABILITIES = frozenset(Capability)
 
 
@@ -68,10 +75,14 @@ POLICIES: dict[str, ListenerPolicy] = {
         secure_cookie=True,
         ceiling=_ALL_CAPABILITIES,
     ),
-    # `tailscale serve --funnel`: still Tailscale-terminated TLS, reachable
-    # from the public internet by anyone with the URL. Same ceiling as
-    # tailnet -- the transport is still Tailscale's, not a relay's -- but
-    # public reachability is exactly why admin and bearer stay off.
+    # `tailscale funnel` -- a top-level command, not a `serve` flag; there is
+    # no `tailscale serve --funnel`. Publicly reachable from the open
+    # internet by anyone with the URL, but TLS is still terminated on this
+    # machine by the Tailscale client, not decrypted at a relay in between --
+    # Tailscale's infrastructure never sees the plaintext. Same ceiling as
+    # tailnet for that reason: the plaintext exposure is identical, only the
+    # audience is wider. Public reachability is exactly why admin and bearer
+    # stay off.
     "funnel": ListenerPolicy(
         name="funnel",
         admin=False,
@@ -93,6 +104,14 @@ POLICIES: dict[str, ListenerPolicy] = {
         admin=False,
         allow_bearer=False,
         secure_cookie=True,
+        # Deliberately an explicit literal, not `_ALL_CAPABILITIES - {...}`.
+        # Spelling out what IS allowed, rather than what is excluded, means a
+        # future capability added to the enum is granted nowhere by default
+        # and must be added here by name after someone vets it for the one
+        # transport a third party can read. Rewriting this as a subtraction
+        # would look like a tidy-up but inverts the safety property: the
+        # next new capability would then be granted automatically over
+        # exactly the listener that must never get one for free.
         ceiling=frozenset({Capability.CHAT}),
     ),
 }

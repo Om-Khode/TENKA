@@ -42,6 +42,12 @@ def test_effective_is_an_intersection_never_a_widening():
     assert Capability.SYSTEM_CONTROL not in effective(device, POLICIES["local"])
 
 
+def test_a_registered_port_resolves_to_its_named_policy():
+    registry = {8787: "local", 8788: "quick"}
+    assert policy_for_port(8787, registry) is POLICIES["local"]
+    assert policy_for_port(8788, registry) is POLICIES["quick"]
+
+
 def test_an_unregistered_port_has_no_policy():
     """Fail closed: a socket nobody registered grants nothing at all."""
     assert policy_for_port(9999, {8787: "local"}) is None
