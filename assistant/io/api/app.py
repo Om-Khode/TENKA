@@ -15,6 +15,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
@@ -26,6 +27,7 @@ from ...core.redact import redact_secrets
 from .context import request_id_var
 from .errors import to_http_exception
 from .events import EventHub, build_ack_frame, build_error_frame, build_status_frame
+from .policy import effective
 from .routes import chat as chat_routes
 from .routes import commands as command_routes
 from .routes import files as file_routes
@@ -34,10 +36,69 @@ from .routes import settings as settings_routes
 from .routes import status as status_routes
 from .routes import system as system_routes
 from .runtime import StudioRuntime
-from .security import AuditEntry, AuthState, device_key
+from .security import (
+    COOKIE_NAME,
+    CSRF_HEADER,
+    AuditEntry,
+    AuthState,
+    accepting_port,
+    device_key,
+    host_is_allowed,
+    origin_is_known,
+    policy_for_scope,
+)
 from .vault import Capability, TokenVault
 
 logger = logging.getLogger(__name__)
+
+
+class HostGate:
+    """Refuse a request whose `Host` is not one of ours. 421, no body.
+
+    DNS rebinding: a page served from `evil.example` re-resolves that same
+    name to 127.0.0.1 and then talks to this daemon as same-origin -- every
+    check the browser performs still passes, because from its point of view
+    nothing changed. The one thing that does not change is the `Host` header,
+    which still says `evil.example`, and which a page cannot alter. Rejecting
+    unknown names is the standard defence.
+
+    Middleware rather than a dependency, for three reasons that all point the
+    same way: it must also cover the `/v1/events` WebSocket (which has no
+    dependency chain), it must cover the unauthenticated static and pairing
+    paths Tasks 7 and 10 add (which by definition never authenticate), and a
+    gate that a route can forget to opt into is not a gate. Written as raw
+    ASGI rather than `@app.middleware("http")` because Starlette's
+    `BaseHTTPMiddleware` skips every non-`http` scope outright, which is
+    exactly the scope that matters most here.
+
+    It is a *rejection* gate only. It never selects a policy -- letting
+    `Host` do that would be attacker-controlled input choosing its own
+    permissions.
+    """
+
+    def __init__(self, app, *, published: set[str]) -> None:
+        self.app = app
+        # The live set, not a copy: a transport started later publishes its
+        # public hostname onto it and this gate must see that immediately.
+        self._published = published
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] in ("http", "websocket"):
+            host = next((value.decode("latin-1")
+                         for key, value in scope.get("headers", ())
+                         if key == b"host"), "")
+            if not host_is_allowed(host, self._published):
+                if scope["type"] == "websocket":
+                    # A close sent in answer to the handshake, before any
+                    # accept: the connection is refused, not established and
+                    # then torn down.
+                    await send({"type": "websocket.close", "code": 1008})
+                else:
+                    await send({"type": "http.response.start", "status": 421,
+                                "headers": [(b"content-length", b"0")]})
+                    await send({"type": "http.response.body", "body": b""})
+                return
+        await self.app(scope, receive, send)
 
 # Route modules are mounted with plain `include_router` -- the call every
 # later route module's brief in this milestone instructs. An earlier
@@ -52,7 +113,8 @@ logger = logging.getLogger(__name__)
 
 
 def create_app(runtime: StudioRuntime, vault: TokenVault, *,
-               origins: list[str], hub: EventHub | None = None) -> FastAPI:
+               origins: list[str], hub: EventHub | None = None,
+               listener_policies: dict[int, str] | None = None) -> FastAPI:
     # Eager, once: instance_secret() is uncached on the environment-override
     # path, and a wrong-length TENKA_SECRET raises ValueError. Resolving it
     # here means a misconfigured override fails when the app is built, not
@@ -80,14 +142,49 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     app.state.auth = AuthState(vault=vault)
     app.state.started_at = time.monotonic()
     app.state.hub = hub if hub is not None else EventHub()
+    # Port -> policy name. An empty registry denies everything, which is the
+    # correct answer to "nobody said what this socket is": see
+    # `policy.py`'s docstring for why the port, and nothing the client sends,
+    # is what decides. 6a registers `{studio_api_port: "local"}` only.
+    app.state.listener_policies = dict(listener_policies or {})
+    # Hostnames a running transport has published, filled in by the transport
+    # itself. Mutable and shared with `HostGate` on purpose: a tunnel's public
+    # name is not knowable when the app is built.
+    published_hosts: set[str] = set()
+    app.state.published_hosts = published_hosts
+    app.state.cors_origins = list(origins)
 
+    # Added before HostGate below, which reverses their nesting: Starlette
+    # builds the stack so that the *last* middleware added is the outermost.
+    # HostGate has to sit outside CORS, or a rebinding page's preflight would
+    # be answered by CORSMiddleware before the host was ever looked at.
+    #
+    # CORS is now a *development* affordance and nothing more. Studio is
+    # served by this daemon from Milestone 6 on, so a real client is
+    # same-origin and never needs it; the only cross-origin caller left is the
+    # Next.js dev server on a developer's own loopback. So the allow-list is
+    # dropped entirely unless a `local` listener is registered -- a tunnelled
+    # deployment has no business advertising a laptop's dev origin as
+    # trusted.
+    #
+    # `allow_credentials` stays False, and that is now load-bearing rather
+    # than incidental: with it off, a browser will not attach the device
+    # cookie to a cross-origin request nor let script read the response. The
+    # cookie is usable same-origin only, which is the entire cross-site
+    # attack surface of moving off `localStorage` closed at the browser.
+    # An `Authorization` header the page sets itself is unaffected -- it is
+    # not a "credential" in the CORS sense -- so the dev server's bearer flow
+    # keeps working.
+    serves_local = any(name == "local" for name in app.state.listener_policies.values())
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=origins,
+        allow_origins=origins if serves_local else [],
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Authorization", "Content-Type", CSRF_HEADER],
     )
+
+    app.add_middleware(HostGate, published=published_hosts)
 
     @app.middleware("http")
     async def audit_and_tag(request: Request, call_next):
@@ -220,21 +317,21 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # this route; they are not decorative, they are the only guard.
     @app.websocket("/v1/events")
     async def events(websocket: WebSocket) -> None:
-        # The browser's WebSocket API cannot set headers, so the token rides a
-        # query parameter here and nowhere else -- test_api_auth.py's
-        # test_the_query_string_exception_is_only_the_socket pins that this
-        # stays the only occurrence. It is loopback-only in this milestone;
-        # Milestone 6 replaces this with a subprotocol handshake before any
-        # tunnel exists. The audit middleware above is HTTP-scope only
-        # (Starlette's BaseHTTPMiddleware skips non-"http" ASGI scopes
-        # outright), so it never sees this route at all -- the connect
-        # outcome (accepted or closed) is recorded explicitly below instead,
-        # directly against the same AuditLog, so a socket connection is no
-        # longer the one surface that leaves no trace either way.
+        # The credential is the same httpOnly cookie every HTTP route reads,
+        # which the browser attaches to a handshake on its own -- the reason
+        # the browser's WebSocket API being unable to set headers is no
+        # longer a problem worth routing around. What it *is* is the reason
+        # for the Origin check below.
+        #
+        # The audit middleware above is HTTP-scope only (Starlette's
+        # BaseHTTPMiddleware skips non-"http" ASGI scopes outright), so it
+        # never sees this route at all -- the connect outcome (accepted or
+        # closed) is recorded explicitly below instead, directly against the
+        # same AuditLog, so a socket connection is not the one surface that
+        # leaves no trace either way.
         auth: AuthState = app.state.auth
         source = websocket.client.host if websocket.client else "unknown"
-        token = websocket.query_params.get("access_token", "")
-        device = auth.vault.verify(token)
+        device = None
 
         def _audit(outcome: str) -> None:
             auth.audit.record(AuditEntry(
@@ -242,6 +339,53 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                 device_id=device.device_id if device else "-",
                 method="WS", path="/v1/events", outcome=outcome,
             ))
+
+        policy = policy_for_scope(websocket.scope, app.state.listener_policies)
+        if policy is None:
+            _audit("1008")
+            await websocket.close(code=1008)
+            return
+
+        # ─── cross-site WebSocket hijacking ──────────────────────────────
+        # Introduced by the cookie, not present before it. A WebSocket
+        # handshake is not subject to CORS -- there is no preflight, and the
+        # browser will complete it against any host from any page -- and it
+        # attaches the cookie regardless of which page asked. So without this
+        # check, any site the user happens to visit could open this socket
+        # and read her status, her telemetry and (with CHAT_SEND) drive her.
+        # The query-string token this replaces prevented it by accident: a
+        # random page does not know the token. Validated before accept(),
+        # because after accept() the socket already exists.
+        #
+        # A handshake with no Origin at all is a non-browser client. On
+        # loopback that is curl, a script, or a test -- all of which already
+        # have this machine, so refusing them buys nothing and costs the one
+        # workflow that has to work. Over a tunnel it is anomalous: a cookie
+        # is a browser artefact, so a remote client holding one but not
+        # behaving like a browser is likelier a replay than a user.
+        origin = websocket.headers.get("origin")
+        if origin and origin.strip():
+            allowed = origin_is_known(origin, app.state,
+                                      accepting_port(websocket.scope), policy)
+        else:
+            allowed = policy.name == "local"
+        if not allowed:
+            _audit("1008")
+            await websocket.close(code=1008)
+            return
+
+        token = websocket.cookies.get(COOKIE_NAME, "")
+        device = auth.vault.verify(token)
+        if device is not None:
+            # Same intersection `authenticate()` applies, for the same
+            # reason: the two capability checks below must read the grants
+            # this *listener* carries, not the ones the device was issued.
+            grants = effective(device.grants, policy)
+            if not grants:
+                _audit("1008")
+                await websocket.close(code=1008)
+                return
+            device = replace(device, grants=grants)
 
         # This socket has two faces with two different gates. The *stream* --
         # the connect-time status frame plus every later status/telemetry
@@ -320,8 +464,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             # Logged because nothing else marks a Studio client attaching:
             # the daemon's own startup lines say it is listening, but a user
             # watching the console had no way to tell a connected dashboard
-            # from a silent one. Device id only -- never the token, which is
-            # in this socket's query string.
+            # from a silent one. Device id only -- never the credential.
             logger.info(f"[API] Studio client attached to /v1/events "
                         f"(device={device.device_id})")
             await _safe_send(build_status_frame(phase="connected",

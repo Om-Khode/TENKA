@@ -9,10 +9,8 @@ a RequestValidationError handler that strips the value out at the source, so
 every route inherits it for free.
 """
 import pytest
-from fastapi.testclient import TestClient
-
-from assistant.io.api.app import create_app
 from assistant.io.api.vault import Capability, TokenVault
+from tests.fakes.api_client import build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
 
@@ -20,7 +18,7 @@ from tests.fakes.studio_runtime import build_fake_runtime
 def context(tmp_path):
     vault = TokenVault(tmp_path)
     runtime = build_fake_runtime()
-    client = TestClient(create_app(runtime, vault, origins=["http://localhost:3000"]))
+    client = build_api_client(runtime, vault)
     token = vault.issue("studio", frozenset(Capability))
     return client, {"Authorization": f"Bearer {token}"}
 

@@ -2,11 +2,11 @@
 import asyncio
 
 import pytest
-from fastapi.testclient import TestClient
 
-from assistant.io.api.app import create_app
 from assistant.io.api.events import EventHub
+from assistant.io.api.security import COOKIE_NAME
 from assistant.io.api.vault import Capability, TokenVault
+from tests.fakes.api_client import build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
 
@@ -15,8 +15,20 @@ def context(tmp_path):
     vault = TokenVault(tmp_path)
     token = vault.issue("studio", frozenset(Capability))
     runtime = build_fake_runtime()
-    app = create_app(runtime, vault, origins=["http://localhost:3000"])
-    return TestClient(app), app, runtime, token
+    client = build_api_client(runtime, vault)
+    return client, client.app, runtime, token
+
+
+def _as(client, token: str):
+    """Present `token` as this client's device cookie, then hand the client
+    back so a `with ... .websocket_connect(...)` still reads as one line.
+
+    The socket used to carry its token in the query string; it now reads the
+    same httpOnly cookie every HTTP route does, so a test that wants to be a
+    particular device sets that cookie rather than decorating a URL.
+    """
+    client.cookies.set(COOKIE_NAME, token)
+    return client
 
 
 def test_the_socket_refuses_an_unauthenticated_connection(context):
@@ -30,20 +42,20 @@ def test_the_socket_refuses_an_invalid_token(context):
     """A missing token is refused (above); a wrong one must be too."""
     client, _, _, _ = context
     with pytest.raises(Exception):
-        with client.websocket_connect("/v1/events?access_token=not-a-real-token"):
+        with _as(client, "not-a-real-token").websocket_connect("/v1/events"):
             pass
 
 
 def test_a_valid_token_connects_and_gets_a_hello(context):
     client, _, _, token = context
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         frame = socket.receive_json()
         assert frame["type"] == "status"
 
 
 def test_a_broadcast_reaches_a_connected_socket(context):
     client, app, _, token = context
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
         app.state.hub.publish({"type": "task_step", "taskId": "t1", "index": 0,
                                "label": "reading", "state": "running"})
@@ -54,7 +66,7 @@ def test_a_broadcast_reaches_a_connected_socket(context):
 
 def test_an_abort_frame_reaches_the_runtime(context):
     client, _, runtime, token = context
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         socket.receive_json()
         socket.send_json({"type": "abort"})
         socket.receive_json()  # ack
@@ -63,7 +75,7 @@ def test_an_abort_frame_reaches_the_runtime(context):
 
 def test_an_unknown_client_frame_is_ignored_not_fatal(context):
     client, _, _, token = context
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         socket.receive_json()
         socket.send_json({"type": "nonsense"})
         socket.send_json({"type": "abort"})
@@ -74,7 +86,7 @@ def test_a_malformed_frame_is_ignored_not_fatal(context):
     """Text that is not JSON at all -- not just well-formed JSON of an
     unknown shape -- must not kill the connection either."""
     client, _, _, token = context
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
         socket.send_text("not json at all {{{")
         frame = socket.receive_json()
@@ -139,7 +151,7 @@ def test_a_publish_from_a_worker_thread_before_any_socket_is_still_delivered(con
     threading.Thread(target=_publish_from_worker).start()
     assert fired.wait(timeout=2), "publish() must not block the calling thread"
 
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
         frame = socket.receive_json()
         assert frame == {"type": "status", "phase": "THINKING"}
@@ -160,7 +172,7 @@ async def test_the_telemetry_loop_stops_when_the_last_socket_leaves():
 def test_a_rejected_socket_connection_is_audited(context):
     client, app, _, _ = context
     with pytest.raises(Exception):
-        with client.websocket_connect("/v1/events?access_token=not-a-real-token"):
+        with _as(client, "not-a-real-token").websocket_connect("/v1/events"):
             pass
     entries = app.state.auth.audit.entries()
     assert any(e.path == "/v1/events" and e.device_id == "-" for e in entries), (
@@ -170,7 +182,7 @@ def test_a_rejected_socket_connection_is_audited(context):
 
 def test_an_accepted_socket_connection_is_audited(context):
     client, app, _, token = context
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
     entries = app.state.auth.audit.entries()
     matches = [e for e in entries if e.path == "/v1/events" and e.device_id != "-"]
@@ -190,7 +202,7 @@ def test_a_non_chat_token_is_refused_before_accept(context):
     files_only = vault.issue("laptop", frozenset({Capability.FILES}))
 
     with pytest.raises(Exception):
-        with client.websocket_connect(f"/v1/events?access_token={files_only}"):
+        with _as(client, files_only).websocket_connect("/v1/events"):
             pass
 
     entries = app.state.auth.audit.entries()
@@ -204,7 +216,7 @@ def test_a_chat_token_still_connects(context):
     client, app, _, token = context
     device = app.state.auth.vault.verify(token)
     assert Capability.CHAT in device.grants
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         frame = socket.receive_json()
         assert frame["type"] == "status"
 
@@ -216,7 +228,7 @@ def test_a_broadcaster_shaped_event_arrives_camelcased_via_publish_status(contex
     status_broadcaster -- exercise it directly with a dict shaped exactly
     the way status_broadcaster.py's set() builds one, snake_case and all."""
     client, app, _, token = context
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # connect frame
         app.state.hub.publish_status({
             "v": 2, "type": "status", "phase": "THINKING", "detail": "",
@@ -235,7 +247,7 @@ def test_the_connect_frame_and_a_real_status_frame_share_one_shape(context):
     """A client that destructures every 'status' frame the same way must
     not find the connect-time one short any keys."""
     client, app, _, token = context
-    with client.websocket_connect(f"/v1/events?access_token={token}") as socket:
+    with _as(client, token).websocket_connect("/v1/events") as socket:
         connect_frame = socket.receive_json()
         app.state.hub.publish_status({
             "v": 2, "phase": "IDLE", "detail": "", "cursor_follows": False,
@@ -311,7 +323,7 @@ def test_a_chat_only_device_connects_and_gets_its_stream(context):
     client, app, _, _ = context
     vault = app.state.auth.vault
     chat_only = vault.issue("reader", frozenset({Capability.CHAT}))
-    with client.websocket_connect(f"/v1/events?access_token={chat_only}") as socket:
+    with _as(client, chat_only).websocket_connect("/v1/events") as socket:
         frame = socket.receive_json()
         assert frame["type"] == "status"
 
@@ -323,7 +335,7 @@ def test_a_chat_only_device_cannot_abort_over_the_socket(context):
     client, app, runtime, _ = context
     vault = app.state.auth.vault
     chat_only = vault.issue("reader", frozenset({Capability.CHAT}))
-    with client.websocket_connect(f"/v1/events?access_token={chat_only}") as socket:
+    with _as(client, chat_only).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
         socket.send_json({"type": "abort"})
         frame = socket.receive_json()
@@ -335,7 +347,7 @@ def test_a_chat_send_device_can_still_abort_over_the_socket(context):
     client, app, runtime, _ = context
     vault = app.state.auth.vault
     sender = vault.issue("phone", frozenset({Capability.CHAT, Capability.CHAT_SEND}))
-    with client.websocket_connect(f"/v1/events?access_token={sender}") as socket:
+    with _as(client, sender).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
         socket.send_json({"type": "abort"})
         frame = socket.receive_json()
@@ -347,7 +359,7 @@ def test_a_refused_abort_frame_is_audited(context):
     client, app, _, _ = context
     vault = app.state.auth.vault
     chat_only = vault.issue("reader", frozenset({Capability.CHAT}))
-    with client.websocket_connect(f"/v1/events?access_token={chat_only}") as socket:
+    with _as(client, chat_only).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
         socket.send_json({"type": "abort"})
         socket.receive_json()  # error
@@ -369,7 +381,7 @@ def test_repeated_bad_socket_tokens_eventually_get_refused_fast(context):
     refused = 0
     for _ in range(150):
         try:
-            with client.websocket_connect("/v1/events?access_token=bad"):
+            with _as(client, "bad").websocket_connect("/v1/events"):
                 pass
         except Exception:
             refused += 1

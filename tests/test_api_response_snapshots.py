@@ -32,10 +32,8 @@ import json
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
-
-from assistant.io.api.app import create_app
 from assistant.io.api.vault import Capability, TokenVault
+from tests.fakes.api_client import build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
 FIXTURES = Path(__file__).parent / "fixtures" / "api_snapshots"
@@ -45,8 +43,7 @@ FIXTURES = Path(__file__).parent / "fixtures" / "api_snapshots"
 def context(tmp_path):
     vault = TokenVault(tmp_path)
     token = vault.issue("studio", frozenset(Capability))
-    client = TestClient(create_app(build_fake_runtime(), vault,
-                                   origins=["http://localhost:3000"]))
+    client = build_api_client(build_fake_runtime(), vault)
     return client, {"Authorization": f"Bearer {token}"}
 
 

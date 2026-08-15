@@ -34,7 +34,13 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     if host != _HOST:
         raise ValueError("the Studio daemon binds loopback only in this milestone")
 
-    app = create_app(runtime, vault, origins=origins, hub=hub)
+    # The one listener this milestone binds, declared by the port it binds
+    # on. Everything a request is allowed to do is looked up from this map by
+    # the port the connection was accepted on; a port that is not in it grants
+    # nothing at all. A later transport adds its own entry here rather than
+    # relying on any property of the traffic itself.
+    app = create_app(runtime, vault, origins=origins, hub=hub,
+                     listener_policies={port: "local"})
     config = uvicorn.Config(app, host=host, port=port, log_level="warning",
                             access_log=False, lifespan="on")
     server = uvicorn.Server(config)
