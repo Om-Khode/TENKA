@@ -276,27 +276,92 @@ def _walk_every_registered_route(routes):
             yield from _walk_every_registered_route(router.routes)
 
 
+# The one route allowed to be invisible to the sweep, named by its endpoint
+# function rather than by its path so a change of prefix cannot silently widen
+# the exemption.
+#
+# `serve_studio_ui` (assistant/io/api/ui.py) is the catch-all that serves the
+# Studio front-end. It is out of schema for two reasons that cut the same way:
+# a `/{ui_path:path}` catch-all belongs in nobody's generated TypeScript
+# client, and it is *deliberately* unauthenticated -- the page it serves is
+# what bootstraps pairing, so it cannot demand a credential -- which means the
+# sweep would flag it as a leak on every run. Its compensating coverage is
+# tests/test_api_ui_serving.py, where every property this sweep would
+# otherwise have checked is pinned instead: traversal refusal, that /v1 is not
+# shadowed, and that the host gate still covers it. Anything added here needs
+# the same: an explicit test, named in this comment, not silent trust.
+_SCHEMA_EXEMPT_ENDPOINTS = frozenset({"serve_studio_ui"})
+
+
+def _is_schema_exempt(route) -> bool:
+    endpoint = getattr(route, "endpoint", None)
+    return getattr(endpoint, "__name__", "") in _SCHEMA_EXEMPT_ENDPOINTS
+
+
+def _assert_nothing_hides_from_the_sweep(app) -> int:
+    """Returns how many exempt routes it saw, so a caller can pin that too."""
+    from starlette.routing import Mount
+
+    exempt = 0
+    for route in _walk_every_registered_route(app.routes):
+        assert not isinstance(route, Mount), (
+            f"a Mount route ({getattr(route, 'path', '?')!r}) is invisible "
+            "to the openapi-based sweep"
+        )
+        if _is_schema_exempt(route):
+            exempt += 1
+            continue
+        if hasattr(route, "include_in_schema"):
+            assert route.include_in_schema, (
+                f"{route.path!r} hides from the schema the auth sweep walks"
+            )
+    return exempt
+
+
 def test_no_route_hides_from_the_schema_sweep(client):
     """`_sweep_v1_routes_require_auth` walks `app.openapi()`'s resolved
     paths -- which is exactly what a route registered with
     `include_in_schema=False` or mounted via `Mount` never appears in. The
     sweep cannot catch what it cannot see, so this is a cheap standing
-    guard: as long as nothing in this app opts out of the schema or mounts
-    a sub-application, the sweep's blind spot stays theoretical. If this
-    ever fails, a route was added that the auth sweep cannot check at all,
-    and it needs its own explicit auth test, not silent trust.
+    guard: as long as nothing in this app opts out of the schema except by
+    the named exemption above, the sweep's blind spot stays accounted for.
+    If this ever fails, a route was added that the auth sweep cannot check
+    at all, and it needs its own explicit auth test, not silent trust.
     """
-    from starlette.routing import Mount
+    assert _assert_nothing_hides_from_the_sweep(client.app) == 0
 
-    for route in _walk_every_registered_route(client.app.routes):
-        assert not isinstance(route, Mount), (
-            f"a Mount route ({getattr(route, 'path', '?')!r}) is invisible "
-            "to the openapi-based sweep"
-        )
-        if hasattr(route, "include_in_schema"):
-            assert route.include_in_schema, (
-                f"{route.path!r} hides from the schema the auth sweep walks"
-            )
+
+def test_the_exemption_holds_when_a_ui_bundle_is_actually_mounted(vault, tmp_path):
+    """The guard above is satisfied on the default client for the wrong
+    reason: no fixture mounts a UI bundle, so the exempt route does not exist
+    yet. Once the packaging step wires a real bundle in, it will -- and an
+    invariant that breaks in production while the suite stays green is exactly
+    what this guard exists to prevent. So mount one here and assert the
+    exemption is real, singular, and still the only thing out of schema."""
+    from tests.fakes.studio_ui import build_ui_bundle
+
+    app = build_api_client(build_fake_runtime(), vault,
+                           ui_bundle=build_ui_bundle(tmp_path)).app
+    assert _assert_nothing_hides_from_the_sweep(app) == 1
+
+
+def test_the_exemption_does_not_excuse_anything_else(vault, tmp_path):
+    """An exemption list is only worth having if it still catches the next
+    route. A second hidden route, mounted alongside the UI one, must fail."""
+    from tests.fakes.studio_ui import build_ui_bundle
+
+    app = build_api_client(build_fake_runtime(), vault,
+                           ui_bundle=build_ui_bundle(tmp_path)).app
+    hidden = APIRouter()
+
+    @hidden.get("/hidden", include_in_schema=False)
+    async def hidden_handler():
+        return {"ok": True}
+
+    app.include_router(hidden, prefix="/v1")
+
+    with pytest.raises(AssertionError, match="hides from the schema"):
+        _assert_nothing_hides_from_the_sweep(app)
 
 
 # ─── fix wave: the wire is camelCase, pinned against the schema itself ────

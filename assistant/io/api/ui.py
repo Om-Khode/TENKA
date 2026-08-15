@@ -38,7 +38,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
@@ -53,19 +53,35 @@ UI_MANIFEST_VERSION = 1
 # while still bounding what a hand-crafted archive can make the cache hold.
 MAX_MEMBER_BYTES = 8 * 1024 * 1024
 
-# The manifest is small by construction. Reading it is the first thing that
+# The marker is small by construction. Reading it is the first thing that
 # happens to an untrusted archive, so it is also the first thing to bound.
-_MAX_MANIFEST_BYTES = 1024 * 1024
+_MAX_MARKER_BYTES = 1024 * 1024
 
-_MANIFEST_NAME = "manifest.json"
+# The daemon's own build marker, written by the packaging step and read from
+# the root of the bundle. *Not* `manifest.json`: that is a name a Next.js app
+# may legitimately ship as a PWA web app manifest, and two different files
+# competing for one name is a collision waiting to be discovered in
+# production. A dotted name also keeps it out of the way of anything the
+# exporter emits.
+MARKER_NAME = ".tenka-ui.json"
 
-# Served over HTTP to nobody. It is the daemon's own build marker, not part of
-# the export, and it carries the exact API contract hash -- an unauthenticated
-# fingerprint of the running build is a targeting aid on a public URL and buys
-# a browser nothing. (If Studio ever ships a PWA `manifest.json` of its own,
-# this collides by name and the packaging step should rename the marker rather
-# than this rule being relaxed.)
-_PRIVATE_MEMBERS = frozenset({_MANIFEST_NAME})
+# Members no HTTP request may reach, whatever it spells them.
+#
+# Compared case-folded, and that is the mechanism rather than a fix for one
+# name: this is the module's only deny-list, so anything added here later
+# inherits whatever comparison it uses. An exact-string compare is defeated on
+# Windows by pressing shift -- `/MANIFEST.JSON` and `/Manifest.json` name the
+# same file on a case-insensitive filesystem -- and in a zip by storing a
+# second entry under a different case.
+#
+# The marker is private because it carries the exact API contract hash. An
+# unauthenticated fingerprint of the running build is a targeting aid on a
+# public URL and buys a browser nothing.
+_PRIVATE_MEMBERS = frozenset({MARKER_NAME.casefold()})
+
+
+def _is_private(member: str) -> bool:
+    return member.casefold() in _PRIVATE_MEMBERS
 
 
 # ─── content types ───────────────────────────────────────────────────────
@@ -118,15 +134,28 @@ def content_type_for(member: str) -> str:
 
 
 # ─── path normalisation ──────────────────────────────────────────────────
-# Windows treats these as devices no matter which directory you name them in,
-# so `dev/out/CON` opens the console rather than a file. Only reachable in the
-# directory-backed mode, but the rule is applied to both so that the zip and
-# the dev directory cannot disagree about what a legal member is.
+# Windows resolves these to devices rather than files, matching on the name up
+# to the first period no matter which directory it appears in -- so opening
+# `out/AUX.woff2` talks to a serial port.
+#
+# Applied *only* on the directory read, and deliberately not in
+# `normalise_member`. The rule is a property of the Win32 file namespace, not
+# of what a legal bundle member is: nothing is opened by name on the zip path,
+# so there it can produce false negatives and nothing else. That is not
+# hypothetical -- Next preserves source basenames in hashed asset names, so a
+# font vendored as `aux.woff` exports as `_next/static/media/aux.a1b2c3.woff2`,
+# and refusing it everywhere would make that asset an unfixable 404.
 _RESERVED_STEMS = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
     | {f"COM{n}" for n in range(1, 10)}
     | {f"LPT{n}" for n in range(1, 10)}
 )
+
+
+def _names_a_windows_device(safe: str) -> bool:
+    return any(part.split(".", 1)[0].upper() in _RESERVED_STEMS
+               for part in safe.split("/"))
+
 
 # Characters that are either separators on some platform, illegal on Windows,
 # or a way of naming something other than the file you appear to be naming
@@ -146,8 +175,9 @@ def normalise_member(raw: str) -> str | None:
     be sure the input was not obviously legitimate. Every shape below has been
     a real traversal at some point: dot segments, both separators, absolute
     and network-path forms, UNC, drive letters and drive-relative names, NUL
-    truncation, Windows' habit of stripping trailing dots and spaces,
-    reserved device names, and NTFS alternate data streams.
+    truncation, Windows' habit of stripping trailing dots and spaces, and NTFS
+    alternate data streams. Reserved device names are *not* checked here -- see
+    `_names_a_windows_device` for why that belongs to the directory read alone.
 
     Percent-encoding is already decoded by the ASGI server before a path
     reaches here, so `%2e%2e%2f` arrives as `../` and is caught below. A
@@ -184,8 +214,6 @@ def normalise_member(raw: str) -> str | None:
         # `x.html ` both open `x.html` -- two names for one member is one name
         # too many for anything that has to be reasoned about.
         if part != part.strip() or part.endswith("."):
-            return None
-        if part.split(".", 1)[0].upper() in _RESERVED_STEMS:
             return None
     return "/".join(parts)
 
@@ -257,7 +285,7 @@ class UiBundle:
                         logger.warning("[UI] dropped an unsafe archive entry")
                         continue
                     names.add(safe)
-                manifest = cls._read_manifest_from_zip(archive)
+                manifest = cls._read_marker_from_zip(archive)
         except (OSError, zipfile.BadZipFile, ValueError) as exc:
             logger.warning(f"[UI] cannot open the Studio bundle at {path}: {exc}")
             return None
@@ -268,9 +296,9 @@ class UiBundle:
 
     @classmethod
     def _from_dir(cls, root: Path) -> "UiBundle | None":
-        marker = root / _MANIFEST_NAME
+        marker = root / MARKER_NAME
         try:
-            if not marker.is_file() or marker.stat().st_size > _MAX_MANIFEST_BYTES:
+            if not marker.is_file() or marker.stat().st_size > _MAX_MARKER_BYTES:
                 return None
             manifest = cls._validated(json.loads(marker.read_text(encoding="utf-8")))
         except (OSError, ValueError, UnicodeDecodeError) as exc:
@@ -284,19 +312,19 @@ class UiBundle:
                    zip_path=None, dir_path=root)
 
     @classmethod
-    def _read_manifest_from_zip(cls, archive: zipfile.ZipFile) -> dict[str, Any] | None:
+    def _read_marker_from_zip(cls, archive: zipfile.ZipFile) -> dict[str, Any] | None:
         try:
-            info = archive.getinfo(_MANIFEST_NAME)
+            info = archive.getinfo(MARKER_NAME)
         except KeyError:
-            logger.warning("[UI] the Studio bundle carries no manifest.json")
+            logger.warning(f"[UI] the Studio bundle carries no {MARKER_NAME}")
             return None
-        if info.file_size > _MAX_MANIFEST_BYTES:
+        if info.file_size > _MAX_MARKER_BYTES:
             return None
         with archive.open(info) as handle:
             # One byte past the cap, so a lying `file_size` is caught by the
             # read rather than trusted by the check above it.
-            raw = handle.read(_MAX_MANIFEST_BYTES + 1)
-        if len(raw) > _MAX_MANIFEST_BYTES:
+            raw = handle.read(_MAX_MARKER_BYTES + 1)
+        if len(raw) > _MAX_MARKER_BYTES:
             return None
         try:
             return cls._validated(json.loads(raw.decode("utf-8")))
@@ -307,11 +335,17 @@ class UiBundle:
     def _validated(manifest: Any) -> dict[str, Any] | None:
         if not isinstance(manifest, dict):
             return None
-        if manifest.get("version") != UI_MANIFEST_VERSION:
+        version = manifest.get("version")
+        # Typed, not merely compared. Python says `1.0 == 1` and `True == 1`,
+        # so a bare `!=` accepts a marker whose version is a float or a
+        # boolean -- and the house rule for an on-disk marker is to reject
+        # what is not exactly right rather than to guess what was meant.
+        # `bool` is excluded explicitly because it is a subclass of `int`.
+        if isinstance(version, bool) or not isinstance(version, int) \
+                or version != UI_MANIFEST_VERSION:
             logger.warning(
-                f"[UI] refusing a Studio bundle at manifest version "
-                f"{manifest.get('version')!r}; this daemon speaks "
-                f"{UI_MANIFEST_VERSION}")
+                f"[UI] refusing a Studio bundle at marker version "
+                f"{version!r}; this daemon speaks {UI_MANIFEST_VERSION}")
             return None
         return manifest
 
@@ -352,6 +386,10 @@ class UiBundle:
     def _read_from_dir(self, safe: str) -> bytes | None:
         root = self._dir_path
         assert root is not None
+        # Before anything touches the filesystem: on Windows this name would
+        # be resolved to a device, not to the file it appears to describe.
+        if _names_a_windows_device(safe):
+            return None
         try:
             resolved = (root / safe).resolve()
             # The name was already proven not to *say* `..`; this proves the
@@ -361,9 +399,22 @@ class UiBundle:
             if not resolved.is_relative_to(root.resolve()):
                 logger.warning("[UI] refused a dev-directory member that escaped the root")
                 return None
-            if not resolved.is_file() or resolved.stat().st_size > MAX_MEMBER_BYTES:
+            if not resolved.is_file():
                 return None
-            return resolved.read_bytes()
+            with resolved.open("rb") as handle:
+                # Bounded at cap+1, exactly as both zip paths are. And bounded
+                # *only* here: a `stat().st_size` pre-check would look like a
+                # second guard while being neither necessary nor sufficient --
+                # a size that was true when `stat()` ran is not a size that is
+                # still true when `read()` does, and a dev directory is
+                # writable by whatever else is running on the machine. One
+                # guard that is always right beats two where the weaker one
+                # silently does the work.
+                body = handle.read(MAX_MEMBER_BYTES + 1)
+            if len(body) > MAX_MEMBER_BYTES:
+                logger.warning(f"[UI] refused an oversized dev-directory member: {safe}")
+                return None
+            return body
         except (OSError, ValueError):
             return None
 
@@ -456,11 +507,35 @@ _IMMUTABLE_CACHE = "public, max-age=31536000, immutable"
 _NO_CACHE = "no-store, no-cache, must-revalidate"
 
 
-def _stamp(response: Response, *, cache_control: str) -> Response:
+def _stamp(response: Response, *, cache_control: str = _NO_CACHE) -> Response:
     for name, value in _SECURITY_HEADERS.items():
         response.headers[name] = value
     response.headers["Cache-Control"] = cache_control
     return response
+
+
+def _refuse(status: int, body: dict) -> Response:
+    """An error answer that carries the same headers a page does.
+
+    A 403 or a 404 is the response an unauthenticated attacker can most
+    reliably elicit, so it is the last one that should arrive without
+    `nosniff`, a CSP and a framing rule. Built here rather than raised as an
+    `HTTPException`, because the app's exception handlers sit outside this
+    route and cannot know these belong to the UI.
+
+    Only for the refusals this route actually owns. A 405 is not one of them:
+    claiming verbs it does not serve, purely so it could stamp their 405, was
+    a bad trade -- see the route registration below.
+    """
+    return _stamp(JSONResponse(status_code=status, content=body))
+
+
+def _short(value: object, limit: int = 80) -> str:
+    """Bound a value that came out of an untrusted marker before it is put in
+    a response body. A 500 K-char `contract` would otherwise make every single
+    request answer with a 500 KB body."""
+    text = str(value)
+    return text if len(text) <= limit else f"{text[:limit]}...({len(text)} chars)"
 
 
 def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
@@ -470,9 +545,15 @@ def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
     match. Registered as an ordinary route rather than a `Mount`, because a
     `Mount` is invisible to the OpenAPI-based auth sweeps in test_api_auth.py
     -- and a public route that the auth sweep cannot even see is the one kind
-    this app should never grow. It is `include_in_schema=False` because a
-    catch-all belongs in nobody's generated client; its own coverage is
-    tests/test_api_ui_serving.py.
+    this app should never grow.
+
+    It is nonetheless `include_in_schema=False`: a catch-all belongs in
+    nobody's generated TypeScript client, and it is deliberately
+    unauthenticated, so appearing in the sweep would only make the sweep
+    wrong. That is a *named* exemption in `test_api_auth.py`'s
+    `test_no_route_hides_from_the_schema_sweep`, not an absence, and
+    tests/test_api_ui_serving.py is the compensating coverage the exemption
+    points at.
     """
     if bundle is None:
         return
@@ -488,34 +569,53 @@ def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
     declared = bundle.manifest().get("contract")
     stale: str | None = None
     if declared != expected:
+        # `declared` came out of an untrusted marker, so it is bounded before
+        # it goes anywhere near a response body -- see `_short`.
         stale = (f"the Studio UI bundle is stale: it was built against API "
-                 f"contract {declared}, and this daemon serves {expected}")
+                 f"contract {_short(declared)}, and this daemon serves {expected}")
         logger.warning(f"[UI] {stale}")
 
-    @app.get("/{ui_path:path}", include_in_schema=False)
+    # `HEAD` as well as `GET`, because FastAPI's `APIRoute` does not add it for
+    # free the way Starlette's plain `Route` does. In 6b the pairing URL gets
+    # pasted into chat apps, and a link unfurler, an uptime probe or a tunnel
+    # health check sends `HEAD` first -- a 405 there reads as "the daemon is
+    # down".
+    #
+    # And *only* those two. An earlier revision claimed every verb so that the
+    # 405 would be one this route could stamp its security headers onto. That
+    # trade does not pay: the headers buy nothing on a fixed JSON body that
+    # reflects no input and renders nothing, while a catch-all owning every
+    # verb silently swallows any route registered after `create_app()` returns
+    # -- for `/v1` the auth sweep would catch it, but a non-GET route outside
+    # `/v1` would simply 405 with nothing watching. Least privilege applies to
+    # routing as much as to capabilities: claim the verbs you serve and leave
+    # the rest to the framework's own 405.
+    @app.api_route("/{ui_path:path}", include_in_schema=False,
+                   methods=["GET", "HEAD"])
     async def serve_studio_ui(ui_path: str) -> Response:
         # An unrouted `/v1` path is an API miss, not a page. Answering it with
         # a 200 HTML shell would hand a `fetch()` a body it then tries to
         # parse as JSON, and would turn every typo'd endpoint into a silent
-        # success. Checked on the raw path, before anything else.
+        # success. Checked on the raw path, before anything else. The body is
+        # the same one the app's own 404 handler produces, so an API miss looks
+        # identical whether or not a UI bundle happens to be mounted.
         if ui_path == "v1" or ui_path.startswith("v1/"):
-            raise HTTPException(status_code=404)
+            return _refuse(404, {"error": "not found"})
 
         member = normalise_member(ui_path)
         if member is None:
             # Deliberately not echoing the path back: it is attacker-supplied
             # and this response is rendered in a browser.
-            raise HTTPException(status_code=403, detail="forbidden")
+            return _refuse(403, {"detail": "forbidden"})
 
         if stale is not None:
             # The whole bundle goes dark, documents and assets alike. Stale JS
             # against a new API is the actual breakage; serving the assets
             # while withholding the page would only make it harder to see.
-            return _stamp(JSONResponse(status_code=503, content={"error": stale}),
-                          cache_control=_NO_CACHE)
+            return _stamp(JSONResponse(status_code=503, content={"error": stale}))
 
-        if member in _PRIVATE_MEMBERS:
-            raise HTTPException(status_code=404)
+        if _is_private(member):
+            return _refuse(404, {"error": "not found"})
 
         if member:
             # Task 1's export shape, in order: the exact file (assets), then
@@ -526,7 +626,7 @@ def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
         else:
             candidates = ["index.html"]
         for candidate in candidates:
-            if candidate in _PRIVATE_MEMBERS:
+            if _is_private(candidate):
                 continue
             found = bundle.read(candidate)
             if found is not None:
@@ -546,10 +646,9 @@ def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
                 shell = bundle.read("index.html")
                 if shell is not None:
                     body, content_type = shell
-                    return _stamp(Response(content=body, media_type=content_type),
-                                  cache_control=_NO_CACHE)
+                    return _stamp(Response(content=body, media_type=content_type))
 
-        raise HTTPException(status_code=404)
+        return _refuse(404, {"error": "not found"})
 
 # Nothing in this module reads `config`. It is tempting -- `studio_ui_path`
 # names exactly what `UiBundle.open()` wants -- but `import-linter` follows

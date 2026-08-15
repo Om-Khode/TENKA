@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from assistant.io.api.ui import (
+    MARKER_NAME,
     UI_MANIFEST_VERSION,
     UiBundle,
     contract_hash,
@@ -33,29 +34,7 @@ from assistant.io.api.ui import (
 from assistant.io.api.vault import TokenVault
 from tests.fakes.api_client import ApiTestClient, build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
-
-# ─── a stand-in for a real `next build` export ───────────────────────────
-# Mirrors the layout Task 1 recorded, including the detail the whole
-# resolution order exists for: `app.html` is a *sibling* of the `app/`
-# directory, not `app/index.html`.
-_INDEX = b"<html><head><title>TENKA</title></head><body>shell<script>1</script></body></html>"
-_APP = b"<html><body>app shell</body></html>"
-_CHAT = b"<html><body>chat page</body></html>"
-_SETTINGS = b"<html><body>settings page</body></html>"
-_CONNECT = b"<html><body>connect page</body></html>"
-_CHUNK = b"self.__next_f=[];console.log('chunk')"
-_FAVICON = b"\x00\x00\x01\x00fake-icon"
-
-_EXPORT: dict[str, bytes] = {
-    "index.html": _INDEX,
-    "app.html": _APP,
-    "app/chat.html": _CHAT,
-    "app/settings.html": _SETTINGS,
-    "connect.html": _CONNECT,
-    "_next/static/chunks/main-deadbeef.js": _CHUNK,
-    "_next/static/css/site-deadbeef.css": b"body{color:#000}",
-    "favicon.ico": _FAVICON,
-}
+from tests.fakes.studio_ui import CHAT, EXPORT, INDEX, write_ui_dir, write_ui_zip
 
 
 def _reference_contract() -> str:
@@ -68,16 +47,11 @@ def _reference_contract() -> str:
 
 
 def _write_zip(path: Path, files: dict[str, bytes], *,
-               version: int = UI_MANIFEST_VERSION,
+               version: int | object = UI_MANIFEST_VERSION,
                contract: str | None = None) -> Path:
-    manifest = {"version": version,
-                "contract": _reference_contract() if contract is None else contract,
-                "builtAt": "2026-08-15T00:00:00Z"}
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("manifest.json", json.dumps(manifest))
-        for name, body in files.items():
-            archive.writestr(name, body)
-    return path
+    return write_ui_zip(path,
+                        _reference_contract() if contract is None else contract,
+                        files=files, version=version)
 
 
 def _member(zip_path: Path, name: str) -> bytes:
@@ -87,17 +61,30 @@ def _member(zip_path: Path, name: str) -> bytes:
 
 @pytest.fixture()
 def ui_zip(tmp_path) -> Path:
-    return _write_zip(tmp_path / "studio-ui.zip", _EXPORT)
+    return _write_zip(tmp_path / "studio-ui.zip", EXPORT)
+
+
+@pytest.fixture()
+def ui_dir(tmp_path) -> Path:
+    """The dev path, built so it actually serves *through the route*.
+
+    Every dev-directory test in the first round called `bundle.read()`
+    directly against a `"contract": "any"` marker, which would have answered
+    503 had it ever reached the route. That gap is the root cause of the
+    case-sensitive deny-list surviving review -- not carelessness about case,
+    but a whole mode of this module never once exercised over HTTP.
+    """
+    return write_ui_dir(tmp_path / "out", _reference_contract())
 
 
 @pytest.fixture()
 def ui_zip_wrong_contract(tmp_path) -> Path:
-    return _write_zip(tmp_path / "stale-ui.zip", _EXPORT, contract="0" * 64)
+    return _write_zip(tmp_path / "stale-ui.zip", EXPORT, contract="0" * 64)
 
 
 @pytest.fixture()
 def ui_zip_v0(tmp_path) -> Path:
-    return _write_zip(tmp_path / "old-ui.zip", _EXPORT, version=0)
+    return _write_zip(tmp_path / "old-ui.zip", EXPORT, version=0)
 
 
 def _app(*, ui_bundle):
@@ -165,8 +152,12 @@ def test_an_older_manifest_version_is_rejected(ui_zip_v0):
 
 
 def test_the_dev_path_wins_over_the_zip(tmp_path, ui_zip):
+    # The brief spelled the marker `manifest.json`. It is `.tenka-ui.json`
+    # now: `manifest.json` is a name a Next app may legitimately ship as a PWA
+    # web app manifest, and one name for two different files is a collision
+    # waiting to be found in production rather than in review.
     (tmp_path / "index.html").write_text("<html>dev</html>", encoding="utf-8")
-    (tmp_path / "manifest.json").write_text(
+    (tmp_path / MARKER_NAME).write_text(
         json.dumps({"version": 1, "contract": "any", "builtAt": "now"}), encoding="utf-8")
     bundle = UiBundle.open(zip_path=ui_zip, dir_path=tmp_path)
     assert b"dev" in bundle.read("index.html")[0]
@@ -219,9 +210,6 @@ _ESCAPES = [
     "index.html.",                          # Windows strips a trailing dot
     "index.html ",                          # ...and trailing space
     " index.html",
-    "CON",                                  # reserved device names
-    "NUL.html",
-    "com1/x.html",
     "a//b",                                 # empty segment
     "\x00",
     "app/chat.html:stream",                 # NTFS alternate data stream
@@ -292,7 +280,7 @@ def test_a_zip_entry_that_escapes_the_root_is_dropped(tmp_path):
     `../devices.json` would still be *readable* by name if the loader trusted
     the names it was given."""
     path = _write_zip(tmp_path / "evil.zip",
-                      {**_EXPORT,
+                      {**EXPORT,
                        "../devices.json": b"stolen",
                        "..\\creds.json": b"stolen",
                        "/etc/passwd": b"stolen"})
@@ -303,27 +291,46 @@ def test_a_zip_entry_that_escapes_the_root_is_dropped(tmp_path):
         assert bundle.read(name) is None, name
 
 
-def test_a_dev_directory_cannot_be_escaped(tmp_path):
-    root = tmp_path / "out"
-    root.mkdir()
-    (root / "index.html").write_bytes(_INDEX)
-    (root / "manifest.json").write_text(
-        json.dumps({"version": 1, "contract": "any", "builtAt": "now"}), encoding="utf-8")
+def test_a_dev_directory_cannot_be_escaped(tmp_path, ui_dir):
     (tmp_path / "devices.json").write_text("stolen", encoding="utf-8")
-    bundle = UiBundle.open(zip_path=None, dir_path=root)
+    bundle = UiBundle.open(zip_path=None, dir_path=ui_dir)
     assert bundle is not None
     assert bundle.read("index.html") is not None
     for name in ("../devices.json", "..\\devices.json", "/etc/passwd"):
         assert bundle.read(name) is None, name
 
 
-def test_a_symlink_out_of_the_dev_directory_is_refused(tmp_path):
+def test_a_windows_device_name_is_refused_by_the_directory_reader(ui_dir):
+    """The reserved-name rule lives here now, not in `normalise_member`.
+
+    It is a property of the Win32 file namespace -- `out/AUX.woff2` resolves to
+    a serial port, not a file -- so it belongs to the one path that actually
+    opens a file by name. On the zip path nothing is opened by name, where the
+    same rule can only produce false negatives; see the companion test below.
+    """
+    bundle = UiBundle.open(zip_path=None, dir_path=ui_dir)
+    for name in ("CON", "NUL.html", "com1/x.html", "app/aux.a1b2c3.woff2"):
+        assert bundle.read(name) is None, name
+
+
+def test_a_source_basename_that_looks_like_a_device_still_serves_from_a_zip(tmp_path):
+    """Next preserves source basenames in hashed asset names, so a font
+    vendored as `aux.woff` exports as `_next/static/media/aux.a1b2c3.woff2`.
+    Refusing that everywhere would make a real asset an unfixable 404 for a
+    Windows rule that cannot apply to a zip member at all."""
+    asset = "_next/static/media/aux.a1b2c3.woff2"
+    path = _write_zip(tmp_path / "fonts.zip", {**EXPORT, asset: b"font-bytes"})
+    client = _client(ui_bundle=UiBundle.open(zip_path=path, dir_path=None))
+    r = client.get(f"/{asset}")
+    assert r.status_code == 200
+    assert r.content == b"font-bytes"
+    assert r.headers["content-type"] == "font/woff2"
+
+
+def test_a_symlink_out_of_the_dev_directory_is_refused(tmp_path, ui_dir):
     """Name-level normalisation cannot see a symlink; only resolving the real
     path can. Skipped where Windows refuses to create one without privileges."""
-    root = tmp_path / "out"
-    root.mkdir()
-    (root / "manifest.json").write_text(
-        json.dumps({"version": 1, "contract": "any", "builtAt": "now"}), encoding="utf-8")
+    root = ui_dir
     secret = tmp_path / "devices.json"
     secret.write_text("stolen", encoding="utf-8")
     try:
@@ -340,6 +347,50 @@ def test_a_directory_is_not_a_member(ui_zip):
     client = _client(ui_bundle=UiBundle.open(zip_path=ui_zip, dir_path=None))
     assert client.get("/_next").status_code == 404
     assert client.get("/_next/static").status_code == 404
+
+
+# ─── the dev directory, exercised over HTTP and not only through read() ──
+def test_the_dev_directory_serves_through_the_route(ui_dir):
+    """The gap that let a case-sensitive deny-list through review. Every dev
+    assertion in round one went through `bundle.read()`, so the whole
+    directory-backed half of this module had zero route coverage."""
+    client = _client(ui_bundle=UiBundle.open(zip_path=None, dir_path=ui_dir))
+    assert client.get("/").content == INDEX
+    assert client.get("/app/chat").content == CHAT          # own prerendered doc
+    assert client.get("/app/deep/unknown").content == INDEX  # bounded fallback
+    assert client.get("/instance_secret").status_code == 404
+    assert client.get("/v1/status").status_code == 401
+
+
+@pytest.mark.parametrize("spelling", [
+    ".tenka-ui.json",
+    ".TENKA-UI.JSON",
+    ".Tenka-Ui.json",
+    ".tenka-ui.JSON",
+    ".TENKA-ui.Json",
+])
+def test_the_build_marker_is_unreachable_in_any_casing(ui_dir, ui_zip, spelling):
+    """Windows filesystems are case-insensitive, so an exact-string deny-list
+    is defeated by pressing shift -- `/MANIFEST.JSON` served the marker while
+    `/manifest.json` 404'd. The comparison is case-folded now, and because
+    this is the module's only deny-list, whatever is added to it later
+    inherits that rather than the hole."""
+    for bundle in (UiBundle.open(zip_path=None, dir_path=ui_dir),
+                   UiBundle.open(zip_path=ui_zip, dir_path=None)):
+        client = _client(ui_bundle=bundle)
+        response = client.get(f"/{spelling}")
+        assert response.status_code == 404, spelling
+        assert "contract" not in response.text
+
+
+def test_a_second_marker_entry_under_another_case_is_still_unreachable(tmp_path):
+    """A zip is case-*sensitive*, so an archive can carry both spellings. The
+    deny-list has to refuse the copy as well as the original."""
+    path = _write_zip(tmp_path / "twin.zip",
+                      {**EXPORT, ".TENKA-UI.JSON": b'{"contract":"leaked"}'})
+    client = _client(ui_bundle=UiBundle.open(zip_path=path, dir_path=None))
+    assert client.get("/.TENKA-UI.JSON").status_code == 404
+    assert client.get("/.tenka-ui.json").status_code == 404
 
 
 # ─── the route sits where the other gates can still see it ───────────────
@@ -399,6 +450,74 @@ def test_every_ui_response_carries_the_headers(ui_zip):
         assert "object-src 'none'" in h["content-security-policy"]
 
 
+def test_an_error_response_carries_the_headers_too(ui_zip):
+    """The response an unauthenticated attacker can most reliably elicit is a
+    404 or a 403, so it is the last one that should arrive without a CSP, a
+    framing rule and `nosniff`."""
+    client = _client(ui_bundle=UiBundle.open(zip_path=ui_zip, dir_path=None))
+    for path, expected in (("/instance_secret", 404),
+                           ("/..%2Finstance_secret", 403),
+                           ("/v1/no-such-route", 404),
+                           (f"/{MARKER_NAME}", 404)):
+        r = client.get(path)
+        assert r.status_code == expected, path
+        assert r.headers["x-content-type-options"] == "nosniff", path
+        assert r.headers["referrer-policy"] == "no-referrer", path
+        assert r.headers["x-frame-options"] == "DENY", path
+        assert "default-src 'self'" in r.headers["content-security-policy"], path
+        assert "no-store" in r.headers["cache-control"], path
+
+
+# ─── methods ─────────────────────────────────────────────────────────────
+def test_head_is_answered_and_not_405(ui_zip):
+    """FastAPI's `APIRoute` does not add HEAD to a GET the way Starlette's
+    plain `Route` does. In 6b the pairing URL is pasted into chat apps, and a
+    link unfurler, an uptime probe or a tunnel health check sends HEAD first --
+    a 405 there reads as 'the daemon is down'."""
+    client = _client(ui_bundle=UiBundle.open(zip_path=ui_zip, dir_path=None))
+    for path in ("/", "/app/chat", "/_next/static/chunks/main-deadbeef.js"):
+        r = client.head(path)
+        assert r.status_code == 200, path
+        assert r.headers["x-content-type-options"] == "nosniff", path
+    assert client.head("/instance_secret").status_code == 404
+
+
+def test_a_write_verb_is_left_to_the_framework(ui_zip):
+    """The route claims `GET` and `HEAD` and nothing else, so the 405 comes
+    from Starlette's router rather than from this handler.
+
+    An earlier revision claimed every verb so that the 405 could carry the
+    security headers. Wrong trade: the headers protect nothing on a fixed body
+    that reflects no input and renders nothing, while a catch-all owning every
+    verb silently swallows any route registered after `create_app()` returns.
+    Least privilege applies to routing as much as to capabilities, so this
+    test pins the *narrowness* -- the bare 405 is the intended outcome, not a
+    regression in header coverage."""
+    client = _client(ui_bundle=UiBundle.open(zip_path=ui_zip, dir_path=None))
+    for verb in ("POST", "PUT", "PATCH", "DELETE"):
+        r = client.request(verb, "/app/chat")
+        assert r.status_code == 405, verb
+        assert "content-security-policy" not in r.headers, verb
+
+
+def test_a_route_registered_after_the_ui_is_still_reachable(ui_zip):
+    """The concrete cost of the reverted decision, pinned so nobody re-widens
+    it. A non-GET route registered after `create_app()` returns -- which is
+    what a later task adding a router does -- must not be swallowed by the
+    catch-all. While the catch-all owned every verb, this answered 405."""
+    from fastapi import APIRouter
+
+    client = _client(ui_bundle=UiBundle.open(zip_path=ui_zip, dir_path=None))
+    later = APIRouter()
+
+    @later.post("/hook")
+    async def hook_handler():
+        return {"ok": True}
+
+    client.app.include_router(later)
+    assert client.post("/hook").status_code == 200
+
+
 # ─── the contract hash itself ────────────────────────────────────────────
 def test_the_contract_hash_is_over_a_canonical_serialisation():
     """Task 16 computes this same hash on the packaging side. Hashing the file
@@ -453,10 +572,23 @@ def test_a_missing_file_is_no_bundle(tmp_path):
     assert UiBundle.open(zip_path=None, dir_path=tmp_path / "absent") is None
 
 
-def test_a_bundle_without_a_manifest_is_no_bundle(tmp_path):
+def test_a_bundle_without_a_marker_is_no_bundle(tmp_path):
     path = tmp_path / "bare.zip"
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("index.html", _INDEX)
+        archive.writestr("index.html", INDEX)
+    assert UiBundle.open(zip_path=path, dir_path=None) is None
+
+
+def test_a_plain_pwa_manifest_is_not_mistaken_for_the_marker(tmp_path):
+    """The rename's whole point. A bundle carrying a Next PWA `manifest.json`
+    and no `.tenka-ui.json` is not a TENKA bundle at all -- and must not be
+    read as one just because a file with the old name happens to parse."""
+    path = tmp_path / "pwa.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("index.html", INDEX)
+        archive.writestr("manifest.json",
+                         json.dumps({"version": 1, "name": "TENKA Studio",
+                                     "icons": [], "start_url": "/"}))
     assert UiBundle.open(zip_path=path, dir_path=None) is None
 
 
@@ -474,6 +606,17 @@ def test_the_manifest_is_readable(ui_zip):
     assert manifest["builtAt"]
 
 
+@pytest.mark.parametrize("version", [1.0, True, "1", 0, 2, None, [1], {"v": 1}])
+def test_only_an_exact_integer_marker_version_is_accepted(tmp_path, version):
+    """`1.0` and `True` both compare equal to `1` in Python, so a bare `!=`
+    accepts a marker whose version is a float or a boolean. The house rule for
+    an on-disk marker is to reject what is not exactly right rather than guess
+    what was meant."""
+    path = _write_zip(tmp_path / f"v-{type(version).__name__}.zip", EXPORT,
+                      version=version)
+    assert UiBundle.open(zip_path=path, dir_path=None) is None
+
+
 def test_a_stale_bundle_names_both_contracts(ui_zip_wrong_contract):
     """'Stale' with no hashes is a dead end for whoever has to fix it."""
     client = _client(ui_bundle=UiBundle.open(zip_path=ui_zip_wrong_contract,
@@ -481,6 +624,19 @@ def test_a_stale_bundle_names_both_contracts(ui_zip_wrong_contract):
     text = client.get("/").text
     assert "0" * 64 in text
     assert _reference_contract() in text
+
+
+def test_a_stale_bundle_does_not_echo_an_unbounded_contract(tmp_path):
+    """The declared contract comes out of an untrusted marker. Interpolated
+    whole, a 500 K-char value makes *every request* answer with a 500 KB body
+    -- an amplifier handed to anyone who can get a bundle onto the machine, on
+    a route that needs no credential."""
+    path = _write_zip(tmp_path / "loud.zip", EXPORT, contract="A" * 500_000)
+    client = _client(ui_bundle=UiBundle.open(zip_path=path, dir_path=None))
+    r = client.get("/")
+    assert r.status_code == 503
+    assert len(r.content) < 1024
+    assert "500000 chars" in r.text
 
 
 def test_a_stale_bundle_refuses_assets_too(ui_zip_wrong_contract):
@@ -502,21 +658,17 @@ def test_reading_a_member_twice_is_the_same_bytes(ui_zip):
     bundle = UiBundle.open(zip_path=ui_zip, dir_path=None)
     first = bundle.read("app/chat.html")
     second = bundle.read("app/chat.html")
-    assert first == second == (_CHAT, "text/html; charset=utf-8")
+    assert first == second == (CHAT, "text/html; charset=utf-8")
 
 
-def test_a_dev_directory_is_not_cached(tmp_path):
+def test_a_dev_directory_is_not_cached(ui_dir):
     """The dev path wins over the zip so a developer can see a change without
     re-packaging. Caching it would take that straight back -- the first read
     would pin the file for the life of the daemon."""
-    root = tmp_path / "out"
-    root.mkdir()
-    (root / "manifest.json").write_text(
-        json.dumps({"version": 1, "contract": "any", "builtAt": "now"}), encoding="utf-8")
-    (root / "index.html").write_text("<html>first</html>", encoding="utf-8")
-    bundle = UiBundle.open(zip_path=None, dir_path=root)
+    bundle = UiBundle.open(zip_path=None, dir_path=ui_dir)
+    (ui_dir / "index.html").write_text("<html>first</html>", encoding="utf-8")
     assert b"first" in bundle.read("index.html")[0]
-    (root / "index.html").write_text("<html>second</html>", encoding="utf-8")
+    (ui_dir / "index.html").write_text("<html>second</html>", encoding="utf-8")
     assert b"second" in bundle.read("index.html")[0]
 
 
@@ -525,21 +677,32 @@ def test_an_absurdly_large_member_is_refused(tmp_path):
     The declared size is checked before the read, not after."""
     from assistant.io.api.ui import MAX_MEMBER_BYTES
 
-    path = tmp_path / "bomb.zip"
-    manifest = {"version": 1, "contract": "any", "builtAt": "now"}
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("manifest.json", json.dumps(manifest))
-        archive.writestr("index.html", _INDEX)
-        archive.writestr("bomb.bin", b"\0" * (MAX_MEMBER_BYTES + 1))
+    path = _write_zip(tmp_path / "bomb.zip",
+                      {"index.html": INDEX,
+                       "bomb.bin": b"\0" * (MAX_MEMBER_BYTES + 1)},
+                      contract="any")
     bundle = UiBundle.open(zip_path=path, dir_path=None)
     assert bundle.read("index.html") is not None
     assert bundle.read("bomb.bin") is None
 
 
-def test_an_oversized_manifest_is_no_bundle(tmp_path):
-    path = tmp_path / "huge-manifest.zip"
+def test_an_absurdly_large_dev_directory_member_is_refused(ui_dir):
+    """The directory read is bounded at cap+1 exactly as both zip reads are: a
+    size that was true when `stat()` ran is not a size that is still true when
+    `read()` does, and a dev directory is writable by whatever else is running
+    on the machine."""
+    from assistant.io.api.ui import MAX_MEMBER_BYTES
+
+    (ui_dir / "huge.bin").write_bytes(b"\0" * (MAX_MEMBER_BYTES + 1))
+    bundle = UiBundle.open(zip_path=None, dir_path=ui_dir)
+    assert bundle.read("huge.bin") is None
+    assert bundle.read("index.html") is not None
+
+
+def test_an_oversized_marker_is_no_bundle(tmp_path):
+    path = tmp_path / "huge-marker.zip"
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("manifest.json", " " * (2 * 1024 * 1024) + "{}")
+        archive.writestr(MARKER_NAME, " " * (2 * 1024 * 1024) + "{}")
     assert UiBundle.open(zip_path=path, dir_path=None) is None
 
 
