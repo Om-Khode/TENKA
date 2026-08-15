@@ -246,6 +246,26 @@ class CommandRunPayload(CamelModel):
     message: str
 
 
+# ─── Session ─────────────────────────────────────────────────────────────
+class SessionPayload(CamelModel):
+    """Who is calling, and what may this connection carry.
+
+    `grants` and `effective` are deliberately two lists, not one. `grants` is
+    what the device was issued at pairing; `effective` is what survives the
+    listener's ceiling on this connection (`policy.py`'s `effective()`). A
+    control Studio greys out because the device itself was never issued a
+    capability is a different story than one greyed out because a Cloudflare
+    tunnel refuses to carry it -- collapsing the two into one list would make
+    that distinction unexplainable at the UI.
+    """
+
+    device_id: str
+    label: str
+    grants: list[str]
+    effective: list[str]
+    policy: str
+
+
 # ─── System ──────────────────────────────────────────────────────────────
 class StatusPayload(CamelModel):
     assistant_name: str

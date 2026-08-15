@@ -132,6 +132,9 @@ WRAPPER_PAYLOADS_WITHOUT_A_DATACLASS: dict[type[payloads.CamelModel], str] = {
     payloads.RemovedPayload: "sourced from MemoryRuntime.forget_all()'s bare int, not a dataclass",
     payloads.DeletedPayload: "echoes the route's own request body path, not a dataclass",
     payloads.ForgetEnrolledPayload: "echoes the route's own path parameters, not a dataclass",
+    payloads.SessionPayload: "sourced from the authenticated Device plus the listener "
+                              "policy and the pre-ceiling issued grants stashed on "
+                              "request.state by authenticate(), not one dataclass",
 }
 
 

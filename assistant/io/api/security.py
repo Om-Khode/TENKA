@@ -413,7 +413,15 @@ async def authenticate(request: Request) -> Device:
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                                 detail="too many requests")
         state.limiter.record_success(key)
-        grants = effective(device.grants, policy)
+        # Captured before the narrowing below overwrites `device.grants` with
+        # the effective set. GET /v1/session needs both: what the device was
+        # issued, and what this listener lets through. Stashing the pre-narrow
+        # set here -- rather than having the route re-verify the token or call
+        # `vault.devices()` itself -- means there is exactly one vault read per
+        # request and exactly one place (`effective()`, right below) that ever
+        # narrows a grant set.
+        issued = device.grants
+        grants = effective(issued, policy)
         if not grants:
             # This transport carries nothing this device holds. Refused as an
             # authentication failure, not a 403: a device that authenticates
@@ -426,6 +434,7 @@ async def authenticate(request: Request) -> Device:
             raise _UNAUTHORIZED
         device = replace(device, grants=grants)
         request.state.device = device
+        request.state.issued_grants = issued
         return device
 
     if not state.limiter.check(source):
