@@ -1,6 +1,7 @@
 """Token vault — the only thing that decides whether a caller is real."""
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 
 import pytest
@@ -465,3 +466,192 @@ def test_corrupt_secret_file_with_no_cached_secret_regenerates_and_persists(tmp_
     on_disk = (tmp_path / "instance_secret").read_text(encoding="utf-8").strip()
     assert bytes.fromhex(on_disk) == secret, "regenerated secret was not persisted"
     assert vault.instance_secret() == secret  # and it is stable from then on
+
+
+# ─── last_seen_at ──────────────────────────────────────────────────────────
+
+
+def test_a_new_device_has_no_last_seen(tmp_path):
+    vault = TokenVault(tmp_path)
+    # `Capability.CHAT` (the brief's literal value) predates the Task 5b
+    # OBSERVE/RECALL split and no longer exists; OBSERVE is the equivalent
+    # "just issued, still valid" grant for this test's purpose.
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    assert vault.devices()[0].last_seen_at is None
+
+
+def test_touch_records_a_timestamp(tmp_path):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    vault.touch(device_id)
+    assert vault.devices()[0].last_seen_at is not None
+
+
+def test_touching_an_unknown_device_is_silent(tmp_path):
+    TokenVault(tmp_path).touch("nope")      # must not raise
+
+
+def test_a_record_without_last_seen_still_parses(tmp_path):
+    """Records written before this task exist on disk. A missing key is not a
+    malformed record.
+
+    Grants use `"observe"` rather than the brief's literal `"chat"`: that
+    string was retired by the Task 5b OBSERVE/RECALL split and is *supposed*
+    to fail closed and drop (tested elsewhere) -- using it here would make
+    this test pass for the wrong reason, on an empty device list, instead of
+    proving a missing `last_seen_at` key parses as `None`.
+    """
+    (tmp_path / "devices.json").write_text(json.dumps({
+        "version": 1,
+        "devices": [{"device_id": "a", "label": "old", "grants": ["observe"],
+                     "created_at": "2026-01-01T00:00:00+00:00", "token_hmac": "x"}],
+    }), encoding="utf-8")
+    assert TokenVault(tmp_path).devices()[0].last_seen_at is None
+
+
+# ─── touch() throttling ────────────────────────────────────────────────────
+# `touch()` sits on the authenticated request path (Task 10). Without a
+# floor, every call pays a full devices.json rewrite plus an `icacls`
+# subprocess -- a per-request cost on the one API that will be reachable
+# from a public URL. These assert on the file itself, not on `devices()`,
+# because the point being tested is the *absence* of I/O, which a read-back
+# through the vault's own re-parsing could not distinguish from "wrote the
+# same value back".
+
+
+def test_first_touch_on_a_device_with_no_stored_timestamp_always_writes(tmp_path):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    path = tmp_path / "devices.json"
+    before = path.read_bytes()
+
+    vault.touch(device_id)
+
+    assert path.read_bytes() != before
+    assert vault.devices()[0].last_seen_at is not None
+
+
+def test_touch_within_the_throttle_window_does_not_write_to_disk(tmp_path):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    vault.touch(device_id)  # first touch: no stored timestamp yet, always writes
+
+    path = tmp_path / "devices.json"
+    before = path.read_bytes()
+    vault.touch(device_id)  # second touch, well inside the 60s window
+
+    assert path.read_bytes() == before, "a touch within the window must not write at all"
+
+
+def test_touch_after_the_throttle_window_does_write(tmp_path):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=61)).isoformat()
+    raw["devices"][0]["last_seen_at"] = stale
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    vault.touch(device_id)
+
+    assert path.read_bytes() != before
+    assert vault.devices()[0].last_seen_at != stale
+
+
+def test_a_future_stored_timestamp_does_not_wedge_the_write_permanently(tmp_path):
+    """A clock change or a hand-edited file could leave `last_seen_at` in the
+    future. That must not disable touching forever -- age computed against a
+    future timestamp is negative, which the throttle window (0 <= age <
+    threshold) excludes, so the write proceeds and overwrites the bogus value.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    raw["devices"][0]["last_seen_at"] = future
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    vault.touch(device_id)
+
+    assert path.read_bytes() != before
+    assert vault.devices()[0].last_seen_at != future
+
+
+def test_a_naive_stored_timestamp_does_not_raise_and_self_heals(tmp_path):
+    """`datetime.fromisoformat("2026-01-01T00:00:00")` does not raise -- it
+    returns a naive datetime -- so subtracting it from an aware `now` is what
+    actually blows up if unguarded. Reproduces the round-2 Critical: this
+    must come back clean, and the stored value must end up aware.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["devices"][0]["last_seen_at"] = "2026-01-01T00:00:00"  # naive, no offset
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    vault.touch(device_id)  # must not raise TypeError
+
+    assert path.read_bytes() != before
+    healed = vault.devices()[0].last_seen_at
+    assert healed != "2026-01-01T00:00:00"
+    assert datetime.fromisoformat(healed).tzinfo is not None
+
+
+def test_a_garbage_stored_timestamp_does_not_raise_and_overwrites(tmp_path):
+    """Untested in round 1 even though the branch existed: a stored value
+    that isn't ISO-8601 at all must not raise, and must be overwritten same
+    as the naive case above.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["devices"][0]["last_seen_at"] = "not-a-timestamp"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    vault.touch(device_id)  # must not raise
+
+    assert path.read_bytes() != before
+    assert vault.devices()[0].last_seen_at != "not-a-timestamp"
+
+
+@pytest.mark.parametrize("bad_value", ["2026-01-01T00:00:00", "not-a-timestamp"])
+def test_a_healed_value_is_well_formed_and_throttles_the_next_touch(tmp_path, bad_value):
+    """The point of healing is that the written value is a real, aware
+    timestamp usable by the throttle itself -- not merely "some string that
+    replaced the bad one". Prove it by touching again right after the heal
+    and confirming the second touch is suppressed, exactly like the
+    well-formed case in `test_touch_within_the_throttle_window_does_not_write_to_disk`.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["devices"][0]["last_seen_at"] = bad_value
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    vault.touch(device_id)  # heals the bad value
+    healed_bytes = path.read_bytes()
+
+    vault.touch(device_id)  # immediately after -- must be throttled
+
+    assert path.read_bytes() == healed_bytes

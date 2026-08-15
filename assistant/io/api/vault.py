@@ -18,7 +18,7 @@ import secrets
 import subprocess
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
 
@@ -27,6 +27,17 @@ logger = logging.getLogger(__name__)
 _SECRET_FILE = "instance_secret"
 _DEVICES_FILE = "devices.json"
 _SCHEMA_VERSION = 1
+
+# "Last seen" carries no useful signal at sub-minute resolution, and
+# TokenVault.touch() is wired into the authenticated request path (Milestone
+# 6a Task 10): without a floor, every authenticated call pays a full
+# _load + _save, and _save's _restrict_to_current_user spawns an `icacls`
+# subprocess on Windows -- a process spawn per request, and a flood of cheap
+# requests becomes a flood of subprocess spawns against the one API that is
+# about to be reachable from a public URL. One write per device per window
+# is enough for a revoke-list column and caps the cost regardless of request
+# rate.
+_TOUCH_THROTTLE = timedelta(seconds=60)
 
 
 class Capability(str, enum.Enum):
@@ -70,6 +81,7 @@ class Device:
     label: str
     grants: frozenset[Capability]
     created_at: str
+    last_seen_at: str | None = None
 
 
 def _restrict_to_current_user(path: Path) -> None:
@@ -292,6 +304,12 @@ class TokenVault:
                 label=entry["label"],
                 grants=grants,
                 created_at=entry["created_at"],
+                # `.get`, not `[...]`: every record written before this task
+                # has no such key at all, and that absence is not malformed --
+                # it just means "never touched". Only a genuinely missing
+                # required field (device_id, label, grants, created_at) should
+                # drop a record; this one must default instead.
+                last_seen_at=entry.get("last_seen_at"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning(f"[API] skipping malformed device record: {exc}")
@@ -364,6 +382,72 @@ class TokenVault:
         data["devices"] = remaining
         self._save(data)
         return True
+
+    def touch(self, device_id: str) -> None:
+        """Record that `device_id` was just seen, for the revoke-list UI.
+
+        Silent on an unknown id: a stale or already-revoked credential
+        showing up on the request path is ordinary, not exceptional, and a
+        vault method must not hand a caller a reason to surface an error for
+        it.
+
+        Throttled to one disk write per `_TOUCH_THROTTLE` per device: this
+        sits on the authenticated request path, and `_save` is not free (a
+        full JSON rewrite plus an `icacls` subprocess via
+        `_restrict_to_current_user`). Without a floor, a device polling every
+        few seconds -- or an attacker flooding an authenticated route -- pays
+        that cost on every single call. A device with no stored timestamp
+        yet (first sighting, or a pre-this-task record) always writes; one
+        within the window is skipped with no `_load`-then-`_save` round trip
+        wasted beyond the read already done to check.
+
+        A stored timestamp that is in the future -- clock skew, or a
+        hand-edited file -- must not wedge the write off forever, so it is
+        treated as stale rather than as "just touched": the age computed
+        against it is negative, which falls outside the
+        `0 <= age < _TOUCH_THROTTLE` window that suppresses the write, so the
+        write proceeds and self-heals the bogus value.
+
+        A stored timestamp with no `tzinfo` (naive) is treated the same way
+        as unparseable garbage: overwritten, not assumed-UTC. A naive
+        value's true offset is genuinely unknown -- guessing UTC would
+        invent a fact this method has no basis for -- and subtracting an
+        aware `now` from a naive `stored_at` raises `TypeError` outright, so
+        this must not be allowed to reach the subtraction unguarded. That
+        mirrors `_parse_device`'s posture elsewhere in this file: a
+        malformed field is dropped/overwritten, never allowed to crash the
+        caller.
+        """
+        data = self._load()
+        target: dict | None = None
+        for entry in data["devices"]:
+            if isinstance(entry, dict) and entry.get("device_id") == device_id:
+                target = entry
+                break
+        if target is None:
+            return
+
+        now = datetime.now(timezone.utc)
+        stored = target.get("last_seen_at")
+        if isinstance(stored, str):
+            try:
+                stored_at = datetime.fromisoformat(stored)
+                age = now - stored_at
+            except (ValueError, TypeError):
+                # ValueError: not a parseable ISO-8601 string at all.
+                # TypeError: parsed fine but naive -- `fromisoformat` does not
+                # raise on a string with no offset, and subtracting an aware
+                # `now` from a naive `stored_at` is what actually raises.
+                # Both are malformed in the sense that matters here: fall
+                # through and overwrite rather than let either one crash the
+                # request path that calls this.
+                pass
+            else:
+                if timedelta(0) <= age < _TOUCH_THROTTLE:
+                    return  # seen recently enough; skip the write entirely
+
+        target["last_seen_at"] = now.isoformat()
+        self._save(data)
 
     def devices(self) -> list[Device]:
         result = []
