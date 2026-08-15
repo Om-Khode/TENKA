@@ -170,10 +170,10 @@ def test_the_sweep_catches_a_route_registered_without_auth(vault):
 def test_a_capability_it_lacks_is_refused(client, vault):
     """A token that lacks the capability a route requires must be refused.
 
-    `/v1/status` requires CHAT and is the only shipped route, so an
-    all-grants or CHAT-holding token can never exercise `require()`'s 403
-    branch -- the original version of this test issued a CHAT token against
-    the CHAT-gated route and asserted 200, which would pass identically if
+    `/v1/status` requires OBSERVE and is the only shipped route, so an
+    all-grants or OBSERVE-holding token can never exercise `require()`'s 403
+    branch -- the original version of this test issued a read token against
+    the read-gated route and asserted 200, which would pass identically if
     the capability check were deleted outright. A second, FILES-gated route
     is mounted here to force the refusal, with a mirror case proving the
     same route accepts a token that does hold the capability it demands.
@@ -186,8 +186,8 @@ def test_a_capability_it_lacks_is_refused(client, vault):
 
     client.app.include_router(probe, prefix="/v1")
 
-    chat_only = vault.issue("phone", frozenset({Capability.CHAT}))
-    refused = client.get("/v1/probe", headers=auth(chat_only))
+    watcher = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    refused = client.get("/v1/probe", headers=auth(watcher))
     assert refused.status_code == 403
 
     files_holder = vault.issue("laptop", frozenset({Capability.FILES}))
@@ -195,12 +195,12 @@ def test_a_capability_it_lacks_is_refused(client, vault):
     assert allowed.status_code == 200
 
 
-# ─── CHAT vs CHAT_SEND: reading her conversations is not driving her ──────
-def test_a_read_only_chat_device_cannot_send(tmp_path):
-    """The whole point of the split: CHAT reaches all 38 intents through
-    POST /v1/chat, so reading history must not imply driving her."""
+# ─── RECALL vs CHAT_SEND: reading her conversations is not driving her ────
+def test_a_read_only_device_cannot_send(tmp_path):
+    """The whole point of the split: POST /v1/chat reaches all 38 intents, so
+    reading history must not imply driving her."""
     vault = TokenVault(tmp_path)
-    token = vault.issue("reader", frozenset({Capability.CHAT}))
+    token = vault.issue("reader", frozenset({Capability.RECALL}))
     client = _client(vault)
     assert client.get("/v1/chat/conversations",
                       headers={"Authorization": f"Bearer {token}"}).status_code == 200
@@ -212,17 +212,18 @@ def test_a_read_only_chat_device_cannot_send(tmp_path):
 
 def test_a_sending_device_still_reads(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("phone", frozenset({Capability.CHAT, Capability.CHAT_SEND}))
+    token = vault.issue("phone", frozenset({Capability.RECALL, Capability.CHAT_SEND}))
     client = _client(vault)
     assert client.post("/v1/chat", json={"text": "hi"},
                        headers={"Authorization": f"Bearer {token}"}).status_code == 202
 
 
 def test_the_events_socket_stays_a_read_gate(tmp_path):
-    """app.py checks CHAT before accept(). The socket only streams, so it must
-    NOT start demanding CHAT_SEND -- a reader device keeps its live view."""
+    """app.py checks OBSERVE before accept(). The socket only streams, so it
+    must NOT start demanding CHAT_SEND -- nor RECALL, which a watching device
+    need not hold at all -- and a reader device keeps its live view."""
     vault = TokenVault(tmp_path)
-    token = vault.issue("reader", frozenset({Capability.CHAT}))
+    token = vault.issue("reader", frozenset({Capability.OBSERVE}))
     client = _client(vault)
     client.cookies.set(COOKIE_NAME, token)
     with client.websocket_connect("/v1/events") as ws:

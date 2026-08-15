@@ -15,9 +15,9 @@ def context(tmp_path):
     client = build_api_client(runtime, vault)
     tokens = {
         "full": vault.issue("studio", frozenset(Capability)),
-        "chat": vault.issue("phone", frozenset({Capability.CHAT})),
+        "observe": vault.issue("phone", frozenset({Capability.OBSERVE})),
         # Holds exactly one of the fixture's two distinct grants -- neither
-        # "full" nor "chat" can exercise the route's per-command grant
+        # "full" nor "observe" can exercise the route's per-command grant
         # lookup, because both clear or fail every entry in FakeCommandRuntime
         # identically regardless of which grant each entry actually declares.
         "screen_only": vault.issue("glasses", frozenset({Capability.SCREEN})),
@@ -29,9 +29,9 @@ def head(token):
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_the_catalogue_is_readable_by_a_chat_device(context):
+def test_the_catalogue_is_readable_by_a_watching_device(context):
     client, _, tokens = context
-    response = client.get("/v1/commands", headers=head(tokens["chat"]))
+    response = client.get("/v1/commands", headers=head(tokens["observe"]))
     assert response.status_code == 200
     assert [c["commandId"] for c in response.json()["data"]["commands"]] == [
         "lock_workstation", "volume_up", "screenshot"]
@@ -39,7 +39,7 @@ def test_the_catalogue_is_readable_by_a_chat_device(context):
 
 def test_the_catalogue_marks_destructive_entries(context):
     client, _, tokens = context
-    commands = client.get("/v1/commands", headers=head(tokens["chat"])).json()["data"]["commands"]
+    commands = client.get("/v1/commands", headers=head(tokens["observe"])).json()["data"]["commands"]
     by_id = {c["commandId"]: c for c in commands}
     assert by_id["lock_workstation"]["destructive"] is True
     assert by_id["volume_up"]["destructive"] is False
@@ -48,7 +48,7 @@ def test_the_catalogue_marks_destructive_entries(context):
 def test_running_needs_the_command_s_own_grant(context):
     client, _, tokens = context
     assert client.post("/v1/commands/volume_up/run",
-                       headers=head(tokens["chat"])).status_code == 403
+                       headers=head(tokens["observe"])).status_code == 403
 
 
 def test_a_granted_device_can_run_it(context):
@@ -66,7 +66,7 @@ def test_an_unknown_command_is_404_not_a_failed_run(context):
 
 def test_a_refused_run_does_not_execute_anything(context):
     client, runtime, tokens = context
-    client.post("/v1/commands/lock_workstation/run", headers=head(tokens["chat"]))
+    client.post("/v1/commands/lock_workstation/run", headers=head(tokens["observe"]))
     assert runtime.commands.ran == []
 
 
@@ -76,7 +76,7 @@ def test_a_screen_grant_runs_screenshot_but_not_a_system_control_command(context
     A route that checked a grant hardcoded onto itself -- the exact
     anti-pattern this task exists to prevent -- would answer identically for
     "full" (holds every grant, including whichever one got hardcoded) and
-    "chat" (holds none of the grants any command needs, so is refused no
+    "observe" (holds none of the grants any command needs, so is refused no
     matter which one is checked). Neither can tell "reads required_grant off
     the command" apart from "always checks system_control". A caller holding
     screen but not system_control can: it must be let through for screenshot

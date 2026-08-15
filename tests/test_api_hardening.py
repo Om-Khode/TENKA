@@ -13,7 +13,7 @@ def context(tmp_path):
     client = build_api_client(build_fake_runtime(), vault)
     tokens = {
         "full": vault.issue("studio", frozenset(Capability)),
-        "chat": vault.issue("phone", frozenset({Capability.CHAT})),
+        "observe": vault.issue("phone", frozenset({Capability.OBSERVE})),
     }
     return client, vault, tokens
 
@@ -104,7 +104,7 @@ def test_a_rejected_call_is_recorded_without_a_device(context):
 
 def test_the_audit_log_needs_system_control(context):
     client, _, tokens = context
-    assert client.get("/v1/audit", headers=head(tokens["chat"])).status_code == 403
+    assert client.get("/v1/audit", headers=head(tokens["observe"])).status_code == 403
 
 
 def test_the_audit_log_records_the_path_without_its_query_string(context):
@@ -149,7 +149,7 @@ def test_shutdown_revokes_every_device(tmp_path):
     from assistant.io.api import server
     vault = TokenVault(tmp_path)
     vault.issue("studio", frozenset(Capability))
-    vault.issue("phone", frozenset({Capability.CHAT}))
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
     server.shutdown(None, vault)
     assert vault.devices() == []
 
@@ -202,7 +202,7 @@ def test_a_valid_token_is_never_refused_by_an_exhausted_anonymous_window(context
     assert client.get("/v1/status", headers=head(tokens["full"])).status_code == 200
 
 
-# ─── deferred item 9: a heavy route gets a tighter budget than CHAT's ────
+# ─── deferred item 9: a heavy route gets a tighter budget than a read's ──
 def test_run_backup_is_throttled_tighter_than_the_shared_budget(context):
     client, _, tokens = context
     codes = [client.post("/v1/backup/run", headers=head(tokens["full"])).status_code

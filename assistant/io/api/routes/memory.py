@@ -85,9 +85,16 @@ def _relationship(rel) -> RelationshipPayload:
 # handler split, not what a caller sends or receives for any of them.
 # DELETE /memory/{scope}/{item_id} stays parameterised below: it has one
 # response shape regardless of scope, so a union was never the issue there.
+#
+# All three reads are RECALL, not OBSERVE. Every row in all three is something
+# this user told her or taught her -- the graph most obviously, but
+# `procedures` too, which reads like a capability listing and is in fact the
+# literal steps of the user's own workflows, and `preferences`, which is a
+# record of how they live. None of it describes the assistant; all of it
+# describes them.
 @router.get("/memory/knowledge")
 async def get_knowledge(request: Request,
-                        _=Depends(require(Capability.CHAT))) -> Envelope[KnowledgeGraphPayload]:
+                        _=Depends(require(Capability.RECALL))) -> Envelope[KnowledgeGraphPayload]:
     graph = await request.app.state.runtime.memory.knowledge()
     return Envelope(data=KnowledgeGraphPayload(
         entities=[_entity(e) for e in graph.entities],
@@ -98,7 +105,7 @@ async def get_knowledge(request: Request,
 
 @router.get("/memory/preferences")
 async def get_preferences(request: Request,
-                          _=Depends(require(Capability.CHAT))) -> Envelope[PreferencesPayload]:
+                          _=Depends(require(Capability.RECALL))) -> Envelope[PreferencesPayload]:
     records = await request.app.state.runtime.memory.preferences()
     return Envelope(data=PreferencesPayload(preferences=[
         PreferenceRecordPayload(
@@ -114,7 +121,7 @@ async def get_preferences(request: Request,
 
 @router.get("/memory/procedures")
 async def get_procedures(request: Request,
-                         _=Depends(require(Capability.CHAT))) -> Envelope[ProceduresPayload]:
+                         _=Depends(require(Capability.RECALL))) -> Envelope[ProceduresPayload]:
     records = await request.app.state.runtime.memory.procedures()
     return Envelope(data=ProceduresPayload(procedures=[
         ProcedureRecordPayload(
@@ -130,11 +137,11 @@ async def get_procedures(request: Request,
 
 @router.delete("/memory/{scope}/{item_id}")
 async def forget_item(scope: Scope, item_id: str, request: Request,
-                      # CHAT_SEND, not CHAT. The earlier ruling here -- "a
+                      # CHAT_SEND, not RECALL. The earlier ruling here -- "a
                       # phone paired for conversation can delete one thing it
                       # was told about", while the wipe below demands
-                      # SYSTEM_CONTROL -- predates the CHAT/CHAT_SEND split,
-                      # and CHAT has since come to mean "may read" and
+                      # SYSTEM_CONTROL -- predates the read/write split, and
+                      # the read grants have since come to mean "may read" and
                       # nothing more. CHAT_SEND keeps that ruling's intent
                       # exactly: forgetting one item is the same class of act
                       # as saying "forget that" in a turn, which is precisely

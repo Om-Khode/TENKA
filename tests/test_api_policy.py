@@ -22,11 +22,19 @@ def test_secure_cookie_everywhere_but_local():
         assert POLICIES[name].secure_cookie is True, name
 
 
-def test_quick_ceiling_is_read_only_and_excludes_screen():
-    """CHAT alone. No CHAT_SEND (arbitrary code execution), no FILES, no
-    SYSTEM_CONTROL -- and no SCREEN, because Cloudflare reads this transport's
-    plaintext and screen capture is the largest disclosure in the API."""
-    assert POLICIES["quick"].ceiling == frozenset({Capability.CHAT})
+def test_observe_and_recall_are_distinct_capabilities():
+    assert Capability.OBSERVE.value == "observe"
+    assert Capability.RECALL.value == "recall"
+    assert not hasattr(Capability, "CHAT")      # the ambiguous name is gone
+
+
+def test_quick_carries_observation_but_no_stored_data():
+    """The one transport a third party reads must not carry her transcripts or
+    her knowledge graph. Excluding SCREEN while admitting those was close to
+    theatre: `read_screen` is an intent, so her narration of the screen lands
+    in a transcript, and the knowledge graph is a larger disclosure than any
+    single screenshot."""
+    assert POLICIES["quick"].ceiling == frozenset({Capability.OBSERVE})
 
 
 def test_full_ceilings_are_every_capability():
@@ -35,9 +43,10 @@ def test_full_ceilings_are_every_capability():
 
 
 def test_effective_is_an_intersection_never_a_widening():
-    device = frozenset({Capability.CHAT, Capability.CHAT_SEND, Capability.FILES})
+    device = frozenset({Capability.OBSERVE, Capability.RECALL,
+                        Capability.CHAT_SEND, Capability.FILES})
     assert effective(device, POLICIES["funnel"]) == device
-    assert effective(device, POLICIES["quick"]) == frozenset({Capability.CHAT})
+    assert effective(device, POLICIES["quick"]) == frozenset({Capability.OBSERVE})
     # a ceiling cannot grant what the device lacks
     assert Capability.SYSTEM_CONTROL not in effective(device, POLICIES["local"])
 

@@ -21,9 +21,14 @@ def _personality_body(state) -> PersonalityPayload:
     )
 
 
+# OBSERVE, both reads below. A settings row and the personality state describe
+# how *she* is configured to behave -- the registry holds tunables (timers,
+# thresholds, toggles), never credentials, which live in .env and never reach
+# `runtime_config.REGISTRY`. Nothing here is something a user told her, so
+# neither read is stored data.
 @router.get("/settings")
 async def list_settings(request: Request,
-                        _=Depends(require(Capability.CHAT))) -> Envelope[SettingsPayload]:
+                        _=Depends(require(Capability.OBSERVE))) -> Envelope[SettingsPayload]:
     rows = await request.app.state.runtime.settings.all()
     return Envelope(data=SettingsPayload(rows=[
         SettingRowPayload(
@@ -43,20 +48,20 @@ async def list_settings(request: Request,
 
 @router.get("/personality")
 async def get_personality(request: Request,
-                          _=Depends(require(Capability.CHAT))) -> Envelope[PersonalityPayload]:
+                          _=Depends(require(Capability.OBSERVE))) -> Envelope[PersonalityPayload]:
     state = await request.app.state.runtime.personality.state()
     return Envelope(data=_personality_body(state))
 
 
 @router.patch("/settings")
 async def save_settings(body: SettingsPatch, request: Request,
-                        # SYSTEM_CONTROL, not CHAT: the same reasoning that
-                        # moved forget-all off of chat applies here, harder --
-                        # a phone paired only for conversation must not be
+                        # SYSTEM_CONTROL, not OBSERVE: the same reasoning that
+                        # moved forget-all off the read grants applies here,
+                        # harder -- a phone paired only to watch must not be
                         # able to rewrite the daemon's own CORS allow-list,
                         # switch the camera on, or flip any other setting the
                         # assistant trusts nobody but its owner to touch.
-                        # Reading settings stays on chat; only writing them
+                        # Reading settings stays on OBSERVE; only writing them
                         # is gated up.
                         _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope[SaveOutcomePayload]:
     outcome = await request.app.state.runtime.settings.save(body.changes)
@@ -69,7 +74,7 @@ async def save_settings(body: SettingsPatch, request: Request,
 
 @router.patch("/personality")
 async def set_personality(body: PersonalityPatch, request: Request,
-                          # SYSTEM_CONTROL, not CHAT, for the same reason
+                          # SYSTEM_CONTROL, not OBSERVE, for the same reason
                           # PATCH /settings above is: the personality base is
                           # a stored, restart-surviving configuration value,
                           # and switching it changes how she answers *every*
@@ -77,7 +82,7 @@ async def set_personality(body: PersonalityPatch, request: Request,
                           # asked. It is a setting that happens to have its
                           # own route, not a conversational act -- which is
                           # what separates it from CHAT_SEND. Reading the
-                          # personality stays on CHAT.
+                          # personality stays on OBSERVE.
                           _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope[PersonalityPayload]:
     # switch_personality() reports an unknown base as a return string, not an
     # exception -- left unchecked, that string was silently discarded and the

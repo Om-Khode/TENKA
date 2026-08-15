@@ -23,9 +23,13 @@ _RUN_MAX_PER_WINDOW = 20
 _RUN_WINDOW_SECONDS = 60.0
 
 
+# OBSERVE: the catalogue is a fixed list of what she *can* be asked to do,
+# declared in code. It says nothing about what she has been asked or told, so
+# it is observation of the assistant, not a read of stored data. Running one
+# is gated by the command's own `required_grant` below, never by this.
 @router.get("/commands")
 async def list_commands(request: Request,
-                        _=Depends(require(Capability.CHAT))) -> Envelope[CommandsPayload]:
+                        _=Depends(require(Capability.OBSERVE))) -> Envelope[CommandsPayload]:
     catalogue = await request.app.state.runtime.commands.catalogue()
     return Envelope(data=CommandsPayload(commands=[
         CommandDefPayload(

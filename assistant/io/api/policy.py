@@ -91,14 +91,21 @@ POLICIES: dict[str, ListenerPolicy] = {
         ceiling=_ALL_CAPABILITIES,
     ),
     # Cloudflare quick tunnel: Cloudflare terminates TLS and can read the
-    # plaintext. The ceiling is read-only -- CHAT alone -- so even a device
-    # issued every capability is limited to reading history and status
-    # through this transport, never to acting (CHAT_SEND, FILES,
-    # SYSTEM_CONTROL). SCREEN is excluded too, but for a different reason
-    # than the others: this isn't about what an attacker could *do*, it's
-    # about what Cloudflare could *see*. Screen capture is the
-    # highest-bandwidth disclosure in the API, and this is the one listener
-    # a third party's infrastructure can observe.
+    # plaintext. The ceiling is OBSERVE alone -- watching her work. Even a
+    # device issued every capability is limited to her status, her telemetry,
+    # the live event stream and how she is configured; never to acting
+    # (CHAT_SEND, FILES, SYSTEM_CONTROL), and never to what she has stored.
+    #
+    # SCREEN and RECALL are excluded for the same reason as each other, and a
+    # different one from the acting grants: this isn't about what an attacker
+    # could *do*, it's about what Cloudflare could *see*. Screen capture is
+    # the highest-bandwidth disclosure in the API -- but RECALL is the widest.
+    # It carries the entire knowledge graph and every transcript, and since
+    # `read_screen` and `camera_look` are intents, her narration of what was
+    # on screen is *in* those transcripts. Excluding SCREEN while admitting
+    # stored data withheld the photograph and shipped the description of it.
+    # Reading stored data over this transport joins acting behind a
+    # deliberate, expiring, audited raise.
     "quick": ListenerPolicy(
         name="quick",
         admin=False,
@@ -112,7 +119,7 @@ POLICIES: dict[str, ListenerPolicy] = {
         # would look like a tidy-up but inverts the safety property: the
         # next new capability would then be granted automatically over
         # exactly the listener that must never get one for free.
-        ceiling=frozenset({Capability.CHAT}),
+        ceiling=frozenset({Capability.OBSERVE}),
     ),
 }
 

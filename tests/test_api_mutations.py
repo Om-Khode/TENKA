@@ -59,7 +59,8 @@ def test_forget_all_demands_system_control_not_just_a_sending_device(tmp_path):
     """Wiping every entity, fact, preference and procedure is not ordinary use.
 
     The two deletes stay on different grants, but both moved up a tier once
-    `CHAT` came to mean "may read" and nothing more. Single-item forget is
+    the read capabilities came to mean "may read" and nothing more.
+    Single-item forget is
     `chat_send`: deleting one thing she was told about is the same class of
     act as saying "forget that" in a turn, so a device trusted to drive her is
     trusted to do it. The wipe is different in kind, not degree -- erasing her
@@ -67,7 +68,7 @@ def test_forget_all_demands_system_control_not_just_a_sending_device(tmp_path):
     cannot reach it.
     """
     vault = TokenVault(tmp_path)
-    sender = vault.issue("phone", frozenset({Capability.CHAT, Capability.CHAT_SEND}))
+    sender = vault.issue("phone", frozenset({Capability.OBSERVE, Capability.CHAT_SEND}))
     runtime = build_fake_runtime()
     client = build_api_client(runtime, vault)
     headers = {"Authorization": f"Bearer {sender}"}
@@ -80,12 +81,13 @@ def test_forget_all_demands_system_control_not_just_a_sending_device(tmp_path):
 
 
 def test_a_read_only_device_cannot_forget_even_one_item(tmp_path):
-    """The regression this closes: `CHAT` alone used to carry a memory delete,
-    so a device deliberately issued read-only could erase what she knows one
-    item at a time -- and on the `quick` listener, whose entire ceiling is
-    `{CHAT}`, that was the only grant any device could hold at all."""
+    """The regression this closes: one read grant alone used to carry a memory
+    delete, so a device deliberately issued read-only could erase what she
+    knows one item at a time -- and on the `quick` listener, whose entire
+    ceiling was that one grant, it was the only grant any device could hold at
+    all."""
     vault = TokenVault(tmp_path)
-    reader = vault.issue("reader", frozenset({Capability.CHAT}))
+    reader = vault.issue("reader", frozenset({Capability.RECALL}))
     client = build_api_client(build_fake_runtime(), vault)
     headers = {"Authorization": f"Bearer {reader}"}
 
@@ -97,17 +99,17 @@ def test_a_read_only_device_cannot_forget_even_one_item(tmp_path):
 
 
 # ─── capability tier: writing settings needs system_control ──────────────
-def test_saving_settings_demands_system_control_not_just_chat(tmp_path):
-    """The same ruling that moved forget-all off of chat: a phone paired
-    only for conversation must not be able to rewrite the daemon's own
-    CORS allow-list, switch the camera on, or flip any other setting.
-    Reading stays on chat -- proven here too, and that nothing changed.
+def test_saving_settings_demands_system_control_not_just_a_read(tmp_path):
+    """The same ruling that moved forget-all off of a read grant: a phone
+    paired only to watch must not be able to rewrite the daemon's own CORS
+    allow-list, switch the camera on, or flip any other setting. Reading
+    stays on OBSERVE -- proven here too, and that nothing changed.
     """
     vault = TokenVault(tmp_path)
-    chat_token = vault.issue("phone", frozenset({Capability.CHAT}))
+    watcher = vault.issue("phone", frozenset({Capability.OBSERVE}))
     runtime = build_fake_runtime()
     client = build_api_client(runtime, vault)
-    headers = {"Authorization": f"Bearer {chat_token}"}
+    headers = {"Authorization": f"Bearer {watcher}"}
 
     before = client.get("/v1/settings", headers=headers).json()["data"]["rows"]
 

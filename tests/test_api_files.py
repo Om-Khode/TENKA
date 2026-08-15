@@ -10,9 +10,9 @@ from tests.fakes.studio_runtime import FAKE_PNG_DATA_URI, build_fake_runtime
 def context(tmp_path):
     vault = TokenVault(tmp_path)
     full = vault.issue("studio", frozenset(Capability))
-    chat_only = vault.issue("phone", frozenset({Capability.CHAT}))
+    watcher = vault.issue("phone", frozenset({Capability.OBSERVE}))
     client = build_api_client(build_fake_runtime(), vault)
-    return client, {"Authorization": f"Bearer {full}"}, {"Authorization": f"Bearer {chat_only}"}
+    return client, {"Authorization": f"Bearer {full}"}, {"Authorization": f"Bearer {watcher}"}
 
 
 def test_listing_a_root_returns_its_entries(context):
@@ -91,22 +91,22 @@ def test_deleting_something_absent_is_404(context):
                           json={"path": "desktop/ghost.md"}).status_code == 404
 
 
-def test_a_chat_only_device_cannot_touch_files(context):
-    client, _, chat_only = context
-    assert client.get("/v1/files?path=desktop", headers=chat_only).status_code == 403
-    assert client.request("DELETE", "/v1/files", headers=chat_only,
+def test_a_watching_device_cannot_touch_files(context):
+    client, _, watcher = context
+    assert client.get("/v1/files?path=desktop", headers=watcher).status_code == 403
+    assert client.request("DELETE", "/v1/files", headers=watcher,
                           json={"path": "desktop/notes.md"}).status_code == 403
 
 
-def test_a_chat_only_device_cannot_read_file_content(context):
-    client, _, chat_only = context
-    response = client.get("/v1/files/content?path=desktop/notes.md", headers=chat_only)
+def test_a_watching_device_cannot_read_file_content(context):
+    client, _, watcher = context
+    response = client.get("/v1/files/content?path=desktop/notes.md", headers=watcher)
     assert response.status_code == 403
 
 
-def test_a_chat_only_device_cannot_rename(context):
-    client, _, chat_only = context
-    response = client.post("/v1/files/rename", headers=chat_only,
+def test_a_watching_device_cannot_rename(context):
+    client, _, watcher = context
+    response = client.post("/v1/files/rename", headers=watcher,
                            json={"path": "desktop/notes.md", "newName": "renamed.md"})
     assert response.status_code == 403
 
@@ -138,9 +138,9 @@ def test_roots_lists_the_configured_roots(context):
     assert response.json()["data"]["roots"] == ["desktop", "documents", "downloads"]
 
 
-def test_a_chat_only_device_cannot_list_roots(context):
-    client, _, chat_only = context
-    assert client.get("/v1/files/roots", headers=chat_only).status_code == 403
+def test_a_watching_device_cannot_list_roots(context):
+    client, _, watcher = context
+    assert client.get("/v1/files/roots", headers=watcher).status_code == 403
 
 
 # ─── Preview redaction ───────────────────────────────────────────────────
