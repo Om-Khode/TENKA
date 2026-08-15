@@ -11,6 +11,7 @@ Layering: io/api — core + config only.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -26,7 +27,10 @@ from fastapi.responses import JSONResponse
 from ...core.redact import redact_secrets
 from .context import request_id_var
 from .errors import to_http_exception
-from .events import EventHub, build_ack_frame, build_error_frame, build_status_frame
+from .events import (
+    EventHub, build_ack_frame, build_error_frame, build_status_frame,
+    visible_frame,
+)
 from .pairing import PairCodeStore
 from .policy import effective
 from .routes import chat as chat_routes
@@ -44,7 +48,9 @@ from .security import (
     CSRF_HEADER,
     AuditEntry,
     AuthState,
+    PublishedHosts,
     accepting_port,
+    anonymous_key,
     cookie_credential,
     device_key,
     host_is_allowed,
@@ -52,7 +58,7 @@ from .security import (
     policy_for_scope,
 )
 from .ui import UiBundle, mount_ui
-from .vault import Capability, TokenVault, VaultUnavailableError
+from .vault import Capability, Device, TokenVault, VaultUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +110,204 @@ class HostGate:
                     await send({"type": "http.response.body", "body": b""})
                 return
         await self.app(scope, receive, send)
+
+
+# The largest request body this API will read. Every write it serves is a
+# small JSON document -- the biggest bounded field in `schemas.py` is
+# `ChatRequest.text` at 8,000 characters -- so a megabyte is orders of
+# magnitude above any honest call and still small enough that a flood of them
+# cannot be a memory story. Deliberately one number for the whole API rather
+# than a per-route budget: the check has to run *before* routing and before
+# authentication, which is the entire point, and a limit that depends on
+# knowing which route was hit is a limit that cannot.
+MAX_BODY_BYTES = 1024 * 1024
+
+# How long the streaming refusal below is willing to keep reading a body it has
+# already decided to throw away. The drain exists so a client that is genuinely
+# mid-upload can finish writing and then read its 413 instead of seeing a
+# broken connection -- but a client that stops sending must not be able to hold
+# a server task open by simply going quiet, which is slowloris with extra
+# steps. Five seconds matches uvicorn's own `timeout_keep_alive` default, and
+# is far more than a loopback or LAN client needs to finish pushing the
+# byte-bounded remainder.
+DRAIN_TIMEOUT_SECONDS = 5.0
+
+
+class BodyLimit:
+    """Refuse an oversized request body. 413, before anything reads it.
+
+    Nothing in this stack bounded a body. Pydantic's field constraints are
+    checked *after* the whole body has been received off the socket and
+    parsed as JSON, and uvicorn has no application-body limit to set, so a
+    20 MiB POST to `/v1/chat` carrying no credential at all was buffered,
+    parsed (~40 MiB of Python heap, measured) and only then answered 401.
+    Authentication is not a bound on work when the work happens first.
+
+    That matters most where there is no credential to check: `POST /v1/pair`
+    is the one unauthenticated write in this API and it becomes publicly
+    reachable in 6b. It matters second-most because this daemon shares the
+    assistant's event loop -- buffering and parsing a large body is her time,
+    not just the API's.
+
+    Two halves, because a client picks which one applies, and they answer
+    differently on purpose:
+
+    - **A declared `Content-Length` over the cap is answered 413 immediately,
+      without calling `receive()` at all.** Not one byte is read, and nothing
+      is awaited. The first draft of this gate drained here too, out of the
+      same courtesy the streaming half extends -- and that turned it into a
+      slowloris primitive on the middleware added for availability: headers
+      declaring two megabytes followed by *nothing* got no response and pinned
+      a server task indefinitely, because uvicorn has no body-read timeout and
+      the drain sat in `await receive()` for a body that never came. A ~150
+      byte request should not be able to do that, least of all on the route
+      that goes public in 6b. The client's own header already said the request
+      is too big, so reading any of it is work done for a request that is
+      already refused, and waiting for it is worse than useless.
+    - **A chunked body (no `Content-Length`, or a lying one) is counted as it
+      streams**, through a wrapped `receive`. The moment the running total
+      crosses the cap the downstream app is cut off and the request is
+      answered 413. Here the drain *does* run -- this client is demonstrably
+      mid-upload, and letting it finish writing is what lets it read the 413
+      rather than a reset connection -- but it is bounded twice over: by bytes
+      (8x the cap) and by `DRAIN_TIMEOUT_SECONDS`, so a client that goes quiet
+      mid-body is dropped rather than waited on.
+
+    A header cannot be trusted to be the truth, so it is used only to refuse
+    early, never to permit: a body arriving under a small (or absent)
+    `Content-Length` is still counted on the way in.
+
+    Raw ASGI for the same reason `HostGate` is: it must cover routes that
+    never authenticate, it must not be something a route can forget to opt
+    into, and `BaseHTTPMiddleware` would consume the body itself.
+    """
+
+    def __init__(self, app, *, max_bytes: int = MAX_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        declared = next((value for key, value in scope.get("headers", ())
+                         if key == b"content-length"), None)
+        if declared is not None:
+            try:
+                if int(declared) > self.max_bytes:
+                    # No `receive()`, no drain, no await on anything the
+                    # client controls -- see the class docstring.
+                    await self._refuse(send)
+                    return
+            except ValueError:
+                # A malformed Content-Length is h11's problem, not this
+                # gate's -- it will reject the framing itself. Fall through
+                # to the streaming count, which does not trust the header
+                # anyway.
+                pass
+
+        read = 0
+        refused = False
+        # Whether the body has already been read to its end. `_drain` must not
+        # call `receive()` again once it has: an ASGI server is entitled to
+        # block that call until the response is complete, and the response is
+        # what this gate is on its way to send -- so a drain past the end of
+        # the body is a deadlock, not a courtesy.
+        body_done = False
+
+        async def counting_receive():
+            nonlocal read, refused, body_done
+            message = await receive()
+            if message["type"] == "http.request":
+                read += len(message.get("body", b"") or b"")
+                if not message.get("more_body", False):
+                    body_done = True
+                if read > self.max_bytes:
+                    refused = True
+                    # Ends the body as far as the app is concerned. The 413
+                    # below is what the client actually gets; this only stops
+                    # the downstream app from waiting on a body that is not
+                    # coming.
+                    return {"type": "http.disconnect"}
+            return message
+
+        async def guarded_send(message):
+            # Suppress whatever the app was about to answer once the body has
+            # already blown the cap -- the honest answer is 413, not the 400
+            # a truncated body would otherwise produce.
+            if refused:
+                return
+            await send(message)
+
+        try:
+            await self.app(scope, counting_receive, guarded_send)
+        except Exception:
+            # A truncated body reaches the app as `http.disconnect`, which
+            # Starlette turns into `ClientDisconnect` -- an exception raised
+            # *because* this gate cut the body off, not a failure worth
+            # surfacing as a 500. Anything raised while the body was still
+            # within the cap is a real error and re-raises untouched.
+            if not refused:
+                raise
+        if refused:
+            if not body_done:
+                await self._drain(receive)
+            await self._refuse(send)
+
+    async def _drain(self, receive) -> None:
+        """Read and discard what is left of a body already being refused.
+
+        Not politeness. A client still writing a body nobody is reading fills
+        the socket buffer and blocks, so it never reaches the point of reading
+        the answer -- it sees a broken connection and cannot tell "too large"
+        from "the daemon fell over". Each chunk is discarded as it arrives, so
+        the memory this gate exists to protect is never allocated; only
+        transfer time is paid, and the sender pays it too.
+
+        Bounded twice, because an unbounded drain is the same denial of
+        service by another name. By bytes: past 8x the cap the connection is
+        left to break, which is the honest answer to a client that will not
+        stop. And by time: `DRAIN_TIMEOUT_SECONDS` caps how long a client can
+        keep this task alive by trickling, or by simply going silent
+        mid-body -- uvicorn has no body-read timeout of its own, so this is
+        the only thing standing between a half-sent body and a pinned task.
+
+        Only ever called when the body is known *not* to be finished. Calling
+        `receive()` after the last chunk is a deadlock, not a courtesy: an
+        ASGI server is entitled to block that call until the response is
+        complete, and the response is what this gate is on its way to send.
+        """
+        async def _pull() -> None:
+            drained = 0
+            limit = self.max_bytes * 8
+            while drained < limit:
+                message = await receive()
+                if message["type"] != "http.request":
+                    return
+                drained += len(message.get("body", b"") or b"")
+                if not message.get("more_body", False):
+                    return
+
+        try:
+            await asyncio.wait_for(_pull(), timeout=DRAIN_TIMEOUT_SECONDS)
+        except Exception:
+            # Timed out, disconnected, or the transport failed underneath.
+            # (`CancelledError` is a `BaseException` and is deliberately not
+            # caught -- a shutdown is not a slow client.)
+            # The 413 is sent either way; whether it arrives is now the
+            # client's problem, and it stopped being ours the moment it went
+            # quiet holding a body it said it would send.
+            pass
+
+    async def _refuse(self, send) -> None:
+        """Answer 413. Nothing is read and nothing is awaited on the client."""
+        await send({"type": "http.response.start", "status": 413,
+                    "headers": [(b"content-type", b"application/json"),
+                                (b"content-length", b"27")]})
+        await send({"type": "http.response.body",
+                    "body": b'{"detail":"body too large"}'})
+
 
 # Route modules are mounted with plain `include_router` -- the call every
 # later route module's brief in this milestone instructs. An earlier
@@ -164,7 +368,16 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # Hostnames a running transport has published, filled in by the transport
     # itself. Mutable and shared with `HostGate` on purpose: a tunnel's public
     # name is not knowable when the app is built.
-    published_hosts: set[str] = set()
+    #
+    # `PublishedHosts`, not a bare `set`, because the lifetime matters as much
+    # as the membership: a hostname is trusted for as long as the transport
+    # session that published it is running, and `unpublish(owner)` takes it
+    # back. A set had no way to express the second half, so a `*.trycloudflare
+    # .com` name -- which Cloudflare reassigns to somebody else once the
+    # tunnel stops -- stayed an accepted `Host` and a trusted `Origin` for the
+    # life of the process. See the class docstring for why that is a session
+    # credential handed to a stranger rather than merely a stale entry.
+    published_hosts = PublishedHosts()
     app.state.published_hosts = published_hosts
     app.state.cors_origins = list(origins)
 
@@ -190,6 +403,26 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # not a "credential" in the CORS sense -- so the dev server's bearer flow
     # keeps working.
     serves_local = any(name == "local" for name in app.state.listener_policies.values())
+
+    # Added FIRST, so it ends up INNERMOST of the three. `add_middleware`
+    # inserts at index 0, so the last one added is the outermost -- which is
+    # the whole reason the ordering above reads backwards, and the reason an
+    # earlier revision of this block put `BodyLimit` between CORS and HostGate
+    # while its comment claimed it sat inside CORS. It sat outside, and a
+    # cross-origin 413 carried no `Access-Control-Allow-Origin` while a 401
+    # under the same cap did.
+    #
+    # Inside is the side worth being on, so the ordering moved rather than the
+    # comment: a response that skips CORS is reported by the browser as "could
+    # not reach her" rather than as a refusal -- exactly the trap the
+    # `BackupProviderError` handler further down was added for -- and a 413 a
+    # developer cannot see is a 413 they will debug as a network fault. It
+    # costs nothing: `CORSMiddleware` never touches a request body, so putting
+    # it outside adds one cheap frame and no buffering. `BodyLimit` still runs
+    # before routing, before authentication and before anything reads a byte,
+    # which is the property that actually matters.
+    app.add_middleware(BodyLimit)
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins if serves_local else [],
@@ -347,7 +580,11 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         # same AuditLog, so a socket connection is not the one surface that
         # leaves no trace either way.
         auth: AuthState = app.state.auth
-        source = websocket.client.host if websocket.client else "unknown"
+        # `anonymous_key`, not `websocket.client.host`: keyed exactly like
+        # `authenticate()`, and for the reason spelled out there -- a client
+        # address can be rewritten by a proxy header, and a budget a caller
+        # can rotate is not a budget.
+        source = anonymous_key(websocket.scope)
         device = None
 
         def _audit(outcome: str) -> None:
@@ -468,8 +705,14 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             # -- must not tear down a connection that would otherwise
             # succeed, just because a bookkeeping write couldn't land this
             # time.
+            #
+            # Off the loop, same as `authenticate()`'s call to this: the
+            # write half spawns `icacls` synchronously, and a handshake is
+            # not a reason for every other request this daemon is serving --
+            # and the assistant sharing its loop -- to stop for tens of
+            # milliseconds.
             try:
-                auth.vault.touch(device.device_id)
+                await asyncio.to_thread(auth.vault.touch, device.device_id)
             except VaultUnavailableError as exc:
                 logger.warning(f"[API] could not record last-seen for "
                                f"{device.device_id}: {exc}")
@@ -486,17 +729,81 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
 
         _audit("accepted")
 
+        # ─── the socket is not a credential ──────────────────────────────
+        # `device` above was resolved once, at the handshake. Everything this
+        # daemon says about revocation depends on that answer never being
+        # reused: `_COOKIE_MAX_AGE_SECONDS`'s docstring defends a one-year
+        # cookie on the grounds that "a revoked device is refused on its very
+        # next request no matter how long its cookie claims to live", and that
+        # is true because `TokenVault.verify()` re-reads devices.json every
+        # time. An accepted socket was the one exception -- it kept receiving
+        # every hub frame and kept reaching `runtime.chat.abort()` through its
+        # write verb, while HTTP from the same device was already answering
+        # 401. A kill switch with an exception is not a kill switch.
+        #
+        # So the handshake's answer is re-derived, never cached, and on both
+        # paths:
+        #
+        #   - Outbound, per frame, by the hub (`EventHub.attach(viewer=...)`
+        #     calls this before every delivery). That makes revocation
+        #     immediate for anything the socket would actually have received.
+        #   - Outbound, on a timer, by the hub's revalidate sweep. A device
+        #     that only *listens* never sends a frame, and a quiet assistant
+        #     publishes none, so the per-frame check alone would cut off the
+        #     busiest sockets first and a silent one never.
+        #   - Inbound, per frame, right here in the receive loop -- unthrottled,
+        #     because that is the write verb and any window at all on it is
+        #     the hole.
+        #
+        # The cost is one `verify()` per frame, which is exactly what every
+        # HTTP request already pays; the outbound frame rate is set by the
+        # assistant's own work, not by the client, so it cannot be driven up
+        # from the far end.
+        def _reverify() -> Device | None:
+            """The device as it stands right now, narrowed by this listener,
+            or `None` if this connection may no longer hold the socket."""
+            fresh = auth.vault.verify(token)
+            if fresh is None or fresh.device_id != device.device_id:
+                return None
+            grants = effective(fresh.grants, policy)
+            if not grants or Capability.OBSERVE not in grants:
+                return None
+            return replace(fresh, grants=grants)
+
+        def _viewer() -> frozenset[Capability] | None:
+            """What the hub asks: what may this socket see now, or `None`."""
+            current = _reverify()
+            return current.grants if current is not None else None
+
         async def _safe_send(payload: dict) -> None:
+            # Through `visible_frame`, like every frame the hub delivers.
+            # This is the socket's *other* send path -- the connect frame and
+            # the `error`/`ack` replies app.py builds itself -- and routing it
+            # around the classifier would be the one exception to "classify
+            # the field once, not per call site", which is exactly the rule
+            # the `detail` leak came from breaking. `build_error_frame` even
+            # emits a field named `detail`; its four values are all protocol
+            # literals ("malformed frame", "unknown frame", "not permitted",
+            # "unauthorized") and `_USER_CONTENT_FIELDS` says so by not
+            # listing the `error` type -- but that is now a decision recorded
+            # in the table, enforceable from one place, rather than a call
+            # site that happens to be harmless today.
+            #
+            # `device.grants` is the live narrowed set: the receive loop below
+            # reassigns `device` from `_reverify()` on every inbound frame, so
+            # a grant narrowed mid-connection reaches this the same way it
+            # reaches the hub.
+            #
             # A socket that already broke between the failed receive/abort
             # and this reply must end cleanly through the finally below, not
             # on a second, unhandled exception raised by the reply itself.
             try:
-                await websocket.send_json(payload)
+                await websocket.send_json(visible_frame(payload, device.grants))
             except Exception:
                 pass
 
         await websocket.accept()
-        await app.state.hub.attach(websocket)
+        await app.state.hub.attach(websocket, _viewer)
         try:
             info = await app.state.runtime.system.status()
             # Same builder as every real status frame (`build_status_frame`,
@@ -510,6 +817,14 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             # from a silent one. Device id only -- never the credential.
             logger.info(f"[API] Studio client attached to /v1/events "
                         f"(device={device.device_id})")
+            # `_safe_send` puts this through `visible_frame` like every
+            # hub-delivered frame. `detail` on a status frame is withheld from
+            # a device without RECALL (see events.py for the argument), and
+            # the connect frame is a status frame -- exempting it because
+            # *this* producer happens to pass something harmless is how a
+            # field ends up classified per call site instead of once. Nothing
+            # is lost: the active model rides the OBSERVE-gated telemetry
+            # frame and `GET /v1/status` already.
             await _safe_send(build_status_frame(phase="connected",
                                                  detail=info.active_model))
             while True:
@@ -529,12 +844,31 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                 if not isinstance(frame, dict) or frame.get("type") != "abort":
                     await _safe_send(build_error_frame("unknown frame"))
                     continue
-                # `device` was resolved once, before accept() -- re-verifying
-                # the vault per frame would cost a hash comparison on every
-                # frame a chatty client sends for no gain, since capability
-                # grants can't change mid-connection. OBSERVE alone must not
-                # be enough here: see the handshake comment above for why the
-                # write verb is gated separately from the stream.
+                # Re-verified per frame, against the vault, before the write
+                # verb is honoured. The comment that used to sit here argued
+                # the opposite -- that re-verification was wasted work
+                # "since capability grants can't change mid-connection" --
+                # and revocation is precisely the thing that falsifies that
+                # premise: a device cut off a second ago kept driving
+                # `runtime.chat.abort()` through this branch for as long as it
+                # held the socket open. A closed door that only checks who you
+                # are on the way in is a door that was never closed.
+                #
+                # Refused and *closed*, not merely refused: a device that no
+                # longer verifies has no business holding the stream either,
+                # and leaving it attached would mean the read half outlived
+                # the write half's own check. The error frame goes first so
+                # the client learns why rather than seeing an unexplained
+                # drop.
+                current = _reverify()
+                if current is None:
+                    _audit("1008")
+                    await _safe_send(build_error_frame("unauthorized"))
+                    break
+                device = current
+                # OBSERVE alone must not be enough here: see the handshake
+                # comment above for why the write verb is gated separately
+                # from the stream.
                 if Capability.CHAT_SEND not in device.grants:
                     _audit("403")
                     await _safe_send(build_error_frame("not permitted"))

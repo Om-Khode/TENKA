@@ -60,11 +60,89 @@ import asyncio
 import contextlib
 import logging
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from .routes.system import telemetry_body
+from .vault import Capability
 
 logger = logging.getLogger(__name__)
+
+# How often an attached socket is re-checked when no frame is flowing. The
+# per-frame check below makes revocation immediate for anything actually
+# delivered; this is what covers the device that only *listens* -- it never
+# sends a frame to be checked on, and a quiet assistant publishes none either,
+# so without this a revoked watcher could sit attached indefinitely simply by
+# being lucky about timing. Two seconds matches the telemetry sampler's own
+# cadence: the same order as "the next thing that would have reached it".
+_REVALIDATE_INTERVAL_SECONDS = 2.0
+
+# Fields on a wire frame that carry what the *user* said, as opposed to facts
+# about the assistant, and the grant it therefore takes to see them.
+#
+# `detail` is the whole list today, and it earns its place by its producers
+# rather than by its name: `status_broadcaster.set(detail=...)` is called with
+# `goal`, `target`, the text about to be typed, a URL, an app name, a search
+# query and the sentence TENKA is about to speak, from `actions/`,
+# `code_executor/` and `io/audio/`. Some producers pass a fixed literal
+# ("synthesizing", "running the code") instead -- but the field has no schema
+# that separates the two, and any allow-list of "safe" details would be the
+# app-specific hardcoding this project does not do. So the field is classified
+# by its worst producer, which is the only classification that stays true when
+# somebody adds the next one.
+#
+# RECALL, specifically. `policy.py` argues that grant carries "the entire
+# knowledge graph and every transcript", and that excluding SCREEN while
+# admitting stored data "withheld the photograph and shipped the description
+# of it". The first forty characters of what she was asked to do is that
+# description, arriving live. A device paired to watch -- and the Cloudflare
+# `quick` tunnel, whose {OBSERVE} ceiling exists precisely to keep the user's
+# content away from an intermediary that reads the plaintext -- keeps
+# everything that is about *her*: `phase`, `step`, `tier`, `cursorFollows`,
+# `ts`. Nothing approved as observable is lost, including which model is
+# active: that rides `telemetry_body()` (the `"telemetry"` frame and
+# `GET /v1/telemetry`) and `GET /v1/status`, all of them OBSERVE-gated
+# already, so it reaches a watching device by the routes that were always
+# meant to carry it.
+#
+# Absence from this table is a decision, not an oversight, and the two absent
+# types are worth naming because one of them is a trap. `telemetry` carries
+# cpu, ram, battery, active model and uptime -- facts about the machine, none
+# of them anything the user said. `error` carries a field *also* called
+# `detail` (`build_error_frame`), which is exactly the coincidence that gets a
+# field classified per call site instead of once: its values are four protocol
+# literals ("malformed frame", "unknown frame", "not permitted",
+# "unauthorized") and they describe the socket, not the person using it. Both
+# types still pass through `visible_frame` -- `app.py`'s `_safe_send` sends
+# nothing that does not -- so if either ever grows a user-derived field, the
+# fix is one row here and the enforcement is already wired.
+_USER_CONTENT_FIELDS: dict[str, tuple[str, ...]] = {
+    "status": ("detail",),
+}
+_USER_CONTENT_CAPABILITY = Capability.RECALL
+
+
+def visible_frame(frame: dict, grants: frozenset[Capability] | None) -> dict:
+    """`frame` as a device holding `grants` may see it.
+
+    Blanked, never dropped: `test_the_connect_frame_and_a_real_status_frame_
+    share_one_shape` and the client that relies on it both require every
+    `"status"` frame to carry the identical key set, so a withheld field
+    stays present as `""`. A client cannot tell "she was given no detail"
+    from "you may not read it" -- which is the correct answer to give a
+    device that may not read it.
+
+    `grants` of `None` means "no capability model applies here" -- a caller
+    that attached a socket without one (test scaffolding). Unfiltered, as it
+    was before this existed.
+    """
+    if grants is None:
+        return frame
+    if _USER_CONTENT_CAPABILITY in grants:
+        return frame
+    fields = _USER_CONTENT_FIELDS.get(frame.get("type", ""), ())
+    if not fields:
+        return frame
+    return {**frame, **{name: "" for name in fields if name in frame}}
 
 
 # ─── frame builders ─────────────────────────────────────────────────────────
@@ -148,10 +226,27 @@ def build_ack_frame(of: str) -> dict:
 
 
 class EventHub:
+    """Fan-out with a live authorisation check attached to each socket.
+
+    A socket is not a credential that was checked once. `attach()` takes a
+    `viewer` callable -- "what may this connection see *right now*?" -- and
+    the hub consults it before every frame it delivers and on a timer while
+    nothing is flowing. `None` from that callable means the connection is no
+    longer authorised at all, and the hub closes it rather than delivering.
+    See `app.py`'s socket handler for the implementation of one, and the
+    revocation argument for why an accepted socket cannot be trusted for its
+    own lifetime.
+    """
+
     def __init__(self) -> None:
-        self._sockets: set[Any] = set()
+        # socket -> viewer callable (or None when a caller attached without
+        # one). A dict rather than the set this used to be, because "who is
+        # on the other end of this socket" is now something the hub has to be
+        # able to answer per socket, not just per fan-out.
+        self._sockets: dict[Any, Callable[[], frozenset[Capability] | None] | None] = {}
         self._queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=1_000)
         self._telemetry_task: asyncio.Task | None = None
+        self._revalidate_task: asyncio.Task | None = None
         self._pump_task: asyncio.Task | None = None
         self._runtime = None
         self._interval = 2.0
@@ -170,25 +265,40 @@ class EventHub:
     def telemetry_running(self) -> bool:
         return self._telemetry_task is not None and not self._telemetry_task.done()
 
-    async def attach(self, socket) -> None:
+    async def attach(self, socket,
+                     viewer: Callable[[], frozenset[Capability] | None] | None = None) -> None:
+        """Start delivering to `socket`.
+
+        `viewer` is re-consulted, not cached: it must answer "what may this
+        connection see now", by whatever means its owner considers
+        authoritative (`app.py` re-reads the vault). Returning `None` closes
+        the socket. Left unset -- test scaffolding attaching a bare object --
+        the socket is delivered to unconditionally and unfiltered, exactly as
+        before this parameter existed.
+        """
         # Captured here too, not just in start(): a test harness (or a
         # deployment that never calls start() before the first connection)
         # still needs publish() to land on the loop actually running this
         # socket's pump, not on whatever loop happened to exist first.
         self._set_loop(asyncio.get_running_loop())
-        self._sockets.add(socket)
+        self._sockets[socket] = viewer
         if self._pump_task is None:
             self._pump_task = asyncio.create_task(self._pump())
+        if self._revalidate_task is None:
+            self._revalidate_task = asyncio.create_task(self._revalidate())
         if self._telemetry_task is None and self._runtime is not None:
             self._telemetry_task = asyncio.create_task(self._sample_telemetry())
 
     async def detach(self, socket) -> None:
-        self._sockets.discard(socket)
-        if not self._sockets and self._telemetry_task is not None:
-            self._telemetry_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._telemetry_task
-            self._telemetry_task = None
+        self._sockets.pop(socket, None)
+        if not self._sockets:
+            for name in ("_telemetry_task", "_revalidate_task"):
+                task = getattr(self, name)
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+                    setattr(self, name, None)
 
     # ─── fan-out ────────────────────────────────────────────────────────
     def publish(self, event: dict) -> None:
@@ -234,17 +344,75 @@ class EventHub:
         except asyncio.QueueFull:
             logger.warning("[API] event queue full; dropping a frame")
 
+    async def _drop(self, socket, *, close: bool) -> None:
+        """Forget a socket, optionally closing it first.
+
+        Never `detach()`: this is called from `_pump` and `_revalidate`, and
+        `detach()` awaits the cancellation of the revalidate task, which from
+        inside that task is a wait on itself.
+        """
+        self._sockets.pop(socket, None)
+        if not close:
+            return
+        try:
+            await socket.close(code=1008)
+        except Exception:
+            # Already gone, half-closed, or a stub in a test. The socket is
+            # out of `_sockets` either way, which is the part that matters.
+            pass
+
     async def _pump(self) -> None:
         while True:
             event = await self._queue.get()
-            dead = []
-            for socket in list(self._sockets):
+            for socket, viewer in list(self._sockets.items()):
+                # Authorisation, re-asked per frame. The handshake's answer is
+                # never reused: a device revoked a moment ago must not receive
+                # this frame, and `TokenVault.verify()` re-reading disk on
+                # every call is the only reason the one-year cookie is
+                # defensible in the first place. HTTP already pays exactly
+                # this cost per request; the socket's frame rate is set by the
+                # assistant's own work, not by the client, so it cannot be
+                # driven up from the other end.
+                grants = None
+                if viewer is not None:
+                    try:
+                        grants = viewer()
+                    except Exception:
+                        grants = None
+                    if grants is None:
+                        logger.info("[API] closing an event socket whose "
+                                    "device is no longer authorised")
+                        await self._drop(socket, close=True)
+                        continue
                 try:
-                    await socket.send_json(event)
+                    await socket.send_json(visible_frame(event, grants))
                 except Exception:
-                    dead.append(socket)
-            for socket in dead:
-                self._sockets.discard(socket)
+                    await self._drop(socket, close=False)
+
+    async def _revalidate(self) -> None:
+        """Close sockets whose device stopped being authorised, on a timer.
+
+        The per-frame check in `_pump` covers every socket a frame reaches.
+        This covers the one it does not: a device that only listens sends
+        nothing to be checked on, and a quiet assistant publishes nothing
+        either, so revocation would otherwise wait on traffic that may never
+        come. This is the outbound half of "an accepted socket is not a
+        credential" -- without it, the loudest devices are cut off first and
+        the silent ones last, which is exactly backwards.
+        """
+        while True:
+            await asyncio.sleep(_REVALIDATE_INTERVAL_SECONDS)
+            for socket, viewer in list(self._sockets.items()):
+                if viewer is None:
+                    continue
+                try:
+                    still = viewer()
+                except Exception:
+                    still = None
+                if still is None:
+                    logger.info("[API] closing an idle event socket whose "
+                                "device is no longer authorised")
+                    await self._drop(socket, close=True)
 
     async def _sample_telemetry(self) -> None:
         while True:
@@ -267,11 +435,12 @@ class EventHub:
             self._pump_task = asyncio.create_task(self._pump())
 
     async def stop(self) -> None:
-        for task in (self._telemetry_task, self._pump_task):
+        for task in (self._telemetry_task, self._revalidate_task, self._pump_task):
             if task is not None:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
         self._telemetry_task = None
+        self._revalidate_task = None
         self._pump_task = None
         self._sockets.clear()

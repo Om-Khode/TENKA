@@ -59,8 +59,38 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     app = create_app(runtime, vault, origins=origins, hub=hub,
                      listener_policies={port: "local"}, ui_bundle=ui_bundle,
                      pair_store=pair_store)
+    # `proxy_headers=False`, explicitly, and it is a security setting rather
+    # than a preference. Uvicorn's default is True with
+    # `forwarded_allow_ips="127.0.0.1"`, which installs
+    # `ProxyHeadersMiddleware` and lets it rewrite `scope["client"]` from the
+    # `X-Forwarded-For` header on any connection whose peer is loopback --
+    # which is *every* tunnelled connection, because `cloudflared` and
+    # `tailscale funnel` both connect to this daemon from 127.0.0.1.
+    #
+    # Two things in this codebase are keyed on `request.client.host`: the
+    # anonymous rate-limit budget and the exponential auth lockout
+    # (`security.py`'s `authenticate()`), and both are documented as safe on
+    # the grounds that a tunnel collapses every remote caller onto one shared
+    # key. With the default in force that reasoning was simply wrong -- ten
+    # wrong-token guesses under one `X-Forwarded-For` value lock that value
+    # out, and the next request under a different value is answered as a
+    # fresh, unmetered caller. The lockout and the window were both rotatable
+    # by a header, and `RateLimiter` grew one permanent entry per distinct
+    # value on the way. (Task 10's review missed this because `TestClient`
+    # speaks ASGI directly and never installs uvicorn's middleware at all;
+    # only a real `server.serve()` shows it.)
+    #
+    # Turning it off is the right direction rather than trusting the header
+    # more carefully: nothing in this daemon wants a client-supplied address.
+    # Policy comes from the accepting port, the `Host` gate is a rejection
+    # list, and the two budgets above are better off metering the one peer
+    # they can actually see. The cost is that a tunnel's traffic all meters
+    # as one caller -- which is exactly what the code already claims, and now
+    # true. `forwarded_allow_ips` is pinned to an empty list as well so that
+    # re-enabling the middleware by accident still trusts nobody.
     config = uvicorn.Config(app, host=host, port=port, log_level="warning",
-                            access_log=False, lifespan="on")
+                            access_log=False, lifespan="on",
+                            proxy_headers=False, forwarded_allow_ips=[])
     server = uvicorn.Server(config)
 
     async def _run() -> None:
