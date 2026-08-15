@@ -9,6 +9,10 @@ untrusted input.
 """
 from __future__ import annotations
 
+import threading
+
+import pytest
+
 from assistant.io.api.pairing import CODE_TTL_SECONDS, PairCodeStore, _ALPHABET
 from assistant.io.api.vault import Capability
 
@@ -73,3 +77,69 @@ def test_codes_do_not_repeat():
     store = PairCodeStore()
     seen = {store.mint("p", frozenset({Capability.CHAT})).code for _ in range(200)}
     assert len(seen) == 200
+
+
+# ─── Fix round 1 additions ───────────────────────────────────────────────
+
+def test_repr_never_reveals_the_code():
+    """A dataclass's default __repr__ prints every field. Without
+    `field(repr=False)` on `code`, an f-string, an uncaught exception, or
+    pytest's own assertion-rewrite on a failing `==` would put a live pair
+    code straight into a log or terminal."""
+    pair_code = PairCodeStore().mint("phone", frozenset({Capability.CHAT}))
+    rendered = repr(pair_code)
+    assert pair_code.code not in rendered
+    assert "phone" in rendered                # non-secret fields still show
+
+
+def test_mint_refuses_an_empty_grant_set():
+    """Mirrors TokenVault.issue(): a zero-grant credential can still
+    authenticate, turning any route gated by authentication alone into an
+    oracle. Refused at the source, not surfaced from inside issue() later."""
+    with pytest.raises(ValueError):
+        PairCodeStore().mint("phone", frozenset())
+
+
+def test_concurrent_consumers_race_for_one_code():
+    """The whole read-compare-clear sits inside one lock acquisition. A
+    regression that released the lock between the compare and the clear
+    would let two threads both see a match before either clears the slot --
+    a single-threaded exactly-once test cannot catch that; only a real race
+    can."""
+    store = PairCodeStore()
+    code = store.mint("phone", frozenset({Capability.CHAT})).code
+    results: list[object] = [None] * 50
+    barrier = threading.Barrier(50)
+
+    def attempt(i: int) -> None:
+        barrier.wait()
+        results[i] = store.consume(code)
+
+    threads = [threading.Thread(target=attempt, args=(i,)) for i in range(50)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    successes = [r for r in results if r is not None]
+    assert len(successes) == 1
+
+
+def test_a_wrong_guess_does_not_burn_the_live_code():
+    """Only a matching code may clear the slot. Otherwise one garbage guess
+    -- accidental or an attacker fishing -- would kill a legitimate pairing
+    session before its owner ever gets to redeem it."""
+    store = PairCodeStore()
+    code = store.mint("phone", frozenset({Capability.CHAT})).code
+    assert store.consume("WRONG-CODE") is None
+    assert store.consume(code) is not None
+
+
+def test_consume_rejects_non_str_and_oversized_input_without_raising():
+    """The brief's untrusted-input test only covers malformed strings.
+    `consume` also has to survive a caller passing the wrong type entirely,
+    and a wire value with no realistic relation to a 9-character code."""
+    store = PairCodeStore()
+    store.mint("phone", frozenset({Capability.CHAT}))
+    for bad in (None, b"7K2M-9QX4", 12345, "X" * 10_000):
+        assert store.consume(bad) is None

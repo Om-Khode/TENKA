@@ -23,7 +23,7 @@ import hmac
 import secrets
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .vault import Capability
 
@@ -36,10 +36,22 @@ _ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 # left on an unattended screen is worthless within a few minutes.
 CODE_TTL_SECONDS = 180.0
 
+# A real code is always 9 chars ("XXXX-XXXX"). Anything wildly longer than
+# that arriving in `consume()` is not a typo, it is either a bug upstream or
+# a probe -- reject before `.encode()` ever touches it rather than paying to
+# encode and compare an attacker-chosen blob.
+_MAX_CODE_LENGTH = 64
+
 
 @dataclass(frozen=True)
 class PairCode:
-    code: str                        # "7K2M-9QX4"
+    # `repr=False`: a dataclass's default __repr__ prints every field, and
+    # this one is the live credential itself. Without this, an f-string, an
+    # uncaught exception, or pytest's assertion-rewrite on a failing
+    # `==` comparison would put a working pair code straight into a log or
+    # terminal. `label`, `grants`, and `expires_at` carry nothing secret, so
+    # they stay in the default repr.
+    code: str = field(repr=False)    # "7K2M-9QX4"
     label: str
     grants: frozenset[Capability]
     expires_at: float                # time.monotonic() basis
@@ -64,7 +76,17 @@ class PairCodeStore:
     def mint(
         self, label: str, grants: frozenset[Capability], *, now: float | None = None
     ) -> PairCode:
-        """Create a new code, replacing (invalidating) any code already live."""
+        """Create a new code, replacing (invalidating) any code already live.
+
+        Mirrors `TokenVault.issue()`'s refusal of an empty grant set, for the
+        same reason: a device that authenticates with zero capabilities can
+        still reach any route gated by authentication alone, turning it into
+        an oracle. Raising here means the empty set is rejected at the
+        source, not surfaced as a `ValueError` from inside `issue()` once
+        Task 10 feeds a zero-grant code through the pairing route.
+        """
+        if not grants:
+            raise ValueError("a pair code must carry at least one capability")
         moment = time.monotonic() if now is None else now
         pair_code = PairCode(
             code=_generate_code(),
@@ -89,6 +111,13 @@ class PairCodeStore:
         text and must not be allowed to raise out of this method.
         """
         moment = time.monotonic() if now is None else now
+        if not isinstance(code, str) or len(code) > _MAX_CODE_LENGTH:
+            # Reject before encoding: this module never trusts the wire, and
+            # it backs the only unauthenticated write in the API. A caller
+            # upstream may add its own body-size limits, but that is a
+            # different layer -- this one refuses on its own terms rather
+            # than relying on Task 10's route to have remembered to.
+            return None
         with self._lock:
             current = self._current
             if current is None:
@@ -97,9 +126,7 @@ class PairCodeStore:
                 matches = hmac.compare_digest(
                     current.code.encode("utf-8"), code.encode("utf-8")
                 )
-            except (UnicodeEncodeError, AttributeError):
-                # AttributeError guards a non-str `code` (e.g. None) reaching
-                # here from a caller that skipped validation upstream.
+            except UnicodeEncodeError:
                 return None
             if not matches:
                 return None
