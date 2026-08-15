@@ -1,10 +1,8 @@
 """File routes carry their own grant and refuse anything outside a root."""
 import pytest
-from fastapi.testclient import TestClient
-
 from assistant.core.redact import redact_secrets_strict
-from assistant.io.api.app import create_app
 from assistant.io.api.vault import Capability, TokenVault
+from tests.fakes.api_client import build_api_client
 from tests.fakes.studio_runtime import FAKE_PNG_DATA_URI, build_fake_runtime
 
 
@@ -13,8 +11,7 @@ def context(tmp_path):
     vault = TokenVault(tmp_path)
     full = vault.issue("studio", frozenset(Capability))
     chat_only = vault.issue("phone", frozenset({Capability.CHAT}))
-    client = TestClient(create_app(build_fake_runtime(), vault,
-                                   origins=["http://localhost:3000"]))
+    client = build_api_client(build_fake_runtime(), vault)
     return client, {"Authorization": f"Bearer {full}"}, {"Authorization": f"Bearer {chat_only}"}
 
 

@@ -1,9 +1,7 @@
 """Telemetry, backup and enrollment — including the restore that must be real."""
 import pytest
-from fastapi.testclient import TestClient
-
-from assistant.io.api.app import create_app
 from assistant.io.api.vault import Capability, TokenVault
+from tests.fakes.api_client import build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
 PHRASE = "amber moss steel gold bone quiet signal drift"
@@ -13,7 +11,7 @@ PHRASE = "amber moss steel gold bone quiet signal drift"
 def context(tmp_path):
     vault = TokenVault(tmp_path)
     runtime = build_fake_runtime()
-    client = TestClient(create_app(runtime, vault, origins=["http://localhost:3000"]))
+    client = build_api_client(runtime, vault)
     tokens = {
         "full": vault.issue("studio", frozenset(Capability)),
         "chat": vault.issue("phone", frozenset({Capability.CHAT})),

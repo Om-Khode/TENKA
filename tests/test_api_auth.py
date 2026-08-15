@@ -1,11 +1,11 @@
 """Nothing is reachable without a token. Not even status."""
 import pytest
 from fastapi import APIRouter, Depends
-from fastapi.testclient import TestClient
 
 from assistant.io.api.app import create_app
-from assistant.io.api.security import RateLimiter, require
+from assistant.io.api.security import COOKIE_NAME, RateLimiter, require
 from assistant.io.api.vault import Capability, TokenVault
+from tests.fakes.api_client import ApiTestClient, build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
 ALL = frozenset(Capability)
@@ -21,7 +21,7 @@ def token(vault):
     return vault.issue("studio", ALL)
 
 
-def _client(vault: TokenVault) -> TestClient:
+def _client(vault: TokenVault) -> ApiTestClient:
     """Build a client against a caller-supplied vault.
 
     The `client` fixture below covers the common case of one vault per test;
@@ -29,8 +29,7 @@ def _client(vault: TokenVault) -> TestClient:
     they construct themselves, so the app-building step is pulled out here
     rather than duplicated per test.
     """
-    app = create_app(build_fake_runtime(), vault, origins=["http://localhost:3000"])
-    return TestClient(app)
+    return build_api_client(build_fake_runtime(), vault)
 
 
 @pytest.fixture()
@@ -154,7 +153,7 @@ def test_the_sweep_catches_a_route_registered_without_auth(vault):
     regressed to something that can be dodged by registration style, which
     is exactly the gap `_sweep_v1_routes_require_auth` exists to close.
     """
-    app = create_app(build_fake_runtime(), vault, origins=["http://localhost:3000"])
+    leaky_client = build_api_client(build_fake_runtime(), vault)
 
     leaky = APIRouter()
 
@@ -162,8 +161,7 @@ def test_the_sweep_catches_a_route_registered_without_auth(vault):
     async def leaky_handler():
         return {"ok": True}
 
-    app.include_router(leaky, prefix="/v1")
-    leaky_client = TestClient(app)
+    leaky_client.app.include_router(leaky, prefix="/v1")
 
     with pytest.raises(AssertionError, match="answered 200"):
         _sweep_v1_routes_require_auth(leaky_client)
@@ -225,7 +223,9 @@ def test_the_events_socket_stays_a_read_gate(tmp_path):
     NOT start demanding CHAT_SEND -- a reader device keeps its live view."""
     vault = TokenVault(tmp_path)
     token = vault.issue("reader", frozenset({Capability.CHAT}))
-    with _client(vault).websocket_connect(f"/v1/events?access_token={token}") as ws:
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+    with client.websocket_connect("/v1/events") as ws:
         assert ws is not None
 
 
@@ -234,11 +234,14 @@ def test_openapi_is_not_public(client):
         assert client.get(path).status_code in (401, 404)
 
 
-def test_the_query_string_exception_is_only_the_socket():
-    """One route may take a token from the query string. Exactly one."""
-    import pathlib
-    source = pathlib.Path("assistant/io/api/app.py").read_text(encoding="utf-8")
-    assert source.count("query_params.get(\"access_token\"") == 1
+# `test_the_query_string_exception_is_only_the_socket` lived here: it pinned
+# that exactly one route -- the event socket -- read its token from the query
+# string. That exception no longer exists; the socket authenticates by cookie
+# like everything else, so the property to pin inverted with it. Its successor
+# is `test_no_source_file_reads_access_token` in test_api_cookie_auth.py,
+# which asserts the string appears in *no* source file under io/api. Replaced
+# rather than deleted, because a query-string credential reappearing is
+# exactly the regression the original test existed to catch.
 
 
 def test_a_bad_tenka_secret_fails_at_app_build_not_per_request(tmp_path, monkeypatch):
@@ -334,7 +337,7 @@ def test_the_hiding_guard_catches_a_route_that_opts_out_of_the_schema(vault):
     is invisible to a naive `app.routes` scan in this FastAPI version --
     proven by using that naive scan here and showing it finds nothing.
     """
-    app = create_app(build_fake_runtime(), vault, origins=["http://localhost:3000"])
+    app = build_api_client(build_fake_runtime(), vault).app
     hidden = APIRouter()
 
     @hidden.get("/hidden", include_in_schema=False)

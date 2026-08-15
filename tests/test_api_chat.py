@@ -1,9 +1,7 @@
 """Chat enters the existing pipeline, one turn at a time."""
 import pytest
-from fastapi.testclient import TestClient
-
-from assistant.io.api.app import create_app
 from assistant.io.api.vault import Capability, TokenVault
+from tests.fakes.api_client import build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
 
@@ -12,7 +10,7 @@ def context(tmp_path):
     vault = TokenVault(tmp_path)
     token = vault.issue("studio", frozenset(Capability))
     runtime = build_fake_runtime()
-    client = TestClient(create_app(runtime, vault, origins=["http://localhost:3000"]))
+    client = build_api_client(runtime, vault)
     return client, runtime, {"Authorization": f"Bearer {token}"}
 
 

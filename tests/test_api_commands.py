@@ -2,11 +2,9 @@
 import dataclasses
 
 import pytest
-from fastapi.testclient import TestClient
-
-from assistant.io.api.app import create_app
 from assistant.io.api.runtime import CommandDef, CommandOutcome
 from assistant.io.api.vault import Capability, TokenVault
+from tests.fakes.api_client import build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
 
@@ -14,7 +12,7 @@ from tests.fakes.studio_runtime import build_fake_runtime
 def context(tmp_path):
     vault = TokenVault(tmp_path)
     runtime = build_fake_runtime()
-    client = TestClient(create_app(runtime, vault, origins=["http://localhost:3000"]))
+    client = build_api_client(runtime, vault)
     tokens = {
         "full": vault.issue("studio", frozenset(Capability)),
         "chat": vault.issue("phone", frozenset({Capability.CHAT})),
@@ -131,7 +129,7 @@ def test_a_command_declaring_an_unknown_grant_fails_closed(tmp_path):
     vault = TokenVault(tmp_path)
     bogus = _BogusGrantCommandRuntime()
     runtime = dataclasses.replace(build_fake_runtime(), commands=bogus)
-    client = TestClient(create_app(runtime, vault, origins=["http://localhost:3000"]))
+    client = build_api_client(runtime, vault)
     token = vault.issue("studio", frozenset(Capability))
 
     response = client.post("/v1/commands/mystery/run", headers=head(token))

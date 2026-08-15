@@ -1,18 +1,16 @@
 """Rate limiting, lockout, audit, and a kill switch that actually kills."""
 import pytest
-from fastapi.testclient import TestClient
 
-from assistant.io.api.app import create_app
 from assistant.io.api.security import RateLimiter
 from assistant.io.api.vault import Capability, TokenVault
+from tests.fakes.api_client import build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
 
 @pytest.fixture()
 def context(tmp_path):
     vault = TokenVault(tmp_path)
-    client = TestClient(create_app(build_fake_runtime(), vault,
-                                   origins=["http://localhost:3000"]))
+    client = build_api_client(build_fake_runtime(), vault)
     tokens = {
         "full": vault.issue("studio", frozenset(Capability)),
         "chat": vault.issue("phone", frozenset({Capability.CHAT})),

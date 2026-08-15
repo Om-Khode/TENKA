@@ -130,7 +130,20 @@ async def get_procedures(request: Request,
 
 @router.delete("/memory/{scope}/{item_id}")
 async def forget_item(scope: Scope, item_id: str, request: Request,
-                      _=Depends(require(Capability.CHAT))) -> Envelope[ForgottenPayload]:
+                      # CHAT_SEND, not CHAT. The earlier ruling here -- "a
+                      # phone paired for conversation can delete one thing it
+                      # was told about", while the wipe below demands
+                      # SYSTEM_CONTROL -- predates the CHAT/CHAT_SEND split,
+                      # and CHAT has since come to mean "may read" and
+                      # nothing more. CHAT_SEND keeps that ruling's intent
+                      # exactly: forgetting one item is the same class of act
+                      # as saying "forget that" in a turn, which is precisely
+                      # what CHAT_SEND authorises. It is deliberately *not*
+                      # raised to SYSTEM_CONTROL -- that would collapse the
+                      # distinction between correcting one memory and
+                      # erasing all of them, which the wipe's separate grant
+                      # exists to preserve.
+                      _=Depends(require(Capability.CHAT_SEND))) -> Envelope[ForgottenPayload]:
     removed = await request.app.state.runtime.memory.forget(scope, item_id)
     if not removed:
         raise HTTPException(status_code=404)  # detail is dead on a 404 -- see app.py's handler

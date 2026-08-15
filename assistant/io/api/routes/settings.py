@@ -69,7 +69,16 @@ async def save_settings(body: SettingsPatch, request: Request,
 
 @router.patch("/personality")
 async def set_personality(body: PersonalityPatch, request: Request,
-                          _=Depends(require(Capability.CHAT))) -> Envelope[PersonalityPayload]:
+                          # SYSTEM_CONTROL, not CHAT, for the same reason
+                          # PATCH /settings above is: the personality base is
+                          # a stored, restart-surviving configuration value,
+                          # and switching it changes how she answers *every*
+                          # caller on this machine, not just the one that
+                          # asked. It is a setting that happens to have its
+                          # own route, not a conversational act -- which is
+                          # what separates it from CHAT_SEND. Reading the
+                          # personality stays on CHAT.
+                          _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope[PersonalityPayload]:
     # switch_personality() reports an unknown base as a return string, not an
     # exception -- left unchecked, that string was silently discarded and the
     # route answered 200 with the *previous* (unchanged) state, giving a
@@ -87,6 +96,12 @@ async def set_personality(body: PersonalityPatch, request: Request,
 
 @router.post("/personality/reset")
 async def reset_personality(request: Request,
-                            _=Depends(require(Capability.CHAT))) -> Envelope[PersonalityPayload]:
+                            # SYSTEM_CONTROL, matching PATCH above: this is
+                            # the *destructive* half of the same setting. It
+                            # discards the trait state her reflection loop
+                            # accumulated over every past conversation, and
+                            # there is no undo. A route that can only destroy
+                            # cannot sit below the one that merely changes.
+                            _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope[PersonalityPayload]:
     state = await request.app.state.runtime.personality.reset()
     return Envelope(data=_personality_body(state))
