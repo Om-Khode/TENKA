@@ -17,6 +17,7 @@ import os
 import secrets
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -131,11 +132,57 @@ def _atomic_write(path: Path, content: str) -> None:
 
 
 class TokenVault:
-    """Owns the instance secret and the device records under `root`."""
+    """Owns the instance secret and the device records under `root`.
+
+    `issue`, `revoke`, and `touch` are each a `_load()` ... mutate ... `_save()`
+    sequence, and none of them held a lock until this pass. Two of those
+    sequences interleaving on the same in-memory document is a lost update:
+    whichever finishes last overwrites the other's write in full, silently.
+    The scenario that made this more than a theoretical race: `touch()` now
+    runs on the authenticated request path (Milestone 6a Task 10), so a
+    misbehaving device's in-flight request can call `touch()` at the exact
+    moment an operator calls `revoke()` on it -- which is exactly when
+    anyone revokes anything. `touch()` loads a copy that still has the
+    device, `revoke()` runs to completion and removes it, then `touch()`
+    saves its stale copy back and un-revokes the device it was never told
+    about. `issue()` racing `revoke()` is the same class of bug: whichever
+    saves last wins, and the other caller's write vanishes with no error
+    anywhere. `self._lock` (a plain `threading.Lock`, mirroring
+    `PairCodeStore`'s in `pairing.py`) makes each of those three methods hold
+    the lock across its *entire* load-mutate-save sequence, so no second
+    mutator can observe -- or overwrite -- a snapshot the first is still
+    working from.
+
+    Deliberately not locked: `verify()`, `devices()`, and `instance_secret()`.
+    All three only read; `_atomic_write`'s `os.replace()` already guarantees
+    that any concurrent read of `devices.json` (or the secret file) sees a
+    complete write or the previous complete write, never a torn one, so a
+    lock buys a lock-free read nothing in exchange for making it wait behind
+    whichever mutator got there first. `verify()` in particular runs on
+    every authenticated request specifically so a revocation is never stale
+    (see its own note about re-reading on every call); serialising it behind
+    `touch()`'s throttled-but-still-real disk writes would tax the one path
+    this design goes out of its way to keep live, for a torn-read hazard
+    that does not exist.
+
+    Cross-process concurrency is explicitly out of scope for this lock. Two
+    separate TENKA processes -- the uvicorn daemon and, say, a `/studio
+    revoke` invocation that opens its own `TokenVault` on the same root --
+    can still interleave `_load()` and `_save()` calls across the OS process
+    boundary, and a `threading.Lock` only ever serialises threads *within
+    one process*; it cannot see, let alone block, a write from another
+    process. That hazard is real and unfixed by anything here -- it would
+    need a file lock (`msvcrt.locking` / `fcntl.flock`) or a single-writer
+    process design, neither of which this pass adds.
+    """
 
     def __init__(self, root: Path) -> None:
         self._root = Path(root)
         self._secret: bytes | None = None
+        # Guards `issue`/`revoke`/`touch`'s _load-through-_save sequence as
+        # one critical section. See the class docstring for what this does
+        # and does not cover.
+        self._lock = threading.Lock()
 
     # ─── instance secret ────────────────────────────────────────────────
     def instance_secret(self) -> bytes:
@@ -331,15 +378,21 @@ class TokenVault:
         if not grants:
             raise ValueError("a device must be issued at least one capability")
         token = secrets.token_urlsafe(32)
-        data = self._load()
-        data["devices"].append({
-            "device_id": secrets.token_hex(8),
-            "label": label,
-            "grants": sorted(c.value for c in grants),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "token_hmac": self._hash(token),
-        })
-        self._save(data)
+        # Locked for the whole load-append-save sequence: without it, a
+        # concurrent revoke() that loads, filters, and saves entirely inside
+        # this window would have its write clobbered the instant this method
+        # saves its own copy back -- the new device would survive, but the
+        # revocation that raced it would silently vanish.
+        with self._lock:
+            data = self._load()
+            data["devices"].append({
+                "device_id": secrets.token_hex(8),
+                "label": label,
+                "grants": sorted(c.value for c in grants),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "token_hmac": self._hash(token),
+            })
+            self._save(data)
         return token
 
     def verify(self, token: str) -> Device | None:
@@ -371,17 +424,24 @@ class TokenVault:
         return self._parse_device(match)
 
     def revoke(self, device_id: str) -> bool:
-        data = self._load()
-        devices = data["devices"]
-        remaining = [
-            d for d in devices
-            if not (isinstance(d, dict) and d.get("device_id") == device_id)
-        ]
-        if len(remaining) == len(devices):
-            return False
-        data["devices"] = remaining
-        self._save(data)
-        return True
+        # Locked for the whole load-filter-save sequence -- this is the kill
+        # switch this whole design leans on (see class docstring). A revoke
+        # that only holds the lock around `_load()` or only around `_save()`
+        # is exactly as unsafe as no lock at all: the window a racing
+        # touch()/issue() needs to observe a stale snapshot is *between*
+        # those two calls, not during either one alone.
+        with self._lock:
+            data = self._load()
+            devices = data["devices"]
+            remaining = [
+                d for d in devices
+                if not (isinstance(d, dict) and d.get("device_id") == device_id)
+            ]
+            if len(remaining) == len(devices):
+                return False
+            data["devices"] = remaining
+            self._save(data)
+            return True
 
     def touch(self, device_id: str) -> None:
         """Record that `device_id` was just seen, for the revoke-list UI.
@@ -418,36 +478,43 @@ class TokenVault:
         malformed field is dropped/overwritten, never allowed to crash the
         caller.
         """
-        data = self._load()
-        target: dict | None = None
-        for entry in data["devices"]:
-            if isinstance(entry, dict) and entry.get("device_id") == device_id:
-                target = entry
-                break
-        if target is None:
-            return
+        # Locked for the whole load-check-save sequence, not just the save:
+        # this method sits on the authenticated request path (Task 10), which
+        # is exactly where it can race an operator's revoke() of the same
+        # device -- the scenario the class docstring walks through. Every
+        # `return` below exits the `with` block too, releasing the lock, so a
+        # throttled no-op touch (the common case) never blocks anyone.
+        with self._lock:
+            data = self._load()
+            target: dict | None = None
+            for entry in data["devices"]:
+                if isinstance(entry, dict) and entry.get("device_id") == device_id:
+                    target = entry
+                    break
+            if target is None:
+                return
 
-        now = datetime.now(timezone.utc)
-        stored = target.get("last_seen_at")
-        if isinstance(stored, str):
-            try:
-                stored_at = datetime.fromisoformat(stored)
-                age = now - stored_at
-            except (ValueError, TypeError):
-                # ValueError: not a parseable ISO-8601 string at all.
-                # TypeError: parsed fine but naive -- `fromisoformat` does not
-                # raise on a string with no offset, and subtracting an aware
-                # `now` from a naive `stored_at` is what actually raises.
-                # Both are malformed in the sense that matters here: fall
-                # through and overwrite rather than let either one crash the
-                # request path that calls this.
-                pass
-            else:
-                if timedelta(0) <= age < _TOUCH_THROTTLE:
-                    return  # seen recently enough; skip the write entirely
+            now = datetime.now(timezone.utc)
+            stored = target.get("last_seen_at")
+            if isinstance(stored, str):
+                try:
+                    stored_at = datetime.fromisoformat(stored)
+                    age = now - stored_at
+                except (ValueError, TypeError):
+                    # ValueError: not a parseable ISO-8601 string at all.
+                    # TypeError: parsed fine but naive -- `fromisoformat` does not
+                    # raise on a string with no offset, and subtracting an aware
+                    # `now` from a naive `stored_at` is what actually raises.
+                    # Both are malformed in the sense that matters here: fall
+                    # through and overwrite rather than let either one crash the
+                    # request path that calls this.
+                    pass
+                else:
+                    if timedelta(0) <= age < _TOUCH_THROTTLE:
+                        return  # seen recently enough; skip the write entirely
 
-        target["last_seen_at"] = now.isoformat()
-        self._save(data)
+            target["last_seen_at"] = now.isoformat()
+            self._save(data)
 
     def devices(self) -> list[Device]:
         result = []

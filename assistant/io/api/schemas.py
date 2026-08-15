@@ -184,6 +184,41 @@ class RestoreRequest(BaseModel):
     )
 
 
+class PairCodeRequest(BaseModel):
+    """What the laptop asks for when it puts a QR on screen.
+
+    `grants` is a list of `Capability` *values* rather than the enum itself:
+    an unknown string must be a 422 built by the route from a name it never
+    echoes, not a Pydantic error whose `msg` might one day carry the
+    submitted value back. The route parses and bounds it (`routes/pairing.py`).
+    """
+    label: str = Field(min_length=1, max_length=64)
+    grants: list[str] = Field(min_length=1)
+
+
+class PairRequest(BaseModel):
+    """The only unauthenticated body this API accepts, and it carries exactly
+    one field.
+
+    Deliberately without `extra="forbid"`, unlike `ChatRequest`. A client that
+    sends `{"code": ..., "grants": ["system_control"], "label": "laptop"}` must
+    end up with exactly the grants and the name the laptop authorised --
+    ignoring the extra keys proves the request cannot influence either, where a
+    422 would only prove they are spelled wrongly and could be routed around by
+    dropping them.
+
+    **There is no `label` field, and its absence is the point.** The device's
+    name comes from the code, because that is what the person at the laptop
+    typed while choosing the grants, and it is the text the revoke list is read
+    by. A field that validated and was then ignored would be worse than no
+    field: the next reader assumes it works, and a self-naming device could
+    offer `laptop` as a lie at the exact moment somebody is deciding which row
+    to cut off. `routes/pairing.py` carries the same note where the label is
+    actually chosen.
+    """
+    code: str = Field(min_length=1, max_length=16)
+
+
 class UnlockRequest(BaseModel):
     """Same field, deliberately a separate model from RestoreRequest.
 

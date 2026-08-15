@@ -27,11 +27,14 @@ from ...core.redact import redact_secrets
 from .context import request_id_var
 from .errors import to_http_exception
 from .events import EventHub, build_ack_frame, build_error_frame, build_status_frame
+from .pairing import PairCodeStore
 from .policy import effective
 from .routes import chat as chat_routes
 from .routes import commands as command_routes
+from .routes import devices as device_routes
 from .routes import files as file_routes
 from .routes import memory as memory_routes
+from .routes import pairing as pairing_routes
 from .routes import session as session_routes
 from .routes import settings as settings_routes
 from .routes import status as status_routes
@@ -117,7 +120,8 @@ class HostGate:
 def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                origins: list[str], hub: EventHub | None = None,
                listener_policies: dict[int, str] | None = None,
-               ui_bundle: UiBundle | None = None) -> FastAPI:
+               ui_bundle: UiBundle | None = None,
+               pair_store: PairCodeStore | None = None) -> FastAPI:
     # Eager, once: instance_secret() is uncached on the environment-override
     # path, and a wrong-length TENKA_SECRET raises ValueError. Resolving it
     # here means a misconfigured override fails when the app is built, not
@@ -145,6 +149,13 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     app.state.auth = AuthState(vault=vault)
     app.state.started_at = time.monotonic()
     app.state.hub = hub if hub is not None else EventHub()
+    # Scoped to this one app, exactly like `hub` above and for the same
+    # reason: a process-wide store would let a code minted by one app be
+    # redeemed against another, which is nonsense in production (there is one
+    # daemon) and a cross-test leak in the suite. A caller passes one in only
+    # when it needs to hold the same store the routes do -- the pairing tests,
+    # which mint without going through the loopback-only route.
+    app.state.pair_store = pair_store if pair_store is not None else PairCodeStore()
     # Port -> policy name. An empty registry denies everything, which is the
     # correct answer to "nobody said what this socket is": see
     # `policy.py`'s docstring for why the port, and nothing the client sends,
@@ -311,6 +322,8 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     app.include_router(command_routes.router, prefix="/v1")
     app.include_router(chat_routes.router, prefix="/v1")
     app.include_router(system_routes.router, prefix="/v1")
+    app.include_router(pairing_routes.router, prefix="/v1")
+    app.include_router(device_routes.router, prefix="/v1")
 
     # ─── the event socket ───────────────────────────────────────────────
     # Not a route module like the ones above: `test_every_registered_route_
@@ -443,6 +456,11 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                 await websocket.close(code=1013)
                 return
             auth.limiter.record_success(budget_key)
+            # Same "when was this device last used?" column `authenticate()`
+            # keeps for HTTP. A socket handshake is an authenticated request
+            # too, and a phone that only ever holds this socket open would
+            # otherwise sit at the top of the revoke list looking abandoned.
+            auth.vault.touch(device.device_id)
         else:
             if not auth.limiter.check(source):
                 _audit("429")

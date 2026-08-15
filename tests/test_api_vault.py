@@ -1,6 +1,7 @@
 """Token vault — the only thing that decides whether a caller is real."""
 import json
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 
@@ -655,3 +656,118 @@ def test_a_healed_value_is_well_formed_and_throttles_the_next_touch(tmp_path, ba
     vault.touch(device_id)  # immediately after -- must be throttled
 
     assert path.read_bytes() == healed_bytes
+
+
+# ─── Write races: _load-through-_save must be one critical section ────────
+# A barrier alone does not prove anything here -- it only synchronises thread
+# *start*, and CPython's GIL serialises these short critical sections tightly
+# enough that a racing pair can pass by accident even with no lock at all.
+# Both tests below force the interleaving explicitly: the first `_load()` call
+# is made to pause -- after capturing its snapshot, before returning it -- so
+# the racing caller is provably still running when the second call is allowed
+# to proceed. `_load` is patched on the *instance*, not the class, so other
+# tests are unaffected.
+
+
+def test_touch_cannot_resurrect_a_device_revoked_mid_sequence(tmp_path):
+    """Reproduces the bug from the brief directly: touch() loads a snapshot
+    that still has the device, is held there while revoke() runs to
+    completion, and then must not save that stale snapshot back over the
+    revocation. Without a lock spanning `_load()` through `_save()`, it does
+    exactly that -- the device comes back.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.verify(token).device_id
+
+    touch_loaded = threading.Event()   # touch() has captured its snapshot
+    let_touch_save = threading.Event()  # revoke() has finished; touch() may resume
+    original_load = vault._load
+    call_count = {"n": 0}
+
+    def blocking_load():
+        # `_load` is patched on the instance, so *every* caller through this
+        # vault goes through here, including revoke()'s own `_load()` call.
+        # Only the first call (touch's) pauses; revoke's call must read the
+        # live document and return immediately, or the two threads would
+        # deadlock waiting on each other's events instead of racing.
+        call_count["n"] += 1
+        data = original_load()
+        if call_count["n"] == 1:
+            touch_loaded.set()
+            assert let_touch_save.wait(timeout=5), "revoke() never let touch() resume"
+        return data
+
+    vault._load = blocking_load
+    touch_thread = threading.Thread(target=vault.touch, args=(device_id,))
+    touch_thread.start()
+    assert touch_loaded.wait(timeout=5), "touch() never reached _load()"
+
+    # touch() is now holding a snapshot that still contains the device (with
+    # the lock in place, it is also still holding `self._lock`). Run revoke()
+    # to completion -- or, with the fix, until it blocks on that lock -- on
+    # its own thread; the bounded join just keeps this from hanging either way.
+    revoke_thread = threading.Thread(target=vault.revoke, args=(device_id,))
+    revoke_thread.start()
+    revoke_thread.join(timeout=1.0)
+
+    let_touch_save.set()
+    touch_thread.join(timeout=5)
+    revoke_thread.join(timeout=5)
+    vault._load = original_load
+
+    assert not touch_thread.is_alive() and not revoke_thread.is_alive()
+    assert vault.verify(token) is None, "touch() resurrected a device revoked mid-sequence"
+
+
+def test_issue_racing_revoke_loses_neither_the_new_device_nor_the_revocation(tmp_path):
+    """Same class of bug, the other direction: issue() appending a new device
+    and revoke() removing an existing one are both load-mutate-save. If they
+    interleave, whichever saves last wins outright and the other caller's
+    write is silently gone -- either the new device never really got added,
+    or the revoked one comes back.
+    """
+    vault = TokenVault(tmp_path)
+    existing_token = vault.issue("existing", frozenset({Capability.OBSERVE}))
+    existing_id = vault.verify(existing_token).device_id
+
+    revoke_loaded = threading.Event()   # revoke() has captured its snapshot
+    let_revoke_save = threading.Event()  # issue() has finished; revoke() may resume
+    original_load = vault._load
+    call_count = {"n": 0}
+
+    def blocking_load():
+        # Only the first call (revoke's) pauses. A second call through this
+        # same patched attribute -- issue()'s, if it gets that far before the
+        # lock releases -- must read live, not repeat the pause.
+        call_count["n"] += 1
+        data = original_load()
+        if call_count["n"] == 1:
+            revoke_loaded.set()
+            assert let_revoke_save.wait(timeout=5), "issue() never let revoke() resume"
+        return data
+
+    vault._load = blocking_load
+    revoke_thread = threading.Thread(target=vault.revoke, args=(existing_id,))
+    revoke_thread.start()
+    assert revoke_loaded.wait(timeout=5), "revoke() never reached _load()"
+
+    # revoke() is now holding a snapshot with the existing device still in it
+    # (with the lock in place, also still holding `self._lock`). Run issue()
+    # to completion -- or, with the fix, until it blocks on that lock.
+    issue_thread = threading.Thread(
+        target=vault.issue, args=("new", frozenset({Capability.OBSERVE}))
+    )
+    issue_thread.start()
+    issue_thread.join(timeout=1.0)
+
+    let_revoke_save.set()
+    revoke_thread.join(timeout=5)
+    issue_thread.join(timeout=5)
+    vault._load = original_load
+
+    assert not revoke_thread.is_alive() and not issue_thread.is_alive()
+    labels = sorted(d.label for d in vault.devices())
+    assert labels == ["new"], (
+        f"expected only the new device to survive the race, got {labels}"
+    )

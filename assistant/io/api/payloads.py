@@ -266,6 +266,50 @@ class SessionPayload(CamelModel):
     policy: str
 
 
+# ─── Pairing and devices ─────────────────────────────────────────────────
+class PairCodePayload(CamelModel):
+    """What the laptop puts on screen. The code is in here exactly once, and
+    it is the reason nothing on this route is logged.
+
+    `qr_svg` encodes `<endpoint>/pair#<code>` -- the code in the URL
+    *fragment*, which a browser never sends to a server, so it lands in no
+    access log on the way. `endpoints` is a list because a phone may have to
+    be told more than one way to reach this machine once transports exist; in
+    6a it holds the loopback origin alone.
+    """
+
+    code: str
+    expires_at: str
+    endpoints: list[str]
+    qr_svg: str
+
+
+class DevicePayload(CamelModel):
+    """One row of the revoke list, and deliberately nothing more.
+
+    This response describes every credential that reaches this machine, so it
+    carries only what a person needs to decide what to kill: which row, what
+    it is called, what it can do, and when it was last used. No token, no
+    token hash, no listener or address -- a device's grants say what it may
+    do, and where it happened to connect from is not a fact this list is
+    allowed to make somebody act on.
+    """
+
+    device_id: str
+    label: str
+    grants: list[str]
+    created_at: str
+    last_seen_at: str | None
+
+
+class DevicesPayload(CamelModel):
+    devices: list[DevicePayload]
+
+
+class RevokedPayload(CamelModel):
+    revoked: str
+
+
 # ─── System ──────────────────────────────────────────────────────────────
 class StatusPayload(CamelModel):
     assistant_name: str

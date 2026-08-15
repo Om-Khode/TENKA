@@ -89,6 +89,25 @@ def test_a_token_in_the_query_string_does_not_work(client, token):
     assert client.get(f"/v1/status?token={token}").status_code == 401
 
 
+# The operations that are deliberately reachable without a credential. This
+# list is the record of what this daemon answers to a stranger, so it is kept
+# short enough to read in one glance and every entry states why.
+#
+# ("POST", "/v1/pair") -- how a device gets a credential in the first place,
+# and therefore the only unauthenticated write in the API. It cannot demand
+# one without being unable to issue one. What stands in for a credential is
+# the pair code in its body: ~40 bits, live for 180 seconds, single-use, at
+# most one outstanding at a time, and mintable only from the loopback
+# listener by a device holding SYSTEM_CONTROL. Its compensating coverage is
+# tests/test_api_pairing_routes.py, which pins every one of those properties
+# plus the global attempt budget that burns the outstanding code when it is
+# spent. Anything added here needs the same: a named test file, not silent
+# trust.
+_ANONYMOUS_OPERATIONS = frozenset({
+    ("POST", "/v1/pair"),
+})
+
+
 def _sweep_v1_routes_require_auth(client) -> int:
     """Call every /v1 route with no token; fail loudly if any answers publicly.
 
@@ -114,9 +133,12 @@ def _sweep_v1_routes_require_auth(client) -> int:
                         .replace("{conversation_id}", "c1")
                         .replace("{item_id}", "k1")
                         .replace("{command_id}", "volume_up")
-                        .replace("{kind}", "voice"))
+                        .replace("{kind}", "voice")
+                        .replace("{device_id}", "d1"))
         for method in operations:
             if method.upper() in ("HEAD", "OPTIONS"):
+                continue
+            if (method.upper(), path) in _ANONYMOUS_OPERATIONS:
                 continue
             # A fresh limiter before every probe, not once before the loop:
             # the sweep's whole point is "every route answers 401/403 with no
@@ -142,6 +164,25 @@ def _sweep_v1_routes_require_auth(client) -> int:
 def test_every_registered_route_rejects_an_anonymous_call(client):
     checked = _sweep_v1_routes_require_auth(client)
     assert checked > 0, "no /v1 routes were checked — the sweep found nothing"
+
+
+def test_the_anonymous_allow_list_names_only_real_operations(client):
+    """A stale entry is a standing exemption for an operation that no longer
+    exists -- or, worse, for a path a later task reuses for something else.
+    The list only stays readable if it cannot accumulate ghosts."""
+    schema = client.app.openapi()
+    for verb, path in _ANONYMOUS_OPERATIONS:
+        assert verb.lower() in schema["paths"].get(path, {}), (
+            f"{verb} {path} is exempted from the auth sweep but is not a "
+            "route this app serves"
+        )
+
+
+def test_the_one_anonymous_route_really_is_reachable_without_a_credential(client):
+    """The other direction: the exemption must describe something true. A
+    422 (a body it could not parse) proves the request reached the route
+    rather than being turned away by an auth dependency."""
+    assert client.post("/v1/pair", json={}).status_code == 422
 
 
 def test_the_sweep_catches_a_route_registered_without_auth(vault):

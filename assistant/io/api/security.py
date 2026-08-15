@@ -85,6 +85,15 @@ _CROSS_SITE = HTTPException(status_code=status.HTTP_403_FORBIDDEN,
 _CSRF_MISSING = HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                               detail="missing request header")
 
+# Device enrollment, the device listing and revocation are refused on any
+# listener that is not `policy.admin` -- loopback alone. Deliberately the same
+# shape and status as `require()`'s capability refusal: a caller that already
+# authenticated learns "this connection may not do that" and not which of the
+# two gates said so, so a remote session cannot map out which of its
+# capabilities are transport-limited and which are grant-limited.
+_NOT_ADMIN = HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                           detail="capability not granted")
+
 _WINDOW_SECONDS = 60.0
 _MAX_PER_WINDOW = 120
 _MAX_FAILURES = 10
@@ -158,6 +167,23 @@ class AuthState:
     audit: AuditLog = field(default_factory=AuditLog)
 
 
+# A year. Milestone 6a's spec is that a paired device STAYS paired: a session
+# cookie un-pairs the phone the moment its browser closes while the device
+# record lives on in devices.json, so the two disagree and the person re-pairs
+# forever for no security gain -- training her to leave a QR screen open,
+# which is worse than whatever a long-lived cookie costs back.
+#
+# What it would ordinarily cost is that the issuer can never take it back.
+# That does not hold here: `TokenVault.verify()` re-reads and re-parses
+# devices.json from disk on *every* call (see vault.py), so a revoked device
+# is refused on its very next request no matter how long its cookie claims to
+# live, in this process or any other. The `max_age` below is a hint to the
+# browser about how long to keep offering the cookie back, never a promise
+# about how long it is honoured -- that promise is `verify()`'s alone, and it
+# is immediate.
+_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365
+
+
 # ─── the credential ──────────────────────────────────────────────────────
 def cookie_kwargs(policy: ListenerPolicy) -> dict:
     """Flags for `Response.set_cookie`, chosen by the listener.
@@ -175,12 +201,22 @@ def cookie_kwargs(policy: ListenerPolicy) -> dict:
     Milestone 6 on, so there is no legitimate cross-site navigation into an
     authenticated view to preserve. `secure` follows the transport: required
     everywhere TLS exists, impossible to require on plain-http loopback.
+
+    `max_age` is `_COOKIE_MAX_AGE_SECONDS`, a year, on every policy: without
+    one this is a *session* cookie, and closing the browser would un-pair the
+    phone while its `Device` record stays in the vault -- the credential and
+    the record disagree, and she re-pairs for no security gain. See
+    `_COOKIE_MAX_AGE_SECONDS` above for why a year is safe to hand out:
+    revocation is enforced by `TokenVault.verify()` re-reading disk on every
+    request, not by the cookie's own expiry, so this is never the thing
+    standing between a revoked device and this daemon.
     """
     return {
         "httponly": True,       # an XSS in the served UI cannot read it
         "samesite": "strict",
         "secure": policy.secure_cookie,
         "path": "/",
+        "max_age": _COOKIE_MAX_AGE_SECONDS,
     }
 
 
@@ -435,6 +471,23 @@ async def authenticate(request: Request) -> Device:
         device = replace(device, grants=grants)
         request.state.device = device
         request.state.issued_grants = issued
+        # Last on the success path, and only on it. "When was this device last
+        # used?" is the column the revoke list is read by -- a row nobody
+        # recognises with a timestamp from three months ago is what makes
+        # somebody click revoke -- and it is a fact about a *verified* device,
+        # so a wrong token has nothing to attribute. A device refused further
+        # down for lacking a capability was still that device, though, which
+        # is why this sits here rather than inside `require()`.
+        #
+        # The write is throttled to one per device per minute inside the vault
+        # (see `TokenVault.touch`), because `_save` costs a full JSON rewrite
+        # plus an `icacls` subprocess. What is NOT throttled is the read the
+        # throttle check itself needs: this adds one `devices.json` load and
+        # parse to every authenticated request, on top of the one `verify()`
+        # above already did. That is the standing cost of the column, paid on
+        # the request path by design rather than hidden behind a second cache
+        # here that could disagree with the vault's own window.
+        state.vault.touch(device.device_id)
         return device
 
     if not state.limiter.check(source):
@@ -472,14 +525,35 @@ def _refuse_cross_site(request: Request, policy: ListenerPolicy) -> None:
     which is what lets both run ahead of verification and keeps the refusal
     from doubling as a credential oracle.
     """
-    port = accepting_port(request.scope)
-    origin = request.headers.get("Origin")
-    if origin and origin.strip():
-        if not origin_is_known(origin, request.app.state, port, policy):
-            raise _CROSS_SITE
+    refuse_unknown_origin(request, policy)
     if request.method.upper() in _AMBIENT_METHODS and cookie_credential(request):
         if not request.headers.get(CSRF_HEADER):
             raise _CSRF_MISSING
+
+
+def refuse_unknown_origin(request: Request, policy: ListenerPolicy) -> None:
+    """The `Origin` half of the gate above, on its own.
+
+    Split out for `POST /v1/pair`, the one route that needs this half and
+    must not have the other. That route reads no credential at all -- its
+    authority is the pair code in the body, which a cross-site page would
+    have to supply itself -- so there is no ambient authority for a CSRF
+    header to defend, and demanding one would refuse a phone whose stale
+    cookie from a revoked pairing is still in its jar. The `Origin` check
+    still earns its place there: it stops a page the user happens to be
+    visiting from redeeming a code it learned and planting the resulting
+    device cookie in her browser.
+
+    Only checked when the header is present. A browser omits `Origin` on a
+    same-origin GET and on a plain navigation, and a non-browser client never
+    sends one, so demanding it would break both the UI this daemon serves and
+    every script on loopback.
+    """
+    origin = request.headers.get("Origin")
+    if origin and origin.strip():
+        if not origin_is_known(origin, request.app.state,
+                               accepting_port(request.scope), policy):
+            raise _CROSS_SITE
 
 
 def require(capability: Capability):
@@ -494,6 +568,36 @@ def require(capability: Capability):
         if capability not in device.grants:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                                 detail="capability not granted")
+        return device
+
+    return _dependency
+
+
+def require_admin(capability: Capability):
+    """Dependency factory: `require(capability)`, then insist on a listener
+    that is trusted to manage this daemon's own credentials.
+
+    Two gates, not one, and neither is redundant. `policy.admin` is loopback
+    alone, so device enrollment and revocation cannot be reached from a
+    tunnel at all -- one compromised remote session must not be able to open
+    a second, permanent door, nor to close the doors somebody else is using.
+    The capability is what stops the *other* direction: a device paired only
+    to watch, sitting on the loopback listener, could otherwise mint itself a
+    pair code carrying every capability there is. That is the same escalation
+    arrived at from inside the house, and the transport check says nothing
+    about it.
+
+    Ordered capability-first so the two refusals are indistinguishable in
+    practice as well as in shape: whichever gate a caller trips, it is the
+    same 403 body `require()` already returns.
+    """
+
+    async def _dependency(request: Request,
+                          device: Device = Depends(require(capability))) -> Device:
+        # `request.state.policy` is set by `authenticate()`, which
+        # `require(capability)` above depends on, so it is always present here.
+        if not request.state.policy.admin:
+            raise _NOT_ADMIN
         return device
 
     return _dependency

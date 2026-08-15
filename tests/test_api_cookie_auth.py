@@ -18,16 +18,18 @@ from fastapi import APIRouter, Depends
 from starlette.websockets import WebSocketDisconnect
 
 from assistant.io.api.app import create_app
+from assistant.io.api.pairing import PairCodeStore
 from assistant.io.api.policy import POLICIES
 from assistant.io.api.security import (
     COOKIE_NAME,
     CSRF_HEADER,
     RateLimiter,
+    _COOKIE_MAX_AGE_SECONDS,
     cookie_kwargs,
     require,
 )
 from assistant.io.api.vault import Capability, TokenVault
-from tests.fakes.api_client import BASE_URL, LOCAL_PORT, ApiTestClient
+from tests.fakes.api_client import BASE_URL, LOCAL_PORT, ApiTestClient, build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
 
 
@@ -200,6 +202,7 @@ def test_no_source_file_reads_access_token():
 def test_cookie_flags_follow_the_policy():
     assert cookie_kwargs(POLICIES["funnel"]) == {
         "httponly": True, "samesite": "strict", "secure": True, "path": "/",
+        "max_age": _COOKIE_MAX_AGE_SECONDS,
     }
     assert cookie_kwargs(POLICIES["local"])["secure"] is False
     assert cookie_kwargs(POLICIES["local"])["httponly"] is True
@@ -211,6 +214,33 @@ def test_the_cookie_is_never_given_a_domain():
     A Domain attribute would send this credential to strangers."""
     for policy in POLICIES.values():
         assert "domain" not in cookie_kwargs(policy)
+
+
+def test_the_cookie_survives_closing_the_browser():
+    """A paired device STAYS paired (Milestone 6a spec): without an explicit
+    `max_age` this is a session cookie, and closing the browser would un-pair
+    the phone while its `Device` record lives on in the vault -- the
+    credential and the record disagree, and she re-pairs for no security gain.
+    Every policy gets the same long lifetime; the constant, not a magic
+    number, is what a change to the lifetime should have to touch."""
+    for policy in POLICIES.values():
+        assert cookie_kwargs(policy)["max_age"] == _COOKIE_MAX_AGE_SECONDS
+
+
+def test_a_real_pair_sets_a_long_lived_cookie(tmp_path):
+    """The helper being right is not the same as the route using it: this
+    exercises `POST /v1/pair` end to end and reads the `Set-Cookie` header
+    the client actually received, rather than only asserting on
+    `cookie_kwargs`'s return value."""
+    vault = TokenVault(tmp_path)
+    store = PairCodeStore()
+    code = store.mint("p", frozenset({Capability.CHAT_SEND})).code
+    client = build_api_client(build_fake_runtime(), vault,
+                              policies={LOCAL_PORT: "local"}, pair_store=store)
+    r = client.post("/v1/pair", json={"code": code})
+    assert r.status_code == 204
+    set_cookie = r.headers.get("set-cookie", "")
+    assert f"Max-Age={_COOKIE_MAX_AGE_SECONDS}" in set_cookie, set_cookie
 
 
 def test_the_socket_refuses_a_cross_site_origin(tmp_path):
@@ -386,7 +416,21 @@ _PATH_PARAMS = {
     "{item_id}": "k1",
     "{command_id}": "volume_up",
     "{kind}": "voice",
+    "{device_id}": "d1",
 }
+
+# The one mutating operation that is deliberately not gated on a capability
+# at all, so the ceiling has nothing to narrow and the sweep below has
+# nothing to assert. `POST /v1/pair` is how a device gets a credential --
+# demanding one would make it unable to issue one -- so it is reachable on
+# every listener by construction, including a read-only ceiling. That is not
+# a hole in the ceiling: pairing does not act on the machine, and the grants
+# the new device receives come from a code only a loopback admin could mint,
+# then pass through `effective()` on every later request exactly like any
+# other device's. Its own coverage is tests/test_api_pairing_routes.py.
+_ANONYMOUS_OPERATIONS = frozenset({
+    ("POST", "/v1/pair"),
+})
 
 
 # Every mutating operation this daemon serves, by name. Asserted as an exact
@@ -410,6 +454,11 @@ _MUTATING_OPERATIONS = frozenset({
     ("POST", "/v1/commands/{command_id}/run"),
     ("POST", "/v1/files/rename"),
     ("POST", "/v1/personality/reset"),
+    # Enrollment and revocation. Both are `require_admin(SYSTEM_CONTROL)`, so
+    # they are refused here twice over -- the ceiling carries no
+    # SYSTEM_CONTROL, and `quick` is not an admin listener.
+    ("POST", "/v1/pair/code"),
+    ("DELETE", "/v1/devices/{device_id}"),
 })
 
 
@@ -448,6 +497,11 @@ def _sweep_mutations_are_refused(client) -> set[tuple[str, str]]:
         for method in operations:
             verb = method.upper()
             if verb not in ("POST", "PUT", "PATCH", "DELETE"):
+                continue
+            if (verb, path) in _ANONYMOUS_OPERATIONS:
+                # Nothing to refuse: this one never reads a credential, so
+                # there is no grant for the ceiling to narrow. See the
+                # comment on `_ANONYMOUS_OPERATIONS` above.
                 continue
             # A fresh limiter per probe: several of these routes carry their
             # own tighter budget, and this sweep must fail on authorization,
@@ -548,6 +602,11 @@ _STORED_DATA_OPERATIONS = frozenset({
 # assertion below can be an equality rather than a subset.
 _OFF_THIS_TRANSPORT_ENTIRELY = frozenset({
     ("GET", "/v1/audit"),
+    # Who holds a credential to this machine: the security configuration, the
+    # same class of fact as the audit log, and refused here for the same two
+    # reasons -- SYSTEM_CONTROL is not in this ceiling, and `quick` is not an
+    # admin listener.
+    ("GET", "/v1/devices"),
     ("GET", "/v1/files"),
     ("GET", "/v1/files/content"),
     ("GET", "/v1/files/roots"),
