@@ -63,15 +63,23 @@ def build_api_client(runtime: StudioRuntime, vault: TokenVault, *,
                      origins: list[str] | None = None,
                      policies: dict[int, str] | None = None,
                      hub: EventHub | None = None,
-                     ui_bundle: Any = None) -> TestClient:
+                     ui_bundle: Any = None,
+                     pair_store: Any = None) -> TestClient:
     """`ui_bundle` defaults to None, so every existing caller keeps an app with
     no UI route at all -- the daemon Milestone 5a shipped. Only the UI-serving
-    suite passes one."""
+    suite passes one.
+
+    `pair_store` is the same shape of escape hatch: left unset, the app builds
+    its own private `PairCodeStore`. The pairing suite passes one in when it
+    needs to mint a code without going through the loopback-only route, or to
+    assert afterwards that the route burned it.
+    """
     app = create_app(
         runtime, vault,
         origins=list(DEV_ORIGINS if origins is None else origins),
         hub=hub,
         listener_policies=LOCAL_POLICIES if policies is None else policies,
         ui_bundle=ui_bundle,
+        pair_store=pair_store,
     )
     return ApiTestClient(app, base_url=BASE_URL)

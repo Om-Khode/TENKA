@@ -145,6 +145,26 @@ class PairCodeStore:
                 return None
             return current
 
+    def burn(self) -> None:
+        """Destroy the live code without redeeming it, and without being told
+        what it is.
+
+        The pairing route calls this when its global attempt budget is
+        exhausted (see `routes/pairing.py`). `consume()` cannot express that:
+        it needs the code, and the whole situation is that somebody who does
+        not have the code has been guessing at it. Leaving a code standing
+        under sustained guessing is the one outcome worth refusing outright --
+        an attacker must be made to beat a *new* 180-second window that only
+        the laptop can open, rather than being merely slowed down against the
+        one already in the air.
+
+        Idempotent, and silent when there is nothing live: the route calls it
+        on every refused attempt once the budget is spent, not only on the
+        first.
+        """
+        with self._lock:
+            self._current = None
+
     def current(self, *, now: float | None = None) -> PairCode | None:
         """Peek at the live code without consuming it, or `None` if there is
         none or it has expired."""

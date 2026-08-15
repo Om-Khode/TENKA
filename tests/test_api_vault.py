@@ -1,12 +1,22 @@
 """Token vault — the only thing that decides whether a caller is real."""
 import json
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
-from assistant.io.api.vault import Capability, Device, TokenVault
+from assistant.io.api import vault as vault_module
+from assistant.io.api.vault import (
+    Capability,
+    Device,
+    TokenVault,
+    VaultReadError,
+    VaultUnavailableError,
+    VaultWriteError,
+)
 
 
 @pytest.fixture()
@@ -137,6 +147,12 @@ def test_corrupt_secret_file_regenerates_and_revokes_everything(tmp_path):
 
 
 def test_devices_json_as_bare_array_is_rejected_wholesale(tmp_path):
+    """`verify()`/`devices()` still fail closed (unchanged): there is nothing
+    to overwrite on a read. `revoke()` no longer reports a false `False`,
+    though -- a wrong-shape document is not the same as "device not found",
+    and this method must not guess which one it is (see the F-2 fix on
+    `_load()`: a bare array used to be silently treated as an empty vault).
+    """
     vault = TokenVault(tmp_path)
     token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     device_id = vault.verify(token).device_id
@@ -144,7 +160,8 @@ def test_devices_json_as_bare_array_is_rejected_wholesale(tmp_path):
 
     assert vault.verify(token) is None
     assert vault.devices() == []
-    assert vault.revoke(device_id) is False
+    with pytest.raises(VaultReadError):
+        vault.revoke(device_id)
 
 
 def test_devices_field_as_string_is_rejected_wholesale(tmp_path):
@@ -157,7 +174,8 @@ def test_devices_field_as_string_is_rejected_wholesale(tmp_path):
 
     assert vault.verify(token) is None
     assert vault.devices() == []
-    assert vault.revoke(device_id) is False
+    with pytest.raises(VaultReadError):
+        vault.revoke(device_id)
 
 
 def test_entry_that_is_not_a_dict_is_skipped(tmp_path):
@@ -632,6 +650,237 @@ def test_a_garbage_stored_timestamp_does_not_raise_and_overwrites(tmp_path):
     assert vault.devices()[0].last_seen_at != "not-a-timestamp"
 
 
+# ─── I-3: a read failure is not the same as an empty vault ────────────────
+# `_load()` used to swallow `OSError`/`json.JSONDecodeError` into a
+# synthetic empty document -- indistinguishable from a fresh install. That
+# made every mutator unsafe: `issue()` appended to the fake-empty list and
+# saved, destroying every other device the moment a lock (a scanner, a
+# backup tool, a second TENKA process) coincided with a write. Proved on
+# Windows under real contention (`PermissionError [WinError 5]`); simulated
+# here deterministically by breaking reads of exactly this vault's
+# `devices.json`, nothing else -- not the instance secret file, which lives
+# in the same directory and must stay readable throughout.
+
+
+def _break_devices_json_reads(monkeypatch, tmp_path):
+    target = tmp_path / "devices.json"
+    original_read_text = Path.read_text
+
+    def broken(self, *args, **kwargs):
+        if self == target:
+            raise PermissionError("simulated lock")
+        return original_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", broken)
+    return original_read_text
+
+
+def test_verify_fails_closed_on_a_genuine_read_failure(tmp_path, monkeypatch, caplog):
+    """Decision: `verify()` treats an unreadable devices.json the same way it
+    treats an unknown or revoked token -- refuse. This is the call
+    `authenticate()` makes on every request specifically so a revocation is
+    never stale, so the alternative (verify whatever was last cached) is not
+    a thing this vault does anywhere else. The cost is real -- every device
+    is refused for as long as the lock holds -- and accepted on purpose.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="assistant.io.api.vault"):
+        assert vault.verify(token) is None
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert "could not read devices.json" in caplog.text
+    assert vault.verify(token) is not None, (
+        "the device must still be there once the read recovers -- verify() "
+        "must not have treated the failure as a revocation"
+    )
+
+
+def test_devices_reports_none_on_a_genuine_read_failure(tmp_path, monkeypatch):
+    """Decision: `devices()` also fails closed to an empty listing. This is an
+    admin-only read (`GET /v1/devices`, `/studio devices`), not a security
+    decision -- a stale "none issued" while a lock clears costs a confusing
+    UI, not a privilege handed to someone who should not have had it.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    assert vault.devices() == []
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert len(vault.devices()) == 1, "the device must still be there once the read recovers"
+
+
+def test_issue_raises_rather_than_destroying_every_other_device(tmp_path, monkeypatch):
+    """The finding, reproduced directly: `issue()` used to overwrite
+    devices.json with a document containing only the new device, silently
+    destroying everything else, whenever the read that should have loaded
+    the real document failed instead. It must now raise and write nothing.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("existing", frozenset({Capability.OBSERVE}))
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    with pytest.raises(VaultReadError):
+        vault.issue("new", frozenset({Capability.OBSERVE}))
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert {d.label for d in vault.devices()} == {"existing"}, (
+        "issue() must not have written anything while the read was failing"
+    )
+
+
+def test_revoke_raises_rather_than_reporting_a_false_not_found(tmp_path, monkeypatch):
+    """`revoke()` returning `False` under a read failure would tell the one
+    person trying to cut a device off that it is already gone, when the
+    truth is "the vault could not be read." That is worse than an error.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.verify(token).device_id
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    with pytest.raises(VaultReadError):
+        vault.revoke(device_id)
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert vault.verify(token) is not None, "not actually revoked -- the write never happened"
+
+
+def test_touch_raises_rather_than_silently_skipping(tmp_path, monkeypatch):
+    """`touch()`'s existing silence covers "the device is not in the
+    document" -- a stale or revoked credential on the request path is
+    ordinary. "The document could not be read at all" is a different fact
+    and must not collapse into that same silence, or a target that is
+    genuinely present in a stale-but-readable snapshot could be skipped as if
+    it were merely unknown.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    original = _break_devices_json_reads(monkeypatch, tmp_path)
+
+    with pytest.raises(VaultReadError):
+        vault.touch(device_id)
+
+    monkeypatch.setattr(Path, "read_text", original)
+    assert vault.devices()[0].last_seen_at is None, "no write happened while the read was failing"
+
+
+# ─── F-2: a wrong-shape document is not the same as an empty one ──────────
+# `_load()` raised on `OSError`/`JSONDecodeError` but still silently emptied
+# a document that parsed fine as JSON yet was not a version-1 devices
+# document -- and still logged "...starting empty", the exact phrasing the
+# I-3 fix removed for the other two cases. Proved to matter at boot: a
+# devices.json written by a newer build (version bumped) read by a
+# rolled-back one made `devices()` report `[]`, which `main.py`'s bootstrap
+# treats as "nothing has ever been issued" and re-issues a fresh `'studio'`
+# device -- silently discarding every real device on disk.
+
+
+@pytest.mark.parametrize("raw", [
+    '{"version": 2, "devices": []}',    # a schema version this build has never seen
+    '{"version": 1, "devices": {}}',    # devices present but not a list
+    "[1, 2, 3]",                        # not even a JSON object
+    '"hello"',                          # a bare string
+])
+def test_load_raises_on_a_wrong_shape_document_rather_than_starting_empty(tmp_path, raw):
+    vault = TokenVault(tmp_path)
+    (tmp_path / "devices.json").write_text(raw, encoding="utf-8")
+
+    with pytest.raises(VaultReadError):
+        vault._load()
+
+
+def test_issue_against_a_wrong_shape_document_raises_and_does_not_overwrite_it(tmp_path):
+    """The composed, boot-time scenario the review traced through
+    `main.py:309-310`. Before this fix: `devices()` reports `[]`, the
+    bootstrap re-issues `'studio'`, and `issue()` writes a document
+    containing only that one device -- every pre-existing device gone,
+    silently, at startup. `issue()` must refuse instead, and the file on
+    disk must survive completely untouched.
+    """
+    raw = json.dumps({
+        "version": 2,
+        "devices": [{"device_id": "future", "label": "from-a-newer-build"}],
+    })
+    (tmp_path / "devices.json").write_text(raw, encoding="utf-8")
+    vault = TokenVault(tmp_path)
+
+    assert vault.devices() == [], "still fails closed to an empty listing on the read side"
+
+    with pytest.raises(VaultReadError):
+        vault.issue("studio", frozenset({Capability.OBSERVE}))
+
+    assert (tmp_path / "devices.json").read_text(encoding="utf-8") == raw, (
+        "the newer build's document must survive completely untouched"
+    )
+
+
+# ─── F-1: a write failure must not become 403 "protected path" ────────────
+# `_save()`'s underlying `_atomic_write` raises `PermissionError` under the
+# same Windows lock contention that made `_load()` need `VaultReadError` --
+# and an uncaught `PermissionError` is mapped by `errors.py` to 403
+# "protected path". `touch()` runs on every authenticated request, so an
+# unwrapped write failure there answered 403 -- "you are not allowed" -- to
+# every request while the lock held. `_save()` now wraps it in
+# `VaultWriteError` instead, so every caller sees one exception family
+# (`VaultUnavailableError`) regardless of which half of the sequence failed.
+
+
+def _break_devices_json_writes(monkeypatch):
+    """Make the next write of *any* devices.json raise `PermissionError`,
+    simulating the write-side half of the same Windows lock contention
+    `_break_devices_json_reads` simulates for reads. Patched at the
+    module-level `_atomic_write` function `_save()` calls, not at `os`
+    directly, so this cannot affect an unrelated file written by some other
+    part of a test (the instance secret, for one) that happens to run first.
+    """
+    original = vault_module._atomic_write
+
+    def broken(path, content):
+        if path.name == "devices.json":
+            raise PermissionError("simulated lock")
+        return original(path, content)
+
+    monkeypatch.setattr(vault_module, "_atomic_write", broken)
+    return original
+
+
+def test_save_raises_vault_write_error_not_a_raw_permission_error(tmp_path, monkeypatch):
+    vault = TokenVault(tmp_path)
+    _break_devices_json_writes(monkeypatch)
+
+    with pytest.raises(VaultWriteError):
+        vault.issue("phone", frozenset({Capability.OBSERVE}))
+
+
+def test_touch_write_failure_is_a_vault_unavailable_error_and_writes_nothing(tmp_path, monkeypatch):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    _break_devices_json_writes(monkeypatch)
+
+    with pytest.raises(VaultUnavailableError):
+        vault.touch(device_id)
+
+
+def test_revoke_write_failure_does_not_report_success_or_a_false_not_found(tmp_path, monkeypatch):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.verify(token).device_id
+    _break_devices_json_writes(monkeypatch)
+
+    with pytest.raises(VaultUnavailableError):
+        vault.revoke(device_id)
+
+    monkeypatch.undo()
+    assert vault.verify(token) is not None, "not actually revoked -- the write never landed"
+
+
 @pytest.mark.parametrize("bad_value", ["2026-01-01T00:00:00", "not-a-timestamp"])
 def test_a_healed_value_is_well_formed_and_throttles_the_next_touch(tmp_path, bad_value):
     """The point of healing is that the written value is a real, aware
@@ -655,3 +904,118 @@ def test_a_healed_value_is_well_formed_and_throttles_the_next_touch(tmp_path, ba
     vault.touch(device_id)  # immediately after -- must be throttled
 
     assert path.read_bytes() == healed_bytes
+
+
+# ─── Write races: _load-through-_save must be one critical section ────────
+# A barrier alone does not prove anything here -- it only synchronises thread
+# *start*, and CPython's GIL serialises these short critical sections tightly
+# enough that a racing pair can pass by accident even with no lock at all.
+# Both tests below force the interleaving explicitly: the first `_load()` call
+# is made to pause -- after capturing its snapshot, before returning it -- so
+# the racing caller is provably still running when the second call is allowed
+# to proceed. `_load` is patched on the *instance*, not the class, so other
+# tests are unaffected.
+
+
+def test_touch_cannot_resurrect_a_device_revoked_mid_sequence(tmp_path):
+    """Reproduces the bug from the brief directly: touch() loads a snapshot
+    that still has the device, is held there while revoke() runs to
+    completion, and then must not save that stale snapshot back over the
+    revocation. Without a lock spanning `_load()` through `_save()`, it does
+    exactly that -- the device comes back.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.verify(token).device_id
+
+    touch_loaded = threading.Event()   # touch() has captured its snapshot
+    let_touch_save = threading.Event()  # revoke() has finished; touch() may resume
+    original_load = vault._load
+    call_count = {"n": 0}
+
+    def blocking_load():
+        # `_load` is patched on the instance, so *every* caller through this
+        # vault goes through here, including revoke()'s own `_load()` call.
+        # Only the first call (touch's) pauses; revoke's call must read the
+        # live document and return immediately, or the two threads would
+        # deadlock waiting on each other's events instead of racing.
+        call_count["n"] += 1
+        data = original_load()
+        if call_count["n"] == 1:
+            touch_loaded.set()
+            assert let_touch_save.wait(timeout=5), "revoke() never let touch() resume"
+        return data
+
+    vault._load = blocking_load
+    touch_thread = threading.Thread(target=vault.touch, args=(device_id,))
+    touch_thread.start()
+    assert touch_loaded.wait(timeout=5), "touch() never reached _load()"
+
+    # touch() is now holding a snapshot that still contains the device (with
+    # the lock in place, it is also still holding `self._lock`). Run revoke()
+    # to completion -- or, with the fix, until it blocks on that lock -- on
+    # its own thread; the bounded join just keeps this from hanging either way.
+    revoke_thread = threading.Thread(target=vault.revoke, args=(device_id,))
+    revoke_thread.start()
+    revoke_thread.join(timeout=1.0)
+
+    let_touch_save.set()
+    touch_thread.join(timeout=5)
+    revoke_thread.join(timeout=5)
+    vault._load = original_load
+
+    assert not touch_thread.is_alive() and not revoke_thread.is_alive()
+    assert vault.verify(token) is None, "touch() resurrected a device revoked mid-sequence"
+
+
+def test_issue_racing_revoke_loses_neither_the_new_device_nor_the_revocation(tmp_path):
+    """Same class of bug, the other direction: issue() appending a new device
+    and revoke() removing an existing one are both load-mutate-save. If they
+    interleave, whichever saves last wins outright and the other caller's
+    write is silently gone -- either the new device never really got added,
+    or the revoked one comes back.
+    """
+    vault = TokenVault(tmp_path)
+    existing_token = vault.issue("existing", frozenset({Capability.OBSERVE}))
+    existing_id = vault.verify(existing_token).device_id
+
+    revoke_loaded = threading.Event()   # revoke() has captured its snapshot
+    let_revoke_save = threading.Event()  # issue() has finished; revoke() may resume
+    original_load = vault._load
+    call_count = {"n": 0}
+
+    def blocking_load():
+        # Only the first call (revoke's) pauses. A second call through this
+        # same patched attribute -- issue()'s, if it gets that far before the
+        # lock releases -- must read live, not repeat the pause.
+        call_count["n"] += 1
+        data = original_load()
+        if call_count["n"] == 1:
+            revoke_loaded.set()
+            assert let_revoke_save.wait(timeout=5), "issue() never let revoke() resume"
+        return data
+
+    vault._load = blocking_load
+    revoke_thread = threading.Thread(target=vault.revoke, args=(existing_id,))
+    revoke_thread.start()
+    assert revoke_loaded.wait(timeout=5), "revoke() never reached _load()"
+
+    # revoke() is now holding a snapshot with the existing device still in it
+    # (with the lock in place, also still holding `self._lock`). Run issue()
+    # to completion -- or, with the fix, until it blocks on that lock.
+    issue_thread = threading.Thread(
+        target=vault.issue, args=("new", frozenset({Capability.OBSERVE}))
+    )
+    issue_thread.start()
+    issue_thread.join(timeout=1.0)
+
+    let_revoke_save.set()
+    revoke_thread.join(timeout=5)
+    issue_thread.join(timeout=5)
+    vault._load = original_load
+
+    assert not revoke_thread.is_alive() and not issue_thread.is_alive()
+    labels = sorted(d.label for d in vault.devices())
+    assert labels == ["new"], (
+        f"expected only the new device to survive the race, got {labels}"
+    )

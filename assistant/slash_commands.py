@@ -334,7 +334,19 @@ def _studio_revoke(raw_target: str) -> str:
         return _STUDIO_USAGE
 
     device_id = tokens[0]
-    if vault.revoke(device_id):
+    from .io.api.vault import VaultUnavailableError
+    try:
+        revoked = vault.revoke(device_id)
+    except VaultUnavailableError:
+        # Either half of a lock: devices.json could not be read (so whether
+        # device_id exists is genuinely unknown) or could not be written back
+        # (so the revoke did not happen even though the read that preceded it
+        # may have succeeded). Reporting "nothing was revoked" for either
+        # would be a guess dressed up as an answer, on the one command that
+        # has to tell the truth about whether a device is actually gone.
+        return ("Could not read or write the Studio device list right now -- "
+                "something else may have it open. Try again in a moment.")
+    if revoked:
         return f"Revoked Studio device {device_id}."
     return f"No Studio device found with id {device_id!r} -- nothing was revoked."
 

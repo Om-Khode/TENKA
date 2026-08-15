@@ -45,6 +45,7 @@ import pytest
 
 from assistant.io.api import payloads, runtime
 from assistant.io.api.security import AuditEntry
+from assistant.io.api.vault import Device
 
 
 def _is_nullable(annotation: object) -> bool:
@@ -109,6 +110,13 @@ PAIRS: list[Pair] = [
     Pair("EnrolledItem -> EnrolledItemPayload", runtime.EnrolledItem, payloads.EnrolledItemPayload),
     Pair("EnrollmentState -> EnrollmentPayload", runtime.EnrollmentState, payloads.EnrollmentPayload),
     Pair("AuditEntry -> AuditEntryPayload", AuditEntry, payloads.AuditEntryPayload),
+    # `Device` lives in vault.py rather than runtime.py -- it is not something
+    # the assistant reports, it is something this daemon owns -- but its
+    # relationship with the wire is identical, so it belongs in the same
+    # check. Nothing is declared as dropped on purpose: the fields a device
+    # record holds that must never reach a client (`token_hmac`) are not
+    # fields on this dataclass at all, they only exist in `devices.json`.
+    Pair("Device -> DevicePayload", Device, payloads.DevicePayload),
 ]
 
 # Payload models that wrap a bare `list[...]`, a scalar, or a route
@@ -132,6 +140,11 @@ WRAPPER_PAYLOADS_WITHOUT_A_DATACLASS: dict[type[payloads.CamelModel], str] = {
     payloads.RemovedPayload: "sourced from MemoryRuntime.forget_all()'s bare int, not a dataclass",
     payloads.DeletedPayload: "echoes the route's own request body path, not a dataclass",
     payloads.ForgetEnrolledPayload: "echoes the route's own path parameters, not a dataclass",
+    payloads.DevicesPayload: "wraps list[Device]; the vault returns the list directly",
+    payloads.RevokedPayload: "echoes the route's device_id path parameter, not a dataclass",
+    payloads.PairCodePayload: "sourced from the minted PairCode plus the endpoint list "
+                              "and the QR the route renders from it; PairCode's own "
+                              "`grants`/`label` deliberately never reach the wire",
     payloads.SessionPayload: "sourced from the authenticated Device plus the listener "
                               "policy and the pre-ceiling issued grants stashed on "
                               "request.state by authenticate(), not one dataclass",
