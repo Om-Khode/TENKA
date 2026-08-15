@@ -1,6 +1,7 @@
 """Token vault — the only thing that decides whether a caller is real."""
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 
 import pytest
@@ -507,3 +508,80 @@ def test_a_record_without_last_seen_still_parses(tmp_path):
                      "created_at": "2026-01-01T00:00:00+00:00", "token_hmac": "x"}],
     }), encoding="utf-8")
     assert TokenVault(tmp_path).devices()[0].last_seen_at is None
+
+
+# ─── touch() throttling ────────────────────────────────────────────────────
+# `touch()` sits on the authenticated request path (Task 10). Without a
+# floor, every call pays a full devices.json rewrite plus an `icacls`
+# subprocess -- a per-request cost on the one API that will be reachable
+# from a public URL. These assert on the file itself, not on `devices()`,
+# because the point being tested is the *absence* of I/O, which a read-back
+# through the vault's own re-parsing could not distinguish from "wrote the
+# same value back".
+
+
+def test_first_touch_on_a_device_with_no_stored_timestamp_always_writes(tmp_path):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    path = tmp_path / "devices.json"
+    before = path.read_bytes()
+
+    vault.touch(device_id)
+
+    assert path.read_bytes() != before
+    assert vault.devices()[0].last_seen_at is not None
+
+
+def test_touch_within_the_throttle_window_does_not_write_to_disk(tmp_path):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    vault.touch(device_id)  # first touch: no stored timestamp yet, always writes
+
+    path = tmp_path / "devices.json"
+    before = path.read_bytes()
+    vault.touch(device_id)  # second touch, well inside the 60s window
+
+    assert path.read_bytes() == before, "a touch within the window must not write at all"
+
+
+def test_touch_after_the_throttle_window_does_write(tmp_path):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=61)).isoformat()
+    raw["devices"][0]["last_seen_at"] = stale
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    vault.touch(device_id)
+
+    assert path.read_bytes() != before
+    assert vault.devices()[0].last_seen_at != stale
+
+
+def test_a_future_stored_timestamp_does_not_wedge_the_write_permanently(tmp_path):
+    """A clock change or a hand-edited file could leave `last_seen_at` in the
+    future. That must not disable touching forever -- age computed against a
+    future timestamp is negative, which the throttle window (0 <= age <
+    threshold) excludes, so the write proceeds and overwrites the bogus value.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    raw["devices"][0]["last_seen_at"] = future
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    vault.touch(device_id)
+
+    assert path.read_bytes() != before
+    assert vault.devices()[0].last_seen_at != future
