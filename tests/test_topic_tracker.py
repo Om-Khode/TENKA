@@ -211,3 +211,65 @@ class TestGetTopicHint:
 
     def test_hint_empty_stack(self, tracker):
         assert tracker.get_topic_hint() is None
+
+
+class TestCodeIsNotConversation:
+    """Pronoun resolution must not rewrite a pasted program.
+
+    The live failure: a guessing game containing
+    `print(f"You got it in {attempts} attempts.")` reached the intent
+    classifier as `You got /set studio in {attempts} attempts.` -- the top of
+    the topic stack spliced into the user's own source. code_executor's repair
+    loop then desynced (its <old> block was the mutated line, which never
+    appears in the generated code) and the turn burned three retries and two
+    minutes before timing out.
+    """
+
+    GAME = '''import random
+
+secret_number = random.randint(1, 100)
+attempts = 0
+
+while True:
+    guess = int(input("Enter your guess: "))
+    attempts += 1
+
+    if guess < secret_number:
+        print("Too low!")
+    else:
+        print(f"Correct! You got it in {attempts} attempts.")
+        break'''
+
+    def test_a_pasted_program_is_returned_verbatim(self, tracker):
+        """PROOF-OF-FAILURE: before the guard this returned the mutated body."""
+        tracker.push_turn("Tell me about Python", turn_number=1)
+        assert tracker.resolve_query(self.GAME) == self.GAME
+
+    def test_a_fenced_block_inside_prose_is_left_alone(self, tracker):
+        """Prose overall, so the ratio test rates it conversation -- the fence
+        is what protects the snippet."""
+        tracker.push_turn("Tell me about Python", turn_number=1)
+        text = 'run this please\n\n```\nprint("You got it now")\n```\n'
+        resolved = tracker.resolve_query(text)
+        assert 'print("You got it now")' in resolved
+
+    def test_a_quoted_literal_on_one_line_is_left_alone(self, tracker):
+        """One line is below the ratio test's threshold, so the quote layer is
+        the only thing standing between the stack and the string."""
+        tracker.push_turn("Tell me about Python", turn_number=1)
+        text = 'print("You got it")'
+        assert tracker.resolve_query(text) == text
+
+    def test_prose_outside_a_fence_still_resolves(self, tracker):
+        """The guard must not disable resolution wholesale."""
+        tracker.push_turn("Tell me about the Beatles", turn_number=1)
+        text = 'when did they split\n\n```\ncode = 1\n```\n'
+        resolved = tracker.resolve_query(text)
+        assert "Beatles" in resolved
+
+    def test_ordinary_multi_line_speech_still_resolves(self, tracker):
+        """Multi-line does not mean code. Dictation wraps."""
+        tracker.push_turn("Tell me about World War 2", turn_number=1)
+        text = "so about that documentary\nwho actually won it"
+        resolved = tracker.resolve_query(text)
+        assert "World War" in resolved
