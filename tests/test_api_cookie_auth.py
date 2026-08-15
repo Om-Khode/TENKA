@@ -459,6 +459,31 @@ _MUTATING_OPERATIONS = frozenset({
     # SYSTEM_CONTROL, and `quick` is not an admin listener.
     ("POST", "/v1/pair/code"),
     ("DELETE", "/v1/devices/{device_id}"),
+    # Moving a verified credential from the bearer channel onto the cookie.
+    # Refused here, like everything else in this set -- but with 401 rather
+    # than 403; see `_REFUSED_WITH_UNAUTHORIZED` below for why the difference
+    # is deliberate.
+    ("POST", "/v1/session/cookie"),
+})
+
+# The operations in the set above whose refusal on this listener is 401, not
+# 403. One entry, and it is not an inconsistency to be tidied away.
+#
+# Every other mutation here is refused by a *capability* gate: the device
+# holds the grant, the `quick` ceiling does not carry it, and 403 "capability
+# not granted" is the true sentence. `POST /v1/session/cookie` is gated on no
+# capability at all -- it is gated on `policy.allow_bearer`, a property of the
+# listener, because a cookie/bearer exchange is only meaningful where a bearer
+# could have arrived. Answering 403 "capability not granted" would name a
+# capability that does not exist for this route; `UNAUTHORIZED` is the same
+# constant-shape refusal `authenticate()` already raises for the other
+# listener-level refusal (a device whose grants survive the ceiling not at
+# all), so this route's answer matches the gate that produced it.
+#
+# Pinned rather than exempted: the sweep still calls this route and still
+# insists it is refused. Only the expected status differs.
+_REFUSED_WITH_UNAUTHORIZED = frozenset({
+    ("POST", "/v1/session/cookie"),
 })
 
 
@@ -509,10 +534,11 @@ def _sweep_mutations_are_refused(client) -> set[tuple[str, str]]:
             client.app.state.auth.limiter = RateLimiter()
             response = client.request(verb, concrete, headers={CSRF_HEADER: "1"})
             swept.add((verb, path))
-            if response.status_code != 403:
+            expected = 401 if (verb, path) in _REFUSED_WITH_UNAUTHORIZED else 403
+            if response.status_code != expected:
                 violations.append(
                     f"{verb} {path} answered {response.status_code} on a "
-                    "read-only listener"
+                    f"read-only listener (expected {expected})"
                 )
     assert not violations, "\n".join(violations)
     return swept
