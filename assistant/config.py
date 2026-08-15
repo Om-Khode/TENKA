@@ -860,6 +860,20 @@ STUDIO_API_ORIGINS: str = _runtime_setting(
     needs_restart=True,
 )
 
+STUDIO_UI_PATH: str = _runtime_setting(
+    "studio_ui_path", "",
+    # The daemon serves Studio itself so that the page and the API share one
+    # origin -- which is what removes mixed content and Private Network
+    # Access, and what lets the device credential be an httpOnly cookie at
+    # all. Empty means "serve the bundle vendored with this release"; a path
+    # overrides it with a local build, either a `next build` output directory
+    # (which wins, so iterating on Studio needs no re-packaging) or a .zip.
+    description=("Path to a Studio build the daemon should serve instead of "
+                 "the vendored one -- a `next build` output directory or a "
+                 ".zip. Empty uses the bundled release. Developer override."),
+    needs_restart=True,
+)
+
 # ─── Event monitor settings ───────────────────────────────────────────
 EVENT_MONITOR_ENABLED: bool = True
 EVENT_MONITOR_MAX_ACTIVE: int = 20
@@ -895,7 +909,7 @@ def reload_runtime_settings() -> None:
     global VERIFY_ENABLED, VERIFY_BROWSER_STEPS, VERIFY_APP_STEPS
     global VERIFY_VISION_FALLBACK, VERIFY_STRICT_TEXT_MATCH
     global VERIFY_MIN_CONFIDENCE, VERIFY_MAX_RETRIES
-    global STUDIO_API_ENABLED, STUDIO_API_PORT, STUDIO_API_ORIGINS
+    global STUDIO_API_ENABLED, STUDIO_API_PORT, STUDIO_API_ORIGINS, STUDIO_UI_PATH
     global BROWSER_CDP_PORT, BROWSER_CDP_PROBE_TTL, BROWSER_DOM_CACHE_TTL
     global BROWSER_DOM_MODE_ENABLED, BROWSER_DOM_TREE_TOKEN_BUDGET, BROWSER_PREFER_CDP
     global DETERMINISTIC_MATCHING_ENABLED, DIALOG_ENGAGEMENT_GATE_ENABLED
@@ -938,6 +952,7 @@ def reload_runtime_settings() -> None:
     STUDIO_API_ENABLED = new_values.get("studio_api_enabled", STUDIO_API_ENABLED)
     STUDIO_API_PORT = new_values.get("studio_api_port", STUDIO_API_PORT)
     STUDIO_API_ORIGINS = new_values.get("studio_api_origins", STUDIO_API_ORIGINS)
+    STUDIO_UI_PATH = new_values.get("studio_ui_path", STUDIO_UI_PATH)
 
     BROWSER_CDP_PORT = new_values.get("browser_cdp_port", BROWSER_CDP_PORT)
     BROWSER_CDP_PROBE_TTL = new_values.get("browser_cdp_probe_ttl", BROWSER_CDP_PROBE_TTL)

@@ -48,6 +48,7 @@ from .security import (
     origin_is_known,
     policy_for_scope,
 )
+from .ui import UiBundle, mount_ui
 from .vault import Capability, TokenVault
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,8 @@ class HostGate:
 
 def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                origins: list[str], hub: EventHub | None = None,
-               listener_policies: dict[int, str] | None = None) -> FastAPI:
+               listener_policies: dict[int, str] | None = None,
+               ui_bundle: UiBundle | None = None) -> FastAPI:
     # Eager, once: instance_secret() is uncached on the environment-override
     # path, and a wrong-length TENKA_SECRET raises ValueError. Resolving it
     # here means a misconfigured override fails when the app is built, not
@@ -513,5 +515,15 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             pass
         finally:
             await app.state.hub.detach(websocket)
+
+    # ─── the Studio front-end ───────────────────────────────────────────
+    # Last, deliberately: it registers a catch-all, and Starlette matches
+    # routes in registration order, so every real API path above must already
+    # be claimed by the time it is added. It also sits *inside* `HostGate` --
+    # a public route is not an ungated one, and DNS rebinding does not stop
+    # mattering because a page needs no credential. `mount_ui` does nothing
+    # when there is no bundle, so an app built without one has no `/` at all
+    # and answers 404 there, exactly as it did before this existed.
+    mount_ui(app, ui_bundle)
 
     return app
