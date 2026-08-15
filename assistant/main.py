@@ -289,6 +289,29 @@ _studio_vault: "TokenVault | None" = None
 # too -- a second local variable in a different function's scope can't do
 # that -- so it lives here instead of riding the return value.
 
+_studio_pair_store: "PairCodeStore | None" = None
+# Same reachability need as `_studio_vault`, for a stronger reason:
+# `PairCodeStore` is deliberately in-memory only (pairing.py's docstring --
+# a three-minute code has no reason to survive a restart, and not
+# persisting it means there is no file to steal), so there is no
+# file-backed equivalent of `TokenVault(config.SANDBOX_DIR)` a caller could
+# reconstruct from outside the running app the way `_studio_vault()` in
+# slash_commands.py does. This module-level reference IS the only handle on
+# the one store `POST /v1/pair` actually consults. `/studio pair`
+# (slash_commands.py) reads this global rather than building its own
+# `PairCodeStore()` -- doing that would mint a code into an object the
+# pairing route can never see: a code that looks perfectly valid on the
+# console and can never be redeemed. Invariant this global is meant to hold
+# at every instant: non-`None` if and only if a Studio app is actually
+# serving `POST /v1/pair` right now. `_start_studio_daemon()` only assigns
+# it *after* `serve_studio_api()` has returned without raising (never
+# before, even though the `PairCodeStore` itself has to exist earlier to be
+# threaded through as an argument -- see that function's own comment), and
+# `_stop_studio_daemon()` clears it back to `None` unconditionally, first
+# thing, on every one of its exit paths. `None` here means no daemon has
+# ever successfully started (or one that did has since stopped), and the
+# slash command must say so plainly rather than mint anyway.
+
 
 async def _start_studio_daemon() -> "asyncio.Task | None":
     """Build and start the Studio daemon. Returns the running task, or
@@ -298,10 +321,11 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
     Split out of async_main() so a test can drive this exact sequence
     (e.g. forcing serve() to fail) without booting the assistant.
     """
-    global _studio_dispatch, _studio_vault
+    global _studio_dispatch, _studio_vault, _studio_pair_store
     try:
         from .actions.studio_runtime import build_studio_runtime
         from .io.api.events import EventHub
+        from .io.api.pairing import PairCodeStore
         from .io.api.server import serve as serve_studio_api
         from .io.api.vault import Capability, TokenVault
 
@@ -333,13 +357,39 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
         # failure leaves no trace to leak.
         _studio_hub = EventHub()
         _studio_dispatch = _StudioDispatch()
+        # Built here, explicitly, and threaded through to `serve_studio_api`
+        # rather than left for `create_app()`'s own default -- its default
+        # is a *private* store scoped to whichever app happens to build it,
+        # which is fine for a test building its own app but means nothing
+        # outside this function could ever reach it.
+        #
+        # Held in a LOCAL until serve_studio_api() has returned without
+        # raising -- not assigned to the module global up front. serve()
+        # calls create_app(), which does an eager `vault.instance_secret()`
+        # check that raises synchronously on a bad TENKA_SECRET (see the
+        # comment above on `_studio_hub`/subscribe timing for the identical
+        # reasoning already applied there). Assigning the global before that
+        # call, the same way this function used to, left `_studio_pair_store`
+        # pointing at a real, live-looking `PairCodeStore` even when
+        # `serve()` never returned a task at all -- `/studio pair` would
+        # keep minting codes for a daemon that was never actually serving
+        # `POST /v1/pair`, the identical "unredeemable code" failure the
+        # post-stop cleanup fixes for the *other* end of the daemon's
+        # lifetime. Ordering it this way makes the invariant ("the global is
+        # set only when something is actually listening") hold by
+        # construction -- there is no `except` branch left to forget to
+        # undo it in, because the assignment that would need undoing simply
+        # has not happened yet.
+        _pair_store = PairCodeStore()
         _studio_task = serve_studio_api(
             build_studio_runtime(_studio_dispatch),
             _studio_vault,
             port=config.STUDIO_API_PORT,
             origins=[o.strip() for o in config.STUDIO_API_ORIGINS.split(",") if o.strip()],
             hub=_studio_hub,
+            pair_store=_pair_store,
         )
+        _studio_pair_store = _pair_store
         # publish_status(), not publish() directly: it translates the
         # broadcaster's own snake_case event shape into the daemon's
         # camelCase wire frame (assistant/io/api/events.py) before it ever
@@ -363,7 +413,17 @@ async def _stop_studio_daemon(task: "asyncio.Task | None") -> None:
     Retrieving a done task's exception marks it consumed, so asyncio's own
     "exception was never retrieved" logger never prints it later,
     unredacted, through a handler this module doesn't control.
+
+    Also clears `_studio_pair_store`, unconditionally and first, regardless
+    of which path below actually runs. A stale store is the exact "prints a
+    code nobody can redeem" failure `/studio pair` exists to prevent -- just
+    reached through a global that outlived the daemon instead of a fresh
+    construction. `/studio pair` must see `None` the instant the daemon
+    stops serving, not only after some particular shutdown path (no task,
+    an already-crashed task, or a task actually cancelled here all count).
     """
+    global _studio_pair_store
+    _studio_pair_store = None
     if task is None:
         return
     if task.done():
@@ -717,12 +777,32 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # ─── Slash commands (zero-LLM runtime config) ────────────────────
         # Chat input like "/set followup_timer 7" is intercepted here before
         # any teaching / shortcut / intent processing. Voice rarely produces
-        # leading "/", so this is effectively chat-only in practice.
+        # leading "/", so this is effectively console/voice-only in practice
+        # -- deliberately, not by accident. `source == "studio"` is the one
+        # exception that must never execute: POST /v1/chat requires only
+        # CHAT_SEND, and _StudioDispatch.submit() -> this function applies no
+        # further check per source. CHAT_SEND is in every /studio pair
+        # default grant, so without this refusal a device holding nothing
+        # but CHAT_SEND could type "/studio pair evilphone" (or
+        # "/studio revoke all confirm", or "/set", or "/reset" -- the whole
+        # slash surface, not just pairing) over chat and reach commands that
+        # were never gated by the capability system at all. That is the
+        # sideways escalation Task 10 closed on POST /v1/pair/code, reopened
+        # through a different door. Slash commands stay a console/voice
+        # affordance; Studio's own typed routes (Settings, Devices) are
+        # where a remote caller's grants actually apply.
         # NOTE: no follow-up listen — config commands aren't conversation.
         # The `finally` block at the bottom of this function resumes the
         # wake listener, so bailing out here is safe.
         if slash_commands.is_slash_command(transcription):
-            response = slash_commands.handle(transcription)
+            if source == "studio":
+                response = ("Slash commands aren't available through "
+                            "Studio's chat -- use its Settings and Devices "
+                            "pages for this.")
+                outcome = "refused"
+            else:
+                response = slash_commands.handle(transcription)
+                outcome = "success"
             if source == "chat":
                 print(response)
             else:
@@ -732,7 +812,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 await tts.speak(spoken, bridge, emotion="neutral")
             _tracker.intent_detected = "slash_command"
             _tracker.intent_source = "regex"
-            _tracker.action_outcome = "success"
+            _tracker.action_outcome = outcome
             _tracker.latency_intent_ms = int((_time.monotonic() - _t0_intent) * 1000)
             return
 

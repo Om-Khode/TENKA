@@ -13,6 +13,7 @@ import uvicorn
 
 from .app import create_app
 from .events import EventHub
+from .pairing import PairCodeStore
 from .runtime import StudioRuntime
 from .vault import TokenVault
 
@@ -23,13 +24,20 @@ _HOST = "127.0.0.1"
 
 def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
           port: int = 8787, origins: list[str],
-          hub: EventHub | None = None) -> asyncio.Task:
+          hub: EventHub | None = None,
+          pair_store: PairCodeStore | None = None) -> asyncio.Task:
     """Start uvicorn as a task on the running loop. Cancel the task to stop.
 
     `hub` lets a caller (main.py) subscribe status_broadcaster to the exact
     EventHub instance this app will use, before the socket route ever sees a
     connection. Left unset -- every existing caller (tests, the exporter) --
     `create_app` builds its own, private to that one app, exactly as before.
+
+    `pair_store` is the same shape of escape hatch, for the same reason:
+    main.py threads its own module-level `PairCodeStore` through here so
+    that `/studio pair` (a slash command, not a route) can mint into the
+    exact object `POST /v1/pair` consults. Left unset, `create_app` builds a
+    private store nothing outside that one app could ever reach.
     """
     if host != _HOST:
         raise ValueError("the Studio daemon binds loopback only in this milestone")
@@ -40,7 +48,7 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     # nothing at all. A later transport adds its own entry here rather than
     # relying on any property of the traffic itself.
     app = create_app(runtime, vault, origins=origins, hub=hub,
-                     listener_policies={port: "local"})
+                     listener_policies={port: "local"}, pair_store=pair_store)
     config = uvicorn.Config(app, host=host, port=port, log_level="warning",
                             access_log=False, lifespan="on")
     server = uvicorn.Server(config)

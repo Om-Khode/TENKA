@@ -438,7 +438,16 @@ async def test_a_failed_start_does_not_leak_a_status_subscription(tmp_path, monk
     bad TENKA_SECRET) must not have already subscribed its hub -- otherwise
     every future status.set() call, which fires on every phase transition,
     keeps appending to a hub nothing will ever drain, for the rest of the
-    process, on a machine where the daemon is off."""
+    process, on a machine where the daemon is off.
+
+    Also asserts the pair-store half of this exact scenario (Task 11 review,
+    round 2): this test already drove a synchronous serve() failure and
+    asserted only on the subscription, which is precisely what let
+    `_studio_pair_store` stay orphaned -- assigned before serve() was ever
+    called, never cleared in the `except` -- pass silently for a full round.
+    One scenario, both failure modes, pinned together so that does not
+    happen again.
+    """
     import assistant.config as config
     import assistant.main as m
     from assistant.io.status_broadcaster import status
@@ -455,6 +464,44 @@ async def test_a_failed_start_does_not_leak_a_status_subscription(tmp_path, monk
     assert result is None
     assert len(status._subscribers) == before, (
         "a failed serve() must leave no trace on the broadcaster's subscriber list"
+    )
+    assert m._studio_pair_store is None, (
+        "a serve() that raised synchronously must not leave a pair store "
+        "behind -- /studio pair would keep minting unredeemable codes for "
+        "a daemon that never actually started"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_leaves_studio_pair_refusing(tmp_path, monkeypatch):
+    """The behavioural twin of the test above, driven through the actual
+    slash command rather than the raw global -- proved by execution, per
+    the review: patch serve() to raise the same synchronous
+    `create_app()`-eager-check failure, start the daemon, then run
+    `/studio pair` and assert it refuses (message *and* no code-shaped
+    string), not that it silently succeeds against an orphaned store.
+    """
+    import re
+
+    import assistant.config as config
+    import assistant.main as m
+    from assistant import slash_commands
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    def _raise(*args, **kwargs):
+        raise ValueError("bad TENKA_SECRET")
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _raise)
+
+    result = await m._start_studio_daemon()
+    assert result is None, "sanity: the start must actually have failed"
+
+    response = slash_commands.handle("/studio pair testphone")
+
+    assert "not running" in response.lower()
+    assert not re.search(r"[0-9A-Z]{4}-[0-9A-Z]{4}", response), (
+        "a failed start must not leave a code-minting store reachable"
     )
 
 
@@ -687,3 +734,187 @@ async def test_a_started_daemons_token_never_reaches_a_log_record(tmp_path, monk
     for record in caplog.records:
         assert raw_token not in record.getMessage()
         assert raw_token not in str(record.msg)
+
+
+# ─── Fix round (Task 11 review): the pair store must be the routes' own ───
+# C1/Fix 4: nothing pinned that the module global `/studio pair` reads is
+# the *same object* serve_studio_api() (main.py's alias for
+# assistant.io.api.server.serve()) hands to create_app() as `pair_store=`.
+# A wrong object passed to that kwarg would have gone uncaught -- every
+# `/studio pair` test drives the global directly via a fixture, never
+# through a real _start_studio_daemon() call.
+
+
+@pytest.mark.asyncio
+async def test_a_successful_start_leaves_a_pair_store_the_routes_actually_hold(
+    tmp_path, monkeypatch,
+):
+    """The mirror of test_a_successful_start_leaves_the_vault_reachable_for_
+    shutdown above, for the pair store: a start must leave
+    `assistant.main._studio_pair_store` set to the *exact* `PairCodeStore`
+    instance handed to `serve()` as `pair_store=` -- not merely *a*
+    `PairCodeStore`, which a bug swapping in a second, freshly-constructed
+    one would still satisfy.
+    """
+    import asyncio
+
+    import assistant.config as config
+    import assistant.main as m
+    from assistant.io.api.pairing import PairCodeStore
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    captured: dict = {}
+
+    async def _noop() -> None:
+        return None
+
+    def _fake_serve(*args, **kwargs):
+        captured.update(kwargs)
+        return asyncio.create_task(_noop())
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _fake_serve)
+
+    task = await m._start_studio_daemon()
+    try:
+        assert isinstance(m._studio_pair_store, PairCodeStore)
+        assert "pair_store" in captured, (
+            "_start_studio_daemon() never passed pair_store= to serve() at all"
+        )
+        assert captured["pair_store"] is m._studio_pair_store, (
+            "the module global is not the same store handed to serve() -- "
+            "/studio pair would mint into an object the real app's routes "
+            "never see"
+        )
+    finally:
+        await task
+
+
+@pytest.mark.asyncio
+async def test_stop_studio_daemon_clears_the_pair_store():
+    """Fix 3: a stale store left set after stop is the "prints a code
+    nobody can redeem" failure /studio pair exists to prevent, reached
+    through a global instead of a fresh construction."""
+    import assistant.main as m
+    from assistant.io.api.pairing import PairCodeStore
+
+    m._studio_pair_store = PairCodeStore()
+    await m._stop_studio_daemon(None)
+    assert m._studio_pair_store is None
+
+
+# ─── Fix round (Task 11 review): C1 — slash commands must not execute for
+# the "studio" source ───────────────────────────────────────────────────────
+# POST /v1/chat requires only CHAT_SEND (routes/chat.py), and
+# _StudioDispatch.submit() -> process_text_from_queue applies no further
+# check per source. CHAT_SEND rides in /studio pair's own default grant
+# set, so a device holding nothing else could reach the entire slash
+# surface -- /studio pair, /studio revoke, /set, /reset -- with zero
+# intersection against its own grants: the sideways escalation Task 10
+# closed on POST /v1/pair/code, reopened through chat. Proved behaviourally
+# below, not just by refusal text: the thing a slash command would have
+# mutated (here, the pair store) is asserted untouched.
+#
+# `_telemetry.TurnTracker.save()` is stubbed out because it is a real write
+# through the storage singleton -- this suite must not touch the developer's
+# actual `~/TENKA/memory/tenka.db` (see this file's own docstring/rules
+# above about process_text_from_queue being "a heavy, real pipeline").
+# `tts.speak()` is stubbed for the same class of reason (real Kokoro
+# synthesis + sounddevice playback), not because its behaviour is under
+# test here.
+
+
+class _FakeBridge:
+    async def send_command(self, *args, **kwargs) -> None:
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [
+    "/studio pair evilphone",
+    "/studio revoke all confirm",
+    "/set followup_timer 999",
+])
+async def test_studio_source_refuses_slash_commands_and_executes_nothing(
+    command, monkeypatch,
+):
+    import assistant.main as m
+    from assistant.io.api.pairing import PairCodeStore
+
+    store = PairCodeStore()
+    monkeypatch.setattr(m, "_studio_pair_store", store)
+    monkeypatch.setattr(m, "_wake_listener", None)
+    monkeypatch.setattr(m._telemetry.TurnTracker, "save", lambda self: None)
+
+    async def _fake_speak(text, bridge, emotion="neutral"):
+        return True
+    monkeypatch.setattr(m.tts, "speak", _fake_speak)
+
+    handled: list[str] = []
+    real_handle = m.slash_commands.handle
+
+    def _tracking_handle(text):
+        handled.append(text)
+        return real_handle(text)
+    monkeypatch.setattr(m.slash_commands, "handle", _tracking_handle)
+
+    await m.process_text_from_queue("studio", command, _FakeBridge())
+
+    assert handled == [], (
+        f"slash_commands.handle must never run for the studio source, got: {handled}"
+    )
+    assert store.current() is None, "no code may be minted through the chat/API source"
+
+
+@pytest.mark.asyncio
+async def test_studio_source_cannot_revoke_devices_through_chat(tmp_path, monkeypatch):
+    """The same property as above, proved on a real vault rather than just
+    "handle() was never called": a device paired before this turn must
+    still be there afterwards."""
+    import assistant.main as m
+    import assistant.config as config
+    from assistant.io.api.vault import Capability, TokenVault
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+
+    monkeypatch.setattr(m, "_wake_listener", None)
+    monkeypatch.setattr(m._telemetry.TurnTracker, "save", lambda self: None)
+
+    async def _fake_speak(text, bridge, emotion="neutral"):
+        return True
+    monkeypatch.setattr(m.tts, "speak", _fake_speak)
+
+    await m.process_text_from_queue("studio", "/studio revoke all confirm", _FakeBridge())
+
+    assert len(TokenVault(tmp_path).devices()) == 1, (
+        "a studio-sourced slash command revoked a real device"
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_source_still_executes_slash_commands(monkeypatch):
+    """The mirror of the refusal above: the console/local overlay's "chat"
+    source (a different thing from the Studio API's "studio" source, see
+    main.py's `_input_queue.put(("chat", ...))` at the chat_message event
+    handler) must be unaffected -- this is a console/voice affordance, not
+    a blanket ban on slash commands."""
+    import assistant.main as m
+    from assistant.io.api.pairing import PairCodeStore
+
+    store = PairCodeStore()
+    monkeypatch.setattr(m, "_studio_pair_store", store)
+    monkeypatch.setattr(m, "_wake_listener", None)
+    monkeypatch.setattr(m._telemetry.TurnTracker, "save", lambda self: None)
+
+    printed: list[str] = []
+    monkeypatch.setattr(
+        "builtins.print",
+        lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+    )
+
+    await m.process_text_from_queue("chat", "/studio pair phone", _FakeBridge())
+
+    assert store.current() is not None, "the chat source must still be able to mint"
+    assert any("Pair code minted" in line for line in printed)
