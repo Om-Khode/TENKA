@@ -465,3 +465,45 @@ def test_corrupt_secret_file_with_no_cached_secret_regenerates_and_persists(tmp_
     on_disk = (tmp_path / "instance_secret").read_text(encoding="utf-8").strip()
     assert bytes.fromhex(on_disk) == secret, "regenerated secret was not persisted"
     assert vault.instance_secret() == secret  # and it is stable from then on
+
+
+# ─── last_seen_at ──────────────────────────────────────────────────────────
+
+
+def test_a_new_device_has_no_last_seen(tmp_path):
+    vault = TokenVault(tmp_path)
+    # `Capability.CHAT` (the brief's literal value) predates the Task 5b
+    # OBSERVE/RECALL split and no longer exists; OBSERVE is the equivalent
+    # "just issued, still valid" grant for this test's purpose.
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    assert vault.devices()[0].last_seen_at is None
+
+
+def test_touch_records_a_timestamp(tmp_path):
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+    vault.touch(device_id)
+    assert vault.devices()[0].last_seen_at is not None
+
+
+def test_touching_an_unknown_device_is_silent(tmp_path):
+    TokenVault(tmp_path).touch("nope")      # must not raise
+
+
+def test_a_record_without_last_seen_still_parses(tmp_path):
+    """Records written before this task exist on disk. A missing key is not a
+    malformed record.
+
+    Grants use `"observe"` rather than the brief's literal `"chat"`: that
+    string was retired by the Task 5b OBSERVE/RECALL split and is *supposed*
+    to fail closed and drop (tested elsewhere) -- using it here would make
+    this test pass for the wrong reason, on an empty device list, instead of
+    proving a missing `last_seen_at` key parses as `None`.
+    """
+    (tmp_path / "devices.json").write_text(json.dumps({
+        "version": 1,
+        "devices": [{"device_id": "a", "label": "old", "grants": ["observe"],
+                     "created_at": "2026-01-01T00:00:00+00:00", "token_hmac": "x"}],
+    }), encoding="utf-8")
+    assert TokenVault(tmp_path).devices()[0].last_seen_at is None

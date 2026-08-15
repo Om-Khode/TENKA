@@ -70,6 +70,7 @@ class Device:
     label: str
     grants: frozenset[Capability]
     created_at: str
+    last_seen_at: str | None = None
 
 
 def _restrict_to_current_user(path: Path) -> None:
@@ -292,6 +293,12 @@ class TokenVault:
                 label=entry["label"],
                 grants=grants,
                 created_at=entry["created_at"],
+                # `.get`, not `[...]`: every record written before this task
+                # has no such key at all, and that absence is not malformed --
+                # it just means "never touched". Only a genuinely missing
+                # required field (device_id, label, grants, created_at) should
+                # drop a record; this one must default instead.
+                last_seen_at=entry.get("last_seen_at"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning(f"[API] skipping malformed device record: {exc}")
@@ -364,6 +371,28 @@ class TokenVault:
         data["devices"] = remaining
         self._save(data)
         return True
+
+    def touch(self, device_id: str) -> None:
+        """Record that `device_id` was just seen, for the revoke-list UI.
+
+        Silent on an unknown id: a stale or already-revoked credential
+        showing up on the request path is ordinary, not exceptional, and a
+        vault method must not hand a caller a reason to surface an error for
+        it. Rewrites the whole record through `_save`/`_atomic_write` rather
+        than patching the file in place -- same durability guarantee as every
+        other write here, no special case for this one field.
+        """
+        data = self._load()
+        now = datetime.now(timezone.utc).isoformat()
+        found = False
+        for entry in data["devices"]:
+            if isinstance(entry, dict) and entry.get("device_id") == device_id:
+                entry["last_seen_at"] = now
+                found = True
+                break
+        if not found:
+            return
+        self._save(data)
 
     def devices(self) -> list[Device]:
         result = []
