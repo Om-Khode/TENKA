@@ -350,3 +350,91 @@ def test_pair_mints_into_the_store_the_pair_route_can_redeem(vault_root, running
 
     assert response.status_code == 204
     assert any(d.label == "phone" for d in vault.devices())
+
+
+# ─── Fix round: the daemon stop path must invalidate the store ─────────────
+# C1's review found the store was never cleared on stop, so `/studio pair`
+# kept reporting success after the daemon it belonged to had already gone
+# away -- the exact "prints a code nobody can redeem" failure this task
+# exists to prevent, reached through a stale global instead of a fresh
+# construction.
+
+
+@pytest.mark.asyncio
+async def test_pair_refuses_after_the_daemon_is_stopped(running_pair_store):
+    import assistant.main as main_mod
+
+    # A no-task stop is exactly what happens when the daemon never actually
+    # got a task back from serve() (see _start_studio_daemon's failure
+    # path) -- and it is also the simplest way to drive the real
+    # _stop_studio_daemon() code path without booting uvicorn.
+    await main_mod._stop_studio_daemon(None)
+
+    result = slash_commands.handle("/studio pair phone")
+
+    assert "not running" in result.lower()
+    assert not re.search(r"[0-9A-Z]{4}-[0-9A-Z]{4}", result)
+    assert main_mod._studio_pair_store is None
+
+
+# ─── C2: the code must never reach a log line ──────────────────────────────
+# main.py speaks (and, before this fix, would have logged) only
+# `response.split("\n", 1)[0]` for every non-"chat" source. A code sitting
+# on the first line of /studio pair's response would ride straight into
+# tts.speak()'s log line the moment this command is ever reached by voice
+# (structurally possible even though "voice rarely produces a leading /").
+
+
+def test_pair_response_keeps_the_code_off_the_first_line(running_pair_store):
+    """The property main.py's `spoken = response.split("\\n", 1)[0][:200]`
+    actually depends on. `redact_secrets()` cannot be trusted to catch a
+    9-character pair code on its own (see test_speak_redacts.. below for
+    what it *can* catch) -- so the code must never be on line one at all.
+    """
+    out = slash_commands.handle("/studio pair phone")
+    first_line = out.split("\n", 1)[0]
+    assert not re.search(r"[0-9A-Z]{4}-[0-9A-Z]{4}", first_line), (
+        f"the pair code must not be on the first line -- got: {first_line!r}"
+    )
+    # Sanity: the code is still somewhere in the full response (a human at
+    # the console still needs to read it).
+    assert re.search(r"[0-9A-Z]{4}-[0-9A-Z]{4}", out)
+
+
+@pytest.mark.asyncio
+async def test_speak_redacts_a_secret_shaped_string_before_logging(monkeypatch, caplog):
+    """Generic defence-in-depth on `tts.speak()`'s own log line, for the
+    class C2 named ("nothing upstream of speak() guarantees secret-free
+    text"), not scoped to pair codes -- a 9-character code is below every
+    threshold `redact_secrets()` checks (see the test above for the fix
+    that actually protects it: keeping it off line one in the first
+    place). What this function *can* catch -- a labelled secret like
+    "password is ..." -- must actually be caught, proving the import and
+    the call are real and not merely present in a docstring.
+
+    Driven with `_pipeline` forced `None` and `init_tts()` stubbed to fail,
+    so `speak()` bails out immediately after the log line under test --
+    no Kokoro synthesis, no sounddevice, matching this suite's existing
+    rule against real audio/model calls.
+    """
+    import logging
+
+    from assistant.io.audio import tts as tts_mod
+
+    monkeypatch.setattr(tts_mod, "_pipeline", None)
+    monkeypatch.setattr(tts_mod, "init_tts", lambda: False)
+
+    secret_text = "my password is Sup3rSecretPassw0rd"
+    with caplog.at_level(logging.INFO, logger="tts"):
+        result = await tts_mod.speak(secret_text, bridge=None)
+
+    assert result is False, "sanity: speak() must have bailed out at the stubbed init_tts(), not run real synthesis"
+    assert any("Speaking:" in r.message for r in caplog.records), (
+        "sanity: the log line under test must actually have fired"
+    )
+    for record in caplog.records:
+        assert "Sup3rSecretPassw0rd" not in record.message
+    assert any("[REDACTED]" in r.message for r in caplog.records), (
+        "redact_secrets() must actually have replaced the value, not just "
+        "have been imported"
+    )

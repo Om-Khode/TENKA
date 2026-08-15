@@ -389,7 +389,17 @@ async def _stop_studio_daemon(task: "asyncio.Task | None") -> None:
     Retrieving a done task's exception marks it consumed, so asyncio's own
     "exception was never retrieved" logger never prints it later,
     unredacted, through a handler this module doesn't control.
+
+    Also clears `_studio_pair_store`, unconditionally and first, regardless
+    of which path below actually runs. A stale store is the exact "prints a
+    code nobody can redeem" failure `/studio pair` exists to prevent -- just
+    reached through a global that outlived the daemon instead of a fresh
+    construction. `/studio pair` must see `None` the instant the daemon
+    stops serving, not only after some particular shutdown path (no task,
+    an already-crashed task, or a task actually cancelled here all count).
     """
+    global _studio_pair_store
+    _studio_pair_store = None
     if task is None:
         return
     if task.done():
@@ -743,12 +753,32 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # ─── Slash commands (zero-LLM runtime config) ────────────────────
         # Chat input like "/set followup_timer 7" is intercepted here before
         # any teaching / shortcut / intent processing. Voice rarely produces
-        # leading "/", so this is effectively chat-only in practice.
+        # leading "/", so this is effectively console/voice-only in practice
+        # -- deliberately, not by accident. `source == "studio"` is the one
+        # exception that must never execute: POST /v1/chat requires only
+        # CHAT_SEND, and _StudioDispatch.submit() -> this function applies no
+        # further check per source. CHAT_SEND is in every /studio pair
+        # default grant, so without this refusal a device holding nothing
+        # but CHAT_SEND could type "/studio pair evilphone" (or
+        # "/studio revoke all confirm", or "/set", or "/reset" -- the whole
+        # slash surface, not just pairing) over chat and reach commands that
+        # were never gated by the capability system at all. That is the
+        # sideways escalation Task 10 closed on POST /v1/pair/code, reopened
+        # through a different door. Slash commands stay a console/voice
+        # affordance; Studio's own typed routes (Settings, Devices) are
+        # where a remote caller's grants actually apply.
         # NOTE: no follow-up listen — config commands aren't conversation.
         # The `finally` block at the bottom of this function resumes the
         # wake listener, so bailing out here is safe.
         if slash_commands.is_slash_command(transcription):
-            response = slash_commands.handle(transcription)
+            if source == "studio":
+                response = ("Slash commands aren't available through "
+                            "Studio's chat -- use its Settings and Devices "
+                            "pages for this.")
+                outcome = "refused"
+            else:
+                response = slash_commands.handle(transcription)
+                outcome = "success"
             if source == "chat":
                 print(response)
             else:
@@ -758,7 +788,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 await tts.speak(spoken, bridge, emotion="neutral")
             _tracker.intent_detected = "slash_command"
             _tracker.intent_source = "regex"
-            _tracker.action_outcome = "success"
+            _tracker.action_outcome = outcome
             _tracker.latency_intent_ms = int((_time.monotonic() - _t0_intent) * 1000)
             return
 

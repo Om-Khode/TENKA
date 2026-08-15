@@ -389,9 +389,21 @@ def _studio_pair(label: str) -> str:
     endpoint = f"http://127.0.0.1:{config.STUDIO_API_PORT}"
     ascii_qr = _pair_code_ascii_qr(f"{endpoint}/pair#{pair_code.code}")
 
+    # The code is deliberately NOT on the first line. main.py speaks (and,
+    # before this task, logged) only `response.split("\n", 1)[0]` for every
+    # non-"chat" source -- so a code sitting on line one would ride straight
+    # into `tts.speak()`'s log line the moment this command is ever reached
+    # by voice. `redact_secrets()` cannot be trusted to catch it either: at
+    # 9 characters it clears none of that function's thresholds (the bare
+    # path wants >=24, the labelled path wants a recognised role noun
+    # immediately before the value, and "Pair code for 'x':" is neither).
+    # Keeping the code off line one means the one line TTS ever sees never
+    # contains it, regardless of source -- structurally, not by relying on
+    # a heuristic to strip it back out after the fact.
     return (
-        f"Pair code for {label!r}: {pair_code.code}\n"
+        f"Pair code minted for {label!r} -- see below. "
         f"Expires at {expires_at.isoformat()} (~{int(remaining)}s from now).\n"
+        f"Code: {pair_code.code}\n"
         f"Scan at {endpoint}/pair or enter the code manually.\n"
         f"{ascii_qr}"
     )

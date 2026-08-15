@@ -23,6 +23,7 @@ import warnings
 import os
 
 from ... import config
+from ...core.redact import redact_secrets
 
 logger = logging.getLogger("tts")
 
@@ -260,7 +261,18 @@ async def speak(text: str, bridge=None, emotion: str = "neutral") -> bool:
         logger.warning("Empty text, nothing to speak")
         return False
 
-    logger.info(f'Speaking: "{text}"')
+    # redact_secrets(), not the raw text: this line reaches debug.log
+    # (DEBUG_LOG defaults to true on a fresh install), and nothing upstream
+    # of speak() guarantees `text` is free of secret-shaped content -- a
+    # slash command's response, an error message, anything a future call
+    # site hands to TTS. Generic, same as main.py/intent.py's use of it: this
+    # closes the class (whatever looks secret-shaped), not the specific
+    # instance (a pair code, which is too short to trip redact_secrets' own
+    # heuristics -- see slash_commands.py's `_studio_pair` for the
+    # complementary fix that keeps a pair code off the *first line* of its
+    # response in the first place, which is the only text that ever reaches
+    # this function for a non-chat source).
+    logger.info(f'Speaking: "{redact_secrets(text)}"')
 
     # surface "Speaking" in the status pill — set RIGHT BEFORE the
     # audio actually plays (not at function entry) so the pill appears
