@@ -26,6 +26,7 @@ requests             # HTTP calls (Ollama fallback, whisper.cpp server, Tavily w
 pydantic>=2.0        # Schema validation (LLM JSON responses, app manifests)
 fastapi>=0.115       # Studio daemon HTTP surface (assistant/io/api)
 uvicorn>=0.34        # ASGI server for the Studio daemon, started from main.py
+qrcode               # Pairing QR rendering (assistant/io/api/qr.py) -- SVG factory; adds no image-library dependency of its own
 
 # Screen reading & OCR
 mss                  # Fast cross-platform screenshots
