@@ -354,14 +354,47 @@ _PATH_PARAMS = {
 }
 
 
-def _sweep_mutations_are_refused(client) -> int:
-    """Call every mutating operation the schema knows about; fail loudly if
-    any of them is not refused.
+# Every mutating operation this daemon serves, by name. Asserted as an exact
+# set rather than as a count or a floor, because the sweep's entire value is
+# completeness: a filter that quietly stops matching real routes would still
+# pass a `> 0` check on whatever it happened to keep. Adding a route here is
+# meant to be a conscious act -- the failure message is where somebody is
+# forced to ask whether the new one is gated at the right tier.
+_MUTATING_OPERATIONS = frozenset({
+    ("DELETE", "/v1/enrollment/{kind}/{item_id}"),
+    ("DELETE", "/v1/files"),
+    ("DELETE", "/v1/memory"),
+    ("DELETE", "/v1/memory/{scope}/{item_id}"),
+    ("PATCH", "/v1/personality"),
+    ("PATCH", "/v1/settings"),
+    ("POST", "/v1/abort"),
+    ("POST", "/v1/backup/restore"),
+    ("POST", "/v1/backup/run"),
+    ("POST", "/v1/backup/unlock"),
+    ("POST", "/v1/chat"),
+    ("POST", "/v1/commands/{command_id}/run"),
+    ("POST", "/v1/files/rename"),
+    ("POST", "/v1/personality/reset"),
+})
+
+
+def _sweep_mutations_are_refused(client) -> set[tuple[str, str]]:
+    """Call every mutating operation the schema knows about, and report all of
+    the ones that are not refused -- not just the first.
+
+    Returns the set of `(verb, path)` it actually swept, so a caller can pin
+    the coverage as well as the outcome.
 
     Enumerated from `app.openapi()` for the same reason
     `_sweep_v1_routes_require_auth` in test_api_auth.py is: it walks the
     *effective* routes regardless of how they were registered, so it cannot be
     dodged by choice of registration call.
+
+    Violations are collected and asserted once at the end. Asserting inside
+    the loop reports whichever offender happens to sort first and hides the
+    rest, which for a sweep whose job is completeness means somebody
+    re-running it once per bug -- the four real violations would have been
+    found one at a time.
 
     No request body is sent. A capability dependency raises before FastAPI
     ever validates a body, so a route that refuses correctly answers 403
@@ -369,7 +402,8 @@ def _sweep_mutations_are_refused(client) -> int:
     betrays itself by answering anything else (the four real violations
     answered 200, 200, 422 and 404).
     """
-    checked = 0
+    swept: set[tuple[str, str]] = set()
+    violations: list[str] = []
     for path, operations in client.app.openapi().get("paths", {}).items():
         if not path.startswith("/v1"):
             continue
@@ -385,36 +419,45 @@ def _sweep_mutations_are_refused(client) -> int:
             # never on a 429 that happens to look like a refusal.
             client.app.state.auth.limiter = RateLimiter()
             response = client.request(verb, concrete, headers={CSRF_HEADER: "1"})
-            assert response.status_code == 403, (
-                f"{verb} {path} answered {response.status_code} on a "
-                "read-only listener"
-            )
-            checked += 1
-    return checked
+            swept.add((verb, path))
+            if response.status_code != 403:
+                violations.append(
+                    f"{verb} {path} answered {response.status_code} on a "
+                    "read-only listener"
+                )
+    assert not violations, "\n".join(violations)
+    return swept
 
 
 def test_no_mutation_is_reachable_on_a_read_only_ceiling(tmp_path):
-    """The `quick` ceiling claims to be read-only. This is the claim, executed.
+    """The `quick` ceiling claims to be read-only *on the write side*. This is
+    that half of the claim, executed.
 
     `policy.py` says a device on a Cloudflare quick tunnel is "limited to
-    reading history and status through this transport, never to acting". That
-    property lives entirely in which capability each route happens to demand
-    -- data spread across five route modules, readable from no single place --
-    and four routes were quietly violating it: a real cloud upload, two
-    personality writes and a memory delete, all gated on `CHAT`.
+    reading history and status through this transport, never to acting". The
+    "never to acting" half lives entirely in which capability each route
+    happens to demand -- data spread across five route modules, readable from
+    no single place -- and four routes were quietly violating it: a real cloud
+    upload, two personality writes and a memory delete, all gated on `CHAT`.
 
-    Sweeping every operation is what makes the claim checkable, and what
-    catches the fifth one somebody adds. `CHAT` must mean "may read": a device
-    holding every capability in existence, arriving on a listener whose
-    ceiling is `{CHAT}`, must not be able to change anything.
+    **What this does not check.** It sweeps the 14 mutating operations of 30,
+    and says nothing about what the surviving `{CHAT}` ceiling lets a caller
+    *read*. The ceiling's other stated purpose is limiting disclosure over the
+    one listener a third party can observe -- `SCREEN` is excluded from
+    `quick` for what Cloudflare could see, not for what an attacker could do
+    -- and a read route that discloses too much would pass this sweep
+    untouched. Method-based sweeping cannot express that; a per-capability
+    disclosure test would be a separate thing.
+
+    `CHAT` must mean "may read": a device holding every capability in
+    existence, arriving on a listener whose ceiling is `{CHAT}`, must not be
+    able to change anything.
     """
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
     client = _client(vault, policies={LOCAL_PORT: "quick"})
     client.cookies.set(COOKIE_NAME, token)
-    assert _sweep_mutations_are_refused(client) > 0, (
-        "no mutating routes were checked -- the sweep found nothing"
-    )
+    assert _sweep_mutations_are_refused(client) == _MUTATING_OPERATIONS
 
 
 def test_the_read_only_sweep_catches_a_mutation_gated_on_chat(tmp_path):

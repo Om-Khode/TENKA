@@ -62,10 +62,24 @@ _UNAUTHORIZED = HTTPException(
     headers={"WWW-Authenticate": "Bearer"},
 )
 
-# Both of these are reached only *after* a credential has already verified, so
-# unlike `_UNAUTHORIZED` they may say which one tripped: the caller has learned
-# nothing it did not already know, and a browser client genuinely needs to be
-# told to send the header rather than to guess.
+# Unlike `_UNAUTHORIZED`, these two may say which one tripped -- and the reason
+# is NOT that a credential has already verified by the time they are raised. It
+# is the opposite: `_refuse_cross_site()` runs *before* `credential_from()` and
+# `verify()` (see `authenticate()`), and neither of its checks ever consults the
+# vault. "Did this request come from somewhere allowed to make it?" is
+# answerable without knowing whose request it is, so the answer cannot carry
+# anything about whose it was. A caller learns exactly two things, both of which
+# it already had: which of this daemon's own front doors are allowed, and that
+# it is carrying a cookie -- which its own browser sent.
+#
+# If you are here because you are moving `_refuse_cross_site()` back down below
+# `verify()`: don't. That ordering is what these two constants used to
+# document, and it made the pair into a credential oracle -- 403 to a
+# cross-site request holding a valid cookie, 401 to the identical request
+# without one, which is a "does this browser have a working session for that
+# daemon?" probe any page could run. `test_a_cross_site_refusal_does_not_reveal_
+# whether_the_cookie_is_valid` pins the fix; the event socket's handshake in
+# app.py checks Origin before reading the cookie for the same reason.
 _CROSS_SITE = HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                             detail="origin not allowed")
 _CSRF_MISSING = HTTPException(status_code=status.HTTP_403_FORBIDDEN,
@@ -339,10 +353,25 @@ async def authenticate(request: Request) -> Device:
     *wrong* token is a credential guess and still spends the lockout
     budget (`record_failure`) exactly as before, but a request presenting
     no token at all has nothing to guess with and never does. An anonymous
-    flood is still bounded -- the sliding window above caps it at roughly
-    `_MAX_PER_WINDOW` requests per `_WINDOW_SECONDS`, sustained indefinitely
-    -- it simply never escalates into the exponential, multi-minute lockout
-    that a wrong-token guesser earns.
+    flood that reaches the vault is still bounded -- the sliding window above
+    caps it at roughly `_MAX_PER_WINDOW` requests per `_WINDOW_SECONDS`,
+    sustained indefinitely -- it simply never escalates into the exponential,
+    multi-minute lockout that a wrong-token guesser earns.
+
+    "Reaches the vault" is the honest scope of that bound, and the qualifier
+    is load-bearing: a request refused by `_refuse_cross_site()` below is
+    turned away before any budget is consulted, so a flood of cross-site
+    requests is not metered here at all. That is deliberate, twice over.
+    Such a request costs two header lookups and a set membership test -- no
+    HMAC, no `devices.json` read, strictly less than the 421 the `Host` gate
+    in app.py already answers unmetered and outside this function entirely --
+    so there is no work worth rationing. And metering it would be actively
+    harmful once a tunnel exists: `cloudflared` and `tailscale funnel` both
+    connect from 127.0.0.1, so `source` collapses to a single shared key for
+    every remote caller, and one malicious page running in one visitor's
+    browser could then spend the anonymous budget belonging to everybody
+    behind the tunnel. A cheap refusal that cannot be turned into a denial of
+    service against honest callers is the better trade.
 
     The `Device` this returns is the device *as this listener sees it*: its
     grants have already been intersected with the listener's ceiling, so every
