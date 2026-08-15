@@ -301,9 +301,16 @@ _studio_pair_store: "PairCodeStore | None" = None
 # (slash_commands.py) reads this global rather than building its own
 # `PairCodeStore()` -- doing that would mint a code into an object the
 # pairing route can never see: a code that looks perfectly valid on the
-# console and can never be redeemed. `None` here means no daemon has built
-# a store yet (or none is running), and the slash command must say so
-# plainly rather than mint anyway.
+# console and can never be redeemed. Invariant this global is meant to hold
+# at every instant: non-`None` if and only if a Studio app is actually
+# serving `POST /v1/pair` right now. `_start_studio_daemon()` only assigns
+# it *after* `serve_studio_api()` has returned without raising (never
+# before, even though the `PairCodeStore` itself has to exist earlier to be
+# threaded through as an argument -- see that function's own comment), and
+# `_stop_studio_daemon()` clears it back to `None` unconditionally, first
+# thing, on every one of its exit paths. `None` here means no daemon has
+# ever successfully started (or one that did has since stopped), and the
+# slash command must say so plainly rather than mint anyway.
 
 
 async def _start_studio_daemon() -> "asyncio.Task | None":
@@ -354,18 +361,35 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
         # rather than left for `create_app()`'s own default -- its default
         # is a *private* store scoped to whichever app happens to build it,
         # which is fine for a test building its own app but means nothing
-        # outside this function could ever reach it. Assigning to the
-        # module global before serve_studio_api() runs means `/studio pair`
-        # can read the exact same instance the moment the daemon is up.
-        _studio_pair_store = PairCodeStore()
+        # outside this function could ever reach it.
+        #
+        # Held in a LOCAL until serve_studio_api() has returned without
+        # raising -- not assigned to the module global up front. serve()
+        # calls create_app(), which does an eager `vault.instance_secret()`
+        # check that raises synchronously on a bad TENKA_SECRET (see the
+        # comment above on `_studio_hub`/subscribe timing for the identical
+        # reasoning already applied there). Assigning the global before that
+        # call, the same way this function used to, left `_studio_pair_store`
+        # pointing at a real, live-looking `PairCodeStore` even when
+        # `serve()` never returned a task at all -- `/studio pair` would
+        # keep minting codes for a daemon that was never actually serving
+        # `POST /v1/pair`, the identical "unredeemable code" failure the
+        # post-stop cleanup fixes for the *other* end of the daemon's
+        # lifetime. Ordering it this way makes the invariant ("the global is
+        # set only when something is actually listening") hold by
+        # construction -- there is no `except` branch left to forget to
+        # undo it in, because the assignment that would need undoing simply
+        # has not happened yet.
+        _pair_store = PairCodeStore()
         _studio_task = serve_studio_api(
             build_studio_runtime(_studio_dispatch),
             _studio_vault,
             port=config.STUDIO_API_PORT,
             origins=[o.strip() for o in config.STUDIO_API_ORIGINS.split(",") if o.strip()],
             hub=_studio_hub,
-            pair_store=_studio_pair_store,
+            pair_store=_pair_store,
         )
+        _studio_pair_store = _pair_store
         # publish_status(), not publish() directly: it translates the
         # broadcaster's own snake_case event shape into the daemon's
         # camelCase wire frame (assistant/io/api/events.py) before it ever

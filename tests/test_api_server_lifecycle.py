@@ -438,7 +438,16 @@ async def test_a_failed_start_does_not_leak_a_status_subscription(tmp_path, monk
     bad TENKA_SECRET) must not have already subscribed its hub -- otherwise
     every future status.set() call, which fires on every phase transition,
     keeps appending to a hub nothing will ever drain, for the rest of the
-    process, on a machine where the daemon is off."""
+    process, on a machine where the daemon is off.
+
+    Also asserts the pair-store half of this exact scenario (Task 11 review,
+    round 2): this test already drove a synchronous serve() failure and
+    asserted only on the subscription, which is precisely what let
+    `_studio_pair_store` stay orphaned -- assigned before serve() was ever
+    called, never cleared in the `except` -- pass silently for a full round.
+    One scenario, both failure modes, pinned together so that does not
+    happen again.
+    """
     import assistant.config as config
     import assistant.main as m
     from assistant.io.status_broadcaster import status
@@ -455,6 +464,44 @@ async def test_a_failed_start_does_not_leak_a_status_subscription(tmp_path, monk
     assert result is None
     assert len(status._subscribers) == before, (
         "a failed serve() must leave no trace on the broadcaster's subscriber list"
+    )
+    assert m._studio_pair_store is None, (
+        "a serve() that raised synchronously must not leave a pair store "
+        "behind -- /studio pair would keep minting unredeemable codes for "
+        "a daemon that never actually started"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_start_leaves_studio_pair_refusing(tmp_path, monkeypatch):
+    """The behavioural twin of the test above, driven through the actual
+    slash command rather than the raw global -- proved by execution, per
+    the review: patch serve() to raise the same synchronous
+    `create_app()`-eager-check failure, start the daemon, then run
+    `/studio pair` and assert it refuses (message *and* no code-shaped
+    string), not that it silently succeeds against an orphaned store.
+    """
+    import re
+
+    import assistant.config as config
+    import assistant.main as m
+    from assistant import slash_commands
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    def _raise(*args, **kwargs):
+        raise ValueError("bad TENKA_SECRET")
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _raise)
+
+    result = await m._start_studio_daemon()
+    assert result is None, "sanity: the start must actually have failed"
+
+    response = slash_commands.handle("/studio pair testphone")
+
+    assert "not running" in response.lower()
+    assert not re.search(r"[0-9A-Z]{4}-[0-9A-Z]{4}", response), (
+        "a failed start must not leave a code-minting store reachable"
     )
 
 
