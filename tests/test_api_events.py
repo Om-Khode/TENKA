@@ -304,6 +304,59 @@ def test_no_frame_the_socket_can_emit_has_a_snake_case_key():
         assert not any("_" in key for key in frame), frame
 
 
+# ─── CHAT vs CHAT_SEND: the stream is a read gate, abort is a write gate ──
+def test_a_chat_only_device_connects_and_gets_its_stream(context):
+    """The handshake gate stays CHAT: a read-only device's live view is
+    unaffected by the write-side split."""
+    client, app, _, _ = context
+    vault = app.state.auth.vault
+    chat_only = vault.issue("reader", frozenset({Capability.CHAT}))
+    with client.websocket_connect(f"/v1/events?access_token={chat_only}") as socket:
+        frame = socket.receive_json()
+        assert frame["type"] == "status"
+
+
+def test_a_chat_only_device_cannot_abort_over_the_socket(context):
+    """The bug this closes: before the frame-level gate, a CHAT-only device
+    could still call runtime.chat.abort() by opening the socket and sending
+    one frame, bypassing the CHAT_SEND split entirely on POST /v1/abort."""
+    client, app, runtime, _ = context
+    vault = app.state.auth.vault
+    chat_only = vault.issue("reader", frozenset({Capability.CHAT}))
+    with client.websocket_connect(f"/v1/events?access_token={chat_only}") as socket:
+        socket.receive_json()  # hello
+        socket.send_json({"type": "abort"})
+        frame = socket.receive_json()
+        assert frame["type"] == "error"
+    assert runtime.chat.aborted == 0
+
+
+def test_a_chat_send_device_can_still_abort_over_the_socket(context):
+    client, app, runtime, _ = context
+    vault = app.state.auth.vault
+    sender = vault.issue("phone", frozenset({Capability.CHAT, Capability.CHAT_SEND}))
+    with client.websocket_connect(f"/v1/events?access_token={sender}") as socket:
+        socket.receive_json()  # hello
+        socket.send_json({"type": "abort"})
+        frame = socket.receive_json()
+        assert frame["type"] == "ack"
+    assert runtime.chat.aborted == 1
+
+
+def test_a_refused_abort_frame_is_audited(context):
+    client, app, _, _ = context
+    vault = app.state.auth.vault
+    chat_only = vault.issue("reader", frozenset({Capability.CHAT}))
+    with client.websocket_connect(f"/v1/events?access_token={chat_only}") as socket:
+        socket.receive_json()  # hello
+        socket.send_json({"type": "abort"})
+        socket.receive_json()  # error
+    entries = app.state.auth.audit.entries()
+    assert any(e.path == "/v1/events" and e.outcome == "403" for e in entries), (
+        "a refused abort frame left no trace in the audit log"
+    )
+
+
 def test_repeated_bad_socket_tokens_eventually_get_refused_fast(context):
     """An accept-then-close cycle still costs a TCP handshake and a
     verify() call. The limiter must bound how many of those one source can

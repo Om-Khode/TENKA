@@ -21,10 +21,21 @@ def token(vault):
     return vault.issue("studio", ALL)
 
 
-@pytest.fixture()
-def client(vault):
+def _client(vault: TokenVault) -> TestClient:
+    """Build a client against a caller-supplied vault.
+
+    The `client` fixture below covers the common case of one vault per test;
+    the CHAT/CHAT_SEND split tests need to issue several tokens off vaults
+    they construct themselves, so the app-building step is pulled out here
+    rather than duplicated per test.
+    """
     app = create_app(build_fake_runtime(), vault, origins=["http://localhost:3000"])
     return TestClient(app)
+
+
+@pytest.fixture()
+def client(vault):
+    return _client(vault)
 
 
 def auth(token):
@@ -184,6 +195,38 @@ def test_a_capability_it_lacks_is_refused(client, vault):
     files_holder = vault.issue("laptop", frozenset({Capability.FILES}))
     allowed = client.get("/v1/probe", headers=auth(files_holder))
     assert allowed.status_code == 200
+
+
+# ─── CHAT vs CHAT_SEND: reading her conversations is not driving her ──────
+def test_a_read_only_chat_device_cannot_send(tmp_path):
+    """The whole point of the split: CHAT reaches all 38 intents through
+    POST /v1/chat, so reading history must not imply driving her."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("reader", frozenset({Capability.CHAT}))
+    client = _client(vault)
+    assert client.get("/v1/chat/conversations",
+                      headers={"Authorization": f"Bearer {token}"}).status_code == 200
+    assert client.post("/v1/chat", json={"text": "hi"},
+                       headers={"Authorization": f"Bearer {token}"}).status_code == 403
+    assert client.post("/v1/abort",
+                       headers={"Authorization": f"Bearer {token}"}).status_code == 403
+
+
+def test_a_sending_device_still_reads(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.CHAT, Capability.CHAT_SEND}))
+    client = _client(vault)
+    assert client.post("/v1/chat", json={"text": "hi"},
+                       headers={"Authorization": f"Bearer {token}"}).status_code == 202
+
+
+def test_the_events_socket_stays_a_read_gate(tmp_path):
+    """app.py checks CHAT before accept(). The socket only streams, so it must
+    NOT start demanding CHAT_SEND -- a reader device keeps its live view."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("reader", frozenset({Capability.CHAT}))
+    with _client(vault).websocket_connect(f"/v1/events?access_token={token}") as ws:
+        assert ws is not None
 
 
 def test_openapi_is_not_public(client):
