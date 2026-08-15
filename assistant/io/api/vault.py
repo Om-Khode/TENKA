@@ -407,6 +407,16 @@ class TokenVault:
         against it is negative, which falls outside the
         `0 <= age < _TOUCH_THROTTLE` window that suppresses the write, so the
         write proceeds and self-heals the bogus value.
+
+        A stored timestamp with no `tzinfo` (naive) is treated the same way
+        as unparseable garbage: overwritten, not assumed-UTC. A naive
+        value's true offset is genuinely unknown -- guessing UTC would
+        invent a fact this method has no basis for -- and subtracting an
+        aware `now` from a naive `stored_at` raises `TypeError` outright, so
+        this must not be allowed to reach the subtraction unguarded. That
+        mirrors `_parse_device`'s posture elsewhere in this file: a
+        malformed field is dropped/overwritten, never allowed to crash the
+        caller.
         """
         data = self._load()
         target: dict | None = None
@@ -422,10 +432,17 @@ class TokenVault:
         if isinstance(stored, str):
             try:
                 stored_at = datetime.fromisoformat(stored)
-            except ValueError:
-                stored_at = None  # malformed value: fall through and overwrite it
-            if stored_at is not None:
                 age = now - stored_at
+            except (ValueError, TypeError):
+                # ValueError: not a parseable ISO-8601 string at all.
+                # TypeError: parsed fine but naive -- `fromisoformat` does not
+                # raise on a string with no offset, and subtracting an aware
+                # `now` from a naive `stored_at` is what actually raises.
+                # Both are malformed in the sense that matters here: fall
+                # through and overwrite rather than let either one crash the
+                # request path that calls this.
+                pass
+            else:
                 if timedelta(0) <= age < _TOUCH_THROTTLE:
                     return  # seen recently enough; skip the write entirely
 

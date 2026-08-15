@@ -585,3 +585,73 @@ def test_a_future_stored_timestamp_does_not_wedge_the_write_permanently(tmp_path
 
     assert path.read_bytes() != before
     assert vault.devices()[0].last_seen_at != future
+
+
+def test_a_naive_stored_timestamp_does_not_raise_and_self_heals(tmp_path):
+    """`datetime.fromisoformat("2026-01-01T00:00:00")` does not raise -- it
+    returns a naive datetime -- so subtracting it from an aware `now` is what
+    actually blows up if unguarded. Reproduces the round-2 Critical: this
+    must come back clean, and the stored value must end up aware.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["devices"][0]["last_seen_at"] = "2026-01-01T00:00:00"  # naive, no offset
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    vault.touch(device_id)  # must not raise TypeError
+
+    assert path.read_bytes() != before
+    healed = vault.devices()[0].last_seen_at
+    assert healed != "2026-01-01T00:00:00"
+    assert datetime.fromisoformat(healed).tzinfo is not None
+
+
+def test_a_garbage_stored_timestamp_does_not_raise_and_overwrites(tmp_path):
+    """Untested in round 1 even though the branch existed: a stored value
+    that isn't ISO-8601 at all must not raise, and must be overwritten same
+    as the naive case above.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["devices"][0]["last_seen_at"] = "not-a-timestamp"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    vault.touch(device_id)  # must not raise
+
+    assert path.read_bytes() != before
+    assert vault.devices()[0].last_seen_at != "not-a-timestamp"
+
+
+@pytest.mark.parametrize("bad_value", ["2026-01-01T00:00:00", "not-a-timestamp"])
+def test_a_healed_value_is_well_formed_and_throttles_the_next_touch(tmp_path, bad_value):
+    """The point of healing is that the written value is a real, aware
+    timestamp usable by the throttle itself -- not merely "some string that
+    replaced the bad one". Prove it by touching again right after the heal
+    and confirming the second touch is suppressed, exactly like the
+    well-formed case in `test_touch_within_the_throttle_window_does_not_write_to_disk`.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    device_id = vault.devices()[0].device_id
+
+    path = tmp_path / "devices.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["devices"][0]["last_seen_at"] = bad_value
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    vault.touch(device_id)  # heals the bad value
+    healed_bytes = path.read_bytes()
+
+    vault.touch(device_id)  # immediately after -- must be throttled
+
+    assert path.read_bytes() == healed_bytes
