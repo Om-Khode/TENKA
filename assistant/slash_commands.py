@@ -17,12 +17,64 @@ Reserved command names (cannot collide with setting keys): help, config, set, re
 Every other /word is treated as a setting shortcut.
 """
 
+import sys
 from typing import Optional
 
 from . import config, settings
 
 
 RESERVED = {"help", "config", "set", "reset", "compress", "promote", "studio"}
+
+
+# ─── Resolving the running `assistant.main` ────────────────────────────────
+
+
+def _resolve_running_main():
+    """Return the actual running `assistant.main` module object, not a
+    second, disconnected import of it.
+
+    `start_assistant.bat` launches the daemon as `python -m assistant.main`.
+    Running a module with `-m` executes it under the name `__main__` --
+    Python does **not** additionally register it in `sys.modules` under its
+    dotted name `"assistant.main"`. So when this module later does a plain
+    `import assistant.main as main_mod`, Python finds nothing under that
+    dotted name and imports `assistant/main.py` a *second* time, producing
+    a brand-new module object whose globals (`_studio_pair_store`,
+    `_compression_cache`, ...) sit at their initial values forever --
+    permanently disconnected from the one the daemon is actually running.
+    Writes through that second object vanish; reads from it are always
+    stale. This is exactly the bug that made `/studio pair` insist the
+    daemon "is not running" while it was serving requests.
+
+    No unit test can see this by accident: every test imports
+    `assistant.main` normally (`import assistant.main` or
+    `from assistant import main`), which *does* register it under its
+    dotted name on first import, so a test process only ever has one
+    module object. The split only happens when the *entry point itself*
+    -- the process's `__main__` -- was launched with `-m`.
+
+    The discriminator: a module executed via `-m` is reachable as
+    `sys.modules["__main__"]`, and Python stamps its `__spec__.name` with
+    the dotted name it was launched under (`"assistant.main"` here).
+    Nothing else sets that reliably. So:
+
+    - If `__main__` exists, has a `__spec__`, and that spec's name is
+      `"assistant.main"` -- `__main__` *is* the running daemon; return it.
+    - Otherwise -- `__main__` absent, `__spec__` missing/`None` (REPL,
+      frozen build), or `__main__` is some *other* program that merely
+      imports this assistant as a library -- fall back to a plain import.
+      That import is correct in all of those cases: under pytest, under
+      `python assistant/main.py` (no `-m`), and when embedded elsewhere,
+      `assistant.main` was (or will be) imported normally, so the plain
+      import returns the one true module object.
+    """
+    main_as_entry = sys.modules.get("__main__")
+    spec = getattr(main_as_entry, "__spec__", None)
+    if spec is not None and getattr(spec, "name", None) == "assistant.main":
+        return main_as_entry
+
+    import assistant.main as main_mod
+    return main_mod
 
 
 # ─── Background task strong-refs ───────────────────────────────────────────
@@ -169,7 +221,7 @@ def _format_one_setting(key: str) -> str:
 def _compress_context() -> str:
     """Clear compression cache, forcing re-compression on next turn."""
     try:
-        import assistant.main as main_mod
+        main_mod = _resolve_running_main()
         main_mod._compression_cache = None
         return "Conversation compressed. Fresh summary will be generated on next message."
     except Exception:
@@ -360,7 +412,7 @@ def _studio_pair(label: str) -> str:
     daemon has never started (or isn't running), there is no store at all,
     and a code that cannot be redeemed is worse than an honest refusal.
     """
-    import assistant.main as main_mod
+    main_mod = _resolve_running_main()
 
     store = main_mod._studio_pair_store
     if store is None:
@@ -507,7 +559,7 @@ def _set_setting(key: str, raw_value: str) -> str:
         if result.startswith("Unknown"):
             return result
         try:
-            import assistant.main as main_mod
+            main_mod = _resolve_running_main()
             main_mod._compression_cache = None
         except Exception:
             pass
