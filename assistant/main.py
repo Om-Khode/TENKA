@@ -289,6 +289,22 @@ _studio_vault: "TokenVault | None" = None
 # too -- a second local variable in a different function's scope can't do
 # that -- so it lives here instead of riding the return value.
 
+_studio_pair_store: "PairCodeStore | None" = None
+# Same reachability need as `_studio_vault`, for a stronger reason:
+# `PairCodeStore` is deliberately in-memory only (pairing.py's docstring --
+# a three-minute code has no reason to survive a restart, and not
+# persisting it means there is no file to steal), so there is no
+# file-backed equivalent of `TokenVault(config.SANDBOX_DIR)` a caller could
+# reconstruct from outside the running app the way `_studio_vault()` in
+# slash_commands.py does. This module-level reference IS the only handle on
+# the one store `POST /v1/pair` actually consults. `/studio pair`
+# (slash_commands.py) reads this global rather than building its own
+# `PairCodeStore()` -- doing that would mint a code into an object the
+# pairing route can never see: a code that looks perfectly valid on the
+# console and can never be redeemed. `None` here means no daemon has built
+# a store yet (or none is running), and the slash command must say so
+# plainly rather than mint anyway.
+
 
 async def _start_studio_daemon() -> "asyncio.Task | None":
     """Build and start the Studio daemon. Returns the running task, or
@@ -298,10 +314,11 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
     Split out of async_main() so a test can drive this exact sequence
     (e.g. forcing serve() to fail) without booting the assistant.
     """
-    global _studio_dispatch, _studio_vault
+    global _studio_dispatch, _studio_vault, _studio_pair_store
     try:
         from .actions.studio_runtime import build_studio_runtime
         from .io.api.events import EventHub
+        from .io.api.pairing import PairCodeStore
         from .io.api.server import serve as serve_studio_api
         from .io.api.vault import Capability, TokenVault
 
@@ -333,12 +350,21 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
         # failure leaves no trace to leak.
         _studio_hub = EventHub()
         _studio_dispatch = _StudioDispatch()
+        # Built here, explicitly, and threaded through to `serve_studio_api`
+        # rather than left for `create_app()`'s own default -- its default
+        # is a *private* store scoped to whichever app happens to build it,
+        # which is fine for a test building its own app but means nothing
+        # outside this function could ever reach it. Assigning to the
+        # module global before serve_studio_api() runs means `/studio pair`
+        # can read the exact same instance the moment the daemon is up.
+        _studio_pair_store = PairCodeStore()
         _studio_task = serve_studio_api(
             build_studio_runtime(_studio_dispatch),
             _studio_vault,
             port=config.STUDIO_API_PORT,
             origins=[o.strip() for o in config.STUDIO_API_ORIGINS.split(",") if o.strip()],
             hub=_studio_hub,
+            pair_store=_studio_pair_store,
         )
         # publish_status(), not publish() directly: it translates the
         # broadcaster's own snake_case event shape into the daemon's

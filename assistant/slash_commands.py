@@ -41,6 +41,7 @@ HELP_TEXT = """Runtime config commands:
   /compress                  — compress conversation history
   /promote                   — trigger a manifest-based promotion cycle (background)
   /studio devices            — list Studio device tokens
+  /studio pair [label]       — mint a pairing code + QR for a new device
   /studio revoke <device_id> — revoke one Studio device
   /studio revoke all confirm — revoke every Studio device (re-pairing required)
   /help                      — this message
@@ -260,10 +261,45 @@ def _promote_me1() -> str:
 _STUDIO_USAGE = (
     "Usage:\n"
     "  /studio devices              — list issued Studio device tokens\n"
+    "  /studio pair [label]         — mint a pairing code + QR for a new device\n"
     "  /studio revoke <device_id>   — revoke one device\n"
     "  /studio revoke all confirm   — revoke every device (rotates the "
     "instance secret; every paired device must be re-paired)"
 )
+
+# ─── Studio pairing ─────────────────────────────────────────────────────────
+# Local-only for a different reason than revocation above: the store this
+# reaches is `assistant.main._studio_pair_store`, not a file. See that
+# global's docstring in main.py for why a fresh `PairCodeStore()` here would
+# be a trap -- it would mint a code `POST /v1/pair` could never redeem.
+
+_STUDIO_PAIR_LABEL_DEFAULT = "device"
+
+
+def _studio_pair_default_grants():
+    """What a code mints by default, absent any way for this command to
+    name a device to intersect against.
+
+    `POST /v1/pair/code` narrows a requested grant set to the *minting
+    device's own* grants, so a device holding only SYSTEM_CONTROL can never
+    mint a wider code carrying RECALL/FILES/CHAT_SEND (see
+    routes/pairing.py). A slash command has no device to intersect against
+    -- the restraint has to take a different shape here. Rather than
+    defaulting to "everything" (the bootstrap admin token's own choice,
+    made once, for the one device that starts the daemon), this refuses
+    the single most consequential capability by default: SYSTEM_CONTROL
+    reaches shutdown and backup control (manage_backup), not just chat and
+    observation. Every other capability rides along, so a phone paired
+    this way is still a fully useful remote control -- it just cannot
+    administer the machine unless someone deliberately widens it later.
+
+    A function, not a module-level constant: `Capability` is an `io/`
+    type, and this file follows the codebase's deferred-import convention
+    for that package (see `_studio_vault()` below) rather than importing it
+    at module top.
+    """
+    from .io.api.vault import Capability
+    return frozenset(Capability) - {Capability.SYSTEM_CONTROL}
 
 
 def _studio_vault():
@@ -287,6 +323,9 @@ def _studio_command(args: list) -> str:
     sub = args[0].lower()
     if sub == "devices":
         return _studio_list_devices()
+    if sub == "pair":
+        label = " ".join(args[1:]).strip() or _STUDIO_PAIR_LABEL_DEFAULT
+        return _studio_pair(label)
     if sub == "revoke":
         return _studio_revoke(args[1] if len(args) > 1 else "")
     return _STUDIO_USAGE
@@ -301,11 +340,81 @@ def _studio_list_devices() -> str:
     lines = ["Studio devices:"]
     for device in sorted(devices, key=lambda d: d.created_at):
         grants = ", ".join(sorted(g.value for g in device.grants))
+        # `last_seen_at` is `None` for a device that authenticated at
+        # issue time only and never made a second request -- printing the
+        # literal "None" would read as a bug; "never" reads as a fact.
+        last_seen = device.last_seen_at if device.last_seen_at else "never"
         lines.append(
             f"  {device.device_id}  {device.label!r}  [{grants}]  "
-            f"created {device.created_at}"
+            f"created {device.created_at}  last seen {last_seen}"
         )
     return "\n".join(lines)
+
+
+def _studio_pair(label: str) -> str:
+    """Mint a pair code + QR into the *running daemon's* store.
+
+    Reaches `assistant.main._studio_pair_store` rather than constructing a
+    `PairCodeStore()` of its own -- see that global's docstring for why the
+    latter would print a code `POST /v1/pair` could never redeem. When the
+    daemon has never started (or isn't running), there is no store at all,
+    and a code that cannot be redeemed is worse than an honest refusal.
+    """
+    import assistant.main as main_mod
+
+    store = main_mod._studio_pair_store
+    if store is None:
+        return ("The Studio daemon is not running, so there is no pairing "
+                "store to mint a code into. Start TENKA with the daemon "
+                "enabled, then try /studio pair again.")
+
+    try:
+        pair_code = store.mint(label, _studio_pair_default_grants())
+    except ValueError:
+        # Unreachable today -- _studio_pair_default_grants() is never
+        # empty -- but mint() raises ValueError on an empty grant set, and
+        # that must never surface as a raw traceback on the console.
+        return "Could not mint a pair code: no capabilities to grant."
+
+    import time as _time
+    from datetime import datetime, timedelta, timezone
+
+    remaining = max(0.0, pair_code.expires_at - _time.monotonic())
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=remaining)
+
+    # Same payload shape `POST /v1/pair/code` encodes into its SVG
+    # (`endpoint/pair#code`) -- a phone scanning either QR lands on the
+    # same pairing URL, with the code in the fragment so it is never sent
+    # to a server, proxy, or tunnel in between.
+    endpoint = f"http://127.0.0.1:{config.STUDIO_API_PORT}"
+    ascii_qr = _pair_code_ascii_qr(f"{endpoint}/pair#{pair_code.code}")
+
+    return (
+        f"Pair code for {label!r}: {pair_code.code}\n"
+        f"Expires at {expires_at.isoformat()} (~{int(remaining)}s from now).\n"
+        f"Scan at {endpoint}/pair or enter the code manually.\n"
+        f"{ascii_qr}"
+    )
+
+
+def _pair_code_ascii_qr(payload: str) -> str:
+    """Render `payload` as a block-character QR code a terminal can show.
+
+    `qr_svg()` (io/api/qr.py) renders `<svg>...<svg>`, which is exactly
+    right for a browser dialog and useless in a console. `qrcode`'s own
+    `print_ascii()` writes straight to a stream rather than returning a
+    string, so it is rendered into an `io.StringIO` and read back.
+    """
+    import io as _io
+
+    import qrcode
+
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(payload)
+    qr.make(fit=True)
+    buffer = _io.StringIO()
+    qr.print_ascii(out=buffer)
+    return buffer.getvalue()
 
 
 def _studio_revoke(raw_target: str) -> str:

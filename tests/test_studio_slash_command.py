@@ -12,6 +12,8 @@ Studio pairings.
 """
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from assistant import config, slash_commands
@@ -70,6 +72,30 @@ def test_devices_never_prints_a_plaintext_token(vault_root):
     # would pass just as well against "No Studio devices issued.".
     assert device_id in result
     assert token not in result
+
+
+def test_devices_shows_last_seen_column(vault_root):
+    """Task 11: `Device.last_seen_at` (Task 9) gains a column in the listing."""
+    vault = TokenVault(vault_root)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+
+    result = slash_commands.handle("/studio devices")
+
+    assert "last seen" in result.lower()
+
+
+def test_devices_shows_never_for_a_device_not_yet_seen(vault_root):
+    """A freshly issued device has `last_seen_at is None` -- the column must
+    say so plainly rather than print the literal string 'None' or omit the
+    device from the listing.
+    """
+    vault = TokenVault(vault_root)
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+
+    result = slash_commands.handle("/studio devices")
+
+    assert "none" not in result.lower()
+    assert "never" in result.lower()
 
 
 def test_devices_survives_a_corrupt_devices_json(vault_root):
@@ -228,3 +254,99 @@ def test_studio_with_no_subcommand_returns_usage(vault_root):
 def test_studio_with_unknown_subcommand_returns_usage(vault_root):
     result = slash_commands.handle("/studio frobnicate")
     assert "Usage" in result
+
+
+# ─── /studio pair ────────────────────────────────────────────────────────────
+# `PairCodeStore` is deliberately in-memory only (see pairing.py's docstring),
+# so it is not reachable through a fresh construction the way the file-backed
+# vault is via `_studio_vault()`. It only exists as `assistant.main`'s
+# module-level `_studio_pair_store`, set once by `_start_studio_daemon()`.
+# Every test below drives that global directly rather than actually starting
+# the daemon, the same way test_api_server_lifecycle.py pins the vault
+# equivalent.
+
+
+@pytest.fixture()
+def running_pair_store(monkeypatch):
+    """Simulate a running Studio daemon by installing a live store on the
+    module global `/studio pair` has to read -- without booting uvicorn."""
+    import assistant.main as main_mod
+    from assistant.io.api.pairing import PairCodeStore
+
+    store = PairCodeStore()
+    monkeypatch.setattr(main_mod, "_studio_pair_store", store)
+    return store
+
+
+def test_pair_prints_a_code_and_expiry(running_pair_store):
+    out = slash_commands.handle("/studio pair phone")
+    assert "expires" in out.lower()
+    assert re.search(r"[0-9A-Z]{4}-[0-9A-Z]{4}", out)
+
+
+def test_pair_defaults_the_label(running_pair_store):
+    assert slash_commands.handle("/studio pair").strip() != ""
+
+
+def test_pair_prints_an_ascii_qr_not_svg(running_pair_store):
+    """`qr_svg()` renders `<svg>...</svg>`, which is useless in a terminal --
+    the console command must use `qrcode`'s ASCII renderer instead."""
+    out = slash_commands.handle("/studio pair phone")
+    assert "<svg" not in out.lower()
+    # An ASCII QR is built from block characters over many lines -- a real
+    # render is always more than a couple of lines long.
+    assert len(out.splitlines()) > 5
+
+
+def test_pair_is_reserved_and_not_a_setting_key():
+    assert "studio" in slash_commands.RESERVED
+
+
+def test_pair_refuses_plainly_when_the_daemon_is_not_running(monkeypatch):
+    """No daemon means no store at all -- printing a code nobody could ever
+    redeem would be worse than an honest refusal."""
+    import assistant.main as main_mod
+    monkeypatch.setattr(main_mod, "_studio_pair_store", None)
+
+    result = slash_commands.handle("/studio pair phone")
+
+    assert "not running" in result.lower()
+    assert not re.search(r"[0-9A-Z]{4}-[0-9A-Z]{4}", result)
+
+
+def test_pair_never_grants_system_control_by_default(running_pair_store):
+    """The equivalent of `POST /v1/pair/code`'s intersection-with-the-minting-
+    device's-own-grants restraint: a console command has no device to
+    intersect against, so the restraint here is refusing the single most
+    dangerous capability (shutdown, backup control) by default instead.
+    """
+    slash_commands.handle("/studio pair phone")
+    pair_code = running_pair_store.current()
+    assert Capability.SYSTEM_CONTROL not in pair_code.grants
+    # Still useful as a remote control: every other capability rides along.
+    assert pair_code.grants == frozenset(Capability) - {Capability.SYSTEM_CONTROL}
+
+
+def test_pair_mints_into_the_store_the_pair_route_can_redeem(vault_root, running_pair_store):
+    """The property that matters most: /studio pair must mint into the exact
+    store `POST /v1/pair` consults, not a look-alike of its own. Proved by
+    minting through the slash command, then redeeming that code through a
+    real app wired to the same store, and confirming a device actually lands
+    in the vault -- an output-only assertion would pass even if the command
+    minted into a store nobody could ever reach.
+    """
+    from tests.fakes.api_client import build_api_client
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    vault = TokenVault(vault_root)
+
+    out = slash_commands.handle("/studio pair phone")
+    match = re.search(r"[0-9A-Z]{4}-[0-9A-Z]{4}", out)
+    assert match, f"no code found in: {out!r}"
+    code = match.group(0)
+
+    client = build_api_client(build_fake_runtime(), vault, pair_store=running_pair_store)
+    response = client.post("/v1/pair", json={"code": code})
+
+    assert response.status_code == 204
+    assert any(d.label == "phone" for d in vault.devices())
