@@ -861,21 +861,53 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # where a remote caller's grants actually apply.
         # NOTE: no follow-up listen — config commands aren't conversation.
         # The `finally` block at the bottom of this function resumes the
-        # wake listener, so bailing out here is safe.
+        # wake listener (and, for "studio", clears _StudioDispatch's busy
+        # flag) unconditionally, so bailing out here without _finish_turn()
+        # is safe for every source, including studio: calling it would open
+        # the local microphone for a follow-up listen off the back of a
+        # remote HTTP request, which is a worse problem than the one below.
         if slash_commands.is_slash_command(transcription):
             if source == "studio":
                 response = ("Slash commands aren't available through "
                             "Studio's chat -- use its Settings and Devices "
                             "pages for this.")
                 outcome = "refused"
+                # Studio settles a turn by re-reading the conversation
+                # transcript (LiveChatRuntime.conversation() ->
+                # memory.get_recent(conversation_id)), not from this
+                # function's return value -- POST /v1/chat is 202 Accepted
+                # with no body. Without this, the pane kept showing
+                # whichever turn was last recorded, paired against a
+                # message it had nothing to do with. conversation_id is
+                # session_mod.get_current_session_id(), the same id
+                # _StudioDispatch.submit() handed back for this turn, so
+                # this is the record that id's re-read actually needs --
+                # matching how the pending-handler chain below saves a
+                # turn, not a new mechanism.
+                memory.save_turn(transcription, "slash_command", response,
+                                 session_mod.get_current_session_id())
             else:
                 response = slash_commands.handle(transcription)
                 outcome = "success"
             if source == "chat":
                 print(response)
-            else:
+            elif source != "studio":
                 # Speak a short confirmation only (full help text would be a
                 # wall of speech). Truncate and keep the first line.
+                #
+                # Studio is excluded here for the same reason "chat" is:
+                # both are text-native channels with their own rendered
+                # surface (a console print / Studio's chat pane) rather than
+                # a room TENKA talks in. A device holding nothing but
+                # CHAT_SEND can already reach this refusal on every failed
+                # attempt -- if it also made the local speaker narrate,
+                # that device would have a standing way to make TENKA talk
+                # in the owner's room on demand. The refusal is still
+                # fully visible where it was asked (the Studio pane, via
+                # the save above); an owner who wants an audible heads-up
+                # on refusals has that logged already through the
+                # transcription log line above, without turning every
+                # remote probe into a spoken interruption.
                 spoken = response.split("\n", 1)[0][:200]
                 await tts.speak(spoken, bridge, emotion="neutral")
             _tracker.intent_detected = "slash_command"

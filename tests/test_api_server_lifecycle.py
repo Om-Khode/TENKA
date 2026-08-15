@@ -1040,3 +1040,87 @@ async def test_chat_source_still_executes_slash_commands(monkeypatch):
 
     assert store.current() is not None, "the chat source must still be able to mint"
     assert any("Pair code minted" in line for line in printed)
+
+
+# ─── Fix round: the studio-sourced refusal must reach the transcript ───────
+# Task 11's refusal above was correct but silent to storage: it returned
+# before memory.save_turn(), so Studio -- which settles a turn by re-reading
+# the conversation transcript (LiveChatRuntime.conversation() ->
+# memory.get_recent(conversation_id); POST /v1/chat is 202 Accepted with no
+# turn payload) -- kept showing whatever turn was last recorded, paired
+# against a message that had nothing to do with it. Asserted against the
+# store itself, never the function's return value, since that return value
+# was never what Studio reads.
+
+
+@pytest.mark.asyncio
+async def test_studio_slash_refusal_is_recorded_for_studio_to_render(tmp_path, monkeypatch):
+    import assistant.config as config
+    import assistant.main as m
+    import assistant.memory as memory_mod
+    import assistant.session as session_mod
+    from assistant.storage.db import _reset_for_testing, init_db
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    _reset_for_testing()
+    memory_mod._repo = None
+    init_db(tmp_path / "test.db")
+
+    monkeypatch.setattr(m, "_wake_listener", None)
+    monkeypatch.setattr(m._telemetry.TurnTracker, "save", lambda self: None)
+
+    async def _fake_speak(text, bridge, emotion="neutral"):
+        return True
+    monkeypatch.setattr(m.tts, "speak", _fake_speak)
+
+    command = "/set followup_timer 999"
+    await m.process_text_from_queue("studio", command, _FakeBridge())
+
+    turns = memory_mod.get_recent(5, session_id=session_mod.get_current_session_id())
+    assert turns, "the refusal must land in the transcript store, not just be spoken/returned"
+    last = turns[-1]
+    assert last["user_input"] == command
+    assert "Slash commands aren't available" in last["response"], (
+        "Studio's pane must render the refusal itself, not a stale prior turn"
+    )
+
+    _reset_for_testing()
+    memory_mod._repo = None
+
+
+@pytest.mark.asyncio
+async def test_studio_slash_refusal_is_not_spoken_aloud(tmp_path, monkeypatch):
+    """Design decision: studio is a text-native remote channel with its own
+    rendered surface (the Studio pane), the same reasoning "chat" already
+    gets exempted from speech for. A device holding nothing but CHAT_SEND
+    can already reach this refusal on every failed attempt -- if it also
+    made the local speaker narrate, that device would have a standing way
+    to make TENKA talk in the owner's room on demand. The refusal is still
+    fully visible where it was asked, via the transcript save proved above.
+    """
+    import assistant.config as config
+    import assistant.main as m
+    import assistant.memory as memory_mod
+    from assistant.storage.db import _reset_for_testing, init_db
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    _reset_for_testing()
+    memory_mod._repo = None
+    init_db(tmp_path / "test.db")
+
+    monkeypatch.setattr(m, "_wake_listener", None)
+    monkeypatch.setattr(m._telemetry.TurnTracker, "save", lambda self: None)
+
+    spoken: list[str] = []
+
+    async def _fake_speak(text, bridge, emotion="neutral"):
+        spoken.append(text)
+        return True
+    monkeypatch.setattr(m.tts, "speak", _fake_speak)
+
+    await m.process_text_from_queue("studio", "/set followup_timer 999", _FakeBridge())
+
+    assert spoken == [], f"a studio-sourced refusal must not reach tts.speak(), got: {spoken}"
+
+    _reset_for_testing()
+    memory_mod._repo = None
