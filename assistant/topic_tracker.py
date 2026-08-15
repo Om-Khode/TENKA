@@ -26,6 +26,62 @@ _FOLLOWED_BY_WORD_RE = re.compile(r"^\s+[A-Za-z]")
 
 _LOCATION_PRONOUNS = re.compile(r'\b(there|here)\b', re.IGNORECASE)
 
+# Pronoun resolution is a conversational device, and a pasted program is not
+# conversation. Resolving inside one silently rewrites the user's source: a
+# guessing game containing `print(f"You got it in {attempts} attempts.")`
+# reached the classifier as `You got /set studio in {attempts} attempts.`,
+# because the top of the stack was the previous turn. That corrupted goal then
+# desynced code_executor's repair loop -- its <old> block was the mutated line,
+# which by definition never appears in the generated code -- so three retries
+# chased a phantom edit and the whole turn timed out.
+#
+# Three layers, all shape-based and language-agnostic. Nothing here names a
+# language, a framework, or an app.
+_FENCE_RE = re.compile(r"(?ms)^[ \t]*(?:```|~~~).*?(?:^[ \t]*(?:```|~~~).*$|\Z)")
+_QUOTED_RE = re.compile(r'"[^"\n]*"' + r"|'[^'\n]*'")
+
+# A line is code-shaped if it carries any structural signal. Deliberately no
+# trailing-punctuation signal: prose wraps on commas and colons constantly, and
+# a false positive there would disable resolution for ordinary multi-line
+# speech. Indentation alone carries most real code.
+_CODE_LINE_RE = re.compile(
+    r"""
+      ^[ \t]{2,}\S                          # indented continuation
+    | ^\s*[A-Za-z_][\w.]*\s*=[^=]           # assignment (not comparison)
+    | \b[A-Za-z_]\w*\s*\(                   # call syntax
+    | ^\s*(?:import|from|def|class|return|function|const|let|var|public|private)\b
+    """,
+    re.VERBOSE,
+)
+_CODE_LINE_RATIO = 0.4
+
+
+def _looks_like_code(text: str) -> bool:
+    """True when a multi-line body is mostly code-shaped.
+
+    Single lines are never judged: one line carries too little signal, and the
+    cost of a false positive (an unresolved pronoun in ordinary speech) is paid
+    on every turn, while the cost of a miss is confined to one-line pastes.
+    """
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return False
+    hits = sum(1 for ln in lines if _CODE_LINE_RE.search(ln))
+    return hits >= len(lines) * _CODE_LINE_RATIO
+
+
+def _protected_spans(text: str) -> list[tuple[int, int]]:
+    """Regions a substitution must never land inside.
+
+    Fenced blocks cover prose that merely *contains* code, which
+    `_looks_like_code` would rate as prose overall. Quoted literals cover the
+    single-line case the ratio test declines to judge -- and quoting is rare
+    enough in dictated speech that skipping resolution there costs nothing.
+    """
+    spans = [m.span() for m in _FENCE_RE.finditer(text)]
+    spans += [m.span() for m in _QUOTED_RE.finditer(text)]
+    return spans
+
 _ENTITY_LABELS = {"PERSON", "ORG", "GPE", "EVENT", "WORK_OF_ART", "LOC",
                   "NORP", "FAC", "PRODUCT", "LAW"}
 
@@ -161,12 +217,19 @@ class TopicTracker:
         if not _PRONOUNS.search(text):
             return text
 
+        if _looks_like_code(text):
+            logger.debug("[TOPIC] Skipped resolution — body is code-shaped")
+            return text
+
+        protected = _protected_spans(text)
         top_entity = self._stack[0][0]
         # knowledge-graph livetest bug #1: walk matches and skip 'this/that' when
         # they're acting as determiners ('this week', 'that bet'). Only
         # the first eligible match is substituted, preserving the original
         # count=1 contract.
         for m in _PRONOUNS.finditer(text):
+            if any(start <= m.start() < end for start, end in protected):
+                continue
             word = m.group(0).lower()
             if word in _DEMONSTRATIVES:
                 tail = text[m.end():m.end() + 30]
