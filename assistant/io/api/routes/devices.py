@@ -19,6 +19,7 @@ Layering: io/api -- core + config only.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -87,8 +88,23 @@ async def revoke_device(
     direction. Both halves become 503: unavailable, not unauthorised and not
     already gone.
     """
+    # Off the event loop, like every other vault *write* reachable from a
+    # request: `revoke()` rewrites `devices.json` and then spawns `icacls` to
+    # re-apply the ACL, synchronously, for tens of milliseconds. This daemon
+    # shares its loop with the assistant, so a write left inline stalls her
+    # too, not just this route. `TokenVault`'s own `threading.Lock` covers the
+    # whole load-filter-save sequence, which is what makes a worker thread the
+    # right place for it.
+    #
+    # A comment rather than another docstring paragraph, deliberately: FastAPI
+    # publishes a route handler's docstring as the OpenAPI `description`, and
+    # `ui.contract_hash()` fingerprints the whole schema -- so a sentence added
+    # above this line takes the vendored Studio bundle dark with a stale-
+    # contract 503. Prose about *how* a route is implemented has no business in
+    # the API's published description anyway.
     try:
-        revoked = request.app.state.auth.vault.revoke(device_id)
+        revoked = await asyncio.to_thread(
+            request.app.state.auth.vault.revoke, device_id)
     except VaultUnavailableError as exc:
         logger.warning(f"[API] revoke failed: vault unavailable ({exc})")
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

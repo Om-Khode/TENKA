@@ -41,6 +41,7 @@ Layering: io/api -- core + config only.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -76,6 +77,17 @@ router = APIRouter()
 # forwarded-IP header, is the attacker's own input, which would hand out a
 # fresh budget per spoofed value. A fixed key is the honest description of
 # what this route can actually distinguish, which is nothing.
+#
+# The first half of that -- "every remote caller already shares one source
+# key" -- is only true because `server.py` now passes `proxy_headers=False`
+# to uvicorn. Under uvicorn's own default it was false:
+# `ProxyHeadersMiddleware` rewrote `scope["client"]` from `X-Forwarded-For`
+# for precisely the loopback peers this comment names, so
+# `request.client.host` *was* the attacker-supplied header the next sentence
+# rejects, and this route's conclusion was right for a reason that did not
+# hold. Both halves hold now. The fixed key stays correct either way; what
+# breaks first if anybody re-enables proxy headers is `authenticate()`'s
+# source keying -- see its docstring.
 #
 # The accepted cost is that an attacker can deny *her* a pairing window. That
 # is a real denial of service and it is taken on purpose: the alternative
@@ -324,8 +336,16 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     # rather than rejected (`PairRequest` does not forbid extras) so that a
     # client which tries still ends up with the name the laptop authorised,
     # instead of a 422 it could route around by dropping the key.
+    #
+    # Off the event loop: `issue()` rewrites `devices.json` and then spawns
+    # `icacls` synchronously (tens of milliseconds, measured), and this daemon
+    # shares its loop with the assistant -- an inline write stalls her and
+    # every other caller, not just this one request. `TokenVault` locks the
+    # whole load-append-save sequence itself, so a worker thread is exactly
+    # what that lock is for.
     try:
-        token = request.app.state.auth.vault.issue(pair_code.label, grants)
+        token = await asyncio.to_thread(
+            request.app.state.auth.vault.issue, pair_code.label, grants)
     except VaultUnavailableError as exc:
         # The code is already consumed and gone -- single-use, and
         # `consume()` never puts it back -- so this is not a "retry with the

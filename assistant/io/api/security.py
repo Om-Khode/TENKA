@@ -19,6 +19,7 @@ Layering: io/api — core + config only.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import defaultdict, deque
@@ -100,19 +101,51 @@ _MAX_FAILURES = 10
 _LOCKOUT_BASE_SECONDS = 2.0
 _MAX_LOCKOUT_SECONDS = 300.0
 
+# Eviction. Every distinct key this limiter has ever metered used to keep a
+# dict slot for the life of the process -- ~862 bytes measured, never
+# reclaimed -- which was defended by the claim that a tunnel collapses every
+# remote caller onto one shared source key. That claim was false while
+# uvicorn's `proxy_headers` default was in force (see `server.py`, which now
+# turns it off), and it would be false again the moment anything upstream
+# started keying on a per-caller value. So the growth is bounded here, in the
+# collection itself, rather than by an argument about who can reach it: a key
+# whose window has fully slid and whose lockout has expired is idle, carries
+# no state worth keeping, and is dropped from all three dicts together.
+#
+# `_PRUNE_ABOVE` keeps the scan off small deployments entirely (one laptop,
+# a handful of keys, nothing to reclaim). The sweep itself runs at most once
+# per window, so it costs O(keys) per `_WINDOW_SECONDS` rather than per
+# request. `_MAX_TRACKED_KEYS` is the hard ceiling for the case the sweep
+# cannot help with -- more distinct keys genuinely live inside one window
+# than this process is willing to remember.
+_PRUNE_ABOVE = 1_000
+_MAX_TRACKED_KEYS = 50_000
+
 
 @dataclass
 class RateLimiter:
-    """Per-key sliding window plus exponential lockout on auth failures."""
+    """Per-key sliding window plus exponential lockout on auth failures.
+
+    Bounded: see `_prune` for what is dropped and why an idle key is safe to
+    forget. Nothing that is currently locked out is ever evicted -- forgetting
+    a lockout would hand back the budget it exists to withhold, which is the
+    one direction eviction must never move in.
+    """
 
     hits: dict[str, deque] = field(default_factory=lambda: defaultdict(deque))
     failures: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     locked_until: dict[str, float] = field(default_factory=dict)
+    # -inf, not 0.0: the very first `check()` should be free to sweep, and a
+    # test driving `now` from 0.0 must not look like "already swept at 0".
+    _pruned_at: float = field(default=float("-inf"), repr=False)
 
     def check(self, key: str, now: float | None = None, *,
               max_per_window: int = _MAX_PER_WINDOW,
               window_seconds: float = _WINDOW_SECONDS) -> bool:
         now = time.monotonic() if now is None else now
+        # Before the key is touched, so a sweep can never drop the entry this
+        # very call is about to create.
+        self._maybe_prune(now, window_seconds)
         if now < self.locked_until.get(key, 0.0):
             return False
         window = self.hits[key]
@@ -122,6 +155,67 @@ class RateLimiter:
             return False
         window.append(now)
         return True
+
+    def _maybe_prune(self, now: float, window_seconds: float) -> None:
+        if len(self.hits) < _PRUNE_ABOVE:
+            return
+        # The longest window any caller meters on, never the caller's own:
+        # `throttle()` hands this method a route-specific window, and pruning
+        # a key against a shorter window than the one it was recorded under
+        # would forget state that is still live for somebody else.
+        window = max(window_seconds, _WINDOW_SECONDS)
+        if now - self._pruned_at <= window:
+            return
+        self._pruned_at = now
+        self._prune(now, window)
+
+    def _prune(self, now: float, window_seconds: float) -> None:
+        """Drop every key that is idle: an empty sliding window and no live
+        lockout.
+
+        A dropped key's `failures` count goes with it, and that is deliberate
+        rather than overlooked. To be dropped, a key must have gone a full
+        window with no traffic at all *and* have no lockout outstanding -- so
+        the most a guesser recovers by waiting that long is a reset of a
+        counter whose only effect is the lockout it has already sat out. The
+        sliding window still bounds it at `_MAX_PER_WINDOW` either way, and
+        against a 256-bit token neither bound is what is doing the work.
+        """
+        for key in list(self.hits):
+            window = self.hits[key]
+            while window and now - window[0] > window_seconds:
+                window.popleft()
+            if window or now < self.locked_until.get(key, 0.0):
+                continue
+            del self.hits[key]
+            self.failures.pop(key, None)
+            self.locked_until.pop(key, None)
+        # The other two dicts, swept on their own terms rather than only as a
+        # side effect of the loop above. `record_failure` writes to both
+        # without going through `hits`, so a key that only ever failed would
+        # otherwise be a slot this sweep can never see.
+        for key in list(self.failures):
+            if key not in self.hits and now >= self.locked_until.get(key, 0.0):
+                self.failures.pop(key, None)
+                self.locked_until.pop(key, None)
+        for key in list(self.locked_until):
+            if key not in self.hits and now >= self.locked_until[key]:
+                self.locked_until.pop(key, None)
+                self.failures.pop(key, None)
+        if len(self.hits) <= _MAX_TRACKED_KEYS:
+            return
+        # More live keys than this process will remember. Shed the least
+        # recently active ones first, and never a locked-out one: the point of
+        # the ceiling is memory, and a lockout is the one entry whose absence
+        # would be a grant rather than a cost.
+        evictable = sorted(
+            (key for key in self.hits if now >= self.locked_until.get(key, 0.0)),
+            key=lambda k: self.hits[k][-1] if self.hits[k] else float("-inf"),
+        )
+        for key in evictable[:len(self.hits) - _MAX_TRACKED_KEYS]:
+            del self.hits[key]
+            self.failures.pop(key, None)
+            self.locked_until.pop(key, None)
 
     def record_failure(self, key: str, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -280,6 +374,99 @@ def policy_for_scope(scope, registry: dict[int, str]) -> ListenerPolicy | None:
     return policy_for_port(port, registry)
 
 
+# ─── which hostnames are ours *right now* ────────────────────────────────
+class PublishedHosts:
+    """The hostnames a **currently running** transport answers on.
+
+    A plain `set` was the wrong shape for this, and the reason is a lifecycle
+    rather than a bug in any one line: a transport publishes its public name
+    when it starts, and nothing anywhere could take that name back out again.
+    `HostGate` and `endpoint_origins()` both read this collection, so a name
+    that was published once stayed both an accepted `Host` and a trusted
+    `Origin` for the rest of the process's life -- long after the tunnel that
+    owned it had stopped.
+
+    That is not merely untidy. A `*.trycloudflare.com` name is assigned by
+    Cloudflare for the lifetime of one tunnel and handed to somebody else
+    afterwards. The device cookie is host-only and lives a year, so the
+    browser keeps attaching it to that hostname no matter who is answering
+    there now -- `httpOnly` stops script from reading the cookie, not the
+    browser from sending it. A stale entry here is therefore a live session
+    credential pointed at a stranger's access log, with no attack beyond
+    waiting.
+
+    So membership is derived from ownership, not accumulated: every hostname
+    belongs to the transport session that published it, and a transport's
+    hostnames disappear the moment that session is retracted. Reads keep the
+    `in` / iteration surface the two gates already use, so neither gate
+    changes shape.
+    """
+
+    def __init__(self) -> None:
+        self._by_owner: dict[str, set[str]] = {}
+
+    # ─── ownership ──────────────────────────────────────────────────────
+    def publish(self, hostname: str, *, owner: str) -> None:
+        """Trust `hostname` for as long as `owner` is running.
+
+        `owner` is any label the transport picks for one *session* of itself
+        -- not the transport's type. Two successive runs of the same tunnel
+        get different names from the provider, so they must be different
+        owners; otherwise stopping the second would leave the first's name
+        behind, which is the whole failure this class exists to prevent.
+        """
+        name = str(hostname).strip().lower()
+        if not name:
+            return
+        self._by_owner.setdefault(str(owner), set()).add(name)
+
+    def unpublish(self, owner: str) -> frozenset[str]:
+        """Withdraw everything `owner` published. Returns what was withdrawn.
+
+        Idempotent: an owner that published nothing, or has already been
+        withdrawn, is not an error -- a transport's stop path must be safe to
+        run twice (a crash handler and an orderly shutdown both call it).
+        """
+        return frozenset(self._by_owner.pop(str(owner), set()))
+
+    def owners(self) -> frozenset[str]:
+        return frozenset(self._by_owner)
+
+    # ─── the read surface the gates use ─────────────────────────────────
+    def add(self, hostname: str) -> None:
+        """A hostname with no transport behind it -- test scaffolding and the
+        console, which have no session to tie a lifetime to.
+
+        Owned by its own name, so it is still removable (`unpublish(name)`)
+        rather than being the permanent entry this class was built to
+        abolish. Production transports call `publish(..., owner=...)`.
+        """
+        self.publish(hostname, owner=str(hostname).strip().lower())
+
+    def __contains__(self, hostname: object) -> bool:
+        return str(hostname).strip().lower() in set(self)
+
+    def __iter__(self):
+        return iter({name for names in self._by_owner.values() for name in names})
+
+    def __len__(self) -> int:
+        return len({name for names in self._by_owner.values() for name in names})
+
+
+def unpublish_host(app_state, owner: str) -> frozenset[str]:
+    """Stop trusting everything `owner` published, on this app's state.
+
+    The counterpart a transport calls on its own stop path. Kept as a
+    module-level function beside `host_is_allowed` and `endpoint_origins` --
+    the two gates that read the collection -- so "what makes a hostname
+    trusted" and "what takes that back" are one thing to find, not two.
+    """
+    published = getattr(app_state, "published_hosts", None)
+    if isinstance(published, PublishedHosts):
+        return published.unpublish(owner)
+    return frozenset()
+
+
 # ─── DNS rebinding: the Host allow-list ──────────────────────────────────
 def hostname_of(value: str) -> str:
     """The host part of a `Host` header or an origin authority, lowercased."""
@@ -359,6 +546,42 @@ def origin_is_known(origin: str, app_state, port: int | None,
     return origin.strip().lower().rstrip("/") in endpoint_origins(app_state, port, policy)
 
 
+def anonymous_key(scope) -> str:
+    """The limiter key spent by a caller that did not verify to a device.
+
+    The accepting port, and nothing the caller sent. This used to be
+    `request.client.host`, defended by the claim that "`cloudflared` and
+    `tailscale funnel` both connect from 127.0.0.1, so `source` collapses to a
+    single shared key for every remote caller". That claim was false in the
+    deployed configuration: uvicorn's `proxy_headers` default installs
+    `ProxyHeadersMiddleware`, which rewrites `scope["client"]` from
+    `X-Forwarded-For` for exactly the loopback peers the claim names -- so the
+    anonymous budget *and* the exponential lockout were both keyed on a value
+    the client chose. Ten wrong guesses under one header value, then a
+    different value, and the next request was answered as a fresh, unmetered
+    caller.
+
+    `server.py` now turns that middleware off, which makes the old key honest
+    again. This function is the other half, and the more durable one: rather
+    than depending on one uvicorn argument staying right forever, the key is
+    derived from the one piece of addressing a client cannot choose at all --
+    the local port the connection was accepted on, the same field `policy.py`
+    already trusts to decide what a request may do. Put a real reverse proxy
+    in front of this daemon tomorrow, or re-enable proxy headers by accident,
+    and the budget still cannot be rotated.
+
+    What it gives up is fairness *between* anonymous callers on one listener,
+    and that costs nothing worth keeping. A caller that verifies is metered by
+    `device_key()` and never reaches this, so no honest device shares a budget
+    with an attacker; what remains here is a wrong token, a missing one, or a
+    request that could not be attributed at all. `routes/pairing.py` has
+    metered its whole unauthenticated route on one fixed key since Task 10,
+    for the same reason and with the same trade written out.
+    """
+    port = accepting_port(scope)
+    return f"anon:{port}" if port is not None else "anon:unknown"
+
+
 def device_key(device: Device) -> str:
     """The limiter key a verified device spends, never a source address.
 
@@ -379,10 +602,11 @@ async def authenticate(request: Request) -> Device:
     puts every request behind one tunnel -- can never exhaust a different
     device's throughput. A request that does not verify (no token, a
     malformed header, an unknown, revoked, or wrong token) has no device
-    identity to meter, so it is charged against the source address instead.
-    Verifying before checking either budget also means a valid token is
-    never refused a 429 it never earned just because other traffic from the
-    same address already burned that address's budget.
+    identity to meter, so it is charged against one shared per-listener key
+    instead (`anonymous_key()`, the accepting port -- never the client
+    address, which a proxy header could rewrite). Verifying before checking
+    either budget also means a valid token is never refused a 429 it never
+    earned just because other traffic already burned the anonymous budget.
 
     Failure accounting is asymmetric on purpose, decided here after Task 10
     reverted the same change when it landed as an untested side effect: a
@@ -409,6 +633,25 @@ async def authenticate(request: Request) -> Device:
     behind the tunnel. A cheap refusal that cannot be turned into a denial of
     service against honest callers is the better trade.
 
+    That collapse used to be an *assumption*, and a false one. `source` was
+    `request.client.host`, and uvicorn installs `ProxyHeadersMiddleware`
+    whenever `proxy_headers` is true (its default), which rewrites
+    `scope["client"]` from `X-Forwarded-For` for any peer inside
+    `forwarded_allow_ips` -- default `127.0.0.1`, precisely the peer address
+    every tunnel here connects from. So the anonymous budget and the
+    exponential lockout were both keyed on a value the caller supplied: ten
+    wrong guesses under one header, a different header, and the next request
+    was answered as a fresh, unmetered caller. Task 10's review "proved"
+    otherwise through `TestClient`, which speaks ASGI directly and never
+    installs uvicorn's middleware at all.
+
+    It is no longer an assumption. `server.py` passes `proxy_headers=False`
+    explicitly, and `source` above is `anonymous_key()` -- the accepting port,
+    the one piece of addressing a client cannot choose -- so the collapse is
+    what the code *does* rather than what the deployment is hoped to produce.
+    `RateLimiter` is bounded too (see `_prune`), so the unbounded-growth half
+    of the same mistake cannot come back on its own either.
+
     The `Device` this returns is the device *as this listener sees it*: its
     grants have already been intersected with the listener's ceiling, so every
     caller downstream -- `require()`, and `routes/commands.py`, which checks a
@@ -418,7 +661,9 @@ async def authenticate(request: Request) -> Device:
     to every route and one that applies to the routes that remembered to ask.
     """
     state: AuthState = request.app.state.auth
-    source = request.client.host if request.client else "unknown"
+    # Never `request.client.host`: see `anonymous_key()` for why the caller
+    # must not get to pick which budget it spends.
+    source = anonymous_key(request.scope)
 
     policy = policy_for_scope(request.scope, request.app.state.listener_policies)
     if policy is None:
@@ -509,8 +754,21 @@ async def authenticate(request: Request) -> Device:
         # 403 -- "you are not allowed" -- to every authenticated request for
         # as long as the lock held, which is a lie this call site must not
         # tell. Best-effort either way: log it, keep going.
+        #
+        # Off the event loop, always. `touch()` is synchronous and its write
+        # half spawns `icacls` through `subprocess.run(..., timeout=10)` --
+        # measured at 13-90ms of *blocking* wall time per call. This daemon
+        # shares its loop with the assistant, so those milliseconds are never
+        # this one request's alone: eight unrelated, unauthenticated requests
+        # measured 1.5x-7.7x slower while a single such write was in flight,
+        # because the loop's one thread was sitting inside a subprocess wait
+        # rather than servicing anybody. `asyncio.to_thread` turns
+        # "everything stops" into "this request waits", and it is safe
+        # exactly here: `TokenVault` guards the whole load-check-save
+        # sequence with a `threading.Lock`, which is the case that lock was
+        # written for.
         try:
-            state.vault.touch(device.device_id)
+            await asyncio.to_thread(state.vault.touch, device.device_id)
         except VaultUnavailableError as exc:
             logger.warning(f"[API] could not record last-seen for "
                            f"{device.device_id}: {exc}")
