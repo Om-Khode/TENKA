@@ -188,3 +188,45 @@ def test_meta_generated_at_is_populated(context):
     client, _, headers = context
     body = client.get("/v1/status", headers=headers).json()
     assert body["meta"]["generatedAt"]
+
+
+# ─── OBSERVE reads her; RECALL reads what she stored ─────────────────────
+def _reader(tmp_path, *grants):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("reader", frozenset(grants))
+    client = build_api_client(build_fake_runtime(), vault)
+    return client, {"Authorization": f"Bearer {token}"}
+
+
+def test_a_watching_device_cannot_read_what_she_stored(tmp_path):
+    """All three memory reads are stored data, not observation. `procedures`
+    is the one worth naming: it looks like a capability listing, but every row
+    is something this user taught her, down to the literal steps.
+    """
+    client, headers = _reader(tmp_path, Capability.OBSERVE)
+    for path in ("/v1/memory/knowledge", "/v1/memory/preferences",
+                 "/v1/memory/procedures", "/v1/chat/conversations",
+                 "/v1/enrollment"):
+        assert client.get(path, headers=headers).status_code == 403, path
+
+
+def test_a_recalling_device_reads_stored_data(tmp_path):
+    """And the two are independent, not nested: RECALL alone reads history
+    without being able to watch her work. A ceiling that admits one must not
+    hand over the other by implication."""
+    client, headers = _reader(tmp_path, Capability.RECALL)
+    for path in ("/v1/memory/knowledge", "/v1/memory/preferences",
+                 "/v1/memory/procedures", "/v1/chat/conversations",
+                 "/v1/enrollment"):
+        assert client.get(path, headers=headers).status_code == 200, path
+    assert client.get("/v1/status", headers=headers).status_code == 403
+
+
+def test_a_watching_device_still_reads_how_she_is_configured(tmp_path):
+    """Settings, personality and the command catalogue describe *her*, not
+    what she was told -- they stay on OBSERVE, so the split narrows the
+    stored-data side only."""
+    client, headers = _reader(tmp_path, Capability.OBSERVE)
+    for path in ("/v1/status", "/v1/telemetry", "/v1/settings",
+                 "/v1/personality", "/v1/commands", "/v1/backup"):
+        assert client.get(path, headers=headers).status_code == 200, path

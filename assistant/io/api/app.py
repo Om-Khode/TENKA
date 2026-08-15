@@ -393,27 +393,33 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         # This socket has two faces with two different gates. The *stream* --
         # the connect-time status frame plus every later status/telemetry
         # push -- is read-only, the exact analogue of GET /v1/status and
-        # GET /v1/telemetry, so it is gated on Capability.CHAT here, at the
-        # handshake, same as those routes' `require(Capability.CHAT)`.
+        # GET /v1/telemetry, so it is gated on Capability.OBSERVE here, at the
+        # handshake, same as those routes' `require(Capability.OBSERVE)`.
         # Verifying the token proves *a* device is on the other end; it says
         # nothing about what that device is allowed to see or do. Without
         # this, a FILES-only or SCREEN-only token -- issued for a narrower
-        # purpose, never meant to hold CHAT -- could still stream
+        # purpose, never meant to hold OBSERVE -- could still stream
         # status/telemetry through this one socket, bypassing the same check
         # its HTTP twins enforce. Checked, audited and closed before
         # `accept()`: a capability failure is a rejection, not a connection
         # that then gets torn down.
+        #
+        # OBSERVE and not RECALL, deliberately: nothing this socket emits is
+        # stored data -- it carries status and telemetry frames -- so gating
+        # the handshake on the stored-data grant would deny a live view to a
+        # device that holds no stored-data grant and needs none. A wall
+        # display watching her work is exactly that device.
         #
         # The socket's one *write* verb -- the client-sent `{"type": "abort"}`
         # frame, the analogue of POST /v1/abort -- is gated separately, per
         # frame, on Capability.CHAT_SEND, further down this handler. It
         # cannot be folded into this same handshake check: refusing the
         # connection outright over a write permission a device may lack
-        # would also take away the live status view a CHAT-only (read-only)
-        # device is entitled to keep. So CHAT gets you in and lets you watch;
-        # CHAT_SEND is checked again, separately, before any abort actually
-        # reaches `runtime.chat.abort()`.
-        if device is not None and Capability.CHAT not in device.grants:
+        # would also take away the live status view a watching (read-only)
+        # device is entitled to keep. So OBSERVE gets you in and lets you
+        # watch; CHAT_SEND is checked again, separately, before any abort
+        # actually reaches `runtime.chat.abort()`.
+        if device is not None and Capability.OBSERVE not in device.grants:
             _audit("1008")
             await websocket.close(code=1008)
             return
@@ -492,8 +498,8 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                 # `device` was resolved once, before accept() -- re-verifying
                 # the vault per frame would cost a hash comparison on every
                 # frame a chatty client sends for no gain, since capability
-                # grants can't change mid-connection. CHAT alone must not be
-                # enough here: see the handshake comment above for why the
+                # grants can't change mid-connection. OBSERVE alone must not
+                # be enough here: see the handshake comment above for why the
                 # write verb is gated separately from the stream.
                 if Capability.CHAT_SEND not in device.grants:
                     _audit("403")

@@ -71,7 +71,7 @@ def telemetry_body(snapshot) -> TelemetryPayload:
 
 @router.get("/telemetry")
 async def telemetry(request: Request,
-                    _=Depends(require(Capability.CHAT))) -> Envelope[TelemetryPayload]:
+                    _=Depends(require(Capability.OBSERVE))) -> Envelope[TelemetryPayload]:
     snapshot = await request.app.state.runtime.system.telemetry()
     return Envelope(data=telemetry_body(snapshot))
 
@@ -87,22 +87,25 @@ def _backup_body(state) -> BackupStatePayload:
     )
 
 
+# OBSERVE: this reports *whether* backups are running -- enabled, provider,
+# last result, size, whether the key is armed -- and nothing about what is in
+# one. That is her operational state, the same class of fact as telemetry.
 @router.get("/backup")
 async def backup_state(request: Request,
-                       _=Depends(require(Capability.CHAT))) -> Envelope[BackupStatePayload]:
+                       _=Depends(require(Capability.OBSERVE))) -> Envelope[BackupStatePayload]:
     return Envelope(data=_backup_body(
         await request.app.state.runtime.system.backup_state()))
 
 
 @router.post("/backup/run")
 async def run_backup(request: Request,
-                     # SYSTEM_CONTROL, not CHAT. This was the worst of the
+                     # SYSTEM_CONTROL, not a read grant. This was the worst of the
                      # four routes a read-only listener could still reach:
                      # it encrypts the whole memory database and pushes it to
                      # a third-party cloud provider, spending the user's
                      # storage quota and putting every fact she owns onto
                      # someone else's disk. Reading /backup's *state* is a
-                     # read and stays on CHAT; causing an upload is the
+                     # read and stays on OBSERVE; causing an upload is the
                      # single most consequential act in this module, and its
                      # two siblings (/backup/restore, /backup/unlock) already
                      # demanded SYSTEM_CONTROL -- it was the odd one out, not
@@ -136,9 +139,9 @@ async def unlock_backup(body: UnlockRequest, request: Request,
                         ) -> Envelope[UnlockPayload]:
     """Arm this process's backup encryption key from the recovery phrase.
 
-    SYSTEM_CONTROL, not CHAT: the phrase this accepts is the same secret that
-    can overwrite every memory she has through /backup/restore, so it must not
-    be reachable by a device holding only a chat grant.
+    SYSTEM_CONTROL, not a read grant: the phrase this accepts is the same
+    secret that can overwrite every memory she has through /backup/restore, so
+    it must not be reachable by a device paired only to watch or to read.
 
     Throttled harder than the other write routes. Deriving a key from a
     submitted phrase is the one place an attacker with a foothold could grind
@@ -165,9 +168,16 @@ def _enrolled_item(item) -> EnrolledItemPayload:
     )
 
 
+# RECALL, not OBSERVE, and this is the one assignment in this module that is
+# not obvious. It looks like configuration -- which sensors are set up -- but
+# every row names a *person*: a voiceprint label, a face's name, and a
+# `last_seen_at` saying when that named person was last in front of this
+# machine. That is stored data about the people around her, closer to a
+# preference record than to a telemetry meter, and it must not ride the one
+# transport a third party reads.
 @router.get("/enrollment")
 async def enrollment(request: Request,
-                     _=Depends(require(Capability.CHAT))) -> Envelope[EnrollmentPayload]:
+                     _=Depends(require(Capability.RECALL))) -> Envelope[EnrollmentPayload]:
     state = await request.app.state.runtime.system.enrollment()
     return Envelope(data=EnrollmentPayload(
         voices=[_enrolled_item(v) for v in state.voices],
@@ -177,11 +187,11 @@ async def enrollment(request: Request,
 
 @router.delete("/enrollment/{kind}/{item_id}")
 async def forget_enrolled(kind: EnrollmentKind, item_id: str, request: Request,
-                          # SYSTEM_CONTROL, not CHAT: destroying a biometric
-                          # enrollment (a voiceprint, a face) is not ordinary
-                          # conversational use -- the same reasoning that put
-                          # forget-all and settings writes behind this grant.
-                          # Reading the enrollment list stays on chat.
+                          # SYSTEM_CONTROL, not a read grant: destroying a
+                          # biometric enrollment (a voiceprint, a face) is not
+                          # ordinary conversational use -- the same reasoning
+                          # that put forget-all and settings writes behind
+                          # this grant. Reading the list stays on RECALL.
                           _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope[ForgetEnrolledPayload]:
     removed = await request.app.state.runtime.system.forget_enrolled(kind, item_id)
     if not removed:

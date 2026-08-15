@@ -14,7 +14,7 @@ router = APIRouter()
 
 @router.get("/status")
 async def get_status(request: Request,
-                     _=Depends(require(Capability.CHAT))) -> Envelope[StatusPayload]:
+                     _=Depends(require(Capability.OBSERVE))) -> Envelope[StatusPayload]:
     info = await request.app.state.runtime.system.status()
     return Envelope(data=StatusPayload(
         assistant_name=info.assistant_name,

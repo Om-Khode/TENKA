@@ -190,12 +190,11 @@ def test_an_accepted_socket_connection_is_audited(context):
 
 
 # ─── fix wave: the socket enforces the same capability its HTTP twins do ──
-def test_a_non_chat_token_is_refused_before_accept(context):
-    """Every HTTP analogue of what this socket serves -- GET /v1/status,
-    GET /v1/telemetry, POST /v1/abort -- requires Capability.CHAT. A
-    FILES-only token must be refused the same way, and refused before
-    accept(): the connection must close, not merely answer nothing useful
-    once open.
+def test_a_non_observe_token_is_refused_before_accept(context):
+    """Every HTTP analogue of what this socket *streams* -- GET /v1/status,
+    GET /v1/telemetry -- requires Capability.OBSERVE. A FILES-only token must
+    be refused the same way, and refused before accept(): the connection must
+    close, not merely answer nothing useful once open.
     """
     client, app, _, _ = context
     vault = app.state.auth.vault
@@ -211,11 +210,11 @@ def test_a_non_chat_token_is_refused_before_accept(context):
     )
 
 
-def test_a_chat_token_still_connects(context):
+def test_an_observe_token_still_connects(context):
     """The fix above must not have collapsed into refusing everyone."""
     client, app, _, token = context
     device = app.state.auth.vault.verify(token)
-    assert Capability.CHAT in device.grants
+    assert Capability.OBSERVE in device.grants
     with _as(client, token).websocket_connect("/v1/events") as socket:
         frame = socket.receive_json()
         assert frame["type"] == "status"
@@ -316,26 +315,27 @@ def test_no_frame_the_socket_can_emit_has_a_snake_case_key():
         assert not any("_" in key for key in frame), frame
 
 
-# ─── CHAT vs CHAT_SEND: the stream is a read gate, abort is a write gate ──
-def test_a_chat_only_device_connects_and_gets_its_stream(context):
-    """The handshake gate stays CHAT: a read-only device's live view is
-    unaffected by the write-side split."""
+# ─── OBSERVE vs CHAT_SEND: the stream is a read gate, abort is a write gate ──
+def test_an_observe_only_device_connects_and_gets_its_stream(context):
+    """The handshake gate is OBSERVE: a watching device's live view is
+    unaffected by the write-side split -- and unaffected by the stored-data
+    split too, since it holds no RECALL either."""
     client, app, _, _ = context
     vault = app.state.auth.vault
-    chat_only = vault.issue("reader", frozenset({Capability.CHAT}))
-    with _as(client, chat_only).websocket_connect("/v1/events") as socket:
+    watcher = vault.issue("reader", frozenset({Capability.OBSERVE}))
+    with _as(client, watcher).websocket_connect("/v1/events") as socket:
         frame = socket.receive_json()
         assert frame["type"] == "status"
 
 
-def test_a_chat_only_device_cannot_abort_over_the_socket(context):
-    """The bug this closes: before the frame-level gate, a CHAT-only device
+def test_an_observe_only_device_cannot_abort_over_the_socket(context):
+    """The bug this closes: before the frame-level gate, a read-only device
     could still call runtime.chat.abort() by opening the socket and sending
     one frame, bypassing the CHAT_SEND split entirely on POST /v1/abort."""
     client, app, runtime, _ = context
     vault = app.state.auth.vault
-    chat_only = vault.issue("reader", frozenset({Capability.CHAT}))
-    with _as(client, chat_only).websocket_connect("/v1/events") as socket:
+    watcher = vault.issue("reader", frozenset({Capability.OBSERVE}))
+    with _as(client, watcher).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
         socket.send_json({"type": "abort"})
         frame = socket.receive_json()
@@ -346,7 +346,7 @@ def test_a_chat_only_device_cannot_abort_over_the_socket(context):
 def test_a_chat_send_device_can_still_abort_over_the_socket(context):
     client, app, runtime, _ = context
     vault = app.state.auth.vault
-    sender = vault.issue("phone", frozenset({Capability.CHAT, Capability.CHAT_SEND}))
+    sender = vault.issue("phone", frozenset({Capability.OBSERVE, Capability.CHAT_SEND}))
     with _as(client, sender).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
         socket.send_json({"type": "abort"})
@@ -358,8 +358,8 @@ def test_a_chat_send_device_can_still_abort_over_the_socket(context):
 def test_a_refused_abort_frame_is_audited(context):
     client, app, _, _ = context
     vault = app.state.auth.vault
-    chat_only = vault.issue("reader", frozenset({Capability.CHAT}))
-    with _as(client, chat_only).websocket_connect("/v1/events") as socket:
+    watcher = vault.issue("reader", frozenset({Capability.OBSERVE}))
+    with _as(client, watcher).websocket_connect("/v1/events") as socket:
         socket.receive_json()  # hello
         socket.send_json({"type": "abort"})
         socket.receive_json()  # error

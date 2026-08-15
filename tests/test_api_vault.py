@@ -21,7 +21,7 @@ def test_instance_secret_is_256_bits_and_stable(vault):
 
 def test_chat_send_is_a_distinct_capability():
     assert Capability.CHAT_SEND.value == "chat_send"
-    assert Capability.CHAT_SEND is not Capability.CHAT
+    assert Capability.CHAT_SEND is not Capability.OBSERVE
 
 
 def test_two_installations_get_different_secrets(tmp_path):
@@ -36,18 +36,18 @@ def test_env_var_overrides_the_stored_secret(tmp_path, monkeypatch):
 
 
 def test_issued_token_verifies_and_carries_its_grants(vault):
-    token = vault.issue("studio", frozenset({Capability.CHAT, Capability.FILES}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE, Capability.FILES}))
     device = vault.verify(token)
     assert isinstance(device, Device)
     assert device.label == "studio"
-    assert device.grants == frozenset({Capability.CHAT, Capability.FILES})
+    assert device.grants == frozenset({Capability.OBSERVE, Capability.FILES})
 
 
 def test_issuing_a_device_with_no_grants_is_refused(vault):
     """A device with no capabilities can still authenticate -- just not do
     anything, except distinguish 404 from 403 on a route gated by
     `authenticate` alone rather than `require(capability)`, which leaks
-    membership it was never granted CHAT to read. Refusing at issuance
+    membership it was never granted OBSERVE to read. Refusing at issuance
     closes that for every such route, not just the ones known today.
     """
     with pytest.raises(ValueError):
@@ -55,25 +55,25 @@ def test_issuing_a_device_with_no_grants_is_refused(vault):
 
 
 def test_token_is_at_least_256_bits_of_entropy(vault):
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     assert len(token) >= 43  # 32 bytes, url-safe base64, unpadded
 
 
 def test_two_issues_never_collide(vault):
-    a = vault.issue("one", frozenset({Capability.CHAT}))
-    b = vault.issue("two", frozenset({Capability.CHAT}))
+    a = vault.issue("one", frozenset({Capability.OBSERVE}))
+    b = vault.issue("two", frozenset({Capability.OBSERVE}))
     assert a != b
 
 
 def test_plaintext_token_is_never_written_to_disk(vault, tmp_path):
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     for path in tmp_path.rglob("*"):
         if path.is_file():
             assert token not in path.read_text(encoding="utf-8", errors="ignore")
 
 
 def test_unknown_token_is_rejected(vault):
-    vault.issue("studio", frozenset({Capability.CHAT}))
+    vault.issue("studio", frozenset({Capability.OBSERVE}))
     assert vault.verify("not-a-real-token") is None
 
 
@@ -83,7 +83,7 @@ def test_garbage_token_is_rejected_without_raising(vault):
 
 
 def test_revoked_token_stops_verifying(vault):
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     device = vault.verify(token)
     assert vault.revoke(device.device_id) is True
     assert vault.verify(token) is None
@@ -94,25 +94,25 @@ def test_revoking_an_unknown_device_reports_false(vault):
 
 
 def test_rotating_the_instance_secret_revokes_everything(vault):
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     vault.reset()
     assert vault.verify(token) is None
 
 
 def test_devices_lists_what_was_issued(vault):
-    vault.issue("studio", frozenset({Capability.CHAT}))
-    vault.issue("phone", frozenset({Capability.CHAT, Capability.SCREEN}))
+    vault.issue("studio", frozenset({Capability.OBSERVE}))
+    vault.issue("phone", frozenset({Capability.OBSERVE, Capability.SCREEN}))
     labels = sorted(d.label for d in vault.devices())
     assert labels == ["phone", "studio"]
 
 
 def test_device_record_persists_across_instances(tmp_path):
-    token = TokenVault(tmp_path).issue("studio", frozenset({Capability.CHAT}))
+    token = TokenVault(tmp_path).issue("studio", frozenset({Capability.OBSERVE}))
     assert TokenVault(tmp_path).verify(token) is not None
 
 
 def test_stored_record_holds_a_hash_not_the_token(vault, tmp_path):
-    vault.issue("studio", frozenset({Capability.CHAT}))
+    vault.issue("studio", frozenset({Capability.OBSERVE}))
     raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
     assert raw["devices"], "no device recorded"
     entry = raw["devices"][0]
@@ -126,7 +126,7 @@ def test_stored_record_holds_a_hash_not_the_token(vault, tmp_path):
 
 def test_corrupt_secret_file_regenerates_and_revokes_everything(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     (tmp_path / "instance_secret").write_text("not-hex-garbage", encoding="utf-8")
 
     fresh = TokenVault(tmp_path)  # no in-memory cache -- forces a file read
@@ -137,7 +137,7 @@ def test_corrupt_secret_file_regenerates_and_revokes_everything(tmp_path):
 
 def test_devices_json_as_bare_array_is_rejected_wholesale(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     device_id = vault.verify(token).device_id
     (tmp_path / "devices.json").write_text("[]", encoding="utf-8")
 
@@ -148,7 +148,7 @@ def test_devices_json_as_bare_array_is_rejected_wholesale(tmp_path):
 
 def test_devices_field_as_string_is_rejected_wholesale(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     device_id = vault.verify(token).device_id
     (tmp_path / "devices.json").write_text(
         json.dumps({"version": 1, "devices": "oops"}), encoding="utf-8"
@@ -161,7 +161,7 @@ def test_devices_field_as_string_is_rejected_wholesale(tmp_path):
 
 def test_entry_that_is_not_a_dict_is_skipped(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     device_id = vault.verify(token).device_id
     raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
     raw["devices"][0] = "not-a-dict"
@@ -174,7 +174,7 @@ def test_entry_that_is_not_a_dict_is_skipped(tmp_path):
 
 def test_entry_with_non_string_token_hmac_fails_closed_but_stays_administrable(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     device_id = vault.verify(token).device_id
     raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
     raw["devices"][0]["token_hmac"] = 12345
@@ -192,7 +192,7 @@ def test_entry_with_non_string_token_hmac_fails_closed_but_stays_administrable(t
 
 def test_entry_with_unknown_capability_fails_closed_but_stays_revocable(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     device_id = vault.verify(token).device_id
     raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
     raw["devices"][0]["grants"] = ["not-a-real-capability"]
@@ -203,6 +203,31 @@ def test_entry_with_unknown_capability_fails_closed_but_stays_revocable(tmp_path
     # device_id is untouched, so an operator can still revoke a device whose
     # grants got hand-edited into garbage.
     assert vault.revoke(device_id) is True
+
+
+def test_a_device_paired_before_the_observe_recall_split_fails_closed(tmp_path):
+    """`"chat"` is not a capability any more, and there is deliberately no
+    migration for it.
+
+    A record written before the split says `"chat"`, which meant both "watch
+    her work" and "read everything she stored". Upgrading it to `RECALL` would
+    hand a device paired under the old, ambiguous grant exactly the stored-data
+    access the split exists to withhold; upgrading it to `OBSERVE` would be a
+    silent downgrade nobody asked for. So the record simply stops parsing --
+    `_parse_device` drops it, exactly as it drops any unknown capability
+    string, rather than raising and taking the whole store down with it. The
+    device re-pairs, which is what this milestone is for.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
+    device_id = vault.verify(token).device_id
+    raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    raw["devices"][0]["grants"] = ["chat"]
+    (tmp_path / "devices.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    assert vault.verify(token) is None
+    assert vault.devices() == []            # dropped, not raised
+    assert vault.revoke(device_id) is True  # and still administrable by id
 
 
 def test_entry_with_empty_grants_fails_closed_but_a_normal_entry_still_verifies(tmp_path):
@@ -216,9 +241,9 @@ def test_entry_with_empty_grants_fails_closed_but_a_normal_entry_still_verifies(
     entry in the store.
     """
     vault = TokenVault(tmp_path)
-    ghost_token = vault.issue("ghost", frozenset({Capability.CHAT}))
+    ghost_token = vault.issue("ghost", frozenset({Capability.OBSERVE}))
     ghost_id = vault.verify(ghost_token).device_id
-    normal_token = vault.issue("normal", frozenset({Capability.CHAT}))
+    normal_token = vault.issue("normal", frozenset({Capability.OBSERVE}))
 
     raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
     for entry in raw["devices"]:
@@ -236,7 +261,7 @@ def test_entry_with_empty_grants_fails_closed_but_a_normal_entry_still_verifies(
 
 def test_entry_missing_device_id_fails_closed_everywhere(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     device_id = vault.verify(token).device_id
     raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
     del raw["devices"][0]["device_id"]
@@ -256,7 +281,7 @@ def test_entry_missing_device_id_fails_closed_everywhere(tmp_path):
 
 def test_empty_secret_file_regenerates_and_revokes_everything(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     (tmp_path / "instance_secret").write_text("", encoding="utf-8")
 
     fresh = TokenVault(tmp_path)  # no in-memory cache -- forces a file read
@@ -267,7 +292,7 @@ def test_empty_secret_file_regenerates_and_revokes_everything(tmp_path):
 
 def test_whitespace_only_secret_file_regenerates_and_revokes_everything(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     (tmp_path / "instance_secret").write_text("   \n\t  ", encoding="utf-8")
 
     fresh = TokenVault(tmp_path)
@@ -278,7 +303,7 @@ def test_whitespace_only_secret_file_regenerates_and_revokes_everything(tmp_path
 
 def test_short_but_valid_hex_secret_file_regenerates_and_revokes_everything(tmp_path):
     vault = TokenVault(tmp_path)
-    token = vault.issue("studio", frozenset({Capability.CHAT}))
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
     (tmp_path / "instance_secret").write_text("ab" * 4, encoding="utf-8")  # 4 bytes, not 32
 
     fresh = TokenVault(tmp_path)
@@ -365,7 +390,7 @@ def test_issue_after_another_instance_rotated_the_secret_still_verifies(tmp_path
 
     TokenVault(tmp_path).reset()  # rotated out from under it
 
-    token = daemon.issue("phone", frozenset({Capability.CHAT}))
+    token = daemon.issue("phone", frozenset({Capability.OBSERVE}))
 
     assert daemon.verify(token) is not None, "unusable the moment it was issued"
     fresh = TokenVault(tmp_path)  # what the next daemon start sees: disk only
@@ -383,7 +408,7 @@ def test_rotation_is_visible_even_when_the_device_list_survives(tmp_path):
     against.
     """
     vault = TokenVault(tmp_path)
-    token = vault.issue("phone", frozenset({Capability.CHAT}))
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
     assert vault.verify(token) is not None
 
     (tmp_path / "instance_secret").write_text("ab" * 32, encoding="utf-8")
@@ -401,7 +426,7 @@ def test_deleted_secret_file_mid_run_does_not_revoke_issued_devices(tmp_path, ca
     say so loudly, and leave the decision to the operator.
     """
     vault = TokenVault(tmp_path)
-    token = vault.issue("phone", frozenset({Capability.CHAT}))
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
     (tmp_path / "instance_secret").unlink()
 
     with caplog.at_level(logging.WARNING, logger="assistant.io.api.vault"):
@@ -415,7 +440,7 @@ def test_deleted_secret_file_mid_run_does_not_revoke_issued_devices(tmp_path, ca
 
 def test_corrupt_secret_file_mid_run_does_not_revoke_issued_devices(tmp_path, caplog):
     vault = TokenVault(tmp_path)
-    token = vault.issue("phone", frozenset({Capability.CHAT}))
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
     (tmp_path / "instance_secret").write_text("not-hex-garbage", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING, logger="assistant.io.api.vault"):

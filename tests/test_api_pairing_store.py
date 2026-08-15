@@ -19,7 +19,7 @@ from assistant.io.api.vault import Capability
 
 
 def test_a_minted_code_is_typeable_and_unambiguous():
-    code = PairCodeStore().mint("phone", frozenset({Capability.CHAT})).code
+    code = PairCodeStore().mint("phone", frozenset({Capability.OBSERVE})).code
     assert len(code) == 9 and code[4] == "-"
     assert all(c in _ALPHABET for c in code.replace("-", ""))
     assert not (set("ILOU") & set(code))     # misread as 1, 1, 0, V
@@ -27,20 +27,20 @@ def test_a_minted_code_is_typeable_and_unambiguous():
 
 def test_consume_works_exactly_once():
     store = PairCodeStore()
-    code = store.mint("phone", frozenset({Capability.CHAT})).code
+    code = store.mint("phone", frozenset({Capability.OBSERVE})).code
     assert store.consume(code) is not None
     assert store.consume(code) is None       # replay is indistinguishable from wrong
 
 
 def test_an_expired_code_is_refused():
     store = PairCodeStore()
-    code = store.mint("phone", frozenset({Capability.CHAT}), now=0.0).code
+    code = store.mint("phone", frozenset({Capability.OBSERVE}), now=0.0).code
     assert store.consume(code, now=CODE_TTL_SECONDS + 0.01) is None
 
 
 def test_a_code_is_alive_right_up_to_its_ttl():
     store = PairCodeStore()
-    code = store.mint("phone", frozenset({Capability.CHAT}), now=0.0).code
+    code = store.mint("phone", frozenset({Capability.OBSERVE}), now=0.0).code
     assert store.consume(code, now=CODE_TTL_SECONDS - 0.01) is not None
 
 
@@ -48,35 +48,35 @@ def test_minting_invalidates_the_previous_code():
     """At most one live code. Otherwise a forgotten QR screen from an hour ago
     is still a working credential path."""
     store = PairCodeStore()
-    first = store.mint("phone", frozenset({Capability.CHAT})).code
-    store.mint("laptop", frozenset({Capability.CHAT}))
+    first = store.mint("phone", frozenset({Capability.OBSERVE})).code
+    store.mint("laptop", frozenset({Capability.OBSERVE}))
     assert store.consume(first) is None
 
 
 def test_grants_travel_with_the_code():
     store = PairCodeStore()
-    grants = frozenset({Capability.CHAT, Capability.FILES})
+    grants = frozenset({Capability.OBSERVE, Capability.FILES})
     code = store.mint("phone", grants).code
     assert store.consume(code).grants == grants
 
 
 def test_wrong_code_returns_none_without_raising():
     store = PairCodeStore()
-    store.mint("phone", frozenset({Capability.CHAT}))
+    store.mint("phone", frozenset({Capability.OBSERVE}))
     for bad in ("", "   ", "AAAA-AAAA", "nope", "7K2M9QX4", "\ud800"):
         assert store.consume(bad) is None
 
 
 def test_current_reports_nothing_once_expired():
     store = PairCodeStore()
-    store.mint("phone", frozenset({Capability.CHAT}), now=0.0)
+    store.mint("phone", frozenset({Capability.OBSERVE}), now=0.0)
     assert store.current(now=0.0) is not None
     assert store.current(now=CODE_TTL_SECONDS + 1) is None
 
 
 def test_codes_do_not_repeat():
     store = PairCodeStore()
-    seen = {store.mint("p", frozenset({Capability.CHAT})).code for _ in range(200)}
+    seen = {store.mint("p", frozenset({Capability.OBSERVE})).code for _ in range(200)}
     assert len(seen) == 200
 
 
@@ -87,7 +87,7 @@ def test_repr_never_reveals_the_code():
     `field(repr=False)` on `code`, an f-string, an uncaught exception, or
     pytest's own assertion-rewrite on a failing `==` would put a live pair
     code straight into a log or terminal."""
-    pair_code = PairCodeStore().mint("phone", frozenset({Capability.CHAT}))
+    pair_code = PairCodeStore().mint("phone", frozenset({Capability.OBSERVE}))
     rendered = repr(pair_code)
     assert pair_code.code not in rendered
     assert "phone" in rendered                # non-secret fields still show
@@ -126,7 +126,7 @@ def test_the_critical_section_is_one_unbroken_lock_hold(monkeypatch):
     again. See the fix-round-2 entry in task-4-report.md for the transcript.
     """
     store = PairCodeStore()
-    code = store.mint("phone", frozenset({Capability.CHAT})).code
+    code = store.mint("phone", frozenset({Capability.OBSERVE})).code
 
     order_lock = threading.Lock()
     calls: list[int] = []
@@ -171,7 +171,7 @@ def test_a_wrong_guess_does_not_burn_the_live_code():
     -- accidental or an attacker fishing -- would kill a legitimate pairing
     session before its owner ever gets to redeem it."""
     store = PairCodeStore()
-    code = store.mint("phone", frozenset({Capability.CHAT})).code
+    code = store.mint("phone", frozenset({Capability.OBSERVE})).code
     assert store.consume("WRONG-CODE") is None
     assert store.consume(code) is not None
 
@@ -181,6 +181,6 @@ def test_consume_rejects_non_str_and_oversized_input_without_raising():
     `consume` also has to survive a caller passing the wrong type entirely,
     and a wire value with no realistic relation to a 9-character code."""
     store = PairCodeStore()
-    store.mint("phone", frozenset({Capability.CHAT}))
+    store.mint("phone", frozenset({Capability.OBSERVE}))
     for bad in (None, b"7K2M-9QX4", 12345, "X" * 10_000):
         assert store.consume(bad) is None

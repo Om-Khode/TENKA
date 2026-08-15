@@ -26,7 +26,7 @@ async def send_chat(body: ChatRequest, request: Request,
     ref = await request.app.state.runtime.chat.send(body.text)
     if not ref.accepted:
         # Deliberately generic: a caller that cannot authenticate any further
-        # than "holds a CHAT token" should not learn *what* she is doing --
+        # than "holds a read token" should not learn *what* she is doing --
         # only that she isn't free. `ref.reason` is never interpolated here.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="busy")
     return Envelope(data=ChatSendPayload(turn_id=ref.turn_id,
@@ -34,9 +34,13 @@ async def send_chat(body: ChatRequest, request: Request,
 
 
 # ─── Conversation history ────────────────────────────────────────────────
+# RECALL, not OBSERVE. A transcript is what she was *told*, not what she is
+# doing: it holds whatever the user typed or said, and -- because `read_screen`
+# and `camera_look` are intents like any other -- her description of what was
+# on the screen or in front of the camera. Watching her work must not carry it.
 @router.get("/chat/conversations")
 async def list_conversations(request: Request,
-                             _=Depends(require(Capability.CHAT))) -> Envelope[ConversationsPayload]:
+                             _=Depends(require(Capability.RECALL))) -> Envelope[ConversationsPayload]:
     conversations = await request.app.state.runtime.chat.conversations()
     return Envelope(data=ConversationsPayload(conversations=[
         ConversationRefPayload(
@@ -51,7 +55,7 @@ async def list_conversations(request: Request,
 
 @router.get("/chat/conversations/{conversation_id}")
 async def get_conversation(conversation_id: str, request: Request,
-                           _=Depends(require(Capability.CHAT))) -> Envelope[ConversationDetailPayload]:
+                           _=Depends(require(Capability.RECALL))) -> Envelope[ConversationDetailPayload]:
     detail = await request.app.state.runtime.chat.conversation(conversation_id)
     if detail is None:
         raise HTTPException(status_code=404)  # detail is dead on a 404 -- see app.py's handler

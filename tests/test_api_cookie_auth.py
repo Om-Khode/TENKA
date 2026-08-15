@@ -44,6 +44,18 @@ def _client(vault: TokenVault, *, policies: dict[int, str]) -> ApiTestClient:
     return ApiTestClient(app, base_url=BASE_URL)
 
 
+@pytest.fixture()
+def quick_client(tmp_path):
+    """A device issued every capability, arriving on the Cloudflare quick
+    tunnel. The token is deliberately maximal: whatever this client cannot
+    reach, the *ceiling* refused, not the grant."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+    client = _client(vault, policies={LOCAL_PORT: "quick"})
+    client.cookies.set(COOKIE_NAME, token)
+    return client
+
+
 def test_a_cookie_authenticates(tmp_path):
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
@@ -79,7 +91,30 @@ def test_the_ceiling_narrows_a_full_token(tmp_path):
     quick.cookies.set(COOKIE_NAME, token)
     assert quick.get("/v1/files/roots").status_code == 403
     assert quick.post("/v1/chat", json={"text": "hi"}).status_code == 403
-    assert quick.get("/v1/status").status_code == 200      # CHAT survives
+    assert quick.get("/v1/status").status_code == 200      # OBSERVE survives
+
+
+# ─── OBSERVE is watching her; RECALL is reading what she stored ──────────
+def test_an_observe_only_device_sees_status_but_not_history(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("watcher", frozenset({Capability.OBSERVE}))
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, token)
+    assert client.get("/v1/status").status_code == 200
+    assert client.get("/v1/telemetry").status_code == 200
+    assert client.get("/v1/chat/conversations").status_code == 403
+    assert client.get("/v1/memory/knowledge").status_code == 403
+
+
+def test_the_socket_streams_for_an_observe_only_device(tmp_path):
+    """The stream carries status frames, so it follows OBSERVE -- not RECALL,
+    which would deny a live view to a device holding no stored-data grant."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("watcher", frozenset({Capability.OBSERVE}))
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, token)
+    with client.websocket_connect("/v1/events") as ws:
+        assert ws.receive_json()["type"] == "status"
 
 
 def test_a_forged_host_header_cannot_change_policy(tmp_path):
@@ -441,17 +476,18 @@ def test_no_mutation_is_reachable_on_a_read_only_ceiling(tmp_path):
     upload, two personality writes and a memory delete, all gated on `CHAT`.
 
     **What this does not check.** It sweeps the 14 mutating operations of 30,
-    and says nothing about what the surviving `{CHAT}` ceiling lets a caller
-    *read*. The ceiling's other stated purpose is limiting disclosure over the
-    one listener a third party can observe -- `SCREEN` is excluded from
-    `quick` for what Cloudflare could see, not for what an attacker could do
-    -- and a read route that discloses too much would pass this sweep
-    untouched. Method-based sweeping cannot express that; a per-capability
-    disclosure test would be a separate thing.
+    and says nothing about what the surviving `{OBSERVE}` ceiling lets a
+    caller *read*. The ceiling's other stated purpose is limiting disclosure
+    over the one listener a third party can observe -- `SCREEN` is excluded
+    from `quick` for what Cloudflare could see, not for what an attacker could
+    do -- and a read route that discloses too much would pass this sweep
+    untouched. Method-based sweeping cannot express that;
+    `test_no_stored_data_route_is_reachable_on_a_read_only_ceiling` below is
+    that separate thing, added once the `CHAT` split proved the gap was real.
 
-    `CHAT` must mean "may read": a device holding every capability in
-    existence, arriving on a listener whose ceiling is `{CHAT}`, must not be
-    able to change anything.
+    `OBSERVE` must mean "may watch": a device holding every capability in
+    existence, arriving on a listener whose ceiling is `{OBSERVE}`, must not
+    be able to change anything.
     """
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
@@ -460,9 +496,10 @@ def test_no_mutation_is_reachable_on_a_read_only_ceiling(tmp_path):
     assert _sweep_mutations_are_refused(client) == _MUTATING_OPERATIONS
 
 
-def test_the_read_only_sweep_catches_a_mutation_gated_on_chat(tmp_path):
-    """Guard for the sweep itself, not for the app: a new route gated on
-    `CHAT` -- the exact mistake the four real ones made -- must be caught."""
+def test_the_read_only_sweep_catches_a_mutation_gated_on_a_read(tmp_path):
+    """Guard for the sweep itself, not for the app: a new route gated on a
+    read capability -- the exact mistake the four real ones made -- must be
+    caught."""
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
     client = _client(vault, policies={LOCAL_PORT: "quick"})
@@ -471,13 +508,96 @@ def test_the_read_only_sweep_catches_a_mutation_gated_on_chat(tmp_path):
     leaky = APIRouter()
 
     @leaky.post("/leaky")
-    async def leaky_handler(_=Depends(require(Capability.CHAT))):
+    async def leaky_handler(_=Depends(require(Capability.OBSERVE))):
         return {"ok": True}
 
     client.app.include_router(leaky, prefix="/v1")
 
     with pytest.raises(AssertionError, match="answered 200"):
         _sweep_mutations_are_refused(client)
+
+
+# ─── nothing she stored is readable on a read-only ceiling ──────────────
+# The disclosure-side companion to the sweep above, which says in its own
+# docstring that it checks nothing about what `{OBSERVE}` lets a caller
+# *read*. Same shape and same reason: three exact sets rather than a spot
+# check, so a GET route added later cannot slip through unclassified --
+# whoever adds it is forced to say whether it is observation of her, a read
+# of what she stored, or something this transport carries at all.
+_OBSERVATION_OPERATIONS = frozenset({
+    ("GET", "/v1/backup"),        # whether backups run, not what is in one
+    ("GET", "/v1/commands"),      # what she can be asked to do
+    ("GET", "/v1/personality"),   # how she is configured to answer
+    ("GET", "/v1/settings"),      # the same, in registry form
+    ("GET", "/v1/status"),
+    ("GET", "/v1/telemetry"),
+})
+
+_STORED_DATA_OPERATIONS = frozenset({
+    ("GET", "/v1/chat/conversations"),
+    ("GET", "/v1/chat/conversations/{conversation_id}"),
+    ("GET", "/v1/enrollment"),    # the names of the people she recognises
+    ("GET", "/v1/memory/knowledge"),
+    ("GET", "/v1/memory/preferences"),
+    ("GET", "/v1/memory/procedures"),
+})
+
+# Refused on `quick` for a reason that predates this split: its ceiling
+# carries neither FILES nor SYSTEM_CONTROL. Listed so the completeness
+# assertion below can be an equality rather than a subset.
+_OFF_THIS_TRANSPORT_ENTIRELY = frozenset({
+    ("GET", "/v1/audit"),
+    ("GET", "/v1/files"),
+    ("GET", "/v1/files/content"),
+    ("GET", "/v1/files/roots"),
+})
+
+
+def _sweep_reads(client) -> dict[tuple[str, str], int]:
+    """Call every GET operation the schema knows about and report each status.
+
+    Enumerated from `app.openapi()` for the same reason the mutation sweep is:
+    it walks the effective routes regardless of how they were registered.
+
+    No query string is sent to the routes that require one. A capability
+    dependency raises before FastAPI validates request params -- sub
+    dependencies are solved before the current dependant's own arguments --
+    so a route that refuses correctly answers 403 whether or not its `path=`
+    is supplied, and one that does not betrays itself with a 422.
+    """
+    statuses: dict[tuple[str, str], int] = {}
+    for path, operations in client.app.openapi().get("paths", {}).items():
+        if not path.startswith("/v1"):
+            continue
+        concrete = path
+        for placeholder, value in _PATH_PARAMS.items():
+            concrete = concrete.replace(placeholder, value)
+        for method in operations:
+            if method.upper() != "GET":
+                continue
+            # Fresh limiter per probe, as in the mutation sweep: this must
+            # fail on authorization, never on a 429 that resembles a refusal.
+            client.app.state.auth.limiter = RateLimiter()
+            statuses[("GET", path)] = client.get(concrete).status_code
+    return statuses
+
+
+def test_no_stored_data_route_is_reachable_on_a_read_only_ceiling(quick_client):
+    """The companion to Task 5's mutation sweep, for the disclosure side that
+    sweep explicitly does not cover. Enumerate the GET operations and assert
+    the transcript and knowledge routes refuse on `quick`."""
+    for path in ("/v1/chat/conversations", "/v1/memory/knowledge"):
+        assert quick_client.get(path).status_code == 403
+
+    statuses = _sweep_reads(quick_client)
+    assert set(statuses) == (_OBSERVATION_OPERATIONS | _STORED_DATA_OPERATIONS
+                             | _OFF_THIS_TRANSPORT_ENTIRELY), (
+        "a GET operation appeared or vanished; classify it before this passes"
+    )
+    stored_leaks = {op: code for op, code in statuses.items()
+                    if op in _STORED_DATA_OPERATIONS and code != 403}
+    assert not stored_leaks, f"stored data readable on quick: {stored_leaks}"
+    assert {op for op, code in statuses.items() if code == 200} == _OBSERVATION_OPERATIONS
 
 
 # ─── the commands catalogue may only name capabilities that mean "may act" ──
@@ -489,11 +609,12 @@ def _catalogue():
 def test_no_command_declares_a_read_only_grant():
     """`run_command` trusts the catalogue's `required_grant`. A command that
     declared a read capability would be executable by a device deliberately
-    issued read-only -- the CHAT split undone through a different door. The
-    catalogue may only name capabilities that mean 'may act'."""
+    issued read-only -- the read/write split undone through a different door.
+    The catalogue may only name capabilities that mean 'may act'."""
     actionable = {Capability.CHAT_SEND, Capability.FILES,
                   Capability.SYSTEM_CONTROL, Capability.SCREEN}
+    readonly = {Capability.OBSERVE, Capability.RECALL}
     for command in _catalogue():
         grant = Capability(command.required_grant)
         assert grant in actionable, f"{command.command_id} declares {grant}"
-        assert grant is not Capability.CHAT, command.command_id
+        assert grant not in readonly, command.command_id

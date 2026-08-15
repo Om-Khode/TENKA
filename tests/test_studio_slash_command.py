@@ -43,8 +43,8 @@ def test_devices_with_none_issued_says_so_plainly(vault_root):
 
 def test_devices_lists_id_label_grants_and_created_at(vault_root):
     vault = TokenVault(vault_root)
-    vault.issue("phone", frozenset({Capability.CHAT}))
-    vault.issue("browser", frozenset({Capability.CHAT, Capability.SCREEN}))
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    vault.issue("browser", frozenset({Capability.OBSERVE, Capability.SCREEN}))
     ids = {d.label: d.device_id for d in vault.devices()}
 
     result = slash_commands.handle("/studio devices")
@@ -53,7 +53,7 @@ def test_devices_lists_id_label_grants_and_created_at(vault_root):
     assert ids["browser"] in result
     assert "phone" in result
     assert "browser" in result
-    assert "chat" in result.lower()
+    assert "observe" in result.lower()
     assert "screen" in result.lower()
     # created_at is an ISO timestamp -- year at minimum should show up.
     assert "20" in result
@@ -61,7 +61,7 @@ def test_devices_lists_id_label_grants_and_created_at(vault_root):
 
 def test_devices_never_prints_a_plaintext_token(vault_root):
     vault = TokenVault(vault_root)
-    token = vault.issue("phone", frozenset({Capability.CHAT}))
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
     device_id = vault.devices()[0].device_id
 
     result = slash_commands.handle("/studio devices")
@@ -79,7 +79,7 @@ def test_devices_survives_a_corrupt_devices_json(vault_root):
     stack trace or a misleading count.
     """
     vault = TokenVault(vault_root)
-    vault.issue("phone", frozenset({Capability.CHAT}))
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
     (vault_root / "devices.json").write_text("not json at all", encoding="utf-8")
 
     result = slash_commands.handle("/studio devices")
@@ -95,8 +95,8 @@ def test_devices_survives_one_malformed_entry_among_good_ones(vault_root):
     import json
 
     vault = TokenVault(vault_root)
-    vault.issue("good", frozenset({Capability.CHAT}))
-    vault.issue("bad", frozenset({Capability.CHAT}))
+    vault.issue("good", frozenset({Capability.OBSERVE}))
+    vault.issue("bad", frozenset({Capability.OBSERVE}))
     raw = json.loads((vault_root / "devices.json").read_text(encoding="utf-8"))
     for entry in raw["devices"]:
         if entry["label"] == "bad":
@@ -114,7 +114,7 @@ def test_devices_survives_one_malformed_entry_among_good_ones(vault_root):
 
 def test_revoke_known_device_succeeds_and_removes_it(vault_root):
     vault = TokenVault(vault_root)
-    vault.issue("phone", frozenset({Capability.CHAT}))
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
     device_id = vault.devices()[0].device_id
 
     result = slash_commands.handle(f"/studio revoke {device_id}")
@@ -133,7 +133,7 @@ def test_revoke_success_and_failure_read_differently(vault_root):
     share a distinguishing prefix a skimming user could confuse.
     """
     vault = TokenVault(vault_root)
-    vault.issue("phone", frozenset({Capability.CHAT}))
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
     device_id = vault.devices()[0].device_id
 
     success = slash_commands.handle(f"/studio revoke {device_id}")
@@ -155,7 +155,7 @@ def test_revoke_with_extra_token_after_device_id_is_rejected(vault_root):
     revoke based on the first token.
     """
     vault = TokenVault(vault_root)
-    vault.issue("phone", frozenset({Capability.CHAT}))
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
     device_id = vault.devices()[0].device_id
 
     result = slash_commands.handle(f"/studio revoke {device_id} extra")
@@ -169,8 +169,8 @@ def test_revoke_with_extra_token_after_device_id_is_rejected(vault_root):
 
 def test_revoke_all_without_confirm_does_not_revoke_anything(vault_root):
     vault = TokenVault(vault_root)
-    vault.issue("phone", frozenset({Capability.CHAT}))
-    vault.issue("browser", frozenset({Capability.CHAT}))
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
+    vault.issue("browser", frozenset({Capability.OBSERVE}))
 
     result = slash_commands.handle("/studio revoke all")
 
@@ -180,7 +180,7 @@ def test_revoke_all_without_confirm_does_not_revoke_anything(vault_root):
 
 def test_revoke_all_without_confirm_mentions_it_is_destructive(vault_root):
     vault = TokenVault(vault_root)
-    vault.issue("phone", frozenset({Capability.CHAT}))
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
 
     result = slash_commands.handle("/studio revoke all")
 
@@ -189,8 +189,8 @@ def test_revoke_all_without_confirm_mentions_it_is_destructive(vault_root):
 
 def test_revoke_all_confirm_revokes_every_device(vault_root):
     vault = TokenVault(vault_root)
-    token_a = vault.issue("phone", frozenset({Capability.CHAT}))
-    token_b = vault.issue("browser", frozenset({Capability.CHAT}))
+    token_a = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    token_b = vault.issue("browser", frozenset({Capability.OBSERVE}))
 
     result = slash_commands.handle("/studio revoke all confirm")
 
@@ -207,7 +207,7 @@ def test_revoke_all_near_miss_confirmation_does_not_revoke(vault_root):
     a near-miss like 'confirmed' or 'confirm please' must not slip through.
     """
     vault = TokenVault(vault_root)
-    vault.issue("phone", frozenset({Capability.CHAT}))
+    vault.issue("phone", frozenset({Capability.OBSERVE}))
 
     result_a = slash_commands.handle("/studio revoke all confirmed")
     result_b = slash_commands.handle("/studio revoke all confirm please")

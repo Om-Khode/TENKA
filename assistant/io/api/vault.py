@@ -32,14 +32,32 @@ _SCHEMA_VERSION = 1
 class Capability(str, enum.Enum):
     """What a device is allowed to ask for. Granted per device, never implied."""
 
-    CHAT = "chat"
+    # Watching her work: status, telemetry, the live /v1/events stream, and
+    # the routes that describe how she is configured (settings, personality,
+    # the command catalogue, whether backups run). Everything here is about
+    # the assistant herself, and none of it is something a user told her.
+    OBSERVE = "observe"
+    # Reading what she stored: conversation transcripts, the knowledge graph,
+    # preferences, taught procedures, the names of the people she recognises.
+    #
+    # Split out of the old `CHAT`, which meant both of these at once. That
+    # ambiguity let the `quick` ceiling -- the Cloudflare tunnel, where a
+    # third party terminates TLS and reads the plaintext -- look like
+    # "observation only" while actually admitting the entire knowledge graph
+    # and every transcript. `read_screen` and `camera_look` are intents, so
+    # her narration of what was on screen lands in a transcript: excluding
+    # SCREEN from that ceiling while admitting RECALL was excluding the
+    # photograph and shipping the description.
+    #
+    # Neither implies the other. A wall display may watch without reading a
+    # word she was told; an archive tool may read history without a live view.
+    RECALL = "recall"
     # POST /v1/chat hands text to the same pipeline voice uses, so it reaches
     # every intent -- code_executor, file_task, shutdown, manage_backup --
-    # not just conversation. CHAT alone must not carry that: it also gates
-    # read routes (history, the /v1/events socket) that a device should be
-    # able to hold without being able to drive her. Split so a device can be
-    # trusted to read a transcript without being trusted to act on the
-    # machine through one.
+    # not just conversation. Neither read capability may carry that: both gate
+    # routes a device should be able to hold without being able to drive her.
+    # Split so a device can be trusted to read a transcript without being
+    # trusted to act on the machine through one.
     CHAT_SEND = "chat_send"
     SCREEN = "screen"
     FILES = "files"
@@ -253,6 +271,15 @@ class TokenVault:
         raw dict's device_id without going through this method, so an
         operator who reads devices.json directly can still find and revoke
         it by id even though it no longer verifies or lists.
+
+        A record written before `CHAT` split into `OBSERVE`/`RECALL` carries
+        `"chat"`, which `Capability("chat")` now rejects -- so it lands in
+        exactly this branch and the device stops verifying. That is the
+        intended outcome and there is deliberately no migration: mapping the
+        old string onto `RECALL` would hand a device paired under the
+        ambiguous grant the stored-data access the split exists to withhold.
+        Note that it is *dropped*, not raised past -- one stale record must
+        not take the whole store down.
         """
         if not isinstance(entry, dict):
             return None
@@ -278,7 +305,7 @@ class TokenVault:
         # (unknown command) and 403 (known, not granted) both come after
         # authentication, that is enough to let a zero-grant device tell the
         # two apart -- learning which command ids exist without ever holding
-        # the CHAT grant that GET /v1/commands requires to read the same
+        # the OBSERVE grant that GET /v1/commands requires to read the same
         # list. Refusing to issue an empty grant set at all closes that
         # oracle at its source, for every current and future route shaped
         # this way, rather than patching each route that happens to need a

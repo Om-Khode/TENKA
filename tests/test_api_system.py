@@ -14,7 +14,11 @@ def context(tmp_path):
     client = build_api_client(runtime, vault)
     tokens = {
         "full": vault.issue("studio", frozenset(Capability)),
-        "chat": vault.issue("phone", frozenset({Capability.CHAT})),
+        "observe": vault.issue("phone", frozenset({Capability.OBSERVE})),
+        # Reading the enrollment list is a read of stored data -- the names of
+        # the people she recognises -- so the device that proves "may read is
+        # not may destroy" below has to be the one allowed to read it.
+        "recall": vault.issue("tablet", frozenset({Capability.RECALL})),
     }
     return client, runtime, tokens
 
@@ -94,7 +98,7 @@ def test_a_route_that_raises_is_still_audited(context):
 
 def test_restore_needs_system_control(context):
     client, runtime, tokens = context
-    response = client.post("/v1/backup/restore", headers=head(tokens["chat"]),
+    response = client.post("/v1/backup/restore", headers=head(tokens["observe"]),
                            json={"recoveryPhrase": PHRASE})
     assert response.status_code == 403
     assert runtime.system.restored_with == []
@@ -145,16 +149,18 @@ def test_forgetting_an_unknown_kind_is_422(context):
 
 
 # ─── capability tier: forgetting an enrollment needs system_control ───────
-def test_forgetting_an_enrollment_needs_system_control_not_just_chat(context):
+def test_forgetting_an_enrollment_needs_system_control_not_just_a_read(context):
     """Destroying a biometric enrollment (a voiceprint, a face) is not
     ordinary conversational use -- the same ruling that moved forget-all and
-    settings writes off of chat. Proven both ways: refused, and nothing
-    actually changed -- not merely the status code.
+    settings writes off the read grants. Proven with the RECALL device, the
+    one that may read this very list, so the refusal is specifically "reading
+    it does not let you destroy it" -- and proven both ways: refused, and
+    nothing actually changed, not merely the status code.
     """
     client, runtime, tokens = context
     before = client.get("/v1/enrollment", headers=head(tokens["full"])).json()["data"]
 
-    response = client.delete("/v1/enrollment/face/f1", headers=head(tokens["chat"]))
+    response = client.delete("/v1/enrollment/face/f1", headers=head(tokens["recall"]))
     assert response.status_code == 403
 
     after = client.get("/v1/enrollment", headers=head(tokens["full"])).json()["data"]
@@ -211,10 +217,10 @@ def test_an_unknown_count_survives_as_null_not_zero(context):
 
 
 def test_unlock_needs_system_control(context):
-    """CHAT must not reach it. The phrase this accepts is the same secret that
-    can overwrite every memory she has via /backup/restore."""
+    """A read grant must not reach it. The phrase this accepts is the same
+    secret that can overwrite every memory she has via /backup/restore."""
     client, runtime, tokens = context
-    response = client.post("/v1/backup/unlock", headers=head(tokens["chat"]),
+    response = client.post("/v1/backup/unlock", headers=head(tokens["observe"]),
                            json={"recoveryPhrase": PHRASE})
     assert response.status_code == 403
     assert runtime.system.unlocked_with == []
