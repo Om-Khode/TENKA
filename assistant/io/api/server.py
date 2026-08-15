@@ -88,8 +88,19 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     # as one caller -- which is exactly what the code already claims, and now
     # true. `forwarded_allow_ips` is pinned to an empty list as well so that
     # re-enabling the middleware by accident still trusts nobody.
+    #
+    # `log_config=None` keeps uvicorn out of the host application's logging.
+    # Its default config is applied through `logging.config.dictConfig`, which
+    # calls `logging.shutdown()` on every handler in the process -- including
+    # main.py's `debug.log` FileHandler. `FileHandler.close()` nulls `stream`,
+    # and `emit()` refuses to reopen a closed `mode="w"` handler (that guard
+    # exists so a reopen cannot truncate the file), so every record after this
+    # line was dropped in silence while the handler sat in `root.handlers`
+    # looking healthy. Every debug log since the daemon shipped ended mid-boot,
+    # a few lines before this call. Uvicorn's own records still reach root and
+    # format like the rest.
     config = uvicorn.Config(app, host=host, port=port, log_level="warning",
-                            access_log=False, lifespan="on",
+                            access_log=False, lifespan="on", log_config=None,
                             proxy_headers=False, forwarded_allow_ips=[])
     server = uvicorn.Server(config)
 
