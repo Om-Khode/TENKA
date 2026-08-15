@@ -5,9 +5,21 @@ Task 10 builds the payload -- `https://<endpoint>/pair#<code>` -- and this
 module's only job is turning that string into an image. Three choices are
 load-bearing, not stylistic:
 
-- SVG, not PNG. `qrcode`'s pure-Python SVG factories need no PIL, so one
+- SVG, not PNG. `qr_svg`'s own code path never needs pillow -- rendering
+  goes through `SvgPathImage`, which draws paths, not bitmaps -- so one
   implementation serves the Studio dialog, the console, and the desktop
-  overlay without pulling in an image codec anywhere.
+  overlay without this module adding an image-codec dependency of its own.
+  That is a claim about this module and `requirements.txt`, not about the
+  process: `qrcode`'s own compatibility shim
+  (`qrcode/image/styles/moduledrawers/__init__.py`) imports PIL drawers in
+  a bare `try/except ImportError`, so on an install where pillow happens to
+  be present -- TENKA's is, pulled in transitively by `easyocr`,
+  `face_recognition`, and `torchvision` -- merely importing
+  `qrcode.image.svg` loads PIL into the interpreter as a side effect.
+  Nobody should read this file as proof PIL is absent from the process;
+  `test_qr_svg_works_even_when_pillow_is_unimportable` in
+  `tests/test_api_qr.py` is what actually verifies `qr_svg` does not
+  require it.
 - Path-based SVG, not a factory that labels modules with `<text>` or leaves
   the payload in an XML comment. The pair code is a live credential for
   `PairCode`'s TTL (see `pairing.py`), so the same rule that keeps it out of
@@ -36,9 +48,11 @@ from qrcode.image.svg import SvgPathImage
 def qr_svg(payload: str) -> str:
     """Render `payload` as a standalone `<svg>...</svg>` string.
 
-    No PIL, no file written -- the caller decides whether the SVG is
-    base64-embedded (`<img src="data:image/svg+xml;base64,...">`, Studio's
-    approach) or piped straight to a renderer. It is deliberately never
+    No file written, and no dependency on pillow (see the module docstring
+    for what that claim does and does not cover on this install) -- the
+    caller decides whether the SVG is base64-embedded (`<img
+    src="data:image/svg+xml;base64,...">`, Studio's approach) or piped
+    straight to a renderer. It is deliberately never
     inlined into an HTML DOM by this function: inline SVG is an active
     document format that admits `<script>` and event handlers, and this
     module has no way to know whether its caller's page sanitizes that.
