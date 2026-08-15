@@ -62,11 +62,16 @@ class ApiTestClient(TestClient):
 def build_api_client(runtime: StudioRuntime, vault: TokenVault, *,
                      origins: list[str] | None = None,
                      policies: dict[int, str] | None = None,
-                     hub: EventHub | None = None) -> TestClient:
+                     hub: EventHub | None = None,
+                     ui_bundle: Any = None) -> TestClient:
+    """`ui_bundle` defaults to None, so every existing caller keeps an app with
+    no UI route at all -- the daemon Milestone 5a shipped. Only the UI-serving
+    suite passes one."""
     app = create_app(
         runtime, vault,
         origins=list(DEV_ORIGINS if origins is None else origins),
         hub=hub,
         listener_policies=LOCAL_POLICIES if policies is None else policies,
+        ui_bundle=ui_bundle,
     )
     return ApiTestClient(app, base_url=BASE_URL)
