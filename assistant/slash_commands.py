@@ -339,11 +339,29 @@ def _studio_pair_default_grants():
     -- the restraint has to take a different shape here. Rather than
     defaulting to "everything" (the bootstrap admin token's own choice,
     made once, for the one device that starts the daemon), this refuses
-    the single most consequential capability by default: SYSTEM_CONTROL
-    reaches shutdown and backup control (manage_backup), not just chat and
-    observation. Every other capability rides along, so a phone paired
-    this way is still a fully useful remote control -- it just cannot
-    administer the machine unless someone deliberately widens it later.
+    the two capabilities that let a paired device *act on* the machine
+    rather than talk to it.
+
+    EXECUTE matters most, and it is named here rather than inherited. It
+    gates every intent that runs code or drives the desktop --
+    code_executor, computer_task, find_and_click, shutdown, manage_backup,
+    and the four manage_* intents that install something which executes
+    later. SYSTEM_CONTROL stays excluded alongside it for the enrolment
+    writes (voice, face) it still carries.
+
+    Everything else rides along, so a phone paired this way is still a
+    fully useful remote: it watches, recalls, chats, reads files, sees the
+    screen. It just cannot make her run something.
+
+    Spelled as an explicit set with a test pinning both names, not as
+    `frozenset(Capability)` minus a guess. This site had that shape and it
+    inverted the moment EXECUTE joined the enum: the default silently
+    widened to include the strongest capability there is, while this
+    docstring went on claiming it was narrow because SYSTEM_CONTROL
+    "reaches shutdown" -- which by then had moved to EXECUTE. A default
+    derived from the enum grants every future capability to every paired
+    device the day someone adds one, with nobody having decided that.
+    policy.py's `_ALL_CAPABILITIES` was deleted for the same reason.
 
     A function, not a module-level constant: `Capability` is an `io/`
     type, and this file follows the codebase's deferred-import convention
@@ -351,7 +369,8 @@ def _studio_pair_default_grants():
     at module top.
     """
     from .io.api.vault import Capability
-    return frozenset(Capability) - {Capability.SYSTEM_CONTROL}
+    return frozenset(Capability) - {Capability.SYSTEM_CONTROL,
+                                    Capability.EXECUTE}
 
 
 def _studio_vault():

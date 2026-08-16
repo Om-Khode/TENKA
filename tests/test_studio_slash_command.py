@@ -317,14 +317,25 @@ def test_pair_refuses_plainly_when_the_daemon_is_not_running(monkeypatch):
 def test_pair_never_grants_system_control_by_default(running_pair_store):
     """The equivalent of `POST /v1/pair/code`'s intersection-with-the-minting-
     device's-own-grants restraint: a console command has no device to
-    intersect against, so the restraint here is refusing the single most
-    dangerous capability (shutdown, backup control) by default instead.
+    intersect against, so the restraint here is refusing the capabilities
+    that let a paired device act on the machine rather than talk to it.
+
+    Both exclusions are named, not derived. This assertion used to read
+    `frozenset(Capability) - {SYSTEM_CONTROL}`, which meant it kept passing
+    when EXECUTE joined the enum and quietly widened the default to include
+    the strongest capability in the model. A test written as a subtraction
+    from the enum cannot notice the enum growing -- that is the whole failure
+    mode, and it is why the ceilings in policy.py are literals now too.
     """
     slash_commands.handle("/studio pair phone")
     pair_code = running_pair_store.current()
     assert Capability.SYSTEM_CONTROL not in pair_code.grants
-    # Still useful as a remote control: every other capability rides along.
-    assert pair_code.grants == frozenset(Capability) - {Capability.SYSTEM_CONTROL}
+    assert Capability.EXECUTE not in pair_code.grants
+    # Still useful as a remote: watch, recall, chat, read files, see the screen.
+    assert pair_code.grants == frozenset({
+        Capability.OBSERVE, Capability.RECALL, Capability.CHAT_SEND,
+        Capability.SCREEN, Capability.FILES,
+    })
 
 
 def test_pair_mints_into_the_store_the_pair_route_can_redeem(vault_root, running_pair_store):

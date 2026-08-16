@@ -394,3 +394,37 @@ async def test_a_scheduled_task_runs_with_the_local_grant_set(monkeypatch):
     assert seen["intent"] == "web_search"
     assert Capability.CHAT_SEND in seen["grants"]
     assert actions.current_grants.get() is None
+
+
+# ─── Integration finding: the pair default had the enum-inheritance shape ────
+
+def test_the_pair_default_never_hands_out_execute():
+    """`/studio pair` defaulted to `frozenset(Capability) - {SYSTEM_CONTROL}`.
+    Adding EXECUTE to the enum silently widened it to include the strongest
+    capability in the model -- the same trap `_ALL_CAPABILITIES` was deleted
+    from policy.py for, in a file no stream owned. Found at integration."""
+    from assistant.slash_commands import _studio_pair_default_grants
+    from assistant.core.capabilities import Capability
+    grants = _studio_pair_default_grants()
+    assert Capability.EXECUTE not in grants
+    assert Capability.SYSTEM_CONTROL not in grants
+
+
+def test_the_pair_default_is_still_a_useful_remote():
+    """Excluding the acting grants must not collapse pairing into uselessness:
+    a paired phone still watches, recalls, chats, reads files, sees the screen."""
+    from assistant.slash_commands import _studio_pair_default_grants
+    from assistant.core.capabilities import Capability
+    grants = _studio_pair_default_grants()
+    for c in (Capability.OBSERVE, Capability.RECALL, Capability.CHAT_SEND,
+              Capability.SCREEN, Capability.FILES):
+        assert c in grants
+
+
+def test_the_pair_default_is_not_derived_from_the_enum():
+    """A default spelled as a subtraction from `Capability` grants every future
+    capability to every paired device the day someone adds one."""
+    import inspect
+    from assistant import slash_commands
+    src = inspect.getsource(slash_commands._studio_pair_default_grants)
+    assert "Capability.EXECUTE" in src, "EXECUTE must be excluded by name"
