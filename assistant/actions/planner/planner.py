@@ -116,6 +116,33 @@ def _suspend_plan(plan, resume_from_index, llm_func, tts_func, bridge):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  TOOL MANIFEST — what the planner knows about available tools
 #  Adding a new tool = adding one entry. No logic changes.
+#
+#  Each entry declares TWO parameter roles, and they must never be the same
+#  field (milestone 6a.5, spec §5.3, decision D3):
+#
+#    param_key    — where the USER'S INSTRUCTION goes. Trusted; written by the
+#                   planner from the user's own words.
+#    context_key  — where PRIOR-STEP OUTPUT is allowed to land. Untrusted: a
+#                   file's contents, OCR of the screen, a fetched page. A
+#                   `$step_N` reference resolves only into this field.
+#    inline_refs  — True only for tools whose param is a DATA PAYLOAD rather
+#                   than an instruction to a model: `create_note` writes it to
+#                   disk, `store_memory` writes it to the DB, `web_search`
+#                   hands it to a search API. For those, "save $step_1 as a
+#                   note" IS the feature, so substitution stays inline. Such a
+#                   tool has `context_key: None`, and the two keys are checked
+#                   against each other by tests/test_6a5_stream_c.py.
+#
+#  A tool with `context_key: None` and `inline_refs: False` accepts no prior
+#  output at all; a `$step_N` aimed at it is dropped with a warning rather
+#  than silently delivered. `computer_task`, `browser_action`, `app_action`
+#  and `camera_look` are in that state deliberately: each hands
+#  its goal to a prompt built in `automation/` or another package, so there
+#  is nowhere yet to render the data as data. Splicing it back into the goal
+#  would leave prompt framing as the only control over the three tools that
+#  literally drive the machine — the thing spec §5.3 / D3 rejects. Giving
+#  them a real fenced data path means threading `context` through those
+#  prompt builders; until then this drops the reference and logs it.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 TOOL_MANIFEST = {
@@ -126,12 +153,16 @@ TOOL_MANIFEST = {
                        "with a single API call. NOT for tasks that need a browser "
                        "(booking, purchasing, reserving, filling web forms).",
         "param_key": "goal",
+        "context_key": "context",
+        "inline_refs": False,
         "interactive": False,
     },
     "computer_task": {
         "description": "Control the computer via GUI — click buttons, type in fields, "
                        "navigate menus, interact with visible application windows.",
         "param_key": "goal",
+        "context_key": None,
+        "inline_refs": False,
         "interactive": False,
     },
     "browser_action": {
@@ -142,6 +173,8 @@ TOOL_MANIFEST = {
                        "reliable than computer_task for any web task. Opens its "
                        "own browser — does not interfere with the user's browser.",
         "param_key": "goal",
+        "context_key": None,
+        "inline_refs": False,
         "interactive": False,
     },
     "app_action": {
@@ -151,16 +184,22 @@ TOOL_MANIFEST = {
                        "selectors — faster and more reliable than computer_task "
                        "for tasks targeting specific app UI elements.",
         "param_key": "goal",
+        "context_key": None,
+        "inline_refs": False,
         "interactive": False,
     },
     "web_search": {
         "description": "Search the web for current events, news, facts, prices, scores.",
         "param_key": "query",
+        "context_key": None,
+        "inline_refs": True,
         "interactive": False,
     },
     "browse_url": {
         "description": "Fetch and summarize a specific webpage URL.",
         "param_key": "url",
+        "context_key": None,
+        "inline_refs": True,
         "interactive": False,
     },
     "file_task": {
@@ -168,41 +207,57 @@ TOOL_MANIFEST = {
                        "NOTE: write/rename/move/delete require user confirmation "
                        "and cannot be auto-confirmed in a plan.",
         "param_key": "goal",
+        "context_key": "context",
+        "inline_refs": False,
         "interactive": True,  # destructive ops need confirmation
     },
     "camera_look": {
         "description": "Capture an image from the webcam and describe what is seen.",
         "param_key": "goal",
+        "context_key": None,
+        "inline_refs": False,
         "interactive": False,
     },
     "read_screen": {
         "description": "OCR the current screen and describe what is displayed.",
         "param_key": "goal",
+        "context_key": "context",
+        "inline_refs": False,
         "interactive": False,
     },
     "memory_query": {
         "description": "Search past conversations and stored facts.",
         "param_key": "query",
+        "context_key": None,
+        "inline_refs": True,
         "interactive": False,
     },
     "create_note": {
         "description": "Save a text note to disk. Needs title and content.",
         "param_key": "goal",
+        "context_key": None,
+        "inline_refs": True,
         "interactive": False,
     },
     "open_browser": {
         "description": "Open a URL in the default browser.",
         "param_key": "url",
+        "context_key": None,
+        "inline_refs": True,
         "interactive": False,
     },
     "set_reminder": {
         "description": "Set a timed reminder.",
         "param_key": "goal",
+        "context_key": None,
+        "inline_refs": True,
         "interactive": False,
     },
     "recognize_face": {
         "description": "Look at the webcam and identify who is visible.",
         "param_key": "goal",
+        "context_key": None,
+        "inline_refs": False,
         "interactive": False,
     },
     "synthesize": {
@@ -212,6 +267,8 @@ TOOL_MANIFEST = {
                        "Example: 'extract urgent emails from $step_1' or "
                        "'summarize the key points from $step_2'.",
         "param_key": "goal",
+        "context_key": "context",
+        "inline_refs": False,
         "interactive": False,
     },
     "vision_analyze": {
@@ -223,6 +280,8 @@ TOOL_MANIFEST = {
                        "measurements, counting grid cells, reading barcodes) — use "
                        "camera_preview + code_executor for those tasks instead.",
         "param_key": "goal",
+        "context_key": "context",
+        "inline_refs": False,
         "interactive": False,
     },
     "camera_preview": {
@@ -239,6 +298,8 @@ TOOL_MANIFEST = {
                        "Example: 'Open camera with 3x3 grid overlay for cube face alignment' "
                        "or 'Show camera with crosshair overlay for barcode scanning'.",
         "param_key": "goal",
+        "context_key": None,
+        "inline_refs": False,
         "interactive": False,
     },
     "prompt_user": {
@@ -251,6 +312,8 @@ TOOL_MANIFEST = {
                        "Example: 'Now rotate the cube to show the right face' or "
                        "'Hold the next page up to the camera'.",
         "param_key": "goal",
+        "context_key": None,
+        "inline_refs": False,
         "interactive": False,
     },
     "store_memory": {
@@ -258,6 +321,8 @@ TOOL_MANIFEST = {
                        "remembered. Use for 'remember X', 'my X is Y', 'keep in mind that'. "
                        "NOT for notes (use create_note for titled documents).",
         "param_key": "content",
+        "context_key": None,
+        "inline_refs": True,
         "interactive": False,
     },
 }
@@ -740,21 +805,94 @@ async def _attempt_recovery(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _STEP_REF_RE = re.compile(r'\$step_(\d+)')
+_EMOTION_TAG_RE = re.compile(
+    r'^\[(?:neutral|happy|excited|sad|angry|sarcastic|worried|surprised)\]\s*'
+)
+
+#  Prior-step output is UNTRUSTED. `file_task` returns the raw bytes of a file
+#  the user may not have written, `read_screen` returns OCR of whatever is on
+#  screen, `browse_url` returns a fetched page. Anything that can be planted
+#  can be planted there.
+_MAX_REF_CHARS = 1500
+
+
+def _step_output(step_id: int, plan: Plan) -> str | None:
+    """Return the truncated, tag-stripped output of a succeeded step, or None."""
+    for step in plan.steps:
+        if step.step_id == step_id and step.status == "success":
+            output = _EMOTION_TAG_RE.sub('', step.output)
+            if len(output) > _MAX_REF_CHARS:
+                output = output[:_MAX_REF_CHARS] + "\n... (truncated)"
+            return output
+    return None
 
 
 def _resolve_references(text: str, plan: Plan) -> str:
-    """Replace $step_N references with actual outputs from completed steps."""
+    """Replace $step_N references with actual outputs from completed steps.
+
+    Inline substitution. Correct for `_evaluate_condition`, which builds a
+    local haystack for a string comparison that never reaches a model, and for
+    the payload tools declared `inline_refs` in TOOL_MANIFEST. Everything that
+    reaches a prompt goes through `_split_references` instead.
+    """
+    def _replace(match):
+        output = _step_output(int(match.group(1)), plan)
+        return match.group(0) if output is None else output
+    return _STEP_REF_RE.sub(_replace, text)
+
+
+def _split_references(text: str, plan: Plan, tool: str) -> tuple[str, str]:
+    """Split a step's goal into (instruction, context) for `tool`.
+
+    The milestone 6a.5 data fence, spec §5.3 / decision D3. A `$step_N` token
+    is removed from the instruction and the referenced output is accumulated
+    into a separate context blob, so untrusted prior-step output never shares
+    a field with the user's own words. The instruction keeps a bare "the
+    output of step N" so the sentence still has a referent -- erasing the
+    reference outright would leave "summarise" with nothing to summarise.
+
+    Returns ("", "") shapes rather than raising: a tool with no manifest row
+    fails closed, dropping the reference, because inheriting inlining by
+    omission is exactly how this hole was reachable.
+    """
+    entry = TOOL_MANIFEST.get(tool, {})
+
+    # Payload tools: the param is written to disk, stored, or handed to a
+    # search API -- not interpreted as an instruction. "save $step_1 as a
+    # note" is the feature.
+    if entry.get("inline_refs"):
+        return _resolve_references(text, plan), ""
+
+    context_key = entry.get("context_key")
+    collected: list[tuple[int, str]] = []
+    seen: set[int] = set()
+
     def _replace(match):
         step_id = int(match.group(1))
-        for step in plan.steps:
-            if step.step_id == step_id and step.status == "success":
-                output = step.output
-                output = re.sub(r'^\[(?:neutral|happy|excited|sad|angry|sarcastic|worried|surprised)\]\s*', '', output)
-                if len(output) > 1500:
-                    output = output[:1500] + "\n... (truncated)"
-                return output
-        return match.group(0)
-    return _STEP_REF_RE.sub(_replace, text)
+        output = _step_output(step_id, plan)
+        if output is None:
+            return match.group(0)
+        if step_id not in seen:
+            seen.add(step_id)
+            collected.append((step_id, output))
+        return f"the output of step {step_id}"
+
+    instruction = _STEP_REF_RE.sub(_replace, text)
+
+    if not collected:
+        return instruction, ""
+
+    if context_key is None:
+        logger.warning(
+            f"[PLANNER] Tool '{tool}' accepts no prior-step output — dropping "
+            f"{len(collected)} reference(s) rather than splicing them in"
+        )
+        return instruction, ""
+
+    context = "\n\n".join(
+        f"--- output of step {sid} ---\n{out}" for sid, out in collected
+    )
+    return instruction, context
 
 
 def _evaluate_condition(condition: str, plan: Plan) -> bool:

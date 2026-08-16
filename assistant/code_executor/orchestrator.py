@@ -37,7 +37,8 @@ def _disambiguate_slug_on_mismatch(slug: str, params: dict | None) -> str:
 
 from .. import service_registry as _sr
 from .sandbox import _run_tier2, run_code
-from .prompts import _CODE_GEN_SYSTEM_PROMPT_TIER1, _CODE_GEN_SYSTEM_PROMPT_TIER2, _FIX_EXECUTE_PROMPT
+from .prompts import (_CODE_GEN_SYSTEM_PROMPT_TIER1, _CODE_GEN_SYSTEM_PROMPT_TIER2,
+                      _FIX_EXECUTE_PROMPT, render_untrusted_block)
 from .templates import (
     _load_template, _save_template, _delete_template,
     _goal_matches_template, _dump_code,
@@ -162,7 +163,8 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
                             _escalated: bool = False,
                             _hint_packages: list[str] | None = None,
                             _from_planner: bool = False,
-                            preference_hints: str = "") -> str:
+                            preference_hints: str = "",
+                            context: str = "") -> str:
     """Main entry point: natural-language goal → code → result.
 
     Args:
@@ -174,8 +176,19 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
         _from_planner:    If True, return raw output without synthesis.
         preference_hints: Preference context for routing
                           (e.g. "messaging_default=whatsapp, music_app=spotify").
+        context:          UNTRUSTED prior-step output — a file the user may not
+                          have written, OCR of the screen, a fetched page. It is
+                          rendered in its own labelled block after the goal and
+                          never merged into it (milestone 6a.5, spec §5.3). Not
+                          passed to the router: routing decides a tier from the
+                          user's intent, and letting planted text vote on that
+                          would hand it a second lever.
     """
     logger.info(f'[CODE] Goal: "{goal}"')
+    if context:
+        logger.info(f"[CODE] Untrusted context attached ({len(context)} chars)")
+
+    data_block = render_untrusted_block(context)
 
     # ── Route ─────────────────────────────────────────────────────────────
     route = await _route_goal(goal, llm_func, preference_hints=preference_hints)
@@ -397,6 +410,10 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
                     f"{gen_prompt}\n\nAPI DOCUMENTATION (method names and parameters only — "
                     f"NEVER copy auth patterns from docs; always use auth=ACCESS_TOKEN as per system rules):\n{api_docs}"
                 )
+            # Untrusted data goes LAST, after every trusted instruction, so
+            # nothing it contains can be read as preceding context for them.
+            if data_block:
+                gen_prompt = f"{gen_prompt}\n\n{data_block}"
 
             code = await _generate_code(gen_prompt, llm_func)
             if code is None:
@@ -781,7 +798,10 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
 
     # ── Tier 1 ────────────────────────────────────────────────────────────
     from ..core.datetime_utils import date_context_line
-    code = await llm_func(f"{date_context_line()}\nGoal: {goal}", system_prompt=_CODE_GEN_SYSTEM_PROMPT_TIER1,
+    tier1_prompt = f"{date_context_line()}\nGoal: {goal}"
+    if data_block:
+        tier1_prompt = f"{tier1_prompt}\n\n{data_block}"
+    code = await llm_func(tier1_prompt, system_prompt=_CODE_GEN_SYSTEM_PROMPT_TIER1,
                           task_type="code_gen", max_tokens=400)
     if code == "__LLM_UNAVAILABLE__":
         return "Sorry, no LLM available."
@@ -803,7 +823,7 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
             _hints = [_hint] if _hint and _hint in TIER2_ALLOWED_PACKAGES else None
             if _hints:
                 logger.info(f"[CODE] Carrying forward blocked package hint: {_hints}")
-            return await execute_code_task(goal, llm_func, tts_func, _escalated=True, _hint_packages=_hints, _from_planner=_from_planner)
+            return await execute_code_task(goal, llm_func, tts_func, _escalated=True, _hint_packages=_hints, _from_planner=_from_planner, context=context)
 
         fix_prompt = f"PLAN:\n1. Fix the error shown below.\n\nBroken code to fix:\n```python\n{code}\n```\nError:\n{result}"
         fixed = await llm_func(fix_prompt,
@@ -820,7 +840,7 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
                 _hints = [_hint] if _hint and _hint in TIER2_ALLOWED_PACKAGES else None
                 if _hints:
                     logger.info(f"[CODE] Carrying forward blocked package hint: {_hints}")
-                return await execute_code_task(goal, llm_func, tts_func, _escalated=True, _hint_packages=_hints, _from_planner=_from_planner)
+                return await execute_code_task(goal, llm_func, tts_func, _escalated=True, _hint_packages=_hints, _from_planner=_from_planner, context=context)
 
             # When called from planner, return raw error without synthesis
             if _from_planner:
