@@ -1,0 +1,18 @@
+{
+  "_comment": "Synthetic fixture, documented shape (KI-17 layer 2). Same shape as serve_status_stale_mapping.json, but the mapping already targets the transport's own port (8788) -- the clear-to-start case preflight must accept without refusing.",
+  "TCP": {
+    "443": {
+      "HTTPS": true
+    }
+  },
+  "Web": {
+    "example-host.example-tailnet.ts.net:443": {
+      "Handlers": {
+        "/": {
+          "Proxy": "http://127.0.0.1:8788"
+        }
+      }
+    }
+  },
+  "AllowFunnel": {}
+}

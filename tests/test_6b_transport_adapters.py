@@ -6,13 +6,27 @@ This file's registry half is self-contained: no provider module
 registry directly against a test-double adapter rather than a real one.
 Tasks 7 and 8 extend this file with the provider-specific tests named in
 their own briefs.
+
+Task 7 adds the Tailscale-specific tests below (`tailnet` and `funnel`):
+command construction, the KI-17 layer-2 preflight, and hostname recognition.
 """
 from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
 
 import pytest
 
 from assistant.io.api.transports import TransportRegistry, transport_registry
 from assistant.io.api.transports.base import TransportAdapter, TransportSession
+from assistant.io.api.transports.tailscale import (
+    FunnelAdapter,
+    TailnetAdapter,
+    parse_serve_status,
+)
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "tailscale"
 
 
 class _FakeAdapter:
@@ -112,3 +126,94 @@ def test_url_is_none_before_a_hostname_is_announced():
 def test_url_is_the_https_hostname_once_announced():
     session = _make_session(hostname="laptop.tail1234.ts.net")
     assert session.url == "https://laptop.tail1234.ts.net"
+
+
+# ─── Task 7: tailnet / funnel command construction ───────────────────────────
+
+def test_the_tailnet_command_targets_the_port_it_is_given():
+    argv = TailnetAdapter().command(8788)
+    assert argv[0] == "tailscale"
+    assert "serve" in argv
+    assert "http://127.0.0.1:8788" in argv
+    # A different port produces a different argv -- the port is not baked in
+    # as a constant, it comes from the caller's integer.
+    assert "http://127.0.0.1:9999" in TailnetAdapter().command(9999)
+
+
+def test_the_funnel_command_is_the_top_level_funnel_verb_not_a_serve_flag():
+    """Spec and the 6a.5 `policy.py` comment both record it: there is no
+    `tailscale serve --funnel`. `funnel` is its own top-level command."""
+    argv = FunnelAdapter().command(8789)
+    assert argv[0] == "tailscale"
+    assert argv[1] == "funnel"
+    assert "serve" not in argv
+    assert "--funnel" not in argv
+    assert str(8789) in argv
+
+
+def test_no_caller_supplied_string_reaches_the_command_line():
+    """`command()` builds argv from the integer port and module constants
+    only (spec §8's subprocess-injection row). A non-numeric string sneaking
+    in as *port* must be rejected outright, never formatted into the argv."""
+    malicious = "8788; rm -rf /"
+    with pytest.raises((TypeError, ValueError)):
+        TailnetAdapter().command(malicious)  # type: ignore[arg-type]
+    with pytest.raises((TypeError, ValueError)):
+        FunnelAdapter().command(malicious)  # type: ignore[arg-type]
+
+
+# ─── Task 7: preflight -- KI-17 layer 2 ──────────────────────────────────────
+
+def _load_fixture(name: str) -> dict:
+    return json.loads((_FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def test_preflight_refuses_a_stale_mapping_pointed_at_another_port():
+    payload = _load_fixture("serve_status_stale_mapping.json")
+    refusal = parse_serve_status(payload, expected_port=8788)
+    assert refusal is not None
+    assert "8787" in refusal
+    # Names the misconfiguration, never a hostname, token or path.
+    assert "example-host" not in refusal
+    assert "ts.net" not in refusal
+
+
+def test_preflight_accepts_a_mapping_that_already_points_at_our_own_port():
+    payload = _load_fixture("serve_status_own_port.json")
+    assert parse_serve_status(payload, expected_port=8788) is None
+
+
+def test_preflight_degrades_to_a_warning_on_output_it_cannot_parse(caplog):
+    """Layer 3 contains the failure either way -- a preflight that hard-fails
+    on an unrecognised shape would take the whole transport down for a
+    formatting change."""
+    unrecognised = ["this", "is", "a", "list", "not", "the", "documented", "shape"]
+    with caplog.at_level(logging.WARNING):
+        result = parse_serve_status(unrecognised, expected_port=8788)
+    assert result is None
+    assert any("tailscale" in record.message.lower() for record in caplog.records)
+
+
+# ─── Task 7: hostname recognition ────────────────────────────────────────────
+
+def test_the_hostname_is_recognised_from_real_tailscale_output():
+    """Real `tailscale serve --bg` / `tailscale funnel --bg` stdout shape:
+    'Available within your tailnet: https://<host>/' and
+    'Available on the internet: https://<host>/'."""
+    tailnet_line = "Available within your tailnet: https://laptop.tail1234.ts.net/"
+    funnel_line = "Available on the internet: https://laptop.tail1234.ts.net/"
+    assert TailnetAdapter().hostname_from(tailnet_line) == "laptop.tail1234.ts.net"
+    assert FunnelAdapter().hostname_from(funnel_line) == "laptop.tail1234.ts.net"
+
+
+def test_a_hostname_outside_the_providers_own_domain_is_rejected():
+    """A name announced by the subprocess becomes a trusted Host and Origin
+    (spec §8), so a shape outside the provider's own `*.ts.net` domain must
+    be rejected rather than accepted as anything that merely looks like a
+    hostname."""
+    adapter = TailnetAdapter()
+    assert adapter.hostname_from("Available within your tailnet: https://evil.example.com/") is None
+    # Suffix confusion: contains "ts.net" but does not end with it.
+    assert adapter.hostname_from("https://laptop.ts.net.evil.com/") is None
+    # No URL on the line at all.
+    assert adapter.hostname_from("Success.") is None
