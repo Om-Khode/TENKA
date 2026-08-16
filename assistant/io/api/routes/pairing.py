@@ -55,10 +55,10 @@ from ..qr import qr_svg
 from ..schemas import Envelope, PairCodeRequest, PairRequest
 from ..security import (
     UNAUTHORIZED,
-    COOKIE_NAME,
     AuthState,
     accepting_port,
     cookie_kwargs,
+    cookie_name_for,
     policy_for_scope,
     refuse_unknown_origin,
     require_admin,
@@ -365,5 +365,9 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     logger.info(f"[API] paired a new device: {pair_code.label!r}")
 
     response = Response(status_code=status.HTTP_204_NO_CONTENT)
-    response.set_cookie(COOKIE_NAME, token, **cookie_kwargs(policy))
+    # Prefixed on any listener that can set `Secure` -- see the same call in
+    # routes/session.py and `HOST_COOKIE_NAME` in security.py. This is the one
+    # that matters most: pairing is what a phone does over a tunnel, which is
+    # exactly where the shared parent domain has neighbours on it.
+    response.set_cookie(cookie_name_for(policy), token, **cookie_kwargs(policy))
     return response

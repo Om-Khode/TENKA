@@ -182,7 +182,24 @@ async def test_a_slow_but_working_socket_is_not_dropped():
 @pytest.mark.asyncio
 async def test_a_single_device_cannot_hold_unlimited_sockets(monkeypatch):
     """Lens 5 F6: new handshakes are metered at ~120/min per device, but
-    nothing capped how many one device *accumulates* over hours."""
+    nothing capped how many one device *accumulates* over hours.
+
+    Amended on `fix/6a5-api-review`. This used to assert `refused.closed` --
+    that the hub closes the socket it turns away. It no longer does, and the
+    change is the fix for the review's P2-7: the hub's close sent code 1008,
+    which flipped Starlette's application state to DISCONNECTED, so
+    `app.py`'s own `close(code=1013)` on the next line raised
+    `RuntimeError: Cannot call "send" once a close message has been sent` --
+    out of the endpoint, because that handler's `try:` begins after the
+    return. The client never received the 1013 and could not tell "at
+    capacity, retry" from "you are not allowed here".
+
+    The property being pinned is unchanged -- a refused socket must not be
+    left open and must not be attached -- but closing it is the caller's, who
+    is the only party that knows which close code is true. `app.py` does it
+    under `suppress(Exception)` immediately after this returns `False`, and
+    audits the refusal, which it also never used to do.
+    """
     monkeypatch.setattr(events_mod, "_MAX_SOCKETS_PER_DEVICE", 3, raising=False)
     hub = EventHub()
     try:
@@ -192,8 +209,102 @@ async def test_a_single_device_cannot_hold_unlimited_sockets(monkeypatch):
         refused = _HealthySocket()
         assert await hub.attach(refused, device_id="phone") is False
         assert refused not in hub._sockets
-        assert refused.closed, "a refused socket must be closed, not left open"
+        assert not refused.closed, (
+            "the hub must leave the close to its caller: closing here sends "
+            "1008 and makes app.py's close(1013) raise on a dead socket")
         assert hub.subscriber_count() == 3
+    finally:
+        await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_refused_socket_is_closed_exactly_once_with_1013(monkeypatch):
+    """The other half of the ownership change above, on a socket that behaves
+    the way Starlette's does.
+
+    A real `WebSocket` refuses a second send after a close, so "the hub closes
+    it AND app.py closes it" is not a harmless double-close -- it is a
+    `RuntimeError` per refused attempt, at up to the 120 handshakes/min the
+    limiter allows. This drives the exact two calls the handler makes and
+    asserts the socket saw one close, carrying 1013.
+    """
+    monkeypatch.setattr(events_mod, "_MAX_SOCKETS_PER_DEVICE", 1, raising=False)
+
+    class _Starletteish:
+        def __init__(self):
+            self.closes: list[int] = []
+
+        async def send_json(self, frame):
+            if self.closes:
+                raise RuntimeError(
+                    'Cannot call "send" once a close message has been sent.')
+
+        async def close(self, code: int = 1000):
+            if self.closes:
+                raise RuntimeError(
+                    'Cannot call "send" once a close message has been sent.')
+            self.closes.append(code)
+
+    hub = EventHub()
+    try:
+        assert await hub.attach(_Starletteish(), device_id="phone") is True
+        refused = _Starletteish()
+        if not await hub.attach(refused, device_id="phone"):
+            await refused.close(code=1013)      # what app.py does
+        assert refused.closes == [1013], refused.closes
+    finally:
+        await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_the_hub_publishes_a_keepalive_of_its_own(monkeypatch):
+    """Review P2-6: the idle timeout had nothing refreshing it.
+
+    `_last_active` was written by `attach()`, by an inbound frame, and by a
+    successful send -- and nothing in this module or in `app.py` ever sent
+    anything periodically. uvicorn's protocol pings are handled below Starlette
+    and never reach `note_activity()`, so the whole 120s reaper rested on the
+    telemetry sampler, which needs a runtime and which one bad reading used to
+    end permanently. A listen-only client -- a wall display, a backgrounded
+    phone tab -- was evicted the moment that stopped.
+
+    The heartbeat rides the revalidate sweep and goes through `publish()`, so
+    `_pump` stays the only writer per socket and a successful send refreshes
+    the clock by the same path every other frame uses. Driven here with both
+    intervals collapsed so the test costs milliseconds.
+    """
+    monkeypatch.setattr(events_mod, "_REVALIDATE_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(events_mod, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    hub = EventHub()
+    socket = _HealthySocket()
+    try:
+        assert await hub.attach(socket, device_id="phone") is True
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if any(f.get("type") == "ping" for f in socket.frames):
+                break
+        assert any(f.get("type") == "ping" for f in socket.frames), (
+            "no keepalive reached an attached socket, so the only thing "
+            "refreshing its idle clock is the telemetry sampler")
+    finally:
+        await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_keepalive_refreshes_the_idle_clock(monkeypatch):
+    """The point of the frame, not merely that it is sent: a socket nobody
+    talks to must survive its own idle window because the hub keeps it
+    alive."""
+    monkeypatch.setattr(events_mod, "_REVALIDATE_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(events_mod, "_HEARTBEAT_INTERVAL_SECONDS", 0.0)
+    monkeypatch.setattr(events_mod, "_IDLE_TIMEOUT_SECONDS", 0.15)
+    hub = EventHub()
+    socket = _HealthySocket()
+    try:
+        assert await hub.attach(socket, device_id="phone") is True
+        await asyncio.sleep(0.6)          # four idle windows
+        assert socket in hub._sockets, (
+            "a listen-only socket was idle-reaped despite the keepalive")
     finally:
         await hub.stop()
 

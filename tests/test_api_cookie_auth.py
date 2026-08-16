@@ -23,9 +23,11 @@ from assistant.io.api.policy import POLICIES
 from assistant.io.api.security import (
     COOKIE_NAME,
     CSRF_HEADER,
+    HOST_COOKIE_NAME,
     RateLimiter,
     _COOKIE_MAX_AGE_SECONDS,
     cookie_kwargs,
+    cookie_name_for,
     require,
 )
 from assistant.io.api.vault import Capability, TokenVault
@@ -241,6 +243,91 @@ def test_a_real_pair_sets_a_long_lived_cookie(tmp_path):
     assert r.status_code == 204
     set_cookie = r.headers.get("set-cookie", "")
     assert f"Max-Age={_COOKIE_MAX_AGE_SECONDS}" in set_cookie, set_cookie
+
+
+# ─── fix/6a5-api-review, P2-11: the `__Host-` prefix ─────────────────────
+# The duplicate-cookie rejection this replaced was half a fix in both
+# directions. It converted the session fixation it was written for into a
+# *permanent* denial of service -- our cookie is host-only, so nothing this
+# daemon can send deletes a sibling's parent-domain plant, and re-pairing
+# re-locks it -- while leaving the fixation itself open, because with no cookie
+# held yet the count is 1 and the planted value is simply adopted.
+
+def test_a_secure_listener_writes_the_host_prefixed_cookie(tmp_path):
+    """A browser refuses to store a `__Host-` cookie that carries a `Domain`,
+    so a sibling under `*.ts.net` or `*.trycloudflare.com` cannot plant this
+    name at all. That is what closes both halves, and it is available on every
+    listener that can set `Secure`."""
+    for name in ("tailnet", "funnel", "quick"):
+        assert POLICIES[name].secure_cookie is True, name
+        assert cookie_name_for(POLICIES[name]) == HOST_COOKIE_NAME, name
+
+
+def test_loopback_keeps_the_unprefixed_name(tmp_path):
+    """`__Host-` demands `Secure`, and there is no TLS on plain-http loopback.
+    Loopback also has no shared parent to be a sibling of, so what is left
+    there is another port on 127.0.0.1 -- which needs code already running on
+    this machine, and which the per-name duplicate rule still refuses."""
+    assert POLICIES["local"].secure_cookie is False
+    assert cookie_name_for(POLICIES["local"]) == COOKIE_NAME
+
+
+def test_the_prefixed_cookie_carries_what_the_prefix_demands():
+    """A browser silently discards a `__Host-` cookie that fails any of
+    `Secure`, `Path=/` or no-`Domain`. Silently: the pairing route would
+    answer 204 and the device would simply never be authenticated again. So
+    the two functions that have to agree are pinned together."""
+    for name, policy in POLICIES.items():
+        if cookie_name_for(policy) != HOST_COOKIE_NAME:
+            continue
+        flags = cookie_kwargs(policy)
+        assert flags["secure"] is True, name
+        assert flags["path"] == "/", name
+        assert "domain" not in flags, name
+
+
+def test_a_real_pair_over_a_tunnel_sets_the_prefixed_cookie(tmp_path):
+    """End to end, because the helper being right is not the same as the route
+    using it -- the two `set_cookie` call sites are in `routes/pairing.py` and
+    `routes/session.py`, not here."""
+    vault = TokenVault(tmp_path)
+    store = PairCodeStore()
+    code = store.mint("phone", frozenset({Capability.OBSERVE})).code
+    client = build_api_client(build_fake_runtime(), vault,
+                              policies={LOCAL_PORT: "quick"}, pair_store=store)
+    r = client.post("/v1/pair", json={"code": code})
+    assert r.status_code == 204
+    assert HOST_COOKIE_NAME in r.cookies, dict(r.cookies)
+    assert COOKIE_NAME not in r.cookies, dict(r.cookies)
+
+
+def test_a_planted_unprefixed_cookie_loses_to_the_daemons_own(tmp_path):
+    """The fixation itself. A sibling host can only write the *unprefixed*
+    name; the daemon's own cookie is prefixed, and the read order prefers it.
+    So the operator keeps her session instead of silently moving onto the
+    attacker's -- and instead of 401ing forever, which is what refusing the
+    pair outright used to do."""
+    vault = TokenVault(tmp_path)
+    mine = vault.issue("laptop", frozenset(Capability))
+    planted = vault.issue("attacker", frozenset({Capability.OBSERVE}))
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+
+    r = client.get("/v1/session", headers={
+        "Cookie": f"{COOKIE_NAME}={planted}; {HOST_COOKIE_NAME}={mine}"})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["deviceId"] == vault.devices()[0].device_id
+
+
+def test_two_of_the_same_name_are_still_refused(tmp_path):
+    """The per-name duplicate rule survives, for the listener that cannot use
+    the prefix. Two of one name is never a browser doing its job."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+
+    r = client.get("/v1/session", headers={
+        "Cookie": f"{COOKIE_NAME}={token}; {COOKIE_NAME}=junk"})
+    assert r.status_code == 401, r.text
 
 
 def test_the_socket_refuses_a_cross_site_origin(tmp_path):
