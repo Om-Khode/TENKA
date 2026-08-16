@@ -314,9 +314,55 @@ def cookie_kwargs(policy: ListenerPolicy) -> dict:
     }
 
 
+def _cookie_name_occurrences(connection: HTTPConnection, name: str) -> int:
+    """How many times `name` is presented in the raw `Cookie` header(s).
+
+    `connection.cookies` cannot answer this. It is Starlette's `cookie_parser`,
+    which collapses a repeated name last-wins
+    (`cookie_parser("tenka_device=GOOD; tenka_device=EVIL")` ->
+    `{"tenka_device": "EVIL"}`), so the parsed mapping has no way to express
+    "how many". Counting needs the unparsed header, and `getlist` because a
+    client may also split its jar across several `Cookie` headers.
+
+    Split on `;` and compare the name half, which is exactly the boundary
+    `cookie_parser` itself uses -- so this counts the same morsels the parser
+    would have collapsed, never more.
+    """
+    seen = 0
+    for header in connection.headers.getlist("cookie"):
+        for morsel in header.split(";"):
+            key, sep, _value = morsel.partition("=")
+            if sep and key.strip() == name:
+                seen += 1
+    return seen
+
+
 def cookie_credential(connection: HTTPConnection) -> str:
     """The cookie's value, or `""`. Separate from `credential_from` because
     *which channel* the credential arrived on decides whether CSRF applies."""
+    # More than one `tenka_device` presented on a request is never a browser
+    # doing its job, and it is refused rather than resolved. Cookies ignore
+    # ports, so any page on another port of this host can write one with
+    # `path=/`; and `Domain=` from a sibling under a shared parent -- `*.ts.net`
+    # or `*.trycloudflare.com`, the parents 6b publishes under, where the
+    # neighbours are other people's machines -- plants one inward. RFC 6265
+    # s5.4 serialises equal-path cookies oldest-first, so the *attacker's*
+    # later-set duplicate is the one a last-wins parser adopts: the operator's
+    # browser is silently moved onto a session the attacker also holds, and
+    # everything she then does through Studio is readable by it.
+    #
+    # `__Host-` is the browser-side fix and the only one that stops the cookie
+    # being stored at all, but it cannot be adopted as written: it also demands
+    # `Secure`, and the `local` policy explicitly cannot set `Secure` on
+    # plain-http loopback (see `cookie_kwargs` and `policy.py`). Per-policy
+    # names would lose the session on a listener switch. So this is the
+    # server-side half -- cheap, and it holds on every listener.
+    #
+    # Refusing the pair, rather than picking the first, is deliberate: "which
+    # of these two did the operator mean?" is not a question this daemon can
+    # answer, and guessing right is worth less than never guessing.
+    if _cookie_name_occurrences(connection, COOKIE_NAME) > 1:
+        return ""
     return (connection.cookies.get(COOKIE_NAME) or "").strip()
 
 
