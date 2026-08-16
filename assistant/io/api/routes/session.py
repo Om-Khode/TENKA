@@ -24,6 +24,7 @@ it too.
 from __future__ import annotations
 
 import logging
+import time
 
 from fastapi import APIRouter, Depends, Request, Response, status
 
@@ -52,11 +53,33 @@ async def get_session(request: Request,
     # can report both without a second vault read.
     issued = request.state.issued_grants
     policy = request.state.policy
+
+    # `app.state.raises` is set by `create_app` in a sibling task landing
+    # around the same time as this one. Read defensively: an app built before
+    # that lands (or a test that never attaches a store) has no attribute at
+    # all, and "no raises" is the correct fail-closed answer for that case
+    # anyway -- the same shape `getattr` guards use everywhere else a later
+    # task's wiring is not guaranteed to have landed yet.
+    raise_store = getattr(request.app.state, "raises", None)
+    grant = raise_store.get(device.device_id, policy.name) if raise_store is not None else None
+    if grant is None:
+        raised: list[str] = []
+        raise_expires_in_seconds: int | None = None
+    else:
+        raised = sorted(c.value for c in grant.capabilities)
+        # Converted from the store's own monotonic reading, the same shape
+        # `mint_pair_code` (routes/pairing.py) already converts its own --
+        # never recomputed as `now + duration`, which would drift if the
+        # store's cap ever changed.
+        raise_expires_in_seconds = round(max(0.0, grant.expires_at - time.monotonic()))
+
     return Envelope(data=SessionPayload(
         device_id=device.device_id,
         label=device.label,
         grants=sorted(c.value for c in issued),
         effective=sorted(c.value for c in device.grants),
+        raised=raised,
+        raise_expires_in_seconds=raise_expires_in_seconds,
         policy=policy.name,
     ))
 

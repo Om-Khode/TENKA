@@ -250,19 +250,40 @@ class CommandRunPayload(CamelModel):
 class SessionPayload(CamelModel):
     """Who is calling, and what may this connection carry.
 
-    `grants` and `effective` are deliberately two lists, not one. `grants` is
-    what the device was issued at pairing; `effective` is what survives the
-    listener's ceiling on this connection (`policy.py`'s `effective()`). A
-    control Studio greys out because the device itself was never issued a
-    capability is a different story than one greyed out because a Cloudflare
-    tunnel refuses to carry it -- collapsing the two into one list would make
-    that distinction unexplainable at the UI.
+    Three lists, deliberately, not one -- each answers a different reason a
+    control might be greyed out in Studio, and collapsing any two would make
+    that reason unexplainable at the UI:
+
+    - `grants` is what the device was issued at pairing. A control disabled
+      here means the device itself was never handed that capability, on any
+      connection, ever.
+    - `effective` is what survives this listener's fixed ceiling on this
+      connection (`policy.py`'s `effective()`). A control disabled only here
+      means the device holds the capability, but the transport it arrived on
+      -- a Cloudflare tunnel that can read the plaintext, say -- refuses to
+      carry it.
+    - `raised` is what Milestone 6b's third case, the ceiling lifting, is
+      reporting: a live, expiring, per-device raise minted by the operator at
+      the keyboard, on top of whatever `effective` already allows. A control
+      enabled only because of a raise is not the same story as one always
+      enabled -- Studio's banner needs to say a floor was deliberately and
+      temporarily raised, not render an ordinary control that looks
+      permanent. Empty, never omitted, when no raise is live: a payload
+      whose shape varied by transport would be worse for a client to read
+      than one whose values are simply empty.
+
+    `raise_expires_in_seconds` is `None` exactly when `raised` is empty, and
+    otherwise counts down a live raise -- converted from the store's
+    `time.monotonic()` reading at request time, never recomputed as
+    `now + duration`, which would drift if the store's cap ever changed.
     """
 
     device_id: str
     label: str
     grants: list[str]
     effective: list[str]
+    raised: list[str]
+    raise_expires_in_seconds: int | None
     policy: str
 
 
