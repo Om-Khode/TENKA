@@ -35,6 +35,40 @@ from .core.principal import current_principal
 T = TypeVar("T")
 
 
+# ─── "I did not name an owner" vs "this is owned by nobody" ──────────────
+
+class _AmbientPrincipal:
+    """Sentinel for `PendingState.set`'s `principal` argument.
+
+    `set()` has to be able to say two different things, and before this
+    sentinel existed it could only say one of them, because both were spelled
+    `None`:
+
+    - **"I am not naming an owner — use the turn's."**  The ~18 bare
+      `state.set(payload)` calls in `actions/` mean this. They sit several
+      frames below the turn that authorised them and inherit its identity.
+    - **"This is owned by nobody."**  A lazily-arming row carrying a principal
+      that was captured as `None` means this. `owned_by` refuses everyone for
+      such a state, in both directions, which is the fail-closed answer.
+
+    Collapsing them made `set(payload, principal=x)` silently *invert* when
+    `x` was `None`: an unowned proposal became owned by whoever spoke next,
+    and the very next line's `owned_by(current_principal.get())` then said yes
+    to them. A caller passing a value it did not choose got the opposite of
+    what it asked for. So the two meanings get two spellings, and the one that
+    can only be written deliberately — omitting the argument — is the one that
+    consults the ambient principal.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "AMBIENT_PRINCIPAL"
+
+
+AMBIENT_PRINCIPAL = _AmbientPrincipal()
+
+
 class PendingState(Generic[T]):
     """Single multi-turn interaction state."""
 
@@ -46,25 +80,36 @@ class PendingState(Generic[T]):
         self._principal: Optional[str] = None
         self._foreign_attempts: int = 0
 
-    def set(self, payload: T, *, principal: Optional[str] = None) -> None:
+    def set(self, payload: T, *,
+            principal: "Optional[str] | _AmbientPrincipal" = AMBIENT_PRINCIPAL,
+            ) -> None:
         """Start (or replace) the pending state, recording who armed it.
 
-        `principal` defaults to the turn in flight (`current_principal`)
-        rather than to "no owner", and that default is the mechanism, not a
-        convenience. Almost every arming site in the tree sits inside a
-        handler several frames below the turn that authorised it; asking each
-        of them to pass an identity down would put the whole property one
-        forgotten argument away from an unowned confirmation, which is a
-        silent dead end rather than a loud one. Sites that arm *outside* a
-        turn -- `main.py`'s notification flusher, where no principal is
-        installed -- have to state one, and
-        `tests/test_6b_principal.py::test_every_arming_site_records_a_principal`
-        walks `main.py`'s AST to make sure they do.
+        Three spellings, three meanings:
+
+        - `set(payload)` — inherit the turn in flight (`current_principal`).
+          That default is the mechanism, not a convenience. Almost every
+          arming site in the tree sits inside a handler several frames below
+          the turn that authorised it; asking each of them to pass an identity
+          down would put the whole property one forgotten argument away from
+          an unowned confirmation, which is a silent dead end rather than a
+          loud one. Sites that arm *outside* a turn -- `main.py`'s
+          notification flusher, where no principal is installed -- have to
+          state one, and
+          `tests/test_6b_principal.py::test_every_arming_site_records_a_principal`
+          walks `main.py`'s AST to make sure they do.
+        - `set(payload, principal="device:x")` — owned by that principal.
+        - `set(payload, principal=None)` — **explicitly owned by nobody.**
+          `owned_by` then refuses everyone, including the caller doing the
+          arming. This is the spelling a lazily-arming row needs when the
+          owner it carries turns out to be unknown: see `_AmbientPrincipal`
+          for why it cannot share the "not specified" spelling.
         """
         self._payload = payload
         self._ts = time.time()
-        self._principal = (principal if principal is not None
-                           else current_principal.get())
+        self._principal = (current_principal.get()
+                           if isinstance(principal, _AmbientPrincipal)
+                           else principal)
         self._foreign_attempts = 0
 
     def touch(self) -> None:

@@ -510,7 +510,12 @@ async def handle_pending_knowledge_approval(text: str, bridge=None) -> str | Non
     # `state.active` and the state was inactive at exactly that instant.
     #
     # So the entry carries the principal of the run that learned the lesson,
-    # and the state is armed with THAT.
+    # and the state is armed with THAT. Passing it through explicitly matters
+    # even when it is None: `set(payload, principal=None)` means "owned by
+    # nobody", which is a different thing from omitting the argument, and it
+    # is the fail-closed direction. A lesson learned by a turn with no
+    # identity is a lesson nobody may approve -- not a lesson that belongs to
+    # whoever speaks next.
     if _act.pending_knowledge_approval.payload is None:
         from ..code_executor import pop_pending_knowledge
         entry = pop_pending_knowledge()
@@ -534,13 +539,6 @@ async def handle_pending_knowledge_approval(text: str, bridge=None) -> str | Non
         _act.pending_knowledge_approval.note_foreign_attempt()
         return None
 
-    # ── The owner check the dispatch loop cannot make for this row ──────
-    # Every other row is checked by the loop before its handler is called.
-    # This one arms inside the handler, so it has to ask the question itself,
-    # and it answers it the same way the loop does: skip, returning None, so
-    # the message takes an ordinary turn. The state stays armed with its real
-    # owner, who can still answer it afterwards -- a foreign "yes" costs the
-    # operator nothing but a note that somebody reached for her question.
     text_low = text.strip().lower()
 
     is_yes = any(w in text_low for w in (

@@ -581,7 +581,9 @@ def pop_pending_knowledge() -> dict | None:
 
     The entry carries a `principal` key -- see `_queue_knowledge_proposal`.
     The caller must arm with it rather than letting `PendingState.set()` fall
-    back to the ambient one.
+    back to the ambient one. Pass it through **even when it is None**: that
+    spelling means "owned by nobody" and refuses everybody, where omitting the
+    argument would hand the lesson to whoever happened to speak next.
     """
     if _pending_knowledge_queue:
         return _pending_knowledge_queue.pop(0)

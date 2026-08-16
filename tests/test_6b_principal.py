@@ -541,6 +541,54 @@ def test_a_bare_arm_inherits_the_turns_principal():
     assert state.owned_by(LOCAL_PRINCIPAL) is False
 
 
+def test_an_explicit_nobody_is_not_the_same_as_an_unnamed_owner():
+    """`set(payload)` and `set(payload, principal=None)` are opposites.
+
+    Before the `AMBIENT_PRINCIPAL` sentinel, `set()` collapsed them: both
+    consulted `current_principal`. That made passing a *carried* principal
+    through -- `set(entry, principal=entry.get("principal"))`, which is
+    exactly what the lazily-arming knowledge row does -- invert whenever the
+    carried value was None. The entry meant "the run that learned this had no
+    identity"; the state recorded "owned by whoever is speaking right now",
+    and the `owned_by` check one line below then said yes to them. Fail-open,
+    in the one branch KI-13 exists to close.
+
+    So the two meanings need two spellings, and this pins both. The bare-arm
+    half is `test_a_bare_arm_inherits_the_turns_principal`; this is the half
+    that says an explicit None owns nothing and is owned by nobody.
+    """
+    from assistant.actions import LOCAL_PRINCIPAL, current_principal, set_principal
+    from assistant.pending import AMBIENT_PRINCIPAL, PendingState
+
+    state = PendingState("probe_explicit_nobody", timeout=60.0)
+
+    token = set_principal(_A_DEVICE)
+    try:
+        state.set({"op": "delete"}, principal=None)
+
+        assert state.principal is None, (
+            f"an explicit `principal=None` took the ambient principal instead "
+            f"of meaning nobody: {state.principal!r}")
+        # The caller doing the arming is the one a fail-open default hands it
+        # to, so it is the first thing to refuse.
+        assert state.owned_by(current_principal.get()) is False, (
+            "the caller that armed an unowned state became its owner")
+        assert state.owned_by(_A_DEVICE) is False
+        assert state.owned_by(_ANOTHER_DEVICE) is False
+        assert state.owned_by(LOCAL_PRINCIPAL) is False
+        assert state.owned_by(None) is False, (
+            "an unowned state matched an unknown caller -- two absences of a "
+            "decision agreed with each other")
+
+        # And the sentinel keeps meaning what the ~18 bare arming sites need,
+        # including when it is written out longhand.
+        state.set({"op": "delete"}, principal=AMBIENT_PRINCIPAL)
+        assert state.principal == _A_DEVICE
+        assert state.owned_by(_A_DEVICE) is True
+    finally:
+        current_principal.reset(token)
+
+
 def test_an_unset_principal_owns_nothing():
     """The fail-closed default, and it matches `current_grants`' exactly: the
     absence of a decision is not a decision to allow. A state armed with no
@@ -682,8 +730,18 @@ def test_a_lazily_arming_handler_carries_an_owner_and_checks_it():
     legitimately arms `pending_messaging_send` *after* the loop has already
     owner-checked the row it was called for. A matcher that cries wolf on the
     legitimate chained arm would be turned off, and then it protects nothing.
-    `test_a_foreign_yes_cannot_write_a_knowledge_entry` is the behavioural half
-    that does not depend on spelling.
+
+    SECOND LIMIT, in the same spirit: half one only checks that a `principal=`
+    keyword is *present*. It says nothing about the value, so
+    `set(entry, principal=current_principal.get())` -- the defect verbatim,
+    with the ambient principal spelled out by hand -- passes it. That is
+    acceptable rather than overlooked, because a matcher that judged the
+    *expression* would have to model where a value came from, and the
+    behavioural test below catches exactly this case without pretending to.
+
+    `test_a_foreign_yes_cannot_write_a_knowledge_entry` and
+    `test_a_proposal_that_lost_its_owner_is_answerable_by_nobody` are the
+    behavioural half, and neither depends on spelling.
     """
     import inspect
     import textwrap
@@ -792,6 +850,70 @@ def test_a_foreign_yes_cannot_write_a_knowledge_entry(monkeypatch):
     assert resp is not None
 
 
+def test_a_proposal_that_lost_its_owner_is_answerable_by_nobody(monkeypatch):
+    """The direction the fix for the lazy arm got wrong, now pinned.
+
+    `_principal_for_item` returns None for a studio item whose principal slot
+    is missing or is not a string, and `main.py` then installs
+    `set_principal(None)` -- "a lost principal is refused, never assumed", as
+    its own docstring puts it. A lesson learned during such a turn is queued
+    with `principal: None`.
+
+    This row is the one place in the tree that could invert that rule, because
+    it arms from a carried value rather than from the turn. If the carried
+    None is read as "not specified", the state takes the *answering* caller's
+    identity and the `owned_by` check on the very next line approves them --
+    a foreign write to the knowledge base by way of the fix that was supposed
+    to prevent one. Nothing produces such an item today, which is precisely
+    why it needs a test rather than a comment.
+    """
+    import assistant.actions as _act
+    from assistant import knowledge
+    from assistant.actions import current_principal, set_principal
+    from assistant.actions.pending_handlers import handle_pending_knowledge_approval
+    from assistant.code_executor import retry as _retry
+
+    writes: list = []
+    monkeypatch.setattr(knowledge, "add_works_entry",
+                        lambda *a, **k: writes.append(a) or True)
+    # A lesson learned by a turn that had no identity: exactly what
+    # `_queue_knowledge_proposal` stamps when `current_principal` is unset.
+    monkeypatch.setattr(_retry, "_pending_knowledge_queue", [{
+        "service": "svc", "slug": "slug",
+        "pattern": "a pattern", "reason": "a reason",
+        "principal": None,
+    }])
+
+    token = set_principal(_A_DEVICE)
+    try:
+        resp = asyncio.run(handle_pending_knowledge_approval("yes"))
+    finally:
+        current_principal.reset(token)
+
+    assert resp is None, (
+        f"an ownerless proposal was approved by the first voice to say yes: "
+        f"{resp!r}")
+    assert writes == [], (
+        f"a caller that never learned the lesson wrote it to the knowledge "
+        f"base: {writes}")
+    assert _act.pending_knowledge_approval.principal is None, (
+        "arming from a carried None took the answering caller's identity -- "
+        "the fail-open direction KI-13 is about")
+    assert _act.pending_knowledge_approval.owned_by(_A_DEVICE) is False
+    assert _act.pending_knowledge_approval.owned_by(None) is False
+
+    # Nobody else inherits it either -- not the console, not a second device.
+    from assistant.actions import LOCAL_PRINCIPAL
+    for who in (LOCAL_PRINCIPAL, _ANOTHER_DEVICE):
+        token = set_principal(who)
+        try:
+            assert asyncio.run(handle_pending_knowledge_approval("yes")) is None
+        finally:
+            current_principal.reset(token)
+    assert writes == [], (
+        f"an ownerless proposal found an owner on a later turn: {writes}")
+
+
 @pytest.mark.asyncio
 async def test_a_plan_step_that_learns_a_lesson_runs_to_completion(monkeypatch):
     """Queueing a proposal must not look like "this step is waiting on you".
@@ -804,19 +926,42 @@ async def test_a_plan_step_that_learns_a_lesson_runs_to_completion(monkeypatch):
     proposal is discarded by the orchestrator, so the plan would have
     suspended waiting for an answer to a question nobody was asked.
 
-    This drives the real `execute_step` with a stubbed tool whose only side
-    effect is queueing a proposal, and asserts on the real suspension
-    predicate."""
+    This drives the real `execute_step` with a stubbed tool that calls the
+    real `_save_success_knowledge` -- the production function a self-healed
+    code step ends in -- rather than reaching past it to the helper it uses.
+    That matters: an arm re-added *inside* `_save_success_knowledge`, beside
+    its `_queue_knowledge_proposal` call, is the most natural way to
+    re-introduce the regression, and a test that called the helper directly
+    would have walked straight past it.
+
+    LIMIT: the chain above `_save_success_knowledge` is not driven.
+    `orchestrator.execute_code_task` needs generated code, a sandbox run and a
+    real retry loop, so reaching it from here would mean a live model. The
+    two edges stubbed below are the model call and the on-disk knowledge
+    store; everything between `execute_step` and the queue append is real.
+    """
+    from assistant import knowledge
     from assistant.actions.planner.executor import execute_step
     from assistant.actions.planner.planner import Plan, PlanStep
     from assistant.code_executor import retry as _retry
     from assistant.pending import pending_registry
 
     monkeypatch.setattr(_retry, "_pending_knowledge_queue", [])
+    # The lesson store is on disk; novelty is not what this test is about.
+    monkeypatch.setattr(knowledge, "has_knowledge", lambda service: False)
+
+    async def _lesson_llm(prompt, **kw):
+        return '{"pattern": "a pattern", "reason": "a reason"}'
 
     async def _execute(intent, params, llm_response="", bridge=None, **kw):
-        # What a self-healed code step does on its way out.
-        _retry._queue_knowledge_proposal("svc", "slug", "a pattern", "a reason")
+        # What a self-healed code step does on its way out -- the real one.
+        await _retry._save_success_knowledge(
+            "svc", "slug",
+            broken_code="value = fetch(1)\n",
+            fixed_code="value = fetch(1, retries=3)\n",
+            history=[{"error": "boom"}],
+            llm_func=_lesson_llm,
+        )
         return "Played it."
 
     import assistant.actions as _actions_pkg
@@ -841,6 +986,9 @@ async def test_a_plan_step_that_learns_a_lesson_runs_to_completion(monkeypatch):
     _retry._queue_knowledge_proposal("svc2", "slug2", "second", "second reason")
     assert [e["slug"] for e in _retry._pending_knowledge_queue] == ["slug", "slug2"], (
         "a second proposal inside the window replaced the first")
+    # No turn is installed here, so both entries carry no owner. What that
+    # then means at arm time is
+    # `test_a_proposal_that_lost_its_owner_is_answerable_by_nobody`.
     assert all(e["principal"] is None for e in _retry._pending_knowledge_queue)
 
 
