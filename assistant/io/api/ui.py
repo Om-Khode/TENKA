@@ -29,10 +29,12 @@ Layering: io/api -- core + config only.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import mimetypes
+import os
 import threading
 import zipfile
 from pathlib import Path
@@ -52,6 +54,13 @@ UI_MANIFEST_VERSION = 1
 # asset is a ~790 KB JS chunk, so this is generous by an order of magnitude
 # while still bounding what a hand-crafted archive can make the cache hold.
 MAX_MEMBER_BYTES = 8 * 1024 * 1024
+
+# How many members the directory loader will publish. A real export is a few
+# hundred files; this bounds what a `studio_ui_path` pointed at something
+# enormous (a home directory, a node_modules tree) costs at mount time, and it
+# is a refusal rather than a truncation because a half-enumerated bundle would
+# serve some of the export and 404 the rest, which reads as a build problem.
+_MAX_DIR_MEMBERS = 20_000
 
 # The marker is small by construction. Reading it is the first thing that
 # happens to an untrusted archive, so it is also the first thing to bound.
@@ -249,6 +258,13 @@ class UiBundle:
         self._dir_path = dir_path
         self._cache: dict[str, tuple[bytes, str]] = {}
         self._lock = threading.Lock()
+        # member -> the one task currently reading it. Two requests racing the
+        # same cache miss await the same task instead of each paying for the
+        # decompression; see `read_async`. Guarded by `_lock`, the same lock
+        # the cache dict uses, because "is it cached?" and "is somebody
+        # already fetching it?" have to be answered as one decision -- two
+        # locks would leave a window in which both answers are no.
+        self._inflight: dict[str, asyncio.Future] = {}
 
     # ─── opening ─────────────────────────────────────────────────────────
     @classmethod
@@ -306,10 +322,90 @@ class UiBundle:
             return None
         if manifest is None:
             return None
-        # Names are not enumerated up front: a dev directory changes under the
-        # daemon while it runs, so membership is decided per read instead.
-        return cls(manifest=manifest, names=frozenset(),
+        names = cls._enumerate_dir(root)
+        if names is None:
+            return None
+        return cls(manifest=manifest, names=names,
                    zip_path=None, dir_path=root)
+
+    @classmethod
+    def _enumerate_dir(cls, root: Path) -> frozenset[str] | None:
+        """Every member the directory publishes, decided once at mount time.
+
+        This is the half `_from_zip` always had and this loader did not. The
+        zip path enumerates `infolist()` into `self._names` and refuses
+        anything outside that set; this one passed `names=frozenset()`, so the
+        only barrier between an unauthenticated request and any file under the
+        root was `_PRIVATE_MEMBERS` -- a deny-list with one entry. `GET /.env`
+        returned 200 with the file's contents. Anything a build tool, an
+        editor or a developer leaves in the export directory (`.env*`,
+        `.git/`, a swap file, a stray copy of `devices.json`) was public.
+        An allow-list built from what is actually there is the only shape that
+        does not need a new deny-list entry per tool anybody ever runs.
+
+        The cost is that a file appearing after mount is not served until the
+        daemon restarts, which is a real hit to the iterate-on-Studio workflow
+        this loader exists for. Re-walking on a miss was the obvious repair
+        and is the wrong one: it hands an unauthenticated caller a directory
+        walk per request for a name that does not exist, on the one route in
+        this API with no credential requirement. Editing an existing file
+        still shows up immediately -- nothing from a directory is cached.
+
+        Enumeration alone is not the whole of it, and it is worth being exact
+        about why. The zip's names come from an archive a build step produced;
+        a directory's come from whatever is on disk, so walking it faithfully
+        would publish a `.env` sitting next to `index.html` just as readily as
+        the old per-read check did -- lens 1 F7's observed `GET /.env` -> 200
+        would still hold. So a *hidden* entry -- any path segment beginning
+        with a dot -- is not a member here. That is a rule about a shape, not a
+        list of names: `.env`, `.env.local`, `.git/`, `.DS_Store` and an
+        editor's dotfile all fall out of it without any of them being written
+        down, which is the point. A static export needs no dot-prefixed file
+        served; the one this daemon does read, the marker, is opened by path
+        and is `_PRIVATE_MEMBERS` besides.
+
+        Not applied to the zip loader, deliberately. That archive is a build
+        artifact the packaging step already scans for secrets before it ships,
+        and its members were chosen by a script rather than by whatever a
+        developer's working directory happens to contain. The loaders publish
+        different sets, and the difference is in the safe direction.
+
+        `followlinks=False`, so a symlinked directory is not descended into
+        and cannot make this walk unbounded. A symlinked *file* is still
+        enumerated by name and still refused at read time by the resolved-path
+        guard in `_read_from_dir`, which is where that check belongs.
+        """
+        names: set[str] = set()
+        try:
+            for current, dirs, files in os.walk(root, followlinks=False):
+                relative = Path(current).relative_to(root)
+                # Pruned in place, which is what stops `os.walk` descending
+                # into them at all -- a hidden directory's contents are not
+                # members and are not worth the stat calls either.
+                dirs[:] = [name for name in dirs if not name.startswith(".")]
+                for filename in files:
+                    if filename.startswith("."):
+                        continue
+                    if len(names) >= _MAX_DIR_MEMBERS:
+                        logger.warning(
+                            f"[UI] refusing a Studio directory at {root}: more "
+                            f"than {_MAX_DIR_MEMBERS} files under its root")
+                        return None
+                    raw = filename if relative == Path(".") \
+                        else f"{relative.as_posix()}/{filename}"
+                    safe = normalise_member(raw)
+                    if not safe:
+                        # Same reasoning as the zip side: a name that does not
+                        # survive normalisation is not a member, whatever the
+                        # filesystem lets it be called.
+                        logger.warning("[UI] dropped an unsafe directory entry")
+                        continue
+                    names.add(safe)
+        except OSError as exc:
+            logger.warning(f"[UI] cannot enumerate the Studio directory "
+                           f"at {root}: {exc}")
+            return None
+        return frozenset(names)
 
     @classmethod
     def _read_marker_from_zip(cls, archive: zipfile.ZipFile) -> dict[str, Any] | None:
@@ -369,14 +465,75 @@ class UiBundle:
                 cached = self._cache.get(safe)
                 if cached is not None:
                     return cached
-        body = self._read_bytes(safe)
-        if body is None:
-            return None
-        entry = (body, content_type_for(safe))
-        if cacheable:
+        entry = self._read_entry(safe)
+        if entry is not None and cacheable:
             with self._lock:
                 self._cache[safe] = entry
         return entry
+
+    async def read_async(self, member: str) -> tuple[bytes, str] | None:
+        """`read()`, off the event loop and coalesced. What the route calls.
+
+        Two things this fixes, both measured by lens 5 F4 against the largest
+        member this daemon will hand out (8 MiB, `MAX_MEMBER_BYTES`):
+
+        * a first read cost 47-97ms of *synchronous* work on the loop the
+          assistant herself runs on, from a route with no credential
+          requirement at all -- so `asyncio.to_thread`;
+        * ten concurrent first-requests for the same member produced ten
+          independent full decompressions, because the lock is held only
+          around the cache dict's get and set -- so the in-flight map.
+
+        A miss is still never cached (`_read_entry` returning `None` populates
+        nothing), which is what keeps a flood of requests for paths that do
+        not exist from being a cache-churn primitive. The in-flight entry is
+        cleared either way, so it does not become a negative cache by accident.
+        """
+        safe = normalise_member(member)
+        if not safe:
+            return None
+        cacheable = self._dir_path is None
+        with self._lock:
+            if cacheable:
+                cached = self._cache.get(safe)
+                if cached is not None:
+                    return cached
+            task = self._inflight.get(safe)
+            if task is None:
+                task = asyncio.ensure_future(
+                    asyncio.to_thread(self._read_entry, safe))
+                self._inflight[safe] = task
+                task.add_done_callback(
+                    lambda done, key=safe: self._settle(key, done))
+        # Shielded: a client that disconnects mid-read cancels *its* await,
+        # and cancelling the shared task would fail every other request racing
+        # the same member for a reason none of them caused.
+        return await asyncio.shield(task)
+
+    def _settle(self, safe: str, task: asyncio.Future) -> None:
+        """Retire an in-flight read and cache what it produced, if anything."""
+        with self._lock:
+            if self._inflight.get(safe) is task:
+                del self._inflight[safe]
+            if self._dir_path is not None or task.cancelled():
+                return
+            if task.exception() is not None:
+                return
+            entry = task.result()
+            if entry is not None:
+                self._cache[safe] = entry
+
+    def _read_entry(self, safe: str) -> tuple[bytes, str] | None:
+        """The whole read, cache aside: bytes plus the type they are served as.
+
+        One function so the sync and async paths cannot drift -- and so the
+        thing handed to `asyncio.to_thread` is the entire piece of blocking
+        work, not most of it.
+        """
+        body = self._read_bytes(safe)
+        if body is None:
+            return None
+        return body, content_type_for(safe)
 
     def _read_bytes(self, safe: str) -> bytes | None:
         if self._dir_path is not None:
@@ -386,6 +543,11 @@ class UiBundle:
     def _read_from_dir(self, safe: str) -> bytes | None:
         root = self._dir_path
         assert root is not None
+        # The same membership check `_read_from_zip` has always had. The two
+        # loaders serve the same route and had different answers to "is this a
+        # member?", which is the asymmetry lens 1 F7 is about.
+        if safe not in self._names:
+            return None
         # Before anything touches the filesystem: on Windows this name would
         # be resolved to a device, not to the file it appears to describe.
         if _names_a_windows_device(safe):
@@ -457,6 +619,16 @@ class UiBundle:
         """
         return (self.read(f"{segment}.html") is not None
                 or self.read(segment) is not None)
+
+    async def is_route_prefix_async(self, segment: str) -> bool:
+        """`is_route_prefix`, on the route's own non-blocking path.
+
+        The fallback runs on a cache miss, which is exactly the case where the
+        synchronous version would decompress on the event loop -- the one
+        thing this route may not do.
+        """
+        return (await self.read_async(f"{segment}.html") is not None
+                or await self.read_async(segment) is not None)
 
 
 # ─── mounting ────────────────────────────────────────────────────────────
@@ -628,7 +800,7 @@ def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
         for candidate in candidates:
             if _is_private(candidate):
                 continue
-            found = bundle.read(candidate)
+            found = await bundle.read_async(candidate)
             if found is not None:
                 body, content_type = found
                 immutable = member.startswith(_IMMUTABLE_PREFIX)
@@ -642,8 +814,8 @@ def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
         leaf = member.rsplit("/", 1)[-1]
         if member and "." not in leaf:
             first = member.split("/", 1)[0]
-            if bundle.is_route_prefix(first):
-                shell = bundle.read("index.html")
+            if await bundle.is_route_prefix_async(first):
+                shell = await bundle.read_async("index.html")
                 if shell is not None:
                     body, content_type = shell
                     return _stamp(Response(content=body, media_type=content_type))
