@@ -1,5 +1,6 @@
 """Tests for S11 code_executor package split — verifies import paths and key functions."""
 
+import pytest
 import sys
 import types
 from pathlib import Path
@@ -9,7 +10,17 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Stub heavy modules to prevent real side effects
+# Stub heavy modules to prevent real side effects.
+#
+# Installed at import time, not in a fixture: this file's own imports run at
+# collection, before any fixture could execute. But they used to be left
+# behind for the rest of the session, and an empty `assistant.io.audio.stt`
+# is worse than a missing one -- a later file importing `assistant.main`
+# fails with `cannot import name 'recorder'`, which reads as a broken import
+# in *that* file rather than residue from this one. Anything installed here
+# is recorded and removed again by the teardown below, so the leak stops at
+# this module's boundary.
+_STUBBED: list[str] = []
 for mod_name in (
     "assistant.io.audio.tts", "assistant.io.audio.stt",
     "assistant.io.audio.speaker_verify",
@@ -17,6 +28,15 @@ for mod_name in (
 ):
     if mod_name not in sys.modules:
         sys.modules[mod_name] = types.ModuleType(mod_name)
+        _STUBBED.append(mod_name)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _remove_the_stubs_afterwards():
+    """Hand `sys.modules` back the way this file found it."""
+    yield
+    for name in _STUBBED:
+        sys.modules.pop(name, None)
 
 
 class TestImportPaths:
