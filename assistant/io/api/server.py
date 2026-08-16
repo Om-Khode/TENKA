@@ -338,7 +338,17 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     # instead of surfacing later as an exception inside a task somebody has to
     # remember to retrieve.
     sock = bind_listener(port, host)
-    task = serve_socket(app, sock, name="studio-api", primary=True)
+    try:
+        task = serve_socket(app, sock, name="studio-api", primary=True)
+    except BaseException:
+        # Nothing between the bind and the task takes ownership of the socket,
+        # so a raise here (a `uvicorn.Config` this build rejects, a loop that
+        # is not running) would leave the port bound with no task, no handle
+        # and no reference to close it -- and `_start_studio_daemon()` would
+        # swallow the exception into one warning, so the next attempt would
+        # then fail on a collision with nothing.
+        sock.close()
+        raise
 
     global _listeners
     _listeners = StudioListeners(app=app, tasks={"local": task},
