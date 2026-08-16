@@ -924,14 +924,32 @@ async def _tavily_recon_search(query: str) -> list[dict]:
     return []
 
 
+#: A recon query is a phrase naming a site or a task, never a document.
+_MAX_RECON_QUERY_CHARS = 400
+
+
 async def _url_recon(goal: str, *, planner_goal: str = "") -> str | None:
     if _URL_PATTERN.search(goal):
         return None
 
     # Build a richer search query: parent planner goal + GEO city
+    #
+    # 6a.5 review H3. `planner_goal` is preferred over the step goal here, so
+    # this line decides what text leaves the machine for a third-party search
+    # provider. The planner scrubs and caps the value before it is passed, but
+    # this is the site that actually egresses it, so it enforces the bound
+    # itself rather than trusting its caller -- a second caller added later
+    # inherits the control instead of having to remember it.
     search_query = goal
     if planner_goal and planner_goal != goal:
         search_query = planner_goal
+    search_query = re.sub(r"\s+", " ", search_query or "").strip()
+    if len(search_query) > _MAX_RECON_QUERY_CHARS:
+        logger.warning(
+            f"[DA] URL recon: query of {len(search_query)} chars is a "
+            f"document, not a search phrase — not sending it"
+        )
+        return None
     from ..core.geolocation import get_cached_region
     _geo = get_cached_region() or {}
     _city = _geo.get("city", "")

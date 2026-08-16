@@ -2,6 +2,7 @@
 unknown, reminders, avatar."""
 
 import logging
+import re
 import webbrowser
 from datetime import datetime
 
@@ -38,6 +39,24 @@ def handle_create_note(params: dict, llm_response: str) -> str:
     return personality_say("note_created", title=title)
 
 
+# 6a.5 review H1, sink-side hardening. The planner's egress guard decides
+# whether an untrusted step output may become a URL at all; this is the last
+# line before the address bar, and it applies on every path including the
+# direct intent one. Deliberately provenance-free and narrow: it rejects what
+# is never a legitimate navigation target rather than trying to judge hosts,
+# so "open localhost:3000" keeps working for the developer at the keyboard.
+_NON_WEB_SCHEME_RE = re.compile(
+    r"(?i)^\s*(?:javascript|data|file|vbscript|about|blob|chrome|res)\s*:")
+
+#: Credentials in the authority (`https://bank.example@evil.host`) are a
+#: phishing primitive and never appear in an honest link.
+_URL_USERINFO_RE = re.compile(r"(?i)^(?:https?://)?[^/?#]*@")
+
+#: A URL is one line. Anything with a newline in it is a document that
+#: reached this param, which is the shape the review's H1 attack produced.
+_MAX_URL_CHARS = 2048
+
+
 @tool_registry.decorator("open_browser")
 def handle_open_browser(params: dict, llm_response: str) -> str:
     """Open a URL in the default web browser."""
@@ -45,6 +64,19 @@ def handle_open_browser(params: dict, llm_response: str) -> str:
 
     if not url:
         return personality_say("need_url")
+
+    url = url.strip()
+
+    if (_NON_WEB_SCHEME_RE.match(url)
+            or len(url) > _MAX_URL_CHARS
+            or any(c in url for c in "\r\n\t")
+            or _URL_USERINFO_RE.match(url)):
+        logger.warning(
+            f"[BROWSER] Refused to open a value that is not a web URL: "
+            f"{url[:80]!r}"
+        )
+        return ("That doesn't look like a web address I should open, so I "
+                "didn't.")
 
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url

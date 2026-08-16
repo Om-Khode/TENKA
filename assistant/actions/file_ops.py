@@ -1,6 +1,7 @@
 """File operations handler: find, read, list, open, write, rename, move, delete."""
 
 import logging
+import re
 from pathlib import Path
 
 from .registry import tool_registry
@@ -18,27 +19,143 @@ def _set_pending_destructive(op: str, path: Path, extra: dict):
 
 _GROUNDED_OPS = frozenset({"write", "rename", "move", "delete"})
 
+#: Verbs that ground each destructive op in the user's own words. The op the
+#: model returns must be one the user actually asked for -- 6a.5 review H6
+#: confirmed a goal saying "read notes.txt" grounded a DELETE of notes.txt,
+#: because only `name` was ever checked. Generic English verbs, not app
+#: vocabulary, so a new app or service needs no row here.
+_OP_VERBS = {
+    "write":  ("write", "writing", "create", "creating", "save", "saving",
+               "store", "storing", "make", "put", "append", "overwrite",
+               "record", "jot", "note down", "add to", "export", "dump"),
+    "rename": ("rename", "renaming", "call it", "call the", "name it",
+               "name the", "retitle", "title it"),
+    "move":   ("move", "moving", "relocate", "transfer", "put", "shift",
+               "send it to", "drag"),
+    "delete": ("delete", "deleting", "remove", "removing", "erase", "trash",
+               "discard", "get rid of", "wipe", "clear out", "bin",
+               "throw away", "purge"),
+}
 
-def _ungrounded_destructive_name(op: str, name: str, goal: str) -> bool:
-    """True if a destructive op names a file the user's own words never did.
+#: A stem shorter than this is never enough on its own -- the review's
+#: `a.txt`, `s.ps1`, `do.exe`, `at.cmd`, `y.vbs` all grounded against an
+#: unrelated sentence purely because a substring matched.
+_MIN_STEM_CHARS = 4
+
+#: Common English function words long enough to clear the floor above. Also
+#: generic -- these are grammar, not any app's vocabulary.
+_STEM_STOPWORDS = frozenset({
+    "that", "this", "these", "those", "what", "when", "where", "which",
+    "they", "them", "their", "then", "than", "with", "from", "your", "yours",
+    "have", "here", "there", "into", "onto", "over", "under", "about",
+    "some", "same", "each", "every", "just", "only", "also", "been", "were",
+    "will", "would", "could", "should", "please", "thing", "things", "stuff",
+    "does", "done", "make", "made", "much", "more", "most", "very", "such",
+    "them", "else", "both", "want", "need", "know", "tell", "give", "take",
+})
+
+#: Anything that makes `name` more than a bare filename. The parse prompt
+#: already tells the model "plain filename only -- no directory, no full
+#: path" for these ops; this enforces it instead of hoping.
+_PATH_SHAPED_RE = re.compile(r"[\\/]|^[A-Za-z]:|\.\.")
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_.\-]+")
+
+
+def _goal_tokens(goal: str) -> set[str]:
+    """Filename-shaped tokens in the user's own words, lowercased."""
+    return {t.strip(".,;:!?").lower()
+            for t in _TOKEN_RE.findall(goal or "")}
+
+
+def _name_grounded(name: str, goal: str) -> bool:
+    """True if `name` was named by the user, by token match not substring.
+
+    Three rules, each closing one of the review's confirmed bypasses:
+
+      * The comparison is against TOKENS of the goal, not the raw string, so
+        `a.txt` no longer grounds against any sentence containing the letter
+        "a".
+      * The FULL basename including the extension grounds outright. A
+        stem-only match is still allowed, because the model legitimately
+        corrects "notes" to "notes.txt" -- but only when the goal does not
+        itself name that stem with a DIFFERENT extension, which is what let a
+        goal about `notes.txt` ground a write to `notes.exe`.
+      * A stem-only match additionally needs a stem that could plausibly be a
+        filename rather than a passing English word.
+    """
+    raw = (name or "").strip()
+    if not raw or _PATH_SHAPED_RE.search(raw):
+        return False
+
+    p = Path(raw)
+    full = p.name.strip().lower()
+    stem = p.stem.strip().lower()
+    suffix = p.suffix.strip().lower()
+    if not full or not stem:
+        return False
+
+    tokens = _goal_tokens(goal)
+    if full in tokens:
+        return True
+
+    # The goal named this stem with a different extension → the extension was
+    # swapped, which is exactly the escalation `notes.txt` → `notes.exe`.
+    for tok in tokens:
+        t = Path(tok)
+        if t.stem.lower() == stem and t.suffix and t.suffix.lower() != suffix:
+            return False
+
+    if len(stem) < _MIN_STEM_CHARS or stem in _STEM_STOPWORDS:
+        return False
+    return stem in tokens
+
+
+def _ungrounded_destructive(op: str, op_data: dict, goal: str) -> str:
+    """Return a reason string if a destructive op is not grounded, else "".
 
     Consulted only when a data block is attached, i.e. on the chained planner
     path where prior-step output — a file body someone else may have written —
     is in play. The op-extraction prompt sees that block, so a planted
     `{"op": "delete", "name": "taxes.pdf"}` can influence what comes back. The
-    prompt is told to take `name` only from the goal; this is the control that
-    does not depend on the model having listened.
+    prompt is told to take these fields only from the goal; this is the
+    control that does not depend on the model having listened.
 
-    Matching is on the stem so the model may still add or correct an extension
-    ("notes" → "notes.txt"), which it legitimately does. What it may not do is
-    invent a filename that appears nowhere in what the user actually said.
+    6a.5 review H6 widened this from `name` alone. `op`, `new_name` and `dest`
+    were never checked, so planted data could flip a READ of a file the user
+    named into a DELETE of it, or choose the rename target and the move
+    destination outright, and reach the confirmation gate looking like
+    something TENKA had proposed.
     """
     if op not in _GROUNDED_OPS:
-        return False
-    stem = Path(name.strip()).stem.strip().lower()
-    if not stem:
-        return False
-    return stem not in goal.lower()
+        return ""
+
+    lowered = (goal or "").lower()
+
+    # The verb itself. A goal that says "read notes.txt" grounds no
+    # destructive operation on notes.txt, however well the name matches.
+    if not any(v in lowered for v in _OP_VERBS[op]):
+        return f"the request never asked me to {op} anything"
+
+    if not _name_grounded(op_data.get("name", ""), goal):
+        return "that's not a file you asked me about"
+
+    # The rename target and the move destination are choices, and an
+    # unchecked choice is the attacker's choice.
+    new_name = (op_data.get("new_name") or "").strip()
+    if op == "rename" and new_name and not _name_grounded(new_name, goal):
+        return "you didn't tell me what to rename it to"
+
+    dest = (op_data.get("dest") or "").strip()
+    if dest and dest.lower() not in _goal_tokens(goal):
+        return "you didn't name that destination"
+
+    return ""
+
+
+def _ungrounded_destructive_name(op: str, name: str, goal: str) -> bool:
+    """Back-compatible single-field form. Prefer `_ungrounded_destructive`."""
+    return bool(_ungrounded_destructive(op, {"name": name}, goal))
 
 
 def _extract_explicit_path(text: str) -> Path | None:
@@ -305,13 +422,14 @@ async def handle_file_task(params: dict, llm_response: str, bridge=None) -> str:
     # Refuse before any path is resolved, so a planted filename never reaches
     # the filesystem or the confirmation prompt (where it would be shown to
     # the user as though TENKA had proposed it).
-    if context and _ungrounded_destructive_name(op, op_data.get("name", ""), goal):
+    _ungrounded = _ungrounded_destructive(op, op_data, goal) if context else ""
+    if _ungrounded:
         logger.warning(
-            f"[FILE] Refused '{op}' on a name absent from the user's request "
-            f"— likely injected via attached step data"
+            f"[FILE] Refused {op!r}: {_ungrounded} — likely injected via "
+            f"attached step data"
         )
-        return ("That's not a file you asked me about, so I'm leaving it "
-                "alone. Tell me directly if you meant it.")
+        return (f"{_ungrounded[0].upper()}{_ungrounded[1:]}, so I'm leaving "
+                f"it alone. Tell me directly if you meant it.")
 
     result_text = ""
 
@@ -567,12 +685,20 @@ async def handle_file_task(params: dict, llm_response: str, bridge=None) -> str:
     if not result_text:
         return "I completed the file operation but got no result."
 
+    # 6a.5 review H4. This is the FIRST laundering hop, inside the very tool
+    # the fence was built around: for `op == "read"`, `result_text` is the
+    # file's bytes, and they were interpolated bare directly under
+    # `The user asked: "{goal}"`. Whatever this model returns becomes
+    # `step.output`, i.e. the blob the next plan step inlines -- so a planted
+    # file got to write its own summary. Every instruction now precedes the
+    # data, and the data is fenced and labelled.
+    from ..code_executor.prompts import render_untrusted_block
     synth_prompt = (
         f"The user asked: \"{goal}\"\n\n"
-        f"Result:\n{result_text}\n\n"
-        f"Give a concise natural spoken response in 1-3 sentences. "
-        f"If it's a file read, summarize briefly. "
-        f"If find/list, mention what was found naturally."
+        f"Give a concise natural spoken response in 1-3 sentences, based only "
+        f"on the result below. If it's a file read, summarize briefly. "
+        f"If find/list, mention what was found naturally.\n\n"
+        + render_untrusted_block(result_text, label="file_operation_result")
     )
 
     answer = await ask_for_synthesis(synth_prompt, max_tokens=150)
