@@ -156,8 +156,9 @@ def test_the_two_transports_never_share_a_public_port():
     `--https` port, not on the local target it forwards to. Both adapters
     defaulting to 443 would let starting one silently overwrite the other's
     mapping -- and this milestone requires both to run at once, each with
-    its own capability ceiling. Pinned so a future edit cannot collapse the
-    two back onto one port."""
+    its own capability ceiling. Pins the exact assignment, not only that
+    they differ -- a swap (tailnet 443 / funnel 8443) would pass a mere
+    inequality check but still be wrong (fix round 2 minor)."""
     tailnet_argv = TailnetAdapter().command(8788)
     funnel_argv = FunnelAdapter().command(8789)
 
@@ -167,15 +168,42 @@ def test_the_two_transports_never_share_a_public_port():
     tailnet_port = _https_port(tailnet_argv)
     funnel_port = _https_port(funnel_argv)
     assert tailnet_port != funnel_port
+    assert tailnet_port == "8443"
+    assert funnel_port == "443"
     # Funnel is restricted by Tailscale itself to 443, 8443 or 10000
     # (https://tailscale.com/kb/1223/funnel).
     assert funnel_port in {"443", "8443", "10000"}
 
 
-def test_no_caller_supplied_string_reaches_the_command_line():
-    """`command()` builds argv from the integer port and module constants
-    only (spec §8's subprocess-injection row). A non-numeric string sneaking
-    in as *port* must be rejected outright, never formatted into the argv."""
+def test_a_stop_names_the_same_public_port_its_start_claimed():
+    """Fix round 2, Important 3: the argv with the highest blast radius in
+    this module had zero coverage. Derives both values from `command()` and
+    `stop_command()`'s own output -- never from the module constants -- so
+    a future edit that lets a `command()`/`stop_command()` pair drift apart
+    fails this test rather than silently leaving `off` pointed at the wrong
+    mapping."""
+    def _https_port(argv: list[str]) -> str:
+        return argv[argv.index("--https") + 1]
+
+    for adapter_cls in (TailnetAdapter, FunnelAdapter):
+        adapter = adapter_cls()
+        start_port = _https_port(adapter.command(8788))
+        stop_argv = adapter.stop_command(8788)
+        assert stop_argv is not None
+        assert _https_port(stop_argv) == start_port
+
+    assert _https_port(TailnetAdapter().stop_command(8788)) != _https_port(
+        FunnelAdapter().stop_command(8789)
+    )
+
+
+def test_a_non_numeric_string_is_rejected_before_it_can_reach_the_command_line():
+    """Renamed from `test_no_caller_supplied_string_reaches_the_command_line`
+    (fix round 2 minor): that name overclaimed -- `int("8788")` succeeds, so
+    a numeric *string* does reach `command()`, normalised through `int()`.
+    What actually must hold, and what this proves, is narrower: a
+    non-numeric string is rejected outright rather than formatted into the
+    argv (spec §8's subprocess-injection row)."""
     malicious = "8788; rm -rf /"
     with pytest.raises((TypeError, ValueError)):
         TailnetAdapter().command(malicious)  # type: ignore[arg-type]
@@ -184,24 +212,103 @@ def test_no_caller_supplied_string_reaches_the_command_line():
 
 
 # ─── Task 7: preflight -- KI-17 layer 2 ──────────────────────────────────────
+#
+# Ports used consistently across these tests, matching `listeners.py`'s real
+# offsets from a base port: local=8787, tailnet's own local target=8788,
+# funnel's own local target=8789; tailnet's public port=8443, funnel's=443.
+
+_LOCAL_PORT = 8787
+_TAILNET_TARGET = 8788
+_FUNNEL_TARGET = 8789
+_TAILNET_PUBLIC = 8443
+_FUNNEL_PUBLIC = 443
+
 
 def _load_fixture(name: str) -> dict:
     return json.loads((_FIXTURES / name).read_text(encoding="utf-8"))
 
 
 def test_preflight_refuses_a_stale_mapping_pointed_at_another_port():
-    payload = _load_fixture("serve_status_stale_mapping.json")
-    refusal = parse_serve_status(payload, expected_port=8788)
+    """This is the actual KI-17 scenario (fix round 2, Important 1): a
+    mapping -- here, under tailnet's own public port -- forwards straight
+    into the port `local` holds, regardless of which public port carries
+    it. This is unconditional and checked across every `Web` entry, not
+    only the caller's own."""
+    payload = _load_fixture("serve_status_local_port_danger.json")
+    refusal = parse_serve_status(
+        payload, verb="serve", public_port=_TAILNET_PUBLIC,
+        target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+    )
     assert refusal is not None
-    assert "8787" in refusal
+    assert str(_LOCAL_PORT) in refusal
     # Names the misconfiguration, never a hostname, token or path.
     assert "example-host" not in refusal
     assert "ts.net" not in refusal
+    # Never recommends the config-wide reset (fix round 2 minor).
+    assert "reset" not in refusal
+
+
+def test_preflight_refuses_our_own_mapping_pointed_elsewhere():
+    """A mapping under *this adapter's own* public port, proxying to some
+    local port that is neither `local`'s nor this adapter's own target, is
+    still a stale/wrong mapping and still refused -- but the refusal must
+    name *this* adapter's own verb, never hardcode 'serve' when `funnel`
+    asks (fix round 2 minor)."""
+    payload = {
+        "Web": {
+            "example-host.example-tailnet.ts.net:443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:9999"}}
+            }
+        }
+    }
+    refusal = parse_serve_status(
+        payload, verb="funnel", public_port=_FUNNEL_PUBLIC,
+        target_port=_FUNNEL_TARGET, local_port=_LOCAL_PORT,
+    )
+    assert refusal is not None
+    assert "9999" in refusal
+    assert "funnel" in refusal
+    assert "serve" not in refusal
+    # Warns what `reset` would destroy rather than recommending it as *the*
+    # fix -- the targeted `off` form is the one actually recommended.
+    assert "off" in refusal
+    assert "would also remove" in refusal
 
 
 def test_preflight_accepts_a_mapping_that_already_points_at_our_own_port():
     payload = _load_fixture("serve_status_own_port.json")
-    assert parse_serve_status(payload, expected_port=8788) is None
+    assert parse_serve_status(
+        payload, verb="serve", public_port=_TAILNET_PUBLIC,
+        target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+    ) is None
+
+
+def test_preflight_accepts_the_real_empty_status_this_machine_returns():
+    """`{}` is the only payload shape actually observed by running
+    `tailscale serve status --json` on this machine (fix round 2 minor) --
+    nothing configured, which must read as clear, not as unparseable."""
+    assert parse_serve_status(
+        {}, verb="serve", public_port=_TAILNET_PUBLIC,
+        target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+    ) is None
+
+
+def test_preflight_never_refuses_one_transport_for_the_others_own_mapping():
+    """Fix round 2, Important 1 -- the core regression: `tailnet` and
+    `funnel`'s mappings live in the same `Web` document (a funnel mapping is
+    a serve mapping with `AllowFunnel` set), so the original
+    `parse_serve_status` treated the sibling transport's own legitimate
+    mapping as offending. Both must read as clear when the other is already
+    configured correctly."""
+    payload = _load_fixture("serve_status_both_transports_configured.json")
+    assert parse_serve_status(
+        payload, verb="serve", public_port=_TAILNET_PUBLIC,
+        target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+    ) is None
+    assert parse_serve_status(
+        payload, verb="funnel", public_port=_FUNNEL_PUBLIC,
+        target_port=_FUNNEL_TARGET, local_port=_LOCAL_PORT,
+    ) is None
 
 
 def test_preflight_degrades_to_a_warning_on_output_it_cannot_parse(caplog):
@@ -210,7 +317,31 @@ def test_preflight_degrades_to_a_warning_on_output_it_cannot_parse(caplog):
     formatting change."""
     unrecognised = ["this", "is", "a", "list", "not", "the", "documented", "shape"]
     with caplog.at_level(logging.WARNING):
-        result = parse_serve_status(unrecognised, expected_port=8788)
+        result = parse_serve_status(
+            unrecognised, verb="serve", public_port=_TAILNET_PUBLIC,
+            target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+        )
+    assert result is None
+    assert any("tailscale" in record.message.lower() for record in caplog.records)
+
+
+def test_preflight_degrades_to_a_warning_on_a_malformed_proxy_port(caplog):
+    """Fix round 2, Important 2: `urlparse(...).port` raises `ValueError`
+    on an out-of-range or non-numeric port, and the original `except` tuple
+    (`AttributeError`, `TypeError`) let it escape `parse_serve_status`
+    uncaught -- a hard failure in exactly the direction the spec forbids."""
+    payload = {
+        "Web": {
+            "example-host.example-tailnet.ts.net:8443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:99999"}}
+            }
+        }
+    }
+    with caplog.at_level(logging.WARNING):
+        result = parse_serve_status(
+            payload, verb="serve", public_port=_TAILNET_PUBLIC,
+            target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+        )
     assert result is None
     assert any("tailscale" in record.message.lower() for record in caplog.records)
 
@@ -236,5 +367,8 @@ def test_a_hostname_outside_the_providers_own_domain_is_rejected():
     assert adapter.hostname_from("Available within your tailnet: https://evil.example.com/") is None
     # Suffix confusion: contains "ts.net" but does not end with it.
     assert adapter.hostname_from("https://laptop.ts.net.evil.com/") is None
+    # Userinfo confusion: `urlparse(...).hostname` resolves to "evil.com",
+    # not "laptop.tail1234.ts.net", so this must fail too.
+    assert adapter.hostname_from("https://laptop.tail1234.ts.net@evil.com/") is None
     # No URL on the line at all.
     assert adapter.hostname_from("Success.") is None
