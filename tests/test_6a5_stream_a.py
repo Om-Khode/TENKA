@@ -305,3 +305,44 @@ async def test_a_local_source_keeps_the_full_set_and_its_stt_timing():
     grants, stt_ms = main_mod._grants_for_item(("stt", "hello", 250))
     assert grants == frozenset(Capability)
     assert stt_ms == 250
+
+
+# ─── A6: pinning the pair-grant invariants, and G12's main.py half ───────
+def test_the_bootstrap_device_holds_execute():
+    """main.py issues the first Studio device `frozenset(Capability)`. If
+    someone 'fixes' that the way policy.py's enum-derived ceiling was fixed,
+    the operator's own desktop Studio silently loses code execution and it
+    reads as a bug rather than as a policy change."""
+    from assistant.core.capabilities import Capability
+    src = (_ROOT / "assistant" / "main.py").read_text(encoding="utf-8")
+    assert "frozenset(Capability)" in src
+    assert Capability.EXECUTE in frozenset(Capability)
+
+
+def test_a_code_carrying_execute_is_narrowed_when_redeemed_over_a_tunnel():
+    """routes/pairing.py computes effective(pair_code.grants, policy) at
+    redemption, using the ceiling of the listener the code arrives on. So a
+    tunnel cannot receive EXECUTE no matter what the code was minted with."""
+    from assistant.core.capabilities import Capability
+    from assistant.io.api.policy import POLICIES, effective
+    minted = frozenset(Capability)
+    for name in ("tailnet", "funnel", "quick"):
+        got = effective(minted, POLICIES[name])
+        assert Capability.EXECUTE not in got
+        assert Capability.SYSTEM_CONTROL not in got
+
+
+def test_chat_text_cannot_forge_a_line_in_the_debug_log():
+    """G12, main.py's half. A newline in chat text writes a second, fabricated
+    log line into the file an operator greps after an incident. `!r` makes the
+    newline visible as `\\n` inside one quoted line instead.
+
+    The plan named main.py:839 and :841; the real sites are the two
+    `Transcription (...)` lines, which had drifted. Found by content rather
+    than by line number so the next drift does not silently pass."""
+    src = (_ROOT / "assistant" / "main.py").read_text(encoding="utf-8")
+    sites = [line for line in src.splitlines()
+             if "redact_secrets(transcription)" in line]
+    assert sites, "the transcription log lines vanished -- retarget this test"
+    for line in sites:
+        assert "!r" in line, f"main.py interpolates chat text without !r: {line.strip()}"

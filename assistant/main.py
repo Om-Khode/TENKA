@@ -397,6 +397,16 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
 
         _studio_vault = TokenVault(config.SANDBOX_DIR)
         if not _studio_vault.devices():
+            # `frozenset(Capability)` is the same enum-derived spelling that
+            # Milestone 6a.5 deleted from policy.py's ceilings -- and here it
+            # is correct. This is the operator's own desktop Studio, on the
+            # loopback listener, and it should hold every capability
+            # including any added later; that is what "the person is at the
+            # machine" means. Do not "fix" it by applying policy.py's lesson
+            # uniformly: an explicit literal here would silently strip the
+            # operator's own client of EXECUTE the next time the enum grows,
+            # and it would read as a bug, not as a policy change. The ceiling
+            # is where transports are decided; this is a device.
             _studio_token = _studio_vault.issue("studio", frozenset(Capability))
             # The raw token goes to stdout ONLY -- a browser can't read a
             # file, so this is the one and only time the operator can
@@ -907,10 +917,17 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         _wake_listener.pause()
 
     try:
+        # `!r`, not hand-written quotes. A newline in the text used to end the
+        # log line and start a second one that an operator grepping debug.log
+        # after an incident would read as a real entry -- attacker-authored
+        # text choosing what the audit trail says. repr() escapes the newline
+        # to `\n` and keeps the whole thing on one quoted line. redact_secrets
+        # is the other half and does not cover this: it removes secrets, not
+        # line breaks.
         if source == "stt":
-            logger.info(f'Transcription (STT): "{redact_secrets(transcription)}"')
+            logger.info(f'Transcription (STT): {redact_secrets(transcription)!r}')
         else:
-            logger.info(f'Transcription (Chat): "{redact_secrets(transcription)}"')
+            logger.info(f'Transcription (Chat): {redact_secrets(transcription)!r}')
 
         # The turn has begun. See _publish_turn_status: this is a no-op for
         # every local source, and for "studio" it is the frame that replaces
