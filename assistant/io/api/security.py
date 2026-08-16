@@ -241,17 +241,77 @@ class AuditEntry:
     outcome: str
 
 
-class AuditLog:
-    """Append-only, bounded, in-memory. Surfaced read-only in settings."""
+# Long enough that no real route is ever truncated -- the deepest path this
+# daemon serves is well under a hundred characters, and the record has to stay
+# readable to be worth keeping. Short enough that the field is not a place a
+# caller can park kilobytes.
+_AUDIT_PATH_MAX = 200
+_AUDIT_TRUNCATED = "..."
 
-    def __init__(self, capacity: int = 2_000) -> None:
-        self._entries: deque[AuditEntry] = deque(maxlen=capacity)
+# The device id `audit_and_tag` writes when nothing authenticated. Named here
+# rather than spelled `"-"` in two files, because `AuditLog` now routes on it.
+ANONYMOUS_DEVICE_ID = "-"
+
+
+def sanitize_audit_path(path: str) -> str:
+    """The stored form of a caller-chosen path: bounded, and printable ASCII.
+
+    Every request is audited, including the ones that never authenticate, so
+    this field is written by anyone who can reach the port. Unbounded, it was
+    a place to park kilobytes; unfiltered, it was a place to put an ANSI escape
+    or a NUL that renders in whatever terminal an operator reads the record in.
+
+    Tab, CR and LF are already gone by the time this is called -- `request.url`
+    rebuilds the URL and re-parses it through `urllib.parse.urlsplit`, which
+    strips them -- and that control is pinned by its own passing test. This is
+    the rest of the class, and the backstop if that ever changes.
+    """
+    cleaned = "".join(c if 0x20 <= ord(c) <= 0x7E else "?" for c in path)
+    if len(cleaned) > _AUDIT_PATH_MAX:
+        return cleaned[:_AUDIT_PATH_MAX - len(_AUDIT_TRUNCATED)] + _AUDIT_TRUNCATED
+    return cleaned
+
+
+class AuditLog:
+    """Append-only, bounded, in-memory. Surfaced read-only in settings.
+
+    **Two rings, not one.** A single `deque(maxlen=2000)` made eviction a
+    primitive an unauthenticated caller held: a rate-limited request is still
+    audited, so the limiter never slows the flush below one entry per request
+    and ~2,000 anonymous requests flushed every authenticated entry out of the
+    record an operator reads after an incident. Splitting the rings by whether
+    anything authenticated means a flood can only erase other floods. Both
+    halves stay bounded -- the point is that they cannot reach each other, not
+    that either is unlimited.
+
+    `entries()` merges them back into one chronological sequence, by an
+    internal counter rather than by the `at` string: two entries can share a
+    timestamp, and `GET /v1/audit` reverses this list to show newest first, so
+    the order has to be exact rather than approximately right.
+    """
+
+    def __init__(self, capacity: int = 2_000,
+                 anonymous_capacity: int = 500) -> None:
+        self._seq = 0
+        self._entries: deque[tuple[int, AuditEntry]] = deque(maxlen=capacity)
+        self._anonymous: deque[tuple[int, AuditEntry]] = deque(
+            maxlen=anonymous_capacity)
 
     def record(self, entry: AuditEntry) -> None:
-        self._entries.append(entry)
+        # Sanitised here, at the store, rather than at each call site: there
+        # are three of them (two in the HTTP middleware, one in the event
+        # socket) and a fourth added later would otherwise reintroduce the
+        # hole silently.
+        entry = replace(entry, path=sanitize_audit_path(entry.path))
+        self._seq += 1
+        ring = (self._anonymous if entry.device_id == ANONYMOUS_DEVICE_ID
+                else self._entries)
+        ring.append((self._seq, entry))
 
     def entries(self) -> list[AuditEntry]:
-        return list(self._entries)
+        merged = sorted(list(self._entries) + list(self._anonymous),
+                        key=lambda pair: pair[0])
+        return [entry for _seq, entry in merged]
 
 
 @dataclass

@@ -45,6 +45,7 @@ from .routes import status as status_routes
 from .routes import system as system_routes
 from .runtime import StudioRuntime
 from .security import (
+    ANONYMOUS_DEVICE_ID,
     CSRF_HEADER,
     AuditEntry,
     AuthState,
@@ -455,16 +456,28 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                 device = getattr(request.state, "device", None)
                 request.app.state.auth.audit.record(AuditEntry(
                     at=datetime.now(timezone.utc).isoformat(),
-                    device_id=device.device_id if device else "-",
+                    device_id=(device.device_id if device
+                               else ANONYMOUS_DEVICE_ID),
                     method=request.method,
                     path=redact_secrets(request.url.path),
                     outcome="500",
                 ))
                 raise
             device = getattr(request.state, "device", None)
+            # `request.url.path`, deliberately, and not `scope["path"]` or
+            # `raw_path`. `request.url` rebuilds the URL and re-parses it with
+            # `urllib.parse.urlsplit`, which strips ASCII tab, CR and LF -- the
+            # only reason a caller-chosen path is not CRLF injection into the
+            # record an operator greps after an incident. The other two carry
+            # the bytes through untouched. A passing test pins this so that
+            # swapping it flips to failing.
+            #
+            # The length bound and the character class live in
+            # `AuditLog.record`, at the store, so every call site gets them.
             request.app.state.auth.audit.record(AuditEntry(
                 at=datetime.now(timezone.utc).isoformat(),
-                device_id=device.device_id if device else "-",
+                device_id=(device.device_id if device
+                           else ANONYMOUS_DEVICE_ID),
                 method=request.method,
                 path=redact_secrets(request.url.path),
                 outcome=str(response.status_code),
@@ -590,7 +603,8 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         def _audit(outcome: str) -> None:
             auth.audit.record(AuditEntry(
                 at=datetime.now(timezone.utc).isoformat(),
-                device_id=device.device_id if device else "-",
+                device_id=(device.device_id if device
+                           else ANONYMOUS_DEVICE_ID),
                 method="WS", path="/v1/events", outcome=outcome,
             ))
 

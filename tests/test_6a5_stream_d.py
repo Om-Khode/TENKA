@@ -187,3 +187,168 @@ def test_pairing_refuses_a_blank_origin(tmp_path):
     r = client.post("/v1/pair", json={"code": "000000"},
                     headers={"Origin": "   "})
     assert r.status_code == 403
+
+
+# ─── G9: the audit record's text is not the caller's to choose ───────────
+def _audit_scope(raw_path: bytes, path: str) -> dict:
+    """The ASGI scope uvicorn really builds, not the one `TestClient` builds.
+
+    `TestClient`'s httpx layer strips control characters out of a URL before
+    it ever reaches the app, so the CRLF half of this finding cannot be
+    expressed through it. uvicorn instead hands the app `unquote(raw_path)`
+    verbatim (`h11_impl.py:202`, `httptools_impl.py:260`), which is what this
+    reproduces.
+    """
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": raw_path,
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"host", f"127.0.0.1:{LOCAL_PORT}".encode())],
+        "client": ("127.0.0.1", 51234),
+        "server": ("127.0.0.1", LOCAL_PORT),
+        "state": {},
+    }
+
+
+async def _drive(app, scope: dict) -> list[dict]:
+    sent: list[dict] = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    await app(scope, receive, send)
+    return sent
+
+
+def test_an_anonymous_caller_cannot_choose_the_length_of_an_audit_record(tmp_path):
+    """A 3,004-character attacker-chosen `path` was stored and served verbatim
+    by `GET /v1/audit`. `audit_and_tag` records every request including the
+    ones that never authenticate, and the field had no length bound."""
+    from assistant.io.api.security import _AUDIT_PATH_MAX
+
+    vault = TokenVault(tmp_path)
+    client = _client(vault)
+    client.get("/v1/" + "a" * 3_000)
+    stored = client.app.state.auth.audit.entries()
+    assert stored, "sanity: the anonymous request was audited"
+    longest = max(len(e.path) for e in stored)
+    assert longest <= _AUDIT_PATH_MAX, (
+        f"an anonymous caller wrote a {longest}-character audit record")
+
+
+def test_an_ordinary_path_is_still_recorded_in_full(tmp_path):
+    """The cap must not collapse into recording nothing useful -- the record
+    is what an operator reads after an incident."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+    client.get("/v1/memory/knowledge")
+    paths = [e.path for e in client.app.state.auth.audit.entries()]
+    assert "/v1/memory/knowledge" in paths, paths
+
+
+def test_an_anonymous_flood_cannot_evict_the_authenticated_record(tmp_path):
+    """`AuditLog` was a single 2,000-entry `deque(maxlen=...)`, and a
+    rate-limited request is still audited -- so ~2,000 anonymous requests
+    flush every real entry and the limiter does not slow the flush below one
+    entry per request. Evidence deletion, from an unauthenticated caller.
+
+    Driven against a deliberately tiny ring so the shape is asserted in
+    milliseconds rather than by sending two thousand requests.
+    """
+    from assistant.io.api.security import AuditLog
+
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    client = _client(vault)
+    client.app.state.auth.audit = AuditLog(capacity=4, anonymous_capacity=4)
+
+    client.cookies.set(COOKIE_NAME, token)
+    client.get("/v1/status")                     # the real entry
+    client.cookies.clear()
+    for _ in range(30):                          # the flood
+        client.get("/v1/status")
+
+    stored = client.app.state.auth.audit.entries()
+    assert any(e.device_id != "-" for e in stored), (
+        "30 anonymous requests flushed the one authenticated entry out of the "
+        f"record: {[(e.device_id, e.outcome) for e in stored]}")
+
+
+def test_the_anonymous_ring_is_itself_still_bounded():
+    """Separating the rings must not turn the anonymous one into unbounded
+    memory a caller can grow for free."""
+    from assistant.io.api.security import AuditEntry, AuditLog
+
+    log = AuditLog(capacity=5, anonymous_capacity=5)
+    for i in range(50):
+        log.record(AuditEntry(at=f"t{i:03d}", device_id="-", method="GET",
+                              path="/v1/status", outcome="401"))
+    assert len(log.entries()) == 5
+
+
+def test_the_record_is_still_returned_oldest_first():
+    """`GET /v1/audit` reverses `entries()` to show newest first, so the two
+    rings have to be merged back into one chronological sequence -- not
+    concatenated, which would interleave the two histories wrongly."""
+    from assistant.io.api.security import AuditEntry, AuditLog
+
+    log = AuditLog(capacity=10, anonymous_capacity=10)
+    order = ["-", "dev-1", "-", "-", "dev-1", "dev-2"]
+    for i, device_id in enumerate(order):
+        log.record(AuditEntry(at=f"t{i:03d}", device_id=device_id,
+                              method="GET", path="/v1/status", outcome="200"))
+    assert [e.device_id for e in log.entries()] == order
+
+
+def test_an_anonymous_caller_cannot_write_newlines_into_the_audit_trail(tmp_path):
+    """Control -- this already holds, via `request.url`, which rebuilds the URL
+    and re-parses it with `urllib.parse.urlsplit`, which since CPython's WHATWG
+    fix strips ASCII tab, CR and LF outright.
+
+    Pinned as a *passing* test so that a future change from `request.url.path`
+    to `scope["path"]` or `raw_path` -- both of which carry the bytes through
+    untouched -- flips this to failing instead of quietly becoming real CRLF
+    injection into the file an operator greps after an incident.
+    """
+    import asyncio
+
+    vault = TokenVault(tmp_path)
+    client = _client(vault)
+    scope = _audit_scope(
+        raw_path=b"/v1/%0d%0aFAKE-AUDIT-LINE",
+        path="/v1/\r\nFAKE-AUDIT-LINE",
+    )
+    asyncio.run(_drive(client.app, scope))
+    stored = client.app.state.auth.audit.entries()
+    assert stored, "sanity: the ASGI-level request was audited"
+    # Sanity that the probe has teeth: the attacker's marker really did travel
+    # all the way into the record, so the absence of the CR and LF below is
+    # `urlsplit` stripping them and not the request having been refused
+    # somewhere upstream of the audit middleware.
+    assert any("FAKE-AUDIT-LINE" in e.path for e in stored), [e.path for e in stored]
+    for entry in stored:
+        assert "\n" not in entry.path and "\r" not in entry.path, repr(entry.path)
+
+
+def test_a_control_character_never_reaches_the_stored_path():
+    """The character class, asserted on the store, because the urlsplit control
+    above only covers tab/CR/LF -- a NUL or an ANSI escape reaching a terminal
+    that renders the record is the same class of forgery."""
+    from assistant.io.api.security import AuditEntry, AuditLog
+
+    log = AuditLog(capacity=5, anonymous_capacity=5)
+    log.record(AuditEntry(at="t0", device_id="-", method="GET",
+                          path="/v1/\x1b[2Kfake\x00", outcome="404"))
+    stored = log.entries()[0].path
+    assert all(0x20 <= ord(c) <= 0x7E for c in stored), repr(stored)
