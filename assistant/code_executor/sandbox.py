@@ -33,6 +33,36 @@ _BANNED_CALLS_TIER2: frozenset[tuple[str, str]] = frozenset({
 
 _BANNED_BUILTINS: frozenset[str] = frozenset({"eval", "exec", "compile", "__import__"})
 
+# ─── Process-spawn calls, banned at every tier and from every module ─────────
+# `_BANNED_CALLS_TIER*` bans a (module, attribute) *pair*, which bans a spelling
+# rather than a capability. `subprocess.Popen` is refused while `psutil.Popen`
+# — the same thing, from a package requirements.txt already installs into the
+# very interpreter `_run_tier2` spawns via sys.executable — was not. Verified:
+# Tier 1 ran `psutil.Popen(['cmd','/c','ver'])` and printed the Windows version.
+#
+# These names are refused wherever they are reached from, so a wrapper, an
+# alias, or a package nobody has heard of yet is caught by the same rule. No
+# package is named anywhere here: the ban is on the capability.
+_BANNED_CALL_ATTRS: frozenset[str] = frozenset({
+    "Popen", "popen", "startfile", "check_output", "check_call",
+    "fork", "forkpty", "kill", "killpg",
+    "execl", "execle", "execlp", "execlpe",
+    "execv", "execve", "execvp", "execvpe",
+    "spawnl", "spawnle", "spawnlp", "spawnlpe",
+    "spawnv", "spawnve", "spawnvp", "spawnvpe",
+    "create_subprocess_exec", "create_subprocess_shell",
+    "launch", "launch_persistent_context",
+})
+# Deliberately NOT prefix-matched on "exec": `cursor.execute(...)` is the
+# ordinary way to use a database, and a prefix rule would refuse every script
+# that touches one.
+#
+# "system" is not in the set either, because `platform.system()` returns a
+# string and is one of the most common calls there is. The discriminator is the
+# argument, not the name: a shell-out always takes one, `platform.system()`
+# never does. Handled separately in `_ast_scan`.
+_ARGUMENT_SENSITIVE_CALL_ATTRS: frozenset[str] = frozenset({"system"})
+
 _BANNED_IMPORTS_TIER1: frozenset[str] = frozenset({
     "subprocess", "shutil", "socket", "http", "urllib",
     "requests", "httpx", "ctypes", "multiprocessing",
@@ -47,9 +77,15 @@ _BANNED_IMPORTS_TIER1: frozenset[str] = frozenset({
 # winreg, subprocess). It cannot be a flat allow-list of names, because Tier 2
 # exists to run SDK work: `_ensure_packages` pip-installs whatever the route's
 # `requires` names — spotipy, google-api-python-client, python-docx — and a
-# fixed name list would refuse all of it. A third-party import is therefore
-# admitted: it can only resolve to something an earlier, code-controlled step
-# deliberately installed for this goal.
+# fixed name list would refuse all of it. So a third-party import is admitted.
+#
+# What that admission is NOT: a claim that a third-party import is safe. It is
+# not "only what _ensure_packages installed" either — requirements.txt is
+# installed into this same interpreter, so psutil and playwright are importable
+# with no install step at all, and psutil.Popen spawns processes just as well as
+# subprocess.Popen does. The capability is therefore blocked at the *call*, by
+# name, wherever it is reached from — see `_BANNED_CALL_ATTRS`. This allow-list
+# governs which module may be named; that set governs what may be done with it.
 _TIER2_ALLOWED_MODULES: frozenset[str] = frozenset({
     # Everything Tier 1 may have.
     "math", "statistics", "decimal", "fractions",
@@ -131,6 +167,11 @@ def _ast_scan(code: str, tier: int) -> str | None:
                 violation = _import_violation(name, tier)
                 if violation:
                     return violation
+            # `from x import Popen as q` renames the primitive, so the call site
+            # cannot be checked by name. Refusing the import is what catches it.
+            for alias in node.names:
+                if alias.name.split(".")[-1] in _BANNED_CALL_ATTRS:
+                    return f"BLOCKED: import of '{alias.name}' not allowed"
 
         if tier == 1 and isinstance(node, ast.Attribute):
             if node.attr in _TIER1_ESCAPE_ATTRS:
@@ -138,6 +179,11 @@ def _ast_scan(code: str, tier: int) -> str | None:
 
         if isinstance(node, ast.Call):
             func = node.func
+            called = getattr(func, "attr", None) or getattr(func, "id", None)
+            if called in _BANNED_CALL_ATTRS:
+                return f"BLOCKED: call to {called}() not allowed — process spawning"
+            if called in _ARGUMENT_SENSITIVE_CALL_ATTRS and (node.args or node.keywords):
+                return f"BLOCKED: call to {called}() with arguments not allowed"
             if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
                 pair = (func.value.id, func.attr)
                 if pair in banned_calls:
@@ -182,12 +228,18 @@ def _regex_imported_names(code: str) -> list[str]:
     return names
 
 
+_BANNED_CALL_ATTR_RE = re.compile(
+    r'\b(?:' + '|'.join(sorted(_BANNED_CALL_ATTRS)) + r')\s*\(')
+
+
 def _regex_scan_fallback(code: str, tier: int) -> str | None:
     """Fallback regex scan for code with syntax errors."""
     for name in _regex_imported_names(code):
         violation = _import_violation(name, tier)
         if violation:
             return violation
+    if _BANNED_CALL_ATTR_RE.search(code):
+        return "BLOCKED: unsafe code detected — process spawning"
 
     _PATTERNS_TIER1 = [
         r'\bos\.remove\b', r'\bos\.rmdir\b', r'\bos\.unlink\b', r'\bos\.system\b',
@@ -287,6 +339,12 @@ class _SafeModule:
         if attr in _TIER1_BLOCKED_MODULE_ATTRS:
             raise AttributeError(
                 f"BLOCKED: '{label}.{attr}' exposes interpreter internals")
+        if attr in _BANNED_CALL_ATTRS:
+            # Runtime half of the call-name ban. `psutil.Popen` is a public
+            # class attribute, not a submodule, so the submodule rule below
+            # never sees it — and Tier 1 really did spawn cmd.exe through it.
+            raise AttributeError(
+                f"BLOCKED: '{label}.{attr}' spawns or controls processes")
         value = getattr(object.__getattribute__(self, "_module"), attr)
         if isinstance(value, types.ModuleType):
             name = getattr(value, "__name__", attr)

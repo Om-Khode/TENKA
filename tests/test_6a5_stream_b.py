@@ -193,6 +193,116 @@ def test_the_regex_fallback_still_admits_requests():
     assert sandbox._regex_scan_fallback(broken, tier=2) is None
 
 
+# ─── B2b: a spawn primitive is a capability, not a spelling ──────────────────
+# The stdlib scoping in B2 admitted any non-stdlib import on the reasoning that
+# it could only resolve to something `_ensure_packages` deliberately installed.
+# That reasoning was wrong: requirements.txt is installed into the same
+# interpreter `_run_tier2` spawns via sys.executable, so every TENKA dependency
+# is importable with no install step at all. `psutil.Popen` is a subprocess
+# .Popen subclass, and `_BANNED_CALLS_TIER2` bans the *pair* ("subprocess",
+# "Popen") -- a spelling, not the capability.
+
+def test_a_spawn_primitive_is_importable_without_any_install_step():
+    """The premise of the finding, asserted rather than assumed: psutil ships in
+    requirements.txt, so it is already in the interpreter `_run_tier2` spawns --
+    no `_ensure_packages` step, no route that asked for it."""
+    import importlib
+    import psutil
+    assert importlib.util.find_spec("psutil") is not None
+    assert importlib.util.find_spec("playwright") is not None
+    assert callable(psutil.Popen)
+
+
+def test_tier2_blocks_a_spawn_primitive_reached_through_a_third_party_wrapper():
+    assert _ast_scan("import psutil\npsutil.Popen(['cmd', '/c', 'ver'])", tier=2) is not None
+
+
+def test_tier2_blocks_a_spawn_primitive_under_a_module_alias():
+    """An alias defeats any check keyed on the module name."""
+    assert _ast_scan("import psutil as p\np.Popen(['cmd'])", tier=2) is not None
+
+
+def test_tier2_blocks_a_spawn_primitive_imported_by_name():
+    assert _ast_scan("from psutil import Popen\nPopen(['cmd'])", tier=2) is not None
+
+
+def test_tier2_blocks_a_spawn_primitive_imported_under_an_alias():
+    """`from x import Popen as q` cannot be caught at the call site, so the
+    import of the name is what has to be refused."""
+    assert _ast_scan("from psutil import Popen as q\nq(['cmd'])", tier=2) is not None
+
+
+def test_tier2_blocks_a_browser_launch():
+    """playwright is installed for TENKA's own automation tier and launches
+    browser processes. Same class as psutil.Popen."""
+    code = ("from playwright.sync_api import sync_playwright\n"
+            "sync_playwright().start().chromium.launch()\n")
+    assert _ast_scan(code, tier=2) is not None
+
+
+def test_tier2_blocks_a_shell_out_however_it_is_spelled():
+    for snippet in ("import os\nos.startfile('x.exe')",
+                    "import os\nos.execv('cmd', [])",
+                    "import os\nos.spawnv(0, 'cmd', [])",
+                    "import asyncio\nasyncio.create_subprocess_shell('dir')"):
+        assert _ast_scan(snippet, tier=2) is not None, snippet
+
+
+def test_tier1_cannot_reach_a_spawn_primitive_through_an_allowed_module():
+    """psutil is on the Tier 1 allow-list, and Popen is a public class
+    attribute -- so _SafeModule's submodule rule never sees it."""
+    out = run_code("import psutil\nprint(psutil.Popen)", tier=1)
+    assert "BLOCKED" in out or "ERROR" in out, out
+
+
+def test_tier1_really_cannot_spawn_a_process():
+    """Behavioural, not just scanner-level: `cmd /c ver` is harmless, and a
+    returncode printed here is a process this sandbox started."""
+    out = run_code(
+        "import psutil\np = psutil.Popen(['cmd', '/c', 'ver'])\nprint(p.wait())",
+        tier=1)
+    assert "BLOCKED" in out or "ERROR" in out, out
+    assert "\n0" not in out, out
+
+
+def test_the_regex_fallback_also_blocks_a_spawn_primitive():
+    broken = "import psutil\npsutil.Popen(['cmd'])\nthis is not python("
+    assert _ast_scan(broken, tier=2) is not None
+    assert sandbox._regex_scan_fallback(broken, tier=2) is not None
+
+
+# Controls: over-blocking here breaks real Tier 2 goals.
+
+def test_psutil_still_works_for_what_it_is_on_the_list_for():
+    out = run_code("import psutil\nprint(type(psutil.cpu_percent()).__name__)", tier=1)
+    assert "float" in out or "int" in out, out
+    assert _ast_scan("import psutil\nprint(psutil.cpu_percent(), psutil.virtual_memory())",
+                     tier=2) is None
+
+
+def test_a_zero_argument_system_call_is_not_a_shell_out():
+    """`platform.system()` returns the string 'Windows'. `os.system(cmd)` runs
+    a command. The discriminator is the argument, not the name -- banning the
+    name outright would break the single most common platform call there is."""
+    assert _ast_scan("import platform\nprint(platform.system())", tier=2) is None
+    assert _ast_scan("import platform\nprint(platform.system())", tier=1) is None
+    assert _ast_scan("import os\nos.system('dir')", tier=2) is not None
+
+
+def test_execute_is_not_exec():
+    """No prefix matching on 'exec': `cursor.execute(...)` is the ordinary way
+    to use sqlite3, and a prefix rule would refuse every database script."""
+    assert _ast_scan("import sqlite3\nc = sqlite3.connect(':memory:')\n"
+                     "c.execute('select 1')", tier=2) is None
+
+
+def test_the_legitimate_sdk_imports_still_pass():
+    """The B2 control, re-asserted after the call-name ban: importing an SDK
+    was never the problem, spawning from one was."""
+    assert _ast_scan("import spotipy\nfrom docx import Document\n"
+                     "import requests\nrequests.get('https://x')", tier=2) is None
+
+
 # ─── B3: the Tier 2 environment allow-list ───────────────────────────────────
 
 def test_tier2_does_not_copy_the_real_process_environment():
