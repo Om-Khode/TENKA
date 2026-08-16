@@ -865,7 +865,17 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                 pass
 
         await websocket.accept()
-        await app.state.hub.attach(websocket, _viewer)
+        # `device_id` is what arms the per-device socket cap; without it only
+        # the global one is live, and one device could hold every slot. The
+        # hub answers `False` when either cap is already full -- refuse here
+        # rather than proceeding, because an unattached socket would sit in
+        # the receive loop forever receiving nothing and looking healthy.
+        if not await app.state.hub.attach(websocket, _viewer,
+                                          device_id=device.device_id):
+            logger.info(f"[API] refused /v1/events, socket cap reached "
+                        f"(device={device.device_id})")
+            await websocket.close(code=1013)   # try again later
+            return
         try:
             info = await app.state.runtime.system.status()
             # Same builder as every real status frame (`build_status_frame`,
@@ -904,6 +914,14 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                     # channel carrying status and telemetry (see events.py
                     # for what actually flows here today).
                     parsed = False
+
+                # A frame arrived, so this connection is alive whether or not
+                # the frame parsed. The hub otherwise judges liveness only by
+                # what it manages to *send*, which would reap a device that
+                # talks to her constantly while she happens to have nothing to
+                # say. Recorded before the authorisation check below: this is
+                # a statement about the socket, not about the device's rights.
+                app.state.hub.note_activity(websocket)
 
                 # ─── every inbound frame re-proves the device ─────────────
                 # This check used to sit below the `type != "abort"` filter,
