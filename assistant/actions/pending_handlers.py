@@ -493,12 +493,20 @@ async def handle_pending_knowledge_approval(text: str, bridge=None) -> str | Non
     """
     import assistant.actions as _act
 
+    # Inactive means "no proposal is waiting", full stop. This used to pop
+    # `code_executor`'s queue and arm the state right here, in the same call
+    # that then read the message as the answer -- which made this row
+    # structurally exempt from the owner check in `main.py`'s dispatch loop.
+    # That check asks `state.active`, and `state.active` was False at exactly
+    # the moment it was asked, every time; the owner was then recorded a frame
+    # later by whoever had just spoken. So any caller that could reach this row
+    # became the owner of the operator's knowledge proposal by answering it.
+    #
+    # The arming moved to `code_executor.retry._arm_knowledge_approval`, which
+    # runs inside the turn that produced the proposal and therefore records
+    # that turn's principal. See KI-13.
     if _act.pending_knowledge_approval.payload is None:
-        from ..code_executor import pop_pending_knowledge
-        entry = pop_pending_knowledge()
-        if entry is None:
-            return None
-        _act.pending_knowledge_approval.set(entry)
+        return None
 
     text_low = text.strip().lower()
 

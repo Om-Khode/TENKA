@@ -523,6 +523,7 @@ async def _save_success_knowledge(service: str, slug: str,
             "pattern": pattern,
             "reason": reason,
         })
+        _arm_knowledge_approval()
         from .. import knowledge
         return knowledge.render_for_user(pattern, reason)
 
@@ -539,7 +540,52 @@ _pending_knowledge_queue: list[dict] = []
 
 
 def pop_pending_knowledge() -> dict | None:
-    """Pop the next pending knowledge entry. Called by actions.py."""
+    """Pop the next pending knowledge entry.
+
+    Called by `_arm_knowledge_approval` below, and no longer by
+    `handle_pending_knowledge_approval` -- see that function's own comment for
+    why the pop moved up here.
+    """
     if _pending_knowledge_queue:
         return _pending_knowledge_queue.pop(0)
     return None
+
+
+def _arm_knowledge_approval() -> None:
+    """Arm `pending_knowledge_approval` here, inside the turn that produced it.
+
+    `handle_pending_knowledge_approval` used to do this itself: when the state
+    was inactive it popped the queue, armed the state, and treated the *same*
+    message as the yes/no answer, all in one call. That made row ten of
+    `main.py`'s `_PENDING_HANDLERS` structurally exempt from the owner check
+    that closes KI-13 -- the loop asks `state.active`, which was False at that
+    instant, so the check was a no-op every single time and the owner was then
+    recorded a frame later by whoever had just spoken. A paired device saying
+    "yes" to something else entirely could walk down the table and have row
+    ten turn it into a write to the operator's knowledge base.
+
+    Arming at the moment the proposal is *created* fixes the shape rather than
+    the symptom: this runs inside `execute_code_task`, which every caller
+    reaches through `actions.execute()`, so the ambient `current_principal` is
+    the person or device whose run produced the lesson -- and only they can
+    approve it. A handler that arms its own state as a side effect of being
+    asked cannot be owner-checked by anything, so no row may do it.
+
+    Reached through `pending_registry` rather than by importing
+    `assistant.actions`: `code_executor/` sits below `actions/`, and the
+    registry is exactly the by-name handle that exists so it does not have to.
+    """
+    entry = pop_pending_knowledge()
+    if entry is None:
+        return
+    from ..pending import pending_registry
+    state = pending_registry.get("knowledge_approval")
+    if state is None:
+        # Only reachable if `assistant.actions` was never imported, which no
+        # real turn can manage. Loud rather than silent: the proposal would
+        # otherwise be unapprovable and look like TENKA forgot it.
+        logger.warning(
+            "[CODE] knowledge_approval state is not registered -- the "
+            "proposal cannot be approved")
+        return
+    state.set(entry)

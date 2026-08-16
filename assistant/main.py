@@ -251,7 +251,7 @@ class _StudioDispatch:
         return self._busy
 
     async def submit(self, text: str, grants: "frozenset[Capability]",
-                     principal: "str | None") -> tuple[str, str, bool, str]:
+                     principal: str) -> tuple[str, str, bool, str]:
         if self._busy:
             return ("", "", False, "busy")
         self._busy = True
@@ -782,6 +782,18 @@ on exactly that reasoning.
 # alternative and it is wrong -- `handle_pending_incoming_message` reads
 # `pending_incoming_messages`, so the derivation is already broken on row nine
 # and would fail open exactly where nobody looks.
+#
+# THE INVARIANT THAT COLUMN DEPENDS ON: a handler may not arm its own state as
+# a side effect of being asked. The loop checks ownership by reading
+# `state.active` *before* calling the handler, so a handler that arms itself
+# when it finds the state inactive is exempt from the check by construction --
+# it is False at the only moment anyone looks, and the owner is then recorded
+# a frame later by whoever just spoke. Row ten did precisely that until
+# `code_executor.retry._arm_knowledge_approval` took the arming over, and a
+# device saying "yes" to something else could walk the table and have row ten
+# turn it into a write to the operator's knowledge base.
+# `tests/test_6b_principal.py::test_no_pending_handler_arms_its_own_state_lazily`
+# is what stops the next row copying the pattern.
 
 from .actions import (
     handle_pending_destructive, handle_pending_camera_settings,
@@ -849,6 +861,13 @@ It is spoken, so: under 120 characters, no paths, no error codes, and it never
 names the device that tried. "Something else" is deliberate -- the operator
 needs to know her confirmation was reached for, and naming the reacher would
 turn one leak into two.
+
+Delivered **only to `LOCAL_PRINCIPAL`**. `owned_by` is symmetric, so a device
+can own a pending state, and telling a device owner whether anyone else spoke
+during its window is a presence oracle about the operator that anyone holding
+a pairing can query on demand by arming a long confirmation. The operator is
+the audience KI-13 names; she is also the only one who can be told this
+without it becoming the next finding.
 """
 
 
@@ -1286,9 +1305,17 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 from .actions import handle_pending_teaching
                 _teach_resp = await handle_pending_teaching(transcription)
                 if _teach_resp is not None:
+                    # Local principal only -- see the twin in the dispatch
+                    # loop below for why a device owner is told nothing: it
+                    # would be a presence oracle about the operator.
                     _teach_foreign = _teaching.take_foreign_attempts()
                     if _teach_foreign:
-                        _teach_resp = f"{_teach_resp} {_FOREIGN_ATTEMPT_NOTICE}"
+                        logger.warning(
+                            f"[TEACH] {_teach_foreign} foreign step "
+                            f"attempt(s) while this session was open")
+                        if _principal == _actions_module.LOCAL_PRINCIPAL:
+                            _teach_resp = (
+                                f"{_teach_resp} {_FOREIGN_ATTEMPT_NOTICE}")
                     _teach_emo, _ = llm.parse_emotion_tag(_teach_resp)
                     await _respond(_teach_resp, "teach", _teach_emo or "happy")
                     _tracker.intent_detected = "teaching"
@@ -1586,12 +1613,25 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 # Only the owner reaches this line -- the check above skipped
                 # everyone else -- so there is no path on which the notice is
                 # delivered to the party it is about.
+                #
+                # Spoken only to the LOCAL principal, and that is a security
+                # constraint rather than a cosmetic one. `owned_by` is
+                # symmetric, so a *device* can be an owner; a device that arms
+                # a long confirmation (`pending_backup_oauth` runs 300s) and
+                # then answers it would otherwise be told whether anyone else
+                # spoke during the window. That is a repeatable, on-demand
+                # presence oracle about the operator, obtainable by arming a
+                # confirmation and waiting -- the same disclosure the
+                # capability skip above refuses to make, pointed the other
+                # way. The counter is still drained for every owner, and the
+                # WARNING below is the record for all of them.
                 _foreign = state.take_foreign_attempts()
                 if _foreign:
                     logger.warning(
-                        f"[{label}] Reporting {_foreign} foreign answer "
-                        f"attempt(s) to the owner")
-                    resp = f"{resp} {_FOREIGN_ATTEMPT_NOTICE}"
+                        f"[{label}] {_foreign} foreign answer attempt(s) "
+                        f"while this state was armed")
+                    if _principal == _actions_module.LOCAL_PRINCIPAL:
+                        resp = f"{resp} {_FOREIGN_ATTEMPT_NOTICE}"
                 parsed_emotion, _ = llm.parse_emotion_tag(resp)
                 if parsed_emotion is None:
                     # Pending responses are hardcoded strings — infer emotion cheaply

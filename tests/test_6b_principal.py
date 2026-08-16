@@ -310,7 +310,7 @@ async def test_a_device_can_answer_its_own_confirmation(turn, monkeypatch):
 # ═════════════════════════════════════════════════════════════════════════
 
 @pytest.mark.asyncio
-async def test_a_mismatch_is_refused_loudly_not_silently_ignored(
+async def test_a_mismatch_is_not_silently_ignored_the_owner_is_told(
         turn, monkeypatch):
     """A dropped confirmation reads as a timeout to whoever armed it and as
     nothing at all to whoever tried to answer. KI-13 asks for the opposite,
@@ -399,9 +399,10 @@ async def test_the_owner_is_told_once_not_on_every_later_answer(
     notice that repeated on every subsequent answer would be noise, and noise
     is how a real warning gets ignored."""
     from assistant import main as main_mod
+    from assistant.actions import LOCAL_PRINCIPAL
 
     answered, spy = _spy()
-    state = _arm("destructive", _A_DEVICE)
+    state = _arm("destructive", LOCAL_PRINCIPAL)
     monkeypatch.setattr(main_mod, "_PENDING_HANDLERS", _one_row(spy, state))
 
     # Two foreign attempts, then two answers by the owner.
@@ -409,15 +410,50 @@ async def test_the_owner_is_told_once_not_on_every_later_answer(
     await turn("yes", _remote_grants(), _ANOTHER_DEVICE)
     assert answered == []
 
-    first = await turn("yes", _remote_grants(), _A_DEVICE)
+    first = await turn("yes", _local_grants(), LOCAL_PRINCIPAL, source="stt")
     said = [a[2] for a, _ in first.saved if len(a) > 2]
     assert main_mod._FOREIGN_ATTEMPT_NOTICE in said[-1], said[-1]
 
-    second = await turn("yes", _remote_grants(), _A_DEVICE)
+    second = await turn("yes", _local_grants(), LOCAL_PRINCIPAL, source="stt")
     said = [a[2] for a, _ in second.saved if len(a) > 2]
     assert main_mod._FOREIGN_ATTEMPT_NOTICE not in said[-1], (
         "the owner was told again about attempts she has already heard "
         f"about: {said[-1]!r}")
+
+
+@pytest.mark.asyncio
+async def test_a_device_owner_is_never_told_who_else_was_talking(
+        turn, monkeypatch):
+    """`owned_by` is symmetric, so a *device* can own a pending state -- and a
+    device owner that could be told "something else tried to answer" would
+    hold a presence oracle about the operator: arm a long confirmation
+    (`pending_backup_oauth` runs 300 seconds), wait, answer, and learn whether
+    anyone else spoke to TENKA in that window. Repeatable on demand by anyone
+    holding a pairing.
+
+    That is the same disclosure the capability skip in the dispatch loop
+    refuses to make, pointed the other way. The notice goes to
+    `LOCAL_PRINCIPAL` and nobody else; the WARNING log is the record for every
+    owner."""
+    from assistant import main as main_mod
+    from assistant.actions import LOCAL_PRINCIPAL
+
+    answered, spy = _spy()
+    state = _arm("destructive", _A_DEVICE)
+    monkeypatch.setattr(main_mod, "_PENDING_HANDLERS", _one_row(spy, state))
+
+    # The operator speaks while the device's confirmation is open...
+    await turn("what is the weather", _local_grants(), LOCAL_PRINCIPAL,
+               source="stt")
+    assert answered == [], "the operator drove the device's confirmation"
+
+    # ...and the device answers its own question and learns nothing about it.
+    out = await turn("yes", _remote_grants(), _A_DEVICE)
+    assert answered == ["yes"], "the device could not answer its own question"
+    said = [a[2] for a, _ in out.saved if len(a) > 2]
+    assert main_mod._FOREIGN_ATTEMPT_NOTICE not in said[-1], (
+        "a device owner was told whether the operator was at the machine: "
+        f"{said[-1]!r}")
 
 
 @pytest.mark.asyncio
@@ -465,6 +501,45 @@ async def test_the_teaching_session_answer_site_follows_the_same_rule(
         f"the owner was never told her session was reached for: {said[-1]!r}")
 
 
+def test_a_bare_arm_inherits_the_turns_principal():
+    """The load-bearing default of the entire design, and it had no test.
+
+    Fifteen of the ~17 arming sites in the tree are bare `state.set(payload)`
+    calls inside `actions/` handlers, several frames below the turn that
+    authorised them. They record an owner only because `set()` consumes
+    `current_principal` when none is passed. Change that default to `None` and
+    every confirmation in the product silently stops working; change it to
+    `LOCAL_PRINCIPAL` and KI-13 silently reopens with a device inheriting the
+    operator's identity. Neither turned anything red before this test.
+    """
+    from assistant.actions import LOCAL_PRINCIPAL, current_principal, set_principal
+    from assistant.pending import PendingState
+
+    state = PendingState("probe_ambient", timeout=60.0)
+
+    token = set_principal(_A_DEVICE)
+    try:
+        state.set({"op": "delete"})
+    finally:
+        current_principal.reset(token)
+    assert state.principal == _A_DEVICE, (
+        "a bare arm did not consume the turn's principal -- every handler in "
+        "actions/ arms this way, so nothing they arm would have an owner")
+    assert state.owned_by(_A_DEVICE) is True
+    assert state.owned_by(LOCAL_PRINCIPAL) is False, (
+        "a device-armed state was answerable from the console")
+
+    # Nothing installed: the fallback must not invent an owner.
+    token = set_principal(None)
+    try:
+        state.set({"op": "delete"})
+    finally:
+        current_principal.reset(token)
+    assert state.principal is None, (
+        f"an arm outside any turn invented an owner: {state.principal!r}")
+    assert state.owned_by(LOCAL_PRINCIPAL) is False
+
+
 def test_an_unset_principal_owns_nothing():
     """The fail-closed default, and it matches `current_grants`' exactly: the
     absence of a decision is not a decision to allow. A state armed with no
@@ -496,16 +571,29 @@ def test_an_unset_principal_owns_nothing():
 # ═════════════════════════════════════════════════════════════════════════
 
 def _pending_state_attribute_names() -> "set[str]":
-    """Every attribute name in `assistant.actions` bound to a PendingState.
+    """Every name bound to a PendingState in `assistant.actions` OR in
+    `assistant.main`'s own namespace.
 
-    Derived from the live module, not typed out here. A hand-written list of
+    Derived from the live modules, not typed out here. A hand-written list of
     state names is the same failure mode as a hand-written list of arming
     sites, one level down.
+
+    `main` is unioned in and that is not belt-and-braces -- it is the hole
+    this walk had. `main.py` binds fifteen module-level aliases for the table
+    (`from .actions import pending_destructive as _s_destructive, ...`), so
+    `_s_destructive.set(payload)` is the spelling closest to hand for anyone
+    editing that file, and it resolves to a name `vars(actions)` has never
+    heard of. The walk skipped it in silence and passed. Both spellings now
+    resolve, and the injection check in this file's docstring was re-run with
+    the `_s_*` one specifically.
     """
-    from assistant import actions
+    from assistant import actions, main
     from assistant.pending import PendingState
-    return {name for name, obj in vars(actions).items()
-            if isinstance(obj, PendingState)}
+    names = {name for name, obj in vars(actions).items()
+             if isinstance(obj, PendingState)}
+    names |= {name for name, obj in vars(main).items()
+              if isinstance(obj, PendingState)}
+    return names
 
 
 def _arming_calls_in(path: pathlib.Path):
@@ -558,6 +646,83 @@ def test_every_arming_site_records_a_principal():
         "Pass `principal=` -- `LOCAL_PRINCIPAL` for anything this machine "
         "arms on its own behalf. A state with no owner is answerable by "
         "nobody, which reads as a timeout.")
+
+
+def test_no_pending_handler_arms_its_own_state_lazily():
+    """The invariant the sixth column depends on, and the one row ten broke.
+
+    The dispatch loop asks `state.active` BEFORE calling the handler. A
+    handler that responds to an inactive state by arming it -- and then reads
+    the same message as the answer, in the same call -- is exempt from the
+    owner check by construction: the check looked at the only moment the
+    answer was False, and the owner gets recorded a frame later by whoever
+    just spoke. `handle_pending_knowledge_approval` did exactly that; a device
+    saying "yes" to something else could walk the table and have row ten turn
+    it into a write to the operator's knowledge base.
+
+    Structural, because a comment saying "don't do this" is what the next row
+    that copies the pattern will not read. The shape is unmistakable: a `.set(`
+    inside an `if` whose test asks whether the state is inactive.
+    """
+    import inspect
+    import textwrap
+    from assistant import main as main_mod
+
+    _INACTIVE_TESTS = ("payload is None", "not ", "is None")
+
+    offenders = []
+    for handler, label, _mi, _nb, _cap, _state in main_mod._PENDING_HANDLERS:
+        try:
+            src = textwrap.dedent(inspect.getsource(handler))
+        except (OSError, TypeError):  # pragma: no cover - stdlib-less handler
+            continue
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            test_src = ast.unparse(node.test)
+            if not (("payload" in test_src or "active" in test_src)
+                    and any(t in test_src for t in _INACTIVE_TESTS)):
+                continue
+            arms = [n for n in ast.walk(node)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Attribute)
+                    and n.func.attr == "set"]
+            if arms:
+                offenders.append((label, handler.__name__, test_src))
+
+    assert not offenders, (
+        "pending handlers that arm their own state when they find it "
+        f"inactive: {offenders}. The dispatch loop reads `state.active` "
+        "before calling the handler, so such a row can never be owner-checked "
+        "-- arm the state where the thing being confirmed is produced, inside "
+        "the turn that produced it, the way "
+        "`code_executor.retry._arm_knowledge_approval` does.")
+
+
+def test_a_studio_item_with_no_principal_slot_owns_nothing():
+    """The identity twin of `_grants_for_item`'s missing-slot rule. Nothing
+    produces such an item today, which is exactly why it needs pinning: a lost
+    principal must be refused, never promoted to the local one. Promoting it
+    would hand a turn of unknown provenance the operator's own confirmations."""
+    from assistant import main as main_mod
+    from assistant.actions import LOCAL_PRINCIPAL
+
+    assert main_mod._principal_for_item(("studio", "hello")) is None
+    assert main_mod._principal_for_item(("studio", "hello", frozenset())) is None
+    assert main_mod._principal_for_item(
+        ("studio", "hello", frozenset(), 12345)) is None, (
+        "a non-string in the principal slot was accepted as an identity")
+    assert main_mod._principal_for_item(
+        ("studio", "hi", frozenset(), _A_DEVICE)) == _A_DEVICE
+
+    # Local sources have no fourth slot and never need one.
+    assert main_mod._principal_for_item(("stt", "hello", 250)) == LOCAL_PRINCIPAL
+    assert main_mod._principal_for_item(("chat", "hello")) == LOCAL_PRINCIPAL
+
+    # A source nobody has added yet owns nothing -- `_LOCAL_SOURCES` is a
+    # literal allow-list, not `!= "studio"`.
+    assert main_mod._principal_for_item(("sms", "hello")) is None
 
 
 @pytest.mark.asyncio

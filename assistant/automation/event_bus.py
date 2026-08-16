@@ -297,10 +297,16 @@ class EventBus:
         # core/intent_capabilities.py), so whoever installed this one already
         # held it, and the machine it fires on is this one.
         #
-        # The principal is stated for the matching reason: a monitor that
-        # fires and asks a question (`pending_monitor_disambig` is armed from
-        # exactly this path) must arm it as somebody, or the operator cannot
-        # answer the thing her own machine just asked her.
+        # The principal is stated for the matching reason, and as
+        # defence-in-depth rather than to fix a live path: nothing armed from
+        # here today asks the user anything (`pending_monitor_disambig` is
+        # armed by `event_monitoring._set_disambig`, reached from
+        # `pause_monitor` and its siblings under the `manage_monitor` intent,
+        # inside an ordinary turn that already has a principal). But
+        # `code_executor` can arm one -- `_arm_knowledge_approval` does -- and
+        # a state armed here without a principal would be owned by nobody and
+        # answerable by nobody, which reads as TENKA forgetting rather than as
+        # a bug.
         token = set_grants(LOCAL_GRANTS)
         ptoken = set_principal(LOCAL_PRINCIPAL)
         try:
