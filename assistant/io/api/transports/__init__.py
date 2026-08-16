@@ -84,10 +84,10 @@ transport_registry = TransportRegistry()
 # the same shape `llm/providers/__init__.py` uses for `gemini`, `groq`,
 # `cerebras`, `ollama`.
 #
-# Neither provider exists yet. Task 7 (`tailscale.py`, adds `TailnetAdapter`
-# and `FunnelAdapter`) and Task 8 (`cloudflare.py`, adds `QuickAdapter`) each
-# add their own `from . import <module>  # noqa: E402, F401` line here, once
-# their module exists. Importing a module that is not yet written would
-# fail the whole package import, so the lines are deferred to those tasks
-# rather than stubbed out in advance.
+# Both providers now exist: `tailscale.py` registers `tailnet` and `funnel`
+# (Task 7), `cloudflare.py` registers `quick` (Task 8). A fourth provider adds
+# its own `from . import <module>  # noqa: E402, F401` line here and nothing
+# else -- importing a module that is not yet written would fail the whole
+# package import, so a line is only ever added once its module lands.
 from . import tailscale  # noqa: E402, F401
+from . import cloudflare  # noqa: E402, F401
