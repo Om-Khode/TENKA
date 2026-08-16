@@ -94,3 +94,27 @@ class FakeTerminator:
 def fake_terminator():
     """Reusable FakeTerminator instance for manifest-based primitive/dispatcher tests."""
     return FakeTerminator()
+
+
+# ─── Capability grants (Milestone 6a.5) ──────────────────────────────────
+@pytest.fixture
+def full_grants():
+    """Run the test as a caller sitting at this machine.
+
+    `actions.execute()` refuses when `current_grants` is unset -- the absence
+    of a decision is not a decision to allow -- so a test that drives a real
+    intent through dispatch has to say who is driving it. This says "the
+    operator", which is what every pre-6a.5 test implicitly assumed.
+
+    **Deliberately not autouse.** An autouse version would hand every test in
+    the suite full privileges, including the ones in
+    `tests/test_6a5_stream_a.py` whose entire job is to prove that an unset
+    grant set refuses. The fail-closed default has to stay observable from
+    inside the test suite, or the test that guards it guards nothing.
+    """
+    from assistant import actions
+    token = actions.set_grants(actions.LOCAL_GRANTS)
+    try:
+        yield actions.LOCAL_GRANTS
+    finally:
+        actions.current_grants.reset(token)

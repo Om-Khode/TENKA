@@ -145,3 +145,95 @@ def test_intent_capabilities_imports_only_the_enum():
             raise AssertionError(f"unexpected plain import: {ast.dump(node)}")
         if isinstance(node, ast.ImportFrom):
             assert node.module in ("capabilities", "__future__"), node.module
+
+
+# ─── A4: enforcement at the dispatch choke point ─────────────────────────
+@pytest.mark.asyncio
+async def test_a_chat_send_only_device_cannot_reach_code_executor():
+    from assistant.core.capabilities import Capability
+    from assistant import actions
+    token = actions.set_grants(frozenset({Capability.CHAT_SEND}))
+    try:
+        result = await actions.execute("code_executor", {"goal": "print(1)"}, "")
+    finally:
+        actions.current_grants.reset(token)
+    assert "permission" in result.lower()
+    assert "execute" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_chat_send_only_device_can_still_reach_small_talk():
+    """The refusal must not collapse into refusing everyone."""
+    from assistant.core.capabilities import Capability
+    from assistant import actions
+    token = actions.set_grants(frozenset({Capability.CHAT_SEND}))
+    try:
+        result = await actions.execute("small_talk", {}, "hello there")
+    finally:
+        actions.current_grants.reset(token)
+    assert "permission" not in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_unset_grants_is_a_hard_failure_not_full_access():
+    """The single most dangerous failure mode in this milestone: a turn that
+    reaches dispatch without anyone deciding what it may do must refuse, never
+    inherit local privileges."""
+    from assistant import actions
+    assert actions.current_grants.get() is None
+    result = await actions.execute("code_executor", {"goal": "print(1)"}, "")
+    assert "permission" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_an_unlisted_intent_requires_execute():
+    from assistant.core.capabilities import Capability
+    from assistant import actions
+    token = actions.set_grants(frozenset({Capability.CHAT_SEND}))
+    try:
+        result = await actions.execute("some_intent_nobody_classified", {}, "")
+    finally:
+        actions.current_grants.reset(token)
+    assert "permission" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_planner_step_is_checked_by_the_same_rule():
+    """planner/executor.py re-enters actions.execute(), so the check is
+    recursive. A plan must not be a way around the gate."""
+    from assistant.actions.planner import executor  # noqa: F401 -- the re-entry site
+    from assistant.core.capabilities import Capability
+    from assistant import actions
+    token = actions.set_grants(frozenset({Capability.CHAT_SEND}))
+    try:
+        result = await actions.execute("planner", {"goal": "do a thing"}, "")
+    finally:
+        actions.current_grants.reset(token)
+    assert "permission" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_is_speakable():
+    """It may reach tts.speak(): under 120 chars, no paths, no error codes."""
+    from assistant.core.capabilities import Capability
+    from assistant import actions
+    token = actions.set_grants(frozenset({Capability.CHAT_SEND}))
+    try:
+        result = await actions.execute("file_task", {"goal": "read notes"}, "")
+    finally:
+        actions.current_grants.reset(token)
+    assert len(result) < 120, result
+    assert "\\" not in result and "/" not in result, result
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_does_not_say_what_the_intent_would_have_done():
+    """A caller that cannot reach an intent should not learn what it is."""
+    from assistant.core.capabilities import Capability
+    from assistant import actions
+    token = actions.set_grants(frozenset({Capability.CHAT_SEND}))
+    try:
+        result = await actions.execute("shutdown", {}, "")
+    finally:
+        actions.current_grants.reset(token)
+    assert "shutdown" not in result.lower(), result
