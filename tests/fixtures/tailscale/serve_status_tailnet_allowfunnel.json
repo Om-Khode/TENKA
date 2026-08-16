@@ -1,0 +1,16 @@
+{
+  "_comment": "Synthetic fixture, documented shape (fix round 3 fold-in). tailnet's own public port (8443) already proxies correctly to tailnet's own local target (8788) -- check 3 (stale target) must not fire -- but the same mapping is marked AllowFunnel. 8443 is one of the three ports Tailscale Funnel itself is restricted to, so this is a real, reachable misconfiguration: it would publish the one raisable listener to the open internet while TENKA believes it is tailnet-only.",
+  "TCP": {
+    "8443": { "HTTPS": true }
+  },
+  "Web": {
+    "example-host.example-tailnet.ts.net:8443": {
+      "Handlers": {
+        "/": { "Proxy": "http://127.0.0.1:8788" }
+      }
+    }
+  },
+  "AllowFunnel": {
+    "example-host.example-tailnet.ts.net:8443": true
+  }
+}

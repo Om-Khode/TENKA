@@ -233,19 +233,63 @@ def test_preflight_refuses_a_stale_mapping_pointed_at_another_port():
     mapping -- here, under tailnet's own public port -- forwards straight
     into the port `local` holds, regardless of which public port carries
     it. This is unconditional and checked across every `Web` entry, not
-    only the caller's own."""
+    only the caller's own. Pinned from *both* adapters' perspective against
+    the same fixture (fix round 3, fold-in): check 1 does not key on the
+    caller's own public port at all, so it must catch the danger whether
+    `tailnet` or `funnel` is asking -- that property held in code before
+    this round but was never asserted."""
     payload = _load_fixture("serve_status_local_port_danger.json")
     refusal = parse_serve_status(
         payload, verb="serve", public_port=_TAILNET_PUBLIC,
         target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+        forbid_funnel=True,
     )
     assert refusal is not None
     assert str(_LOCAL_PORT) in refusal
+    # Names the offending mapping's public port (fix round 3 fold-in) --
+    # the fixture's danger entry is keyed under tailnet's own 8443.
+    assert "8443" in refusal
     # Names the misconfiguration, never a hostname, token or path.
     assert "example-host" not in refusal
     assert "ts.net" not in refusal
     # Never recommends the config-wide reset (fix round 2 minor).
     assert "reset" not in refusal
+
+    refusal_from_funnel = parse_serve_status(
+        payload, verb="funnel", public_port=_FUNNEL_PUBLIC,
+        target_port=_FUNNEL_TARGET, local_port=_LOCAL_PORT,
+    )
+    assert refusal_from_funnel is not None
+    assert str(_LOCAL_PORT) in refusal_from_funnel
+
+
+def test_preflight_still_catches_the_danger_entry_despite_a_malformed_sibling():
+    """Fix round 3, Must fix 1: the original single `try` wrapped the whole
+    sweep, so an `AttributeError`/`TypeError`/`ValueError` raised while
+    inspecting one `Web` entry returned `None` -- "clear" -- without ever
+    inspecting the next entry, which could be the one actually proxying
+    into `local`'s port. Adding `ValueError` for Important 2 widened this
+    rather than narrowing it. Neither entry here is under this test's own
+    `public_port`, isolating check 1's cross-entry tolerance from check 2/3
+    entirely."""
+    payload = {
+        "Web": {
+            "bad-entry.example-tailnet.ts.net:9999": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:99999"}}
+            },
+            "danger-entry.example-tailnet.ts.net:8443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}}
+            },
+        }
+    }
+    refusal = parse_serve_status(
+        payload, verb="serve", public_port=_FUNNEL_PUBLIC,
+        target_port=_FUNNEL_TARGET, local_port=_LOCAL_PORT,
+    )
+    assert refusal is not None
+    assert str(_LOCAL_PORT) in refusal
+    assert "8443" in refusal
+    assert "example-tailnet" not in refusal
 
 
 def test_preflight_refuses_our_own_mapping_pointed_elsewhere():
@@ -280,6 +324,7 @@ def test_preflight_accepts_a_mapping_that_already_points_at_our_own_port():
     assert parse_serve_status(
         payload, verb="serve", public_port=_TAILNET_PUBLIC,
         target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+        forbid_funnel=True,
     ) is None
 
 
@@ -290,6 +335,7 @@ def test_preflight_accepts_the_real_empty_status_this_machine_returns():
     assert parse_serve_status(
         {}, verb="serve", public_port=_TAILNET_PUBLIC,
         target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+        forbid_funnel=True,
     ) is None
 
 
@@ -304,10 +350,42 @@ def test_preflight_never_refuses_one_transport_for_the_others_own_mapping():
     assert parse_serve_status(
         payload, verb="serve", public_port=_TAILNET_PUBLIC,
         target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+        forbid_funnel=True,
     ) is None
     assert parse_serve_status(
         payload, verb="funnel", public_port=_FUNNEL_PUBLIC,
         target_port=_FUNNEL_TARGET, local_port=_LOCAL_PORT,
+    ) is None
+
+
+def test_preflight_refuses_tailnets_own_mapping_marked_allowfunnel():
+    """Fix round 3, fold-in: `tailnet`'s public port (8443) is one of
+    Funnel's three permitted ports, so a pre-existing or leftover
+    `AllowFunnel` entry there would publish `tailnet` -- the one raisable
+    listener, reachable up to `EXECUTE` -- to the open internet while TENKA
+    believes it is tailnet-only. Only `forbid_funnel=True` (which
+    `TailnetAdapter` alone sets) triggers this; `FunnelAdapter` is expected
+    to carry `AllowFunnel` on its own mapping and must not be refused for
+    it (covered by the mutual-noninterference test above, which already
+    calls the funnel side with `forbid_funnel` left at its `False` default
+    against a fixture where funnel's own entry is `AllowFunnel: true`)."""
+    payload = _load_fixture("serve_status_tailnet_allowfunnel.json")
+    refusal = parse_serve_status(
+        payload, verb="serve", public_port=_TAILNET_PUBLIC,
+        target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+        forbid_funnel=True,
+    )
+    assert refusal is not None
+    assert "AllowFunnel" in refusal
+    assert "8443" in refusal
+    assert "example-host" not in refusal
+    assert "ts.net" not in refusal
+
+    # The identical mapping is accepted when forbid_funnel is left False --
+    # proving the refusal is `tailnet`-specific, not a blanket rule.
+    assert parse_serve_status(
+        payload, verb="serve", public_port=_TAILNET_PUBLIC,
+        target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
     ) is None
 
 

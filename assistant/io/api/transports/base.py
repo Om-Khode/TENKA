@@ -105,13 +105,19 @@ class TransportAdapter(Protocol):
         obligation. The caller **MUST** treat a returned argv's exit code
         as provisional: run it, then re-read the provider's own status
         (e.g. `tailscale {serve,funnel} status --json`) and confirm no
-        mapping still targets this transport's public port, before
-        treating the stop as successful. If one still does, fail loudly
-        rather than report success -- an internet-facing listener that
-        silently stayed up is the worst failure mode this milestone can
-        produce, worse than a stop that visibly failed. See
-        `transports/tailscale.py`'s two adapters for the concrete case this
-        obligation exists for."""
+        `Web` entry is still keyed under this transport's public port,
+        before treating the stop as successful -- not "no mapping still
+        targets" that port, a phrasing that would always be true here
+        since a mapping *targets* a local port and is *keyed under* a
+        public one, and so would let a literal reading conclude every stop
+        succeeded (fix round 3, Must fix 2: this is exactly the wording
+        that leaked the Critical this docstring exists to prevent, the
+        first time it was written). If a `Web` entry is still keyed under
+        that public port, fail loudly rather than report success -- an
+        internet-facing listener that silently stayed up is the worst
+        failure mode this milestone can produce, worse than a stop that
+        visibly failed. See `transports/tailscale.py`'s two adapters for
+        the concrete case this obligation exists for."""
         ...
 
 
