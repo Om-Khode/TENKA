@@ -196,6 +196,31 @@ class PairCodeRequest(BaseModel):
     grants: list[str] = Field(min_length=1)
 
 
+class RaiseRequest(BaseModel):
+    """What the person at the keyboard asks for when lifting one device's
+    ceiling on one transport, for a while.
+
+    `capabilities` is a list of `Capability` *values* rather than the enum
+    itself, for the same reason `PairCodeRequest.grants` is: an unknown string
+    must become a 422 the route builds from a name it never echoes, not a
+    Pydantic error whose `msg` might one day carry the submitted value back.
+    `transport` is a plain string for the mirror-image reason -- naming an
+    unknown listener must not print the name back either.
+
+    `minutes` is bounded below only. The upper bound is `MAX_RAISE_SECONDS` and
+    it lives in `RaiseStore.grant()`, where it *clamps* rather than refuses:
+    the cap is the safety property, not a promise the caller kept its word, and
+    a 422 here would hand back a retry instead of a bounded raise. Duplicating
+    it as a `Field(le=...)` would also put the number in two places, which is
+    how a cap drifts.
+    """
+
+    transport: str = Field(min_length=1, max_length=32)
+    capabilities: list[str] = Field(min_length=1)
+    minutes: int = Field(gt=0)
+    reason: str = Field(min_length=1, max_length=200)
+
+
 class PairRequest(BaseModel):
     """The only unauthenticated body this API accepts, and it carries exactly
     one field.

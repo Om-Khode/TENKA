@@ -24,10 +24,12 @@ import logging
 import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 
 from fastapi import Depends, HTTPException, Request, status
 from starlette.requests import HTTPConnection
 
+from ...core.redact import redact_secrets
 from .policy import ListenerPolicy, effective, policy_for_port
 from .vault import Capability, Device, TokenVault, VaultUnavailableError
 
@@ -1103,7 +1105,35 @@ async def authenticate(request: Request) -> Device:
         # request and exactly one place (`effective()`, right below) that ever
         # narrows a grant set.
         issued = device.grants
-        grants = effective(issued, policy)
+        # Milestone 6b's third bound, and the only one that moves: a live,
+        # expiring, per-device ceiling raise (`raises.py`), folded into
+        # `effective()` as its third argument. It can only widen the
+        # *transport* side of the intersection, and only within that policy's
+        # fixed `raisable` -- `issued` above is untouched, so a raise can never
+        # manufacture a grant the device was not given.
+        #
+        # `getattr`, because `app.state.raises` is set by `create_app` in a
+        # sibling task: an app built before that lands (or a test that never
+        # attaches a store) has no attribute at all, and `frozenset()` is both
+        # the correct fail-closed answer and exactly 6a.5's behaviour.
+        #
+        # Off the event loop, and its own hop rather than folded into the
+        # `verify()` call above. Two things want it that way. `RaiseStore`
+        # takes a `threading.Lock` that the admin raise route writes under, and
+        # the loop this daemon shares with the assistant must not wait on a
+        # lock held by an unrelated request. And the vault read above has to
+        # stay spelled `asyncio.to_thread(state.vault.verify, ...)`: the 6a.5
+        # availability pass pins that literal dispatch by reading this
+        # function's own source, so wrapping the two in one worker callable
+        # would respell the guard rather than keep it. The extra dispatch buys
+        # both, and it is dwarfed by the devices.json read and HMAC this same
+        # request already paid for.
+        raise_store = getattr(request.app.state, "raises", None)
+        raised: frozenset[Capability] = frozenset()
+        if raise_store is not None:
+            raised = await asyncio.to_thread(
+                raise_store.capabilities_for, device.device_id, policy.name)
+        grants = effective(issued, policy, raised)
         if not grants:
             # This transport carries nothing this device holds. Refused as an
             # authentication failure, not a 403: a device that authenticates
@@ -1117,6 +1147,37 @@ async def authenticate(request: Request) -> Device:
         device = replace(device, grants=grants)
         request.state.device = device
         request.state.issued_grants = issued
+        # Spec §3.6: an audit event on every request that actually consumes a
+        # raised capability -- the difference between knowing a door was
+        # unlocked and knowing it was walked through. A seven-day window is
+        # not something to hold in your head, and the mint line alone says
+        # only that it opened.
+        #
+        # `applied` is what this request holds *because of* the raise and
+        # would not hold without it, so an ordinary request made while a raise
+        # happens to be live -- one asking for nothing the raise added --
+        # records nothing.
+        #
+        # Recorded here rather than inside `require()`, which is where a
+        # per-capability hook would naturally go, because `require()` does not
+        # see the consumption that matters most: `POST /v1/chat` is gated on
+        # CHAT_SEND and then hands `device.grants` straight to the assistant,
+        # where the intent gate spends EXECUTE with no `require()` anywhere in
+        # sight -- and `run_command` checks a grant of its own choosing
+        # inline. Every one of those paths comes through this function, so
+        # this is the site that cannot be walked around. The cost is that the
+        # entry says which capabilities the raise put in reach on this
+        # request, not which one the handler went on to spend; the method and
+        # path beside it are what narrow that down.
+        applied = grants - effective(issued, policy)
+        if applied:
+            state.audit.record(AuditEntry(
+                at=datetime.now(timezone.utc).isoformat(),
+                device_id=device.device_id,
+                method=request.method,
+                path=redact_secrets(request.url.path),
+                outcome=f"raised:{'+'.join(sorted(c.value for c in applied))}",
+            ))
         # Last on the success path, and only on it. "When was this device last
         # used?" is the column the revoke list is read by -- a row nobody
         # recognises with a timestamp from three months ago is what makes

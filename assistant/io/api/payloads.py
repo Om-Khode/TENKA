@@ -305,6 +305,34 @@ class PairCodePayload(CamelModel):
     qr_svg: str
 
 
+class RaisePayload(CamelModel):
+    """One live ceiling raise, as an admin listener reports it.
+
+    Four of the five fields describe the raise; the fifth, `reason`, is the
+    only thing that makes a seven-day window reviewable a week later. It is
+    free text the operator typed at mint time, echoed back verbatim -- which
+    is safe here and only here: this payload is served by
+    `require_admin(SYSTEM_CONTROL)` routes, so the only reader is the loopback
+    caller who wrote it.
+
+    `granted_by` is deliberately absent. The record holds it (`RaiseGrant`) and
+    the log line names it, but a device row in the revoke list is not the place
+    to publish which *other* device authorised something -- the same reasoning
+    that keeps a listener and a source address off `DevicePayload`.
+
+    `expires_in_seconds` counts down, converted from the store's
+    `time.monotonic()` reading at request time. Never a wall-clock timestamp: a
+    monotonic reading means nothing to a client, and recomputing one as
+    `now + duration` would drift the moment the store's cap changed.
+    """
+
+    device_id: str
+    transport: str
+    capabilities: list[str]
+    expires_in_seconds: int
+    reason: str
+
+
 class DevicePayload(CamelModel):
     """One row of the revoke list, and deliberately nothing more.
 
@@ -314,6 +342,13 @@ class DevicePayload(CamelModel):
     token hash, no listener or address -- a device's grants say what it may
     do, and where it happened to connect from is not a fact this list is
     allowed to make somebody act on.
+
+    `raises` is Milestone 6b's one addition, and it belongs to the same
+    question rather than widening it: a device that can currently do more than
+    its grants column suggests is precisely the row somebody reading this list
+    needs to see. Empty, never omitted, for a device with no live raise --
+    and there is deliberately no route that lists raises on their own, so
+    nothing here becomes a second oracle for which device ids exist.
     """
 
     device_id: str
@@ -321,6 +356,7 @@ class DevicePayload(CamelModel):
     grants: list[str]
     created_at: str
     last_seen_at: str | None
+    raises: list[RaisePayload]
 
 
 class DevicesPayload(CamelModel):

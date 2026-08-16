@@ -120,18 +120,24 @@ def test_session_reports_the_raised_capabilities_and_the_time_left(tmp_path, mon
 
 
 def test_session_still_separates_issued_from_effective(tmp_path, monkeypatch):
-    """`raised` is a third story, not a rename of either existing list. The
-    device's issued grants are unaffected by the raise, and this route must
-    not fold the raise into `effective` on its own -- narrowing the listener
-    ceiling with a live raise is `authenticate()`'s job (a separate task), and
-    this route reporting the two as already merged would race ahead of it and
-    make the merge unobservable to a test pinning that boundary."""
+    """`raised` is a third story, not a rename of either existing list.
+
+    The device's issued grants are unaffected by the raise -- that outer bound
+    never moves. `effective` *does* now include the raised capability, because
+    Task 10 wired `authenticate()` to pass the live record as `effective()`'s
+    third argument; before it landed this assertion read `not in`, and the
+    flip is the merge becoming observable rather than a weakening. What the
+    third list buys is the reason: Studio has to say a floor was deliberately
+    and temporarily raised, not render a control that looks permanent, and
+    `effective` alone cannot tell it which.
+    """
     _fake_clock(monkeypatch)
     vault = TokenVault(tmp_path)
     token = vault.issue("Pixel 8", frozenset(Capability))
     device_id = vault.devices()[0].device_id
     store = RaiseStore()
-    store.grant(device_id, "tailnet", frozenset({Capability.EXECUTE}),
+    store.grant(device_id=device_id, policy_name="tailnet",
+                capabilities=frozenset({Capability.EXECUTE}),
                 seconds=60, granted_by="laptop-device", reason="testing")
 
     client = _client(vault, policies={8787: "tailnet"})
@@ -139,9 +145,17 @@ def test_session_still_separates_issued_from_effective(tmp_path, monkeypatch):
     client.cookies.set(COOKIE_NAME, token)
     data = client.get("/v1/session").json()["data"]
 
-    assert "execute" in data["grants"]          # issued: the device holds it
-    assert "execute" not in data["effective"]   # tailnet's fixed ceiling excludes it
-    assert data["raised"] == ["execute"]        # reported on its own, third list
+    assert "execute" in data["grants"]        # issued: the device holds it
+    assert "execute" in data["effective"]     # the raise put it in reach here
+    assert data["raised"] == ["execute"]      # and says it is a raise, not the norm
+
+    # The fixed ceiling itself never moved: a second device on the same
+    # listener, with no raise of its own, computes exactly what it always did.
+    other = vault.issue("wall display", frozenset(Capability))
+    unraised = _client(vault, policies={8787: "tailnet"})
+    unraised.app.state.raises = store
+    unraised.cookies.set(COOKIE_NAME, other)
+    assert "execute" not in unraised.get("/v1/session").json()["data"]["effective"]
 
 
 def test_the_raise_fields_are_absent_for_an_unraisable_transport(tmp_path):

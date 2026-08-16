@@ -53,7 +53,10 @@ def test_the_listing_carries_only_what_the_revoke_list_needs(tmp_path):
     """Deliberately narrow. This response describes every credential to this
     machine, so it carries the four facts a person needs to decide what to
     kill -- which row, what it is called, what it can do, when it was last
-    used -- and nothing else."""
+    used -- plus, from Milestone 6b, any live ceiling raise, which is the same
+    question rather than a widening of it: a device that can currently do more
+    than its grants column suggests is exactly the row somebody reading this
+    list needs to see. Nothing else."""
     vault = TokenVault(tmp_path)
     token = vault.issue("laptop", frozenset(Capability))
     client = _client(vault, policies={LOCAL_PORT: "local"})
@@ -61,8 +64,12 @@ def test_the_listing_carries_only_what_the_revoke_list_needs(tmp_path):
     data = client.get("/v1/devices").json()["data"]
     assert set(data) == {"devices"}
     assert set(data["devices"][0]) == {
-        "deviceId", "label", "grants", "createdAt", "lastSeenAt",
+        "deviceId", "label", "grants", "createdAt", "lastSeenAt", "raises",
     }
+    # Empty, never omitted, for a device with no raise -- and empty here also
+    # because this app has no raise store attached at all, which must read as
+    # "no raises" rather than as a missing key or a 500.
+    assert data["devices"][0]["raises"] == []
 
 
 def test_the_listing_never_carries_a_token_or_its_hash(tmp_path):
