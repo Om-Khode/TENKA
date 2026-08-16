@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from assistant.io.api.pairing import PairCodeStore
-from assistant.io.api.security import COOKIE_NAME, CSRF_HEADER
+from assistant.io.api.security import COOKIE_NAME, CSRF_HEADER, HOST_COOKIE_NAME
 from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.api_client import BASE_URL, LOCAL_PORT, ApiTestClient, build_api_client
 from tests.fakes.studio_runtime import build_fake_runtime
@@ -279,10 +279,15 @@ def test_pairing_over_quick_permanently_limits_the_device_even_on_a_wider_listen
     quick_client = _client(vault, policies={LOCAL_PORT: "quick"}, store=store)
     r = quick_client.post("/v1/pair", json={"code": code})
     assert r.status_code == 204
-    cookie_value = r.cookies[COOKIE_NAME]
+    # `quick`, `tailnet` and `funnel` all set `secure_cookie`, so since
+    # `fix/6a5-api-review` they write the `__Host-` prefixed name -- a browser
+    # will not store that one unless it is host-only, which is what stops a
+    # sibling under `*.trycloudflare.com` planting a `tenka_device` inward.
+    # Only `local` still uses the unprefixed name. Both are read.
+    cookie_value = r.cookies[HOST_COOKIE_NAME]
 
     funnel_client = _client(vault, policies={LOCAL_PORT: "funnel"})
-    funnel_client.cookies.set(COOKIE_NAME, cookie_value)
+    funnel_client.cookies.set(HOST_COOKIE_NAME, cookie_value)
     data = funnel_client.get("/v1/session").json()["data"]
     assert data["grants"] == ["observe"]
 

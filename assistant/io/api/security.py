@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field, replace
 
 from fastapi import Depends, HTTPException, Request, status
@@ -36,6 +36,47 @@ logger = logging.getLogger(__name__)
 # The cookie name is not a secret and does not need to be unguessable -- it
 # names the slot, not the credential in it.
 COOKIE_NAME = "tenka_device"
+
+# The same slot, under the one cookie name a browser polices for us.
+#
+# `__Host-` is not decoration. A browser refuses to *store* a cookie with this
+# prefix unless it is `Secure`, has `Path=/`, and carries **no `Domain`
+# attribute at all** -- and that last clause is the whole point. Without it,
+# any sibling host under a shared parent (`*.ts.net`, `*.trycloudflare.com`:
+# the parents 6b publishes under, where the neighbours are other people's
+# machines) can set `tenka_device` with `Domain=.ts.net` and have the browser
+# send it inward to this daemon. RFC 6265 s5.4 serialises equal-path cookies
+# oldest-first, so the attacker's later-planted duplicate is the one a
+# last-wins parser adopts.
+#
+# The server-side duplicate rejection below was the previous repair and it is
+# half a fix in both directions. It converts the fixation into a *permanent
+# denial of service*: our cookie is host-only, so `set_cookie` cannot delete a
+# parent-domain one -- a different `Domain` is a different cookie -- and there
+# is no route that could. Every request 401s, and re-pairing re-locks it,
+# because the plant is still there. And it does not close the fixation it was
+# written for: with no cookie held yet the count is 1, so the planted value is
+# simply adopted.
+#
+# With the prefix, the sibling cannot plant this name at all, and the read
+# order below prefers it -- so the daemon's own cookie always wins over
+# anything a neighbour writes under the unprefixed name.
+#
+# It cannot be the only name, because it demands `Secure` and the `local`
+# policy serves plain http on loopback (see `cookie_kwargs`). So the name is
+# chosen per listener by `cookie_name_for`, and both names are *read*: that
+# is what keeps a device paired before this change working until it next
+# pairs, and it costs nothing, because a cookie under the prefixed name is
+# strictly more trustworthy than one under the plain name and is preferred.
+#
+# Loopback keeps the unprefixed name and the duplicate rule. It has no shared
+# parent to be a sibling of, so what remains there is "another port on
+# 127.0.0.1", which needs code already running on this machine.
+HOST_COOKIE_NAME = "__Host-tenka_device"
+
+# Preferred first. A `__Host-` cookie can only have been set by this daemon
+# over TLS on this exact host; an unprefixed one is whatever reached the jar.
+_COOKIE_NAMES = (HOST_COOKIE_NAME, COOKIE_NAME)
 
 # A header a cross-site form post or an <img> cannot set. A browser will only
 # attach a custom header to a request its own JavaScript built, and doing that
@@ -252,6 +293,17 @@ _AUDIT_TRUNCATED = "..."
 # rather than spelled `"-"` in two files, because `AuditLog` now routes on it.
 ANONYMOUS_DEVICE_ID = "-"
 
+# How many per-device audit rings this process will hold at once.
+#
+# Not a guess about attackers: a device id only exists because an admin
+# listener enrolled it, so the realistic count is the number of things the
+# operator paired -- a laptop, a phone, maybe a wall display. 16 is the safety
+# net for a vault that grew unattended, and the least recently written ring is
+# dropped whole when it is passed. Deliberately above `_MAX_SOCKETS_PER_DEVICE`
+# (8) in events.py, which is the other place this codebase guesses at "how many
+# things does one household have".
+_MAX_AUDIT_DEVICES = 16
+
 
 def sanitize_audit_path(path: str) -> str:
     """The stored form of a caller-chosen path: bounded, and printable ASCII.
@@ -275,25 +327,58 @@ def sanitize_audit_path(path: str) -> str:
 class AuditLog:
     """Append-only, bounded, in-memory. Surfaced read-only in settings.
 
-    **Two rings, not one.** A single `deque(maxlen=2000)` made eviction a
-    primitive an unauthenticated caller held: a rate-limited request is still
-    audited, so the limiter never slows the flush below one entry per request
-    and ~2,000 anonymous requests flushed every authenticated entry out of the
-    record an operator reads after an incident. Splitting the rings by whether
-    anything authenticated means a flood can only erase other floods. Both
-    halves stay bounded -- the point is that they cannot reach each other, not
-    that either is unlimited.
+    **One ring per writer, not one ring per anonymity class.**
 
-    `entries()` merges them back into one chronological sequence, by an
+    This began as a single `deque(maxlen=2000)`, which made eviction a
+    primitive any caller held: a rate-limited request is still audited, so the
+    limiter never slows the flush below one entry per request, and ~2,000
+    requests flushed every other entry out of the record an operator reads
+    after an incident. The first repair split the ring in two, by whether
+    anything authenticated, and claimed that "a flood can only erase other
+    floods."
+
+    It could not. Anonymity is not the axis a flood runs along. *Any* single
+    paired device -- including an OBSERVE-only wall display, the weakest
+    credential this design issues -- wrote into the one authenticated ring at
+    the 120 requests/minute the limiter permits, so ~2,000 of them flushed
+    every other device's records, the `require_admin` pairing and revocation
+    entries included. The device that erases the evidence of its own pairing
+    is exactly the device an operator is reading the log to find.
+
+    So the axis is the writer. Each device id gets its own ring of `capacity`,
+    the anonymous id keeps its own of `anonymous_capacity`, and nobody's
+    traffic can reach anybody else's records. What one device can still do is
+    lose its *own* oldest entries, which is the irreducible property of a
+    bounded log.
+
+    **`capacity` is per device, and that is a changed meaning.** It was the
+    total. Sizing follows from what bounds the number of rings: device ids come
+    from `devices.json`, which only an admin listener can add to, so the count
+    is operator-controlled and realistically a handful. `_MAX_AUDIT_DEVICES` is
+    the safety net rather than the expected case, and the ring least recently
+    written to is dropped whole when it is exceeded -- an LRU over rings, so
+    the device that has said nothing for longest is the one forgotten.
+
+    The defaults put the worst case at `250 * 16 + 500` = 4,500 entries against
+    the old 2,500, and the realistic case (three devices) at well under it.
+    That is the memory this trade costs.
+
+    `entries()` merges every ring back into one chronological sequence, by an
     internal counter rather than by the `at` string: two entries can share a
     timestamp, and `GET /v1/audit` reverses this list to show newest first, so
     the order has to be exact rather than approximately right.
     """
 
-    def __init__(self, capacity: int = 2_000,
-                 anonymous_capacity: int = 500) -> None:
+    def __init__(self, capacity: int = 250,
+                 anonymous_capacity: int = 500,
+                 max_devices: int = _MAX_AUDIT_DEVICES) -> None:
         self._seq = 0
-        self._entries: deque[tuple[int, AuditEntry]] = deque(maxlen=capacity)
+        self._capacity = max(1, capacity)
+        self._max_devices = max(1, max_devices)
+        # Insertion-ordered and re-ordered on every write, so the first key is
+        # always the least recently used ring.
+        self._by_device: OrderedDict[str, deque[tuple[int, AuditEntry]]] = \
+            OrderedDict()
         self._anonymous: deque[tuple[int, AuditEntry]] = deque(
             maxlen=anonymous_capacity)
 
@@ -304,13 +389,28 @@ class AuditLog:
         # hole silently.
         entry = replace(entry, path=sanitize_audit_path(entry.path))
         self._seq += 1
-        ring = (self._anonymous if entry.device_id == ANONYMOUS_DEVICE_ID
-                else self._entries)
+        if entry.device_id == ANONYMOUS_DEVICE_ID:
+            self._anonymous.append((self._seq, entry))
+            return
+        ring = self._by_device.get(entry.device_id)
+        if ring is None:
+            if len(self._by_device) >= self._max_devices:
+                # Whole ring, not one entry: a device this daemon has not heard
+                # from in longer than any other is the least useful history to
+                # keep, and dropping a slice of each would put every device
+                # back in reach of every other.
+                self._by_device.popitem(last=False)
+            ring = deque(maxlen=self._capacity)
+            self._by_device[entry.device_id] = ring
+        else:
+            self._by_device.move_to_end(entry.device_id)
         ring.append((self._seq, entry))
 
     def entries(self) -> list[AuditEntry]:
-        merged = sorted(list(self._entries) + list(self._anonymous),
-                        key=lambda pair: pair[0])
+        merged: list[tuple[int, AuditEntry]] = list(self._anonymous)
+        for ring in self._by_device.values():
+            merged.extend(ring)
+        merged.sort(key=lambda pair: pair[0])
         return [entry for _seq, entry in merged]
 
 
@@ -411,19 +511,45 @@ def cookie_credential(connection: HTTPConnection) -> str:
     # browser is silently moved onto a session the attacker also holds, and
     # everything she then does through Studio is readable by it.
     #
-    # `__Host-` is the browser-side fix and the only one that stops the cookie
-    # being stored at all, but it cannot be adopted as written: it also demands
-    # `Secure`, and the `local` policy explicitly cannot set `Secure` on
-    # plain-http loopback (see `cookie_kwargs` and `policy.py`). Per-policy
-    # names would lose the session on a listener switch. So this is the
-    # server-side half -- cheap, and it holds on every listener.
+    # `__Host-` is the browser-side fix, it *is* adopted now, and it is what
+    # actually closes this -- see `HOST_COOKIE_NAME` for the full argument and
+    # for why the duplicate rule alone was half a fix in both directions (a
+    # permanent lockout on one side, the original fixation untouched on the
+    # other). The names are tried in preference order, so a cookie this daemon
+    # set over TLS on this exact host beats anything a neighbour planted.
     #
-    # Refusing the pair, rather than picking the first, is deliberate: "which
-    # of these two did the operator mean?" is not a question this daemon can
-    # answer, and guessing right is worth less than never guessing.
-    if _cookie_name_occurrences(connection, COOKIE_NAME) > 1:
-        return ""
-    return (connection.cookies.get(COOKIE_NAME) or "").strip()
+    # The duplicate rule stays, per name, for the listener that cannot use the
+    # prefix. Refusing the pair, rather than picking the first, is deliberate:
+    # "which of these two did the operator mean?" is not a question this daemon
+    # can answer, and guessing right is worth less than never guessing. Logged,
+    # because more than one of these is never a browser doing its job and the
+    # operator has no other way to find out it happened.
+    for name in _COOKIE_NAMES:
+        seen = _cookie_name_occurrences(connection, name)
+        if seen == 0:
+            continue
+        if seen > 1:
+            logger.warning(
+                f"[API] refusing a request presenting {seen} {name} cookies; "
+                f"one of them was not set by this daemon")
+            return ""
+        value = (connection.cookies.get(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def cookie_name_for(policy: ListenerPolicy) -> str:
+    """Which cookie name this listener writes.
+
+    Paired with `cookie_kwargs`, which supplies the three attributes the
+    `__Host-` prefix requires -- `secure`, `path="/"`, and no `domain` -- and
+    is the reason the prefixed name can be used at all wherever
+    `policy.secure_cookie` holds. A browser silently discards a `__Host-`
+    cookie that fails any of those, so the two functions have to agree; they
+    are kept adjacent and read the same field so they cannot drift.
+    """
+    return HOST_COOKIE_NAME if policy.secure_cookie else COOKIE_NAME
 
 
 def credential_from(connection: HTTPConnection, policy: ListenerPolicy) -> str | None:
@@ -792,7 +918,41 @@ async def authenticate(request: Request) -> Device:
     _refuse_cross_site(request, policy)
 
     token = credential_from(request, policy) or ""
-    device = state.vault.verify(token)
+    # Off the event loop, for the reason `touch()` below already is.
+    #
+    # `verify()` reads `instance_secret` and re-reads and re-parses
+    # `devices.json` from disk, then HMACs every record, and it runs on every
+    # request before anything has metered it -- so an unauthenticated caller
+    # presenting any cookie at all sets the rate. That is deliberate and stays
+    # deliberate: re-reading disk every single call is the entire reason a
+    # one-year cookie is defensible, because it is what makes revocation
+    # immediate (see `_COOKIE_MAX_AGE_SECONDS`).
+    #
+    # What was not deliberate is that the reads were *synchronous on the loop
+    # the assistant herself runs on*. The measurement this file already
+    # records for `touch()` -- eight unrelated requests 1.5x-7.7x slower while
+    # one blocking call was in flight -- is the same cost, and here it is paid
+    # by traffic nobody has authenticated yet. `asyncio.to_thread` turns
+    # "everything stops" into "this request waits", which is what a flood
+    # should cost: the flooder's own latency, not the daemon's.
+    #
+    # A reviewer proposed instead moving `state.limiter.check(source)` above
+    # this line so the anonymous window bounds the read *rate*. That was
+    # tried and reverted, and the reason is worth writing down so it is not
+    # tried again. `source` is `anonymous_key()` -- the accepting port -- and
+    # this file's own docstring explains why: a tunnel connects from
+    # 127.0.0.1, so every remote caller collapses onto one shared key. A
+    # source-keyed gate ahead of verification therefore cannot tell a flood
+    # from a paired device; refusing on it means an anonymous flood, or ten
+    # wrong guesses earning the source's exponential lockout, denies every
+    # paired device on that listener. Measured, not reasoned: with the check
+    # moved, `test_a_valid_token_is_never_refused_by_an_exhausted_anonymous_
+    # window` and `test_a_valid_device_survives_a_flood_of_wrong_tokens_from_
+    # its_own_source` both fail. Those two are the property Task 10 landed
+    # this ordering for. A rate limiter keyed on a value the attacker shares
+    # with its victims is a weapon handed to the attacker, and the vault read
+    # is not expensive enough to buy one with.
+    device = await asyncio.to_thread(state.vault.verify, token)
 
     if device is not None:
         key = device_key(device)

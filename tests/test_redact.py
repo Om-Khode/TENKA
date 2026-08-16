@@ -260,10 +260,62 @@ def test_strict_preserves_crlf_line_endings():
 # credential over a transport. If one of these ever has to change, the fix is
 # a narrower *shape* for the identifier, never a shape test on the value.
 
-def test_strict_also_redacts_a_public_upper_snake_constant():
-    """A module constant in a source preview loses its value too."""
-    assert redact_secrets_strict("MAX_PREVIEW_BYTES = 512_000") == \
-        "MAX_PREVIEW_BYTES = [REDACTED]"
+def test_strict_still_redacts_an_upper_snake_constant_by_position():
+    """A module constant in a source preview still loses its value, because on
+    a `.env`/INI/YAML key the value is the payload by position and no shape
+    test can tell `hunter2` from a word.
+
+    Narrowed on `fix/6a5-api-review`, and this test used to read
+    `MAX_PREVIEW_BYTES = 512_000 -> [REDACTED]`. The review (P2-4) measured
+    what that cost: `_is_configuration_value` was short-circuited for every
+    UPPER_SNAKE name, so previewing this project's own `config.py` through the
+    FILES route came back as *broken source* -- `INTENTS = [...]` lost its
+    list, and `TASK_MODEL_MAP = {` lost its opening brace, orphaning the dict
+    body and the closing brace under it. Over-redaction that makes a preview
+    useless is its own bug, and it had its own failing probe.
+
+    The section's own rule -- "if one of these ever has to change, the fix is a
+    narrower *shape* for the identifier, never a shape test on the value" --
+    is honoured on the identifier side: UPPER_SNAKE **with** a role noun is
+    still the strong tier, and UPPER_SNAKE **without** one is a new,
+    lower-evidence tier. Two value shapes are then declined there, and both are
+    shapes no credential takes: a bracketed literal, and a bare number. That is
+    a much smaller concession than it looks -- see the two tests below.
+    """
+    assert redact_secrets_strict("RELEASE_TAG = v2-abc123") == \
+        "RELEASE_TAG = [REDACTED]"
+    assert redact_secrets_strict("ARGS=--foo --bar") == "ARGS=[REDACTED]"
+    assert redact_secrets_strict("  CLIENT_ID: abc123") == \
+        "  CLIENT_ID: [REDACTED]"
+
+
+def test_strict_leaves_a_numeric_constant_alone():
+    """The narrowing, half one. A number is not a credential, and this
+    identifier carries no role noun claiming otherwise."""
+    for line in ("MAX_PREVIEW_BYTES = 512_000", "TIMEOUT_SECONDS = 30",
+                 "PORT: 8787", "MASK = 0xFF", "RATIO = 1.5"):
+        assert redact_secrets_strict(line) == line, line
+
+
+def test_strict_leaves_a_public_constant_that_holds_a_literal_alone():
+    """The narrowing, half two, and the one the review actually measured: a
+    preview of this project's own `config.py` must come back as source
+    somebody can read, not as source with its brackets orphaned."""
+    snippet = ('INTENTS = ["small_talk", "web_search"]\n'
+               'MAX_PREVIEW_BYTES = 65536\n'
+               'TASK_MODEL_MAP = {\n'
+               '    "intent": "flash",\n'
+               '}\n')
+    assert redact_secrets_strict(snippet) == snippet
+
+
+def test_strict_still_redacts_a_numeric_secret_under_a_role_noun():
+    """The narrowing must not become "numbers are safe". A role noun in the
+    identifier puts the line back in the strong tier, where the value's shape
+    is not asked about at all -- which is the whole point of that tier."""
+    assert redact_secrets_strict("TOKEN: 918273645509") == "TOKEN: [REDACTED]"
+    assert redact_secrets_strict("API_KEY = 4815162342") == "API_KEY = [REDACTED]"
+    assert redact_secrets_strict("DB_PASS=13579246") == "DB_PASS=[REDACTED]"
 
 
 def test_strict_leaves_a_private_upper_snake_constant_alone():
@@ -322,6 +374,143 @@ def test_strict_leaves_a_comparison_at_line_start_alone():
     that needed excluding; the rest never match in the first place."""
     for line in ('MODE == "prod"', "COUNT >= 3", "LIMIT != 0", "DEPTH <= 9"):
         assert redact_secrets_strict(line) == line
+
+
+# ─── fix/6a5-api-review: the mechanisms the adversarial pass added ────────
+# Each of these closed a verified leak or a verified over-redaction. The
+# reviewer's own probes live in tests/test_6a5_api_fixes.py; these pin the
+# behaviour at the level of the mechanism, including the cases the probes did
+# not name.
+
+def test_strict_redacts_a_credential_in_a_url_and_keeps_the_rest():
+    """`scheme://user:password@host` had no rule at all, and none of the
+    general ones reach it -- `:`, `@` and `/` fragment every run below the
+    bare rule's 24-character floor. Only the password goes, so the preview
+    still says which host this is and who connects to it."""
+    out = redact_secrets_strict(
+        "clone from https://admin:hunter2@git.internal.example.com/repo.git")
+    assert "hunter2" not in out, out
+    assert "admin" in out and "git.internal.example.com" in out, out
+
+    out = redact_secrets_strict("database_url: postgres://user:p4ssw0rd@host:5432/db")
+    assert "p4ssw0rd" not in out, out
+    assert "database_url:" in out and "host:5432" in out, out
+
+
+def test_the_log_path_keeps_a_url_credential():
+    """The URL rule is strict-only. A connection string in a traceback is a
+    real diagnostic, and the log path's standing contract is that it does not
+    get stricter."""
+    text = "connect failed: postgres://user:pw@localhost:5432/tenka"
+    assert redact_secrets(text) == text
+
+
+def test_strict_reads_a_camel_case_identifier():
+    """`_IDENT_SPLIT` split on `[_-]` only, so `clientSecret` was one token in
+    neither part set and `\\bsecret\\b` could not see inside it -- while
+    camelCase is what JSON and JavaScript config actually use."""
+    out = redact_secrets_strict('const cfg = { clientSecret: "hunter2plain" };')
+    assert "hunter2plain" not in out, out
+    assert "clientSecret" in out, out
+
+
+def test_strict_does_not_read_a_camel_case_hump_as_a_role_noun_on_its_own():
+    """Control: splitting camelCase must not turn every capital into a label.
+    `sortKey` and `nextToken` are weak parts and still need a value that
+    looks the part; `monkey` is one word and is not `key` at all."""
+    for line in ("sortKey = 3", "nextToken: abc", "monkey = banana"):
+        assert redact_secrets_strict(line) == line, line
+
+
+def test_strict_redacts_a_yaml_sequence_item():
+    """`^[ \\t]*` allowed indentation but not a `- ` list marker, and a
+    docker-compose `environment:` block writes its keys as list items."""
+    out = redact_secrets_strict(
+        "environment:\n      - POSTGRES_PASSWORD=hunter2\n")
+    assert "hunter2" not in out, out
+    assert "- POSTGRES_PASSWORD=" in out, out
+
+
+def test_strict_redacts_a_walrus_assignment():
+    """`(?!=)` was added to protect `==` and took `:=` with it."""
+    assert redact_secrets_strict("db_pass := hunter2") == "db_pass := [REDACTED]"
+
+
+def test_strict_redacts_a_punctuation_rich_password():
+    """The bracket exemption treated any bracket as evidence of code, which
+    exempted exactly the passwords that are strongest."""
+    out = redact_secrets_strict("db_pass=P@ssw(rd!1")
+    assert "P@ssw(rd!1" not in out, out
+
+
+def test_a_multiword_passphrase_loses_all_of_itself():
+    """The labelled rule's `\\S+` stopped at the first space, so three quarters
+    of a diceware phrase shipped *underneath* a `[REDACTED]` claiming the line
+    was handled -- worse than not redacting, because the marker says safe."""
+    out = redact_secrets_strict("passphrase: correct horse battery staple")
+    for word in ("correct", "horse", "battery", "staple"):
+        assert word not in out, out
+
+
+def test_a_strong_label_in_prose_still_only_takes_one_word():
+    """Control for the rule above: the rest-of-line behaviour is scoped to an
+    explicit `:` or `=`. Prose does not write `password:` before a sentence it
+    wants read, so a sentence keeps its words."""
+    out = redact_secrets("set the password to hunter2please and then log in")
+    assert "and then log in" in out, out
+    assert "hunter2please" not in out, out
+
+
+def test_a_pgp_private_key_block_is_redacted():
+    """The PEM rule required `-----` directly after `KEY`, and every exported
+    PGP secret key writes ` BLOCK` there."""
+    out = redact_secrets_strict(
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----\nlQOYBGa1\n"
+        "-----END PGP PRIVATE KEY BLOCK-----")
+    assert "lQOYBGa1" not in out, out
+
+
+def test_an_unterminated_pem_marker_only_eats_a_base64_body():
+    """The largest destructive rule in the module. `(.*?)…\\Z` under `(?is)`
+    meant a lowercase prose *mention* of the header erased every line after
+    it -- in the preview path and the log path both."""
+    doc = ("# Setup\n"
+           "Paste the -----BEGIN RSA PRIVATE KEY----- header, then the body.\n"
+           "\n## Step two\nRun the installer.\n")
+    assert redact_secrets_strict(doc) == doc
+
+    clipped = ("-----BEGIN OPENSSH PRIVATE KEY-----\n"
+               "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ+xyz/123\n")
+    out = redact_secrets_strict(clipped)
+    assert "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ" not in out, out
+
+
+def test_a_uuid_is_an_identifier_not_a_secret():
+    """A hyphen counted as the bare rule's entropy signal, so every UUID in a
+    fixture, a migration or a log tripped it."""
+    out = redact_secrets_strict("run id 550e8400-e29b-41d4-a716-446655440000")
+    assert out == "run id 550e8400-e29b-41d4-a716-446655440000", out
+
+
+def test_a_uuid_under_a_role_noun_is_still_redacted():
+    """Control: the exemption is on the *bare* path only. A label still makes
+    it a token."""
+    out = redact_secrets_strict("api_key: 550e8400-e29b-41d4-a716-446655440000")
+    assert "550e8400" not in out, out
+
+
+def test_strict_redacts_a_numeric_token_under_a_role_noun():
+    """`_looks_secret` required both a digit and a letter, so a numeric token
+    was exempt from every labelled path."""
+    out = redact_secrets_strict("token: 918273645509")
+    assert "918273645509" not in out, out
+
+
+def test_a_short_number_under_a_role_noun_survives():
+    """Control for the rule above: the numeric floor is well past every port,
+    size, year and small count a configuration file writes."""
+    for line in ("token: 42", "retry_key: 2024"):
+        assert redact_secrets_strict(line) == line, line
 
 
 def test_strict_names_no_brand():

@@ -30,10 +30,10 @@ from fastapi import APIRouter, Depends, Request, Response, status
 from ..payloads import SessionPayload
 from ..schemas import Envelope
 from ..security import (
-    COOKIE_NAME,
     UNAUTHORIZED,
     authenticate,
     cookie_kwargs,
+    cookie_name_for,
     credential_from,
 )
 from ..vault import Device
@@ -144,5 +144,9 @@ async def adopt_session_cookie(request: Request,
     logger.info(f"[API] moved a credential onto the cookie for {device.device_id}")
 
     response = Response(status_code=status.HTTP_204_NO_CONTENT)
-    response.set_cookie(COOKIE_NAME, token, **cookie_kwargs(policy))
+    # `cookie_name_for(policy)`, not a fixed name: a listener that can set
+    # `Secure` gets the `__Host-` prefixed name, which a browser refuses to
+    # store unless it is host-only. See `HOST_COOKIE_NAME` in security.py --
+    # without it, a sibling host under `*.ts.net` can plant this cookie inward.
+    response.set_cookie(cookie_name_for(policy), token, **cookie_kwargs(policy))
     return response

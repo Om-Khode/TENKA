@@ -406,7 +406,14 @@ def test_a_revoked_device_is_closed_on_an_unparseable_frame_too(tmp_path):
 def test_a_live_device_still_gets_the_ordinary_replies(tmp_path):
     """Control: the check must not collapse into closing everyone. A device
     that is still paired keeps getting `unknown frame` for a verb this daemon
-    does not know, and an `ack` for the one it does."""
+    does not know, and an `ack` for the one it does.
+
+    The unknown verb is no longer spelled `ping`: `fix/6a5-api-review` gave
+    that one a meaning, because the idle timeout had no keepalive behind it
+    (review P2-6) and a client keeping itself alive should not collect an
+    error frame per heartbeat. `wobble` is a verb this daemon really does not
+    know.
+    """
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
     runtime = build_fake_runtime()
@@ -415,7 +422,7 @@ def test_a_live_device_still_gets_the_ordinary_replies(tmp_path):
 
     with client.websocket_connect("/v1/events") as socket:
         socket.receive_json()
-        socket.send_json({"type": "ping"})
+        socket.send_json({"type": "wobble"})
         assert socket.receive_json() == {"type": "error",
                                          "detail": "unknown frame"}
         socket.send_text("{not json")
@@ -456,7 +463,9 @@ def test_a_flood_of_malformed_frames_does_not_cost_a_vault_read_each(tmp_path):
         vault.verify = counting_verify
         try:
             for _ in range(40):
-                socket.send_json({"type": "ping"})
+                # `wobble`, not `ping`: see the control above -- `ping` is a
+                # keepalive now and is answered with a `pong`.
+                socket.send_json({"type": "wobble"})
                 assert socket.receive_json()["detail"] == "unknown frame"
         finally:
             vault.verify = real_verify

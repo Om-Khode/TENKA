@@ -76,7 +76,17 @@ _LABEL_ALT = "|".join(_STRONG_LABELS + _WEAK_LABELS)
 _STRONG_IDENT_PARTS = frozenset(_STRONG_LABELS) | {"pass", "secret", "secrets"}
 _WEAK_IDENT_PARTS = frozenset(_WEAK_LABELS) - {"secret", "secrets"}
 
-_IDENT_SPLIT = re.compile(r"[_\-]+")
+# Split on `_`/`-` **and** on a camelCase hump. The hump alternatives are
+# zero-width: `clientSecret` -> `client`, `Secret`, and `HTTPToken` ->
+# `HTTP`, `Token`. Without them `clientSecret` is one token that belongs to
+# neither part set, and `\bsecret\b` cannot see inside it either -- so a
+# JavaScript or JSON config using the spelling JavaScript and JSON actually
+# use was invisible to every mechanism in this module.
+#
+# The split runs on the identifier as written and the *parts* are lowercased
+# afterwards; lowercasing first would erase the humps this depends on.
+_IDENT_SPLIT = re.compile(
+    r"[_\-]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _UPPER_SNAKE = re.compile(r"[A-Z][A-Z0-9_]*\Z")
 
 # Values that are switches rather than credentials. See
@@ -94,6 +104,51 @@ _FILLER = r"(?:\s|is\b|to\b|[:=])*"
 # label, filler, then the value up to the next whitespace.
 _LABELLED = re.compile(
     rf"(?i)\b({_LABEL_ALT})\b({_FILLER})(\S+)"
+)
+
+# ─── A strong label under an explicit separator ──────────────────────────
+# `\S+` above stops at the first space, so `passphrase: correct horse battery
+# staple` lost the word "correct" and shipped the other three -- *underneath* a
+# `[REDACTED]` claiming the job was done. That is worse than not redacting at
+# all: the marker tells the reader the line is safe. A diceware or BIP39 phrase
+# is the normal shape of a passphrase, not an exotic one.
+#
+# Multi-word values cannot be recovered by widening `_LABELLED` itself, for two
+# reasons. Widening the group to the rest of the line makes the *match* cover
+# the rest of the line, so `re.sub` never rescans it and a second label on the
+# same line stops being redacted -- `password is letmein, token ghp_...` would
+# lose one of its two. And in prose ("the password is fine, thanks") the rest
+# of the line is a sentence, not a secret.
+#
+# So this is a separate, narrower rule: a **strong** label, an explicit `:` or
+# `=` -- machine syntax, not the connective words `_FILLER` also tolerates --
+# and then everything to the end of the line. Eating the whole tail is correct
+# here precisely because the separator says the tail *is* the value. Prose
+# keeps `_LABELLED`'s first-token behaviour, unchanged, because prose does not
+# write `password:` before a sentence it wants read.
+_LABELLED_ASSIGNED = re.compile(
+    rf"(?i)\b({'|'.join(_STRONG_LABELS)})\b([ \t]*[:=][ \t]*)([^\r\n]+)"
+)
+
+# ─── A credential in a URL ───────────────────────────────────────────────
+# `scheme://user:password@host` had no rule anywhere in this module, and none
+# of the general ones reach it: `:`, `@` and `/` all break a run, so every
+# fragment lands under `_BARE`'s 24-character floor, and the identifier on the
+# left of the assignment (`database_url`, `clone from`) carries no role noun.
+# A connection string is one of the two or three most common ways a real
+# credential sits in a real config file.
+#
+# Only the password is replaced. The scheme, the user and the host survive, so
+# a preview still says which database this is and who connects to it -- the
+# same "keep the shape, lose the payload" trade every other rule here makes.
+#
+# Strict only, deliberately. The log path has a pinned contract that it must
+# not get stricter (`test_the_log_path_leaves_a_connection_string_alone`), and
+# a connection string in a traceback is a genuine diagnostic. Text on its way
+# to a reader over a transport is the case where the credential half costs
+# more than the diagnostic half.
+_URL_USERINFO = re.compile(
+    r"(?i)\b([a-z][a-z0-9+.\-]*://)([^\s:/@]+):([^\s/@]+)@"
 )
 
 # ─── Unlabelled high-entropy tokens ──────────────────────────────────────
@@ -122,9 +177,39 @@ _BARE = re.compile(r"(?<![\w-])[A-Za-z0-9_\-]{24,}(?![\w-])")
 # This one lives in the shared path rather than in strict mode. The usual
 # trade -- over-redaction costs a diagnostic -- does not apply, because a
 # base64 key body has never been a useful thing to read in a log.
+# Two patterns rather than one with an optional footer, and that is the fix
+# for the largest destructive rule this module had.
+#
+# It used to be `(BEGIN…)(.*?)(END…|\Z)` under `(?is)`. With no END marker
+# `.*?` expands to the end of the string, and `(?i)` means a lowercase prose
+# *mention* triggers it -- so a setup guide that merely names the header, or a
+# traceback that quotes it, lost every line that followed. Measured on a
+# `# Setup` document: everything after "Paste the -----BEGIN RSA PRIVATE
+# KEY----- header" was gone, in the preview path and the log path both.
+#
+# A terminated block still goes as a block: the footer is the evidence that
+# everything between the two markers is body, whatever it looks like.
+#
+# An unterminated one -- a preview that clipped the footer, and a clipped key
+# is still a key -- consumes only what a PEM body actually is: whole lines of
+# base64, starting on the line *after* the header. A sentence continuing on
+# the header's own line is not that, and neither is a `##` heading two lines
+# down, so a document that mentions the marker keeps its text. The 16-character
+# floor keeps a one-word line from qualifying.
+#
+# `[A-Z0-9 ]*` now appears on *both* sides of `PRIVATE KEY`. The old pattern
+# required `-----` immediately after `KEY`, so `-----BEGIN PGP PRIVATE KEY
+# BLOCK-----` -- the spelling every exported PGP secret key uses -- matched
+# nothing and its body printed in the clear.
+_PEM_MARKER = r"-----{verb} [A-Z0-9 ]*PRIVATE KEY[A-Z0-9 ]*-----"
 _PEM_PRIVATE_KEY = re.compile(
-    r"(?is)(-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----)(.*?)"
-    r"(-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)"
+    "(?is)({begin})(.*?)({end})".format(
+        begin=_PEM_MARKER.format(verb="BEGIN"),
+        end=_PEM_MARKER.format(verb="END"))
+)
+_PEM_PRIVATE_KEY_UNTERMINATED = re.compile(
+    "(?i)({begin})((?:\\r?\\n[ \\t]*[A-Za-z0-9+/=]{{16,}}[ \\t]*)+)".format(
+        begin=_PEM_MARKER.format(verb="BEGIN"))
 )
 
 # ─── Quoted labels (strict only) ─────────────────────────────────────────
@@ -142,8 +227,20 @@ _PEM_PRIVATE_KEY = re.compile(
 # `json.dumps` without `indent` is not obfuscation and must not be a bypass.
 # The quotes and the key survive so the preview still says which values are
 # set.
+# The key may be unquoted as well as quoted, because the shape this rule is
+# for is not only JSON. `const cfg = { clientSecret: "hunter2plain" }` is the
+# same key-colon-quoted-value structure with JavaScript's object syntax, and it
+# reaches nothing else here: `_ASSIGNMENT` is line-anchored and this line
+# starts with `const`, and `\bsecret\b` cannot see inside `clientSecret`. It is
+# also the exact shape a `.ts`/`.js` config file previewed over the FILES route
+# has.
+#
+# Widening the key is safe because the key is not what decides anything --
+# `_identifier_tier` is, and it refuses `{ name: "Bob" }` and `{ key: "abc" }`
+# exactly as it refuses them everywhere else.
 _QUOTED_LABELLED = re.compile(
-    r'"([A-Za-z][A-Za-z0-9_\-]*)"(\s*:\s*)"([^"\r\n]*)"'
+    r'(?:"([A-Za-z][A-Za-z0-9_\-]*)"|\b([A-Za-z][A-Za-z0-9_\-]*))'
+    r'(\s*:\s*)"([^"\r\n]*)"'
 )
 
 # ─── Hard-wrapped values (strict only) ───────────────────────────────────
@@ -174,6 +271,12 @@ _WRAPPED_CONTINUATION = re.compile(
 _BARE_MIN_LEN = 24
 _WEAK_LABEL_MIN_LEN = 8
 _STRONG_LABEL_MIN_LEN = 3
+
+# How long an all-digit value must be, under a role noun, to count as secret
+# rather than as a number. Ten digits is past every port, size, year, HTTP
+# status and small count a configuration file writes, and short of nothing a
+# numeric credential realistically is.
+_NUMERIC_MIN_LEN = 10
 
 # ─── Assignment-shaped lines (strict only) ───────────────────────────────
 # The two mechanisms above both ask "does this value look like a secret?".
@@ -222,9 +325,58 @@ _STRONG_LABEL_MIN_LEN = 3
 # pattern is what lets the two tiers -- redact on the label alone, versus
 # redact only a secret-shaped value -- stay the same two tiers the labelled
 # rule already uses, instead of becoming a second, differently-argued policy.
+# `(?:-[ \t]+)?` in the lead is the YAML sequence marker. `^[ \t]*` allowed
+# spaces and tabs before the identifier -- which is indentation, and covers a
+# YAML *mapping* -- but a docker-compose `environment:` block writes its keys
+# as list items:
+#
+#     environment:
+#       - POSTGRES_PASSWORD=hunter2
+#
+# and that `- ` made the line unrecognisable. It is one of the two or three
+# most common places a real password sits in a real repository.
+#
+# The separator alternates `:=` ahead of the single-character class. `(?!=)`
+# was added to stop `MODE == "prod"` being read as an assignment, and it also
+# killed `db_pass := hunter2` -- Go's and Pascal's assignment operator, and
+# what a `.tf`/`.ini`-adjacent config or a pasted snippet may well use. Trying
+# `:=` first matches the operator; falling through to `[:=](?!=)` still refuses
+# `==`, and every other comparison (`!=`, `<=`, `>=`) never starts a match
+# because `!`, `<` and `>` are not in the class.
 _ASSIGNMENT = re.compile(
-    r"(?m)^([ \t]*(?:export[ \t]+)?)([A-Za-z][A-Za-z0-9_\-]*)"
-    r"([ \t]*[:=](?!=)[ \t]*)([^\r\n]*)"
+    r"(?m)^([ \t]*(?:-[ \t]+)?(?:export[ \t]+)?)([A-Za-z][A-Za-z0-9_\-]*)"
+    r"([ \t]*(?::=|[:=](?!=))[ \t]*)([^\r\n]*)"
+)
+
+# Values that are code rather than configuration: a call, a subscript, or a
+# literal collection. This replaced a blanket "contains any bracket" test,
+# which exempted `db_pass=P@ssw(rd!1` -- so the punctuation-rich passwords,
+# which are the strong ones, were the ones the guard let through. A password is
+# not shaped like a call: the shapes below are an identifier (dotted paths
+# included) immediately followed by `(` or `[`, or a value that opens with a
+# bracket. `P@ssw(rd!1` is neither, because `@` is not part of an identifier.
+_CODE_SHAPE = re.compile(r"\A(?:[\[{(]|[A-Za-z_][A-Za-z0-9_.]*[ \t]*[\[(])")
+
+# A numeric literal, in the spellings source and configuration actually use.
+# Deliberately not "anything made of hex characters": `abc123` is all hex
+# characters and is a plausible short credential, and `CLIENT_ID: abc123` is
+# pinned as redacted. Only decimal (with `_` digit separators) and an explicit
+# `0x`/`0b`/`0o` prefix count.
+_BARE_NUMBER = re.compile(
+    r"\A[+-]?(?:0[xX][0-9A-Fa-f_]+|0[bB][01_]+|0[oO][0-7_]+"
+    r"|[0-9][0-9_]*(?:\.[0-9_]+)?(?:[eE][+-]?[0-9]+)?)\Z"
+)
+
+# The canonical 8-4-4-4-12 identifier. `_looks_secret`'s entropy signal counts
+# a hyphen, so every UUID in a fixture, a migration, a log line or a config
+# tripped the bare rule -- the same false positive the git-hash carve-out
+# exists to prevent, arrived at from the other direction. A UUID is an
+# identifier by definition: it is generated to be *shared*, and it carries no
+# authority on its own. Exempted on the bare path only -- `api_key:
+# 550e8400-...` is a token because the label says so.
+_UUID = re.compile(
+    r"\A[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}"
+    r"-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\Z"
 )
 
 
@@ -250,7 +402,19 @@ def _looks_secret(candidate: str, *, min_len: int, require_entropy: bool) -> boo
     has_digit = any(c.isdigit() for c in candidate)
     has_alpha = any(c.isalpha() for c in candidate)
     if not (has_digit and has_alpha):
-        return False
+        # An all-digit run under a role noun is a secret too. Requiring *both*
+        # a digit and a letter exempted `token: 918273645509` outright -- and
+        # numeric tokens, PINs and account identifiers are common enough that
+        # "it has no letters" is not evidence of anything.
+        #
+        # Only on the labelled paths (`require_entropy=False`), never on the
+        # bare one: a long unlabelled digit string is a timestamp, an id or a
+        # phone number far more often than a credential, and there is no label
+        # to corroborate it. `_NUMERIC_MIN_LEN` is well above the four or five
+        # digits a port, a size or a year takes.
+        if require_entropy or not has_digit or has_alpha:
+            return False
+        return len(candidate) >= _NUMERIC_MIN_LEN
     if not require_entropy:
         return True
     has_case_mix = candidate != candidate.lower() and candidate != candidate.upper()
@@ -296,54 +460,106 @@ def _is_configuration_value(stripped: str) -> bool:
     the branch that fires on ordinary source.
 
     What this knowingly gives up is a quoted config value with spaces under a
-    lowercase key. The quoted rule above covers the JSON spelling of exactly
-    that, which is the one that shows up on disk.
+    lowercase key -- unless a *strong* role noun names it, which
+    `_mask_assignment` now handles separately, because `client_secret:
+    "hunter two"` is not a sentence and the label says so.
     """
-    if any(c in stripped for c in "()[]{}"):
-        return False
-    # Quotes, and a trailing comma or semicolon, are punctuation around the
-    # literal rather than part of it -- `allow_bearer=False,` inside a
-    # multi-line call is still a boolean.
-    if stripped.strip("\"',;").lower() in _NON_SECRET_LITERALS:
-        return False
     return not any(c.isspace() for c in stripped)
+
+
+def _looks_like_code(stripped: str) -> bool:
+    """A call, a subscript, or a literal collection -- syntax, not a value.
+
+    Hoisted out of `_is_configuration_value` and applied to **every** tier,
+    including UPPER_SNAKE, which used to skip that function entirely. That
+    short-circuit is what destroyed a preview of this project's own
+    `config.py`: `INTENTS = [...]` lost its list and `TASK_MODEL_MAP = {` lost
+    its opening brace, orphaning the dict body and the closing brace below it.
+    A source preview that returns structurally broken source is its own bug.
+
+    Narrower than the "any bracket anywhere" test it replaces -- see
+    `_CODE_SHAPE` for why that one exempted exactly the punctuation-rich
+    passwords it should have caught.
+    """
+    return _CODE_SHAPE.match(stripped) is not None
+
+
+def _is_switch_literal(stripped: str) -> bool:
+    """A boolean or a null, in the punctuation a real line wraps it in.
+
+    Quotes and a trailing comma or semicolon are punctuation around the
+    literal rather than part of it -- `allow_bearer=False,` inside a
+    multi-line call is still a boolean. Applied to every tier now, for the
+    same reason `_looks_like_code` is: `DEBUG=true` and `debug=true` are the
+    same line and the identifier's casing was never the thing that made the
+    value a switch.
+    """
+    return stripped.strip("\"',;").lower() in _NON_SECRET_LITERALS
+
+
+def _is_quoted(stripped: str) -> bool:
+    """Whether the value is wholly enclosed in one pair of quotes.
+
+    A quoted value is a value by syntax rather than by guess, which is what
+    lets the colon rule below admit `client_secret: "hunter two"` without
+    also admitting `TODO: buy cable`.
+    """
+    return (len(stripped) >= 2 and stripped[0] == stripped[-1]
+            and stripped[0] in "\"'")
 
 
 def _identifier_tier(name: str) -> str | None:
     """How much evidence an identifier is, on a line whose value is the payload.
 
-    Returns `"strong"` (the name alone is enough — redact whatever follows),
-    `"weak"` (redact only a value that independently looks secret-shaped), or
-    `None` (this is not a secret-carrying identifier at all).
+    Four answers now, and the fourth is the fix for the over-redaction half of
+    the review:
+
+      * `"strong"` — the name alone is enough; redact whatever follows.
+      * `"weak"` — redact only a value that independently looks secret-shaped.
+      * `"constant"` — UPPER_SNAKE with **no** role noun in it. Still redacts
+        by position, because on a `.env`/INI/YAML key the value *is* the
+        payload, but no longer redacts a bare numeric literal.
+      * `None` — not a secret-carrying identifier at all.
 
     Three ways to be strong, in order of how they were arrived at:
 
-      * UPPER_SNAKE. The original rule, unchanged: on a `.env`/INI/YAML key
-        the value is the payload by position, so `DB_PASS=hunter2` loses
-        "hunter2" whatever it looks like. Its accepted cost is a public
-        constant in a source preview, which is pinned by its own test.
       * the whole name is a strong label (`password`, `api_key`, `apiKey`
-        after lowercasing).
-      * one `_`/`-` separated part is a strong part. This is the
-        snake_case fix: `db_pass`, `client_secret`, `db_password` are the
-        shapes real configuration uses, and `\\b` cannot see inside them
-        because `_` is a word character.
+        after lowercasing);
+      * one part is a strong part. This is the snake_case fix: `db_pass`,
+        `client_secret`, `db_password` are the shapes real configuration uses,
+        and `\\b` cannot see inside them because `_` is a word character.
+        `_IDENT_SPLIT` now splits camelCase too, so `clientSecret` lands here
+        as well;
+      * UPPER_SNAKE **and** a role noun of either tier. `SESSION_KEY` and
+        `TOKEN` are configuration keys naming a credential twice over, so the
+        weak tier's shape test does not apply to them -- `export
+        SESSION_KEY=abc123` and `TOKEN: hunter2` are both pinned as redacted
+        and neither value would clear it.
+
+    UPPER_SNAKE **without** a role noun is the `"constant"` tier, and
+    separating it out is the whole of the change. It used to be plain
+    `"strong"`, and `config.py` is essentially nothing but public UPPER_SNAKE
+    constants, so previewing this project's own configuration through the
+    FILES route blanked it. The value shapes that tier now declines to redact
+    -- a bare number, a bracketed literal -- are shapes no credential takes.
+    Everything else it still redacts by position, which is what keeps
+    `DATABASE_URL=postgres://…`, `CLIENT_ID: abc123` and `ARGS=--foo --bar`
+    behaving exactly as their tests pin them.
 
     Weak parts (`key`, `token`, `auth`, `credential`) are the same ordinary
     English words the weak-label tier already distrusts, and they are common
     in source code that is not configuration at all -- `sort_key`,
-    `primary_key`, `next_token`. So they get the same treatment they get in
-    prose: a hint, not proof, and the value still has to look the part.
+    `primary_key`, `next_token`. So on a *lowercase* name they get the same
+    treatment they get in prose: a hint, not proof.
     """
-    if _UPPER_SNAKE.match(name):
-        return "strong"
     lowered = name.lower()
-    parts = {p for p in _IDENT_SPLIT.split(lowered) if p}
+    parts = {p.lower() for p in _IDENT_SPLIT.split(name) if p}
     if lowered in _STRONG_LABEL_SET or parts & _STRONG_IDENT_PARTS:
         return "strong"
-    if lowered in _WEAK_LABEL_SET or parts & _WEAK_IDENT_PARTS:
-        return "weak"
-    return None
+    has_weak_noun = lowered in _WEAK_LABEL_SET or bool(parts & _WEAK_IDENT_PARTS)
+    if _UPPER_SNAKE.match(name):
+        return "strong" if has_weak_noun else "constant"
+    return "weak" if has_weak_noun else None
 
 
 def _mask_assignment(match: re.Match[str]) -> str:
@@ -380,9 +596,40 @@ def _mask_assignment(match: re.Match[str]) -> str:
     stripped = value.strip()
     if not stripped:
         return match.group(0)
-    if ":" in separator and any(c.isspace() for c in stripped):
+    # Already handled, by this rule on an earlier pass or by the quoted rule
+    # above it. Bailing keeps both entry points idempotent without depending on
+    # `[REDACTED]` happening to fail some other test.
+    if REDACTED in stripped:
         return match.group(0)
+    # Code and switches are not credentials, on any tier. Both used to be
+    # skipped for UPPER_SNAKE, which is what destroyed `INTENTS = [...]`,
+    # `TASK_MODEL_MAP = {` and `DEBUG=true` in a source preview.
+    if _looks_like_code(stripped) or _is_switch_literal(stripped):
+        return match.group(0)
+    if ":" in separator and any(c.isspace() for c in stripped):
+        # `:` is the one separator English also writes, so an ALL-CAPS prose
+        # marker ("TODO: buy cable") is assignment-shaped by every structural
+        # test available. A sentence is what tells the two apart.
+        #
+        # Unless the value is quoted *and* a strong role noun named it:
+        # `client_secret: "hunter two"` is a value by syntax and a credential
+        # by label, and it was leaking. The exemption is scoped to the strong
+        # tier so that `SOME_PHRASE: "two words"` -- pinned as surviving -- is
+        # untouched, since `SOME_PHRASE` carries no role noun.
+        if not (tier == "strong" and _is_quoted(stripped)):
+            return match.group(0)
+    # The whitespace half of the configuration-vs-code test stays exclusive to
+    # lowercase names, and that asymmetry is deliberate rather than an
+    # oversight: `=` is machine syntax prose does not reach for, so
+    # `ARGS=--foo --bar` should still lose its value, while `key = 0xAF if
+    # command_id == 'volume_up' else 0xAE` is an expression and must not.
     if not _UPPER_SNAKE.match(name) and not _is_configuration_value(stripped):
+        return match.group(0)
+    if tier == "constant" and _BARE_NUMBER.match(stripped):
+        # A number is not a credential, and this tier's identifier carries no
+        # role noun saying otherwise. `MAX_PREVIEW_BYTES = 65536` survives;
+        # `TOKEN: 918273645509` does not, because that name reaches the strong
+        # tier and never arrives here.
         return match.group(0)
     if tier == "weak" and not _looks_secret(
         stripped, min_len=_WEAK_LABEL_MIN_LEN, require_entropy=False
@@ -398,21 +645,36 @@ def _mask_quoted(match: re.Match[str]) -> str:
     `"password"` key loses a short shapeless passphrase while a `"key"` key
     only loses something that looks the part.
     """
-    name, separator, value = match.groups()
+    quoted_name, bare_name, separator, value = match.groups()
+    name = quoted_name if quoted_name is not None else bare_name
     if value == REDACTED or value.lower() in _NON_SECRET_LITERALS:
         return match.group(0)
     tier = _identifier_tier(name)
     if tier is None:
         return match.group(0)
-    if tier == "strong":
-        keep = not _is_plausible_value(value, min_len=_STRONG_LABEL_MIN_LEN)
-    else:
+    if tier == "constant" and quoted_name is None:
+        # An *unquoted* key is source syntax -- a JavaScript object field, a
+        # YAML mapping in a `.ts` config -- not a `.env` line, so the
+        # "the value is the payload by position" argument that carries the
+        # constant tier on an assignment line does not apply. Only a real role
+        # noun makes an unquoted key evidence here, which is what keeps
+        # `SOME_PHRASE: "two words"` intact while `clientSecret: "…"` goes.
+        return match.group(0)
+    if tier == "weak":
         keep = not _looks_secret(
             value, min_len=_WEAK_LABEL_MIN_LEN, require_entropy=False
         )
+    else:
+        # `strong` and `constant` alike: inside a quoted structure the key is
+        # a field name, not a module constant, so there is no public-constant
+        # cost to weigh here the way there is on an assignment line.
+        keep = not _is_plausible_value(value, min_len=_STRONG_LABEL_MIN_LEN)
     if keep:
         return match.group(0)
-    return f'"{name}"{separator}"{REDACTED}"'
+    # The key comes back the way it went in: quoting it when it was not quoted
+    # would rewrite the JavaScript this rule now also reads.
+    rendered = f'"{name}"' if quoted_name is not None else name
+    return f'{rendered}{separator}"{REDACTED}"'
 
 
 def _mask_wrapped_continuations(text: str) -> str:
@@ -445,10 +707,28 @@ def redact_secrets(text: str) -> str:
 
     # Before anything character-level: a private-key block goes as a block,
     # or the bare rule fragments its base64 on `+`/`/` and prints the pieces
-    # that fall under the length floor.
+    # that fall under the length floor. Terminated first, so that a block with
+    # a footer is consumed as a block and the unterminated pattern -- which
+    # only ever eats whole base64 lines -- has nothing left to see.
     text = _PEM_PRIVATE_KEY.sub(
         lambda m: f"{m.group(1)}\n{REDACTED}\n{m.group(3)}", text
     )
+    text = _PEM_PRIVATE_KEY_UNTERMINATED.sub(
+        lambda m: f"{m.group(1)}\n{REDACTED}", text
+    )
+
+    def _mask_labelled_assigned(match: re.Match[str]) -> str:
+        label, separator, tail = match.groups()
+        value = tail.rstrip()
+        if not value or value == REDACTED:
+            return match.group(0)
+        if not _is_plausible_value(value, min_len=_STRONG_LABEL_MIN_LEN):
+            return match.group(0)
+        # The trailing whitespace the value did not include is put back, so a
+        # file's own spacing survives a preview.
+        return f"{label}{separator}{REDACTED}{tail[len(value):]}"
+
+    text = _LABELLED_ASSIGNED.sub(_mask_labelled_assigned, text)
 
     def _mask_labelled(match: re.Match[str]) -> str:
         label, _filler, value = match.group(1), match.group(2), match.group(3)
@@ -468,6 +748,11 @@ def redact_secrets(text: str) -> str:
 
     def _mask_bare(match: re.Match[str]) -> str:
         candidate = match.group(0)
+        if _UUID.match(candidate):
+            # An identifier, not a credential. Without this every UUID trips
+            # the bare rule, because the hyphens read as the entropy signal
+            # this path requires -- see `_UUID`.
+            return candidate
         if not _looks_secret(candidate, min_len=_BARE_MIN_LEN, require_entropy=True):
             return candidate
         return REDACTED
@@ -501,4 +786,16 @@ def redact_secrets_strict(text: str) -> str:
         return text
     out = _QUOTED_LABELLED.sub(_mask_quoted, text)
     out = _ASSIGNMENT.sub(_mask_assignment, out)
+
+    def _mask_url_userinfo(match: re.Match[str]) -> str:
+        scheme, user, password = match.groups()
+        if password == REDACTED:
+            return match.group(0)
+        return f"{scheme}{user}:{REDACTED}@"
+
+    # After the assignment rule, which will already have taken the whole value
+    # on a line like `DATABASE_URL=postgres://…` -- so this one is what catches
+    # a connection string in prose, in a command line, or under a lowercase key
+    # with no role noun in it.
+    out = _URL_USERINFO.sub(_mask_url_userinfo, out)
     return _mask_wrapped_continuations(redact_secrets(out))

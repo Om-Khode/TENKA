@@ -109,8 +109,10 @@ _CONTENT_TYPES: dict[str, str] = {
     ".map": "application/json",
     ".webmanifest": "application/manifest+json",
     ".txt": "text/plain; charset=utf-8",
-    ".xml": "application/xml",
-    ".svg": "image/svg+xml",
+    # `.svg` and `.xml` were pinned here and are deliberately gone: see
+    # `_SCRIPTABLE_DOCUMENT_TYPES` below. Leaving them in the table and
+    # filtering them afterwards would read as an oversight; removing them says
+    # the daemon does not serve those as documents at all.
     ".ico": "image/x-icon",
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -128,18 +130,60 @@ _CONTENT_TYPES: dict[str, str] = {
 }
 
 
+# Media types a browser will run script from when it is the *top-level*
+# document, which is what a bundle member becomes the moment somebody
+# navigates straight at it. `text/html` was the only one this module used to
+# guard against, and it was the least interesting of the set: the export's own
+# HTML is ours, while these four arrive as assets and are scriptable anyway.
+#
+# `image/svg+xml` is the one that matters. An SVG is a full XML document with
+# `<script>` and event handlers, and the CSP this module ships is
+# `script-src 'self' 'unsafe-inline'` with no nonce -- deliberately, because a
+# Next.js export inlines its hydration payload (see `_CSP`). So an SVG that
+# reaches the served set executes inline script *on the daemon's own origin*,
+# where the device cookie rides along, `X-TENKA-Request` is presence-checked
+# only, and `Origin` is this daemon's. `application/xhtml+xml` and the two XML
+# spellings are the same hole with a different extension, and `mimetypes`
+# reaches all of them through the Windows registry, which this module already
+# refuses to trust for `.js`.
+#
+# The cost is honest and small: an `<img src="logo.svg">` no longer renders,
+# because `image/svg+xml` is the only type that makes an SVG an image. The five
+# `.svg` files in the vendored bundle today are `create-next-app`'s stock
+# decorations, and a UI that needs vector art can inline it in the document or
+# ship a `.png`. Losing a decoration is worth strictly less than same-origin
+# script execution on an unauthenticated route.
+_SCRIPTABLE_DOCUMENT_TYPES = frozenset({
+    "application/xhtml+xml",
+    "image/svg+xml",
+    "application/xml",
+    "text/xml",
+    "text/html",
+})
+
+# The extensions this daemon serves as documents on purpose. Everything else
+# that resolves to a scriptable type is a mis-typed asset, not a page.
+_DOCUMENT_SUFFIXES = frozenset({".html", ".htm"})
+
+
 def content_type_for(member: str) -> str:
     suffix = Path(member).suffix.lower()
-    known = _CONTENT_TYPES.get(suffix)
-    if known:
-        return known
-    guessed, _ = mimetypes.guess_type(member)
-    # Never `text/html` by accident: a sniffed type is exactly how an uploaded
-    # asset turns into a script in someone's origin. Anything unrecognised is
-    # a download, not a document.
-    if guessed and not guessed.startswith("text/html"):
-        return guessed
-    return "application/octet-stream"
+    if suffix in _DOCUMENT_SUFFIXES:
+        return _CONTENT_TYPES[suffix]
+    candidate = _CONTENT_TYPES.get(suffix)
+    if candidate is None:
+        candidate, _ = mimetypes.guess_type(member)
+    if not candidate:
+        return "application/octet-stream"
+    # Compared on the type alone: `_CONTENT_TYPES` carries `; charset=utf-8` on
+    # some entries and a guess may too, and a deny-list that a parameter can
+    # walk past is not a deny-list.
+    if candidate.split(";", 1)[0].strip().lower() in _SCRIPTABLE_DOCUMENT_TYPES:
+        # A download, not a document. Anything unrecognised takes the same
+        # answer, so a sniffed type can never turn an asset into a script in
+        # this origin.
+        return "application/octet-stream"
+    return candidate
 
 
 # ─── path normalisation ──────────────────────────────────────────────────
@@ -174,6 +218,34 @@ _ILLEGAL_CHARS = frozenset('\x00:*?"<>|\r\n\t')
 
 _MAX_MEMBER_DEPTH = 24
 _MAX_MEMBER_LENGTH = 512
+
+
+def is_hidden_member(safe: str) -> bool:
+    """Whether any segment of an already-folded name begins with a dot.
+
+    The rule used to live in `_enumerate_dir` alone, on the argument that a
+    zip's members "were chosen by a script rather than by whatever a
+    developer's working directory happens to contain". The script is
+    `tools/package_studio_ui.py`'s `_collect`, which is `source.rglob("*")` --
+    it ships whatever is in the directory too, and the vendored bundle proved
+    it: `assistant/io/api/studio_ui.zip` carried `.tenka-ui.json` twice, once
+    written by `package()` and once swept off disk. A dot-prefixed name had
+    already reached the archive through the path that could not happen.
+
+    So the rule is a property of the name, applied by `normalise_member` and
+    therefore by *both* loaders, the request path, and the packaging step at
+    once. There is one member this daemon does read that a dot rule would
+    otherwise forbid -- `MARKER_NAME` -- and it is opened by literal path
+    (`root / MARKER_NAME`, `archive.getinfo(MARKER_NAME)`), never through this
+    function, precisely so that it is unreachable by name over HTTP.
+
+    A static export needs no dot-prefixed file served, and the rule is a shape
+    rather than a list: `.env`, `.env.local`, `.git/`, `.DS_Store` and whatever
+    an editor leaves behind all fall out of it without any of them being
+    written down. That is the point -- a deny-list needs a new entry per tool
+    anybody ever runs.
+    """
+    return any(part.startswith(".") for part in safe.split("/"))
 
 
 def normalise_member(raw: str) -> str | None:
@@ -223,6 +295,11 @@ def normalise_member(raw: str) -> str | None:
         # `x.html ` both open `x.html` -- two names for one member is one name
         # too many for anything that has to be reasoned about.
         if part != part.strip() or part.endswith("."):
+            return None
+        # Hidden entries are not members, on any loader and on the request
+        # path. See `is_hidden_member` for why this belongs to the name
+        # pipeline rather than to one enumerator.
+        if part.startswith("."):
             return None
     return "/".join(parts)
 
@@ -287,9 +364,41 @@ class UiBundle:
     def _from_zip(cls, path: Path) -> "UiBundle | None":
         try:
             with zipfile.ZipFile(path) as archive:
+                # A zip may store the same name twice, and `zipfile` resolves a
+                # repeated name to the LAST entry on read. That is not a
+                # cosmetic defect: the vendored bundle carried `.tenka-ui.json`
+                # twice, so `_read_marker_from_zip` was reading the stale
+                # on-disk copy rather than the one packaging computed, and
+                # `mount_ui` was deciding its stale-contract 503 on it. A guard
+                # measuring the wrong document is worse than no guard.
+                #
+                # Refused whole, not per member, and for the same reason the
+                # duplicate cookie is refused rather than resolved: "which of
+                # these two did the build mean?" is not a question this loader
+                # can answer, and a bundle whose contents are ambiguous is a
+                # broken build artifact. Packaging now rejects it at the source
+                # (`tools/package_studio_ui.py`), so a bundle that reaches here
+                # with duplicates was not produced by that script.
+                stored = [info.filename for info in archive.infolist()
+                          if not info.is_dir()]
+                if len(stored) != len(set(stored)):
+                    logger.warning(
+                        f"[UI] refusing the Studio bundle at {path}: it stores "
+                        f"the same member name more than once, so what it "
+                        f"serves for that name is whichever entry came last")
+                    return None
                 names: set[str] = set()
                 for info in archive.infolist():
                     if info.is_dir():
+                        continue
+                    if info.filename == MARKER_NAME:
+                        # The daemon's own member, read below by literal name.
+                        # It is dot-prefixed on purpose, so `normalise_member`
+                        # refuses it -- correctly, since it must not be
+                        # reachable by name over HTTP -- and letting it fall
+                        # into the branch below would log "dropped an unsafe
+                        # archive entry" about the one entry the bundle is
+                        # required to carry.
                         continue
                     safe = normalise_member(info.filename)
                     if safe is None or not safe:
@@ -357,18 +466,22 @@ class UiBundle:
         would publish a `.env` sitting next to `index.html` just as readily as
         the old per-read check did -- lens 1 F7's observed `GET /.env` -> 200
         would still hold. So a *hidden* entry -- any path segment beginning
-        with a dot -- is not a member here. That is a rule about a shape, not a
-        list of names: `.env`, `.env.local`, `.git/`, `.DS_Store` and an
-        editor's dotfile all fall out of it without any of them being written
-        down, which is the point. A static export needs no dot-prefixed file
-        served; the one this daemon does read, the marker, is opened by path
-        and is `_PRIVATE_MEMBERS` besides.
+        with a dot -- is not a member.
 
-        Not applied to the zip loader, deliberately. That archive is a build
-        artifact the packaging step already scans for secrets before it ships,
-        and its members were chosen by a script rather than by whatever a
-        developer's working directory happens to contain. The loaders publish
-        different sets, and the difference is in the safe direction.
+        That rule now lives in `normalise_member`/`is_hidden_member` and
+        therefore applies to the zip loader too. An earlier revision of this
+        docstring argued the opposite -- that the archive's "members were
+        chosen by a script rather than by whatever a developer's working
+        directory happens to contain" -- and the script is
+        `tools/package_studio_ui.py`'s `rglob("*")`, which chooses exactly what
+        is in the directory. The shipped bundle carried a dot member through
+        that path. The two loaders publish the same shape of set again, which
+        is the only arrangement nobody has to remember.
+
+        The `startswith(".")` tests below are kept as a *pre*-filter rather
+        than left to `normalise_member`: pruning `dirs` in place is what stops
+        `os.walk` descending into `.git/` at all, and a hidden directory's
+        contents are not worth the stat calls either.
 
         `followlinks=False`, so a symlinked directory is not descended into
         and cannot make this walk unbounded. A symlinked *file* is still
@@ -772,6 +885,21 @@ def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
         # the same one the app's own 404 handler produces, so an API miss looks
         # identical whether or not a UI bundle happens to be mounted.
         if ui_path == "v1" or ui_path.startswith("v1/"):
+            return _refuse(404, {"error": "not found"})
+
+        # A hidden path answers 404, not the 403 every other refused name
+        # gets. `normalise_member` now refuses a dot member outright -- that is
+        # the fix for `GET /.env` -> 200 -- but the *answer* belongs with
+        # `_PRIVATE_MEMBERS` below rather than with the traversal refusals: a
+        # 403 says "that name is a thing I will not serve", which for the
+        # marker is a confirmation that it exists. Every hidden path takes this
+        # branch whether or not the bundle carries one, so the pair is not an
+        # oracle in either direction.
+        # `.` and `..` are excluded: they start with a dot but they are
+        # traversal, not a hidden file, and traversal keeps its 403.
+        segments = ui_path.replace("\\", "/").strip("/").split("/")
+        if (any(part.startswith(".") for part in segments)
+                and not any(part in (".", "..") for part in segments)):
             return _refuse(404, {"error": "not found"})
 
         member = normalise_member(ui_path)

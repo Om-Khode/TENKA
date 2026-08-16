@@ -15,7 +15,7 @@ import asyncio
 import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -28,8 +28,8 @@ from ...core.redact import redact_secrets
 from .context import request_id_var
 from .errors import to_http_exception
 from .events import (
-    EventHub, build_ack_frame, build_error_frame, build_status_frame,
-    visible_frame,
+    EventHub, build_ack_frame, build_error_frame, build_pong_frame,
+    build_status_frame, visible_frame,
 )
 from .pairing import PairCodeStore
 from .policy import effective
@@ -756,8 +756,6 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             await websocket.close(code=1008)
             return
 
-        _audit("accepted")
-
         # ─── the socket is not a credential ──────────────────────────────
         # `device` above was resolved once, at the handshake. Everything this
         # daemon says about revocation depends on that answer never being
@@ -874,8 +872,18 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                                           device_id=device.device_id):
             logger.info(f"[API] refused /v1/events, socket cap reached "
                         f"(device={device.device_id})")
-            await websocket.close(code=1013)   # try again later
+            # Audited as a refusal: `_audit("accepted")` used to run above
+            # `accept()`, so a refused socket was recorded as accepted and the
+            # refusal nowhere. It now runs below, once the hub has the socket.
+            #
+            # `EventHub.attach` no longer closes on refusal, so this is the
+            # only close and the 1013 really arrives. Suppressed anyway --
+            # this `return` is above the `try:`, so a raise escapes to uvicorn.
+            _audit("1013")
+            with suppress(Exception):
+                await websocket.close(code=1013)   # try again later
             return
+        _audit("accepted")
         try:
             info = await app.state.runtime.system.status()
             # Same builder as every real status frame (`build_status_frame`,
@@ -949,7 +957,27 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                 if not parsed:
                     await _safe_send(build_error_frame("malformed frame"))
                     continue
-                if not isinstance(frame, dict) or frame.get("type") != "abort":
+                if not isinstance(frame, dict):
+                    await _safe_send(build_error_frame("unknown frame"))
+                    continue
+                # The keepalive's inbound half. `note_activity()` above has
+                # already recorded that this connection is alive -- that is
+                # true of any frame, junk included -- so all this branch adds
+                # is an answer that is not an error. Without it, a client
+                # keeping itself alive receives "unknown frame" per heartbeat,
+                # which reads as a protocol mismatch and teaches client authors
+                # to send junk instead. `pong` is accepted and answered with
+                # nothing, so a client replying to the hub's own ping (see
+                # `build_ping_frame` in events.py) is not answered back into a
+                # loop. Neither is a write verb, so neither is capability
+                # gated -- the re-verify above has already run.
+                kind = frame.get("type")
+                if kind == "ping":
+                    await _safe_send(build_pong_frame())
+                    continue
+                if kind == "pong":
+                    continue
+                if kind != "abort":
                     await _safe_send(build_error_frame("unknown frame"))
                     continue
                 # Re-verified per frame, against the vault, before the write
