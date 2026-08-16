@@ -142,7 +142,17 @@ async def _async_run_handler(task: dict) -> str:
             logger.warning(f"[scheduler] Procedure not found: {goal}")
             return ""
         from assistant.procedure_executor import run_procedure
-        return await run_procedure(proc, goal)
+        # Same reasoning as the web_search branch above, and now load-bearing
+        # rather than tidy: `run_procedure` checks EXECUTE itself, so without
+        # this the scheduler would run every stored procedure with
+        # `current_grants` unset and be refused. Installing the schedule
+        # required EXECUTE (`manage_schedule`), so the grant being spent here
+        # is the installer's, stated rather than inherited.
+        token = set_grants(LOCAL_GRANTS)
+        try:
+            return await run_procedure(proc, goal)
+        finally:
+            current_grants.reset(token)
     else:
         logger.warning(f"[scheduler] Unknown task_type: {task_type}")
         return ""

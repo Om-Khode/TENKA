@@ -166,6 +166,39 @@ def _refuse(required: Capability) -> str:
             f"which this device doesn't have.")
 
 
+def capability_refusal(required: Capability) -> "str | None":
+    """May the turn in flight do a thing that costs `required`?
+
+    Returns `None` when it may, and the refusal sentence when it may not.
+
+    **This is the only predicate in the tree that answers that question.**
+    `execute()` below calls it, and so does every branch of
+    `main.py:process_text_from_queue` that produces an effect and returns
+    before dispatch, and so does `procedure_executor.run_procedure` as a
+    backstop for the scheduler. That matters more than it looks: the 6a.5
+    review found the gate guarding the last door while five earlier ones stood
+    open, and the reason a second door could be built unguarded is that the
+    check lived *inside* `execute()` rather than beside it as something a
+    caller could ask. A separate re-implementation at each site would be the
+    same mistake with more code.
+
+    Fails closed twice over: an unset grant set (`None`) refuses everything --
+    the absence of a decision is not a decision to allow -- and any caller that
+    wants a capability the turn does not hold is refused rather than warned.
+
+    Deliberately synchronous and side-effect free apart from a log line, so a
+    branch can consult it in an `if` condition without restructuring itself.
+    """
+    granted = current_grants.get()
+    if granted is not None and required in granted:
+        return None
+    logger.info(
+        f"Refused: needs {required.value}, caller holds "
+        f"{'nothing (grants unset)' if granted is None else sorted(c.value for c in granted)}"
+    )
+    return _refuse(required)
+
+
 # â"€â"€â"€ Preference-Aware Defaults â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 
@@ -338,13 +371,10 @@ async def execute(intent: str, params: dict, llm_response: str = "",
     # everything. Both are the fail-closed direction; see
     # core/intent_capabilities.py and `current_grants`.
     _required = REQUIRED_CAPABILITY.get(intent, DEFAULT_REQUIRED)
-    _granted = current_grants.get()
-    if _granted is None or _required not in _granted:
-        logger.info(
-            f"Refused '{intent}': needs {_required.value}, caller holds "
-            f"{'nothing (grants unset)' if _granted is None else sorted(c.value for c in _granted)}"
-        )
-        return _refuse(_required)
+    _refusal = capability_refusal(_required)
+    if _refusal is not None:
+        logger.info(f"Refused intent '{intent}'")
+        return _refusal
 
     # Apply preference defaults before routing
     params = _apply_preference_defaults(intent, params)

@@ -163,7 +163,28 @@ async def run_procedure(proc: dict, original_text: str) -> str:
     - Self-heals via vision LLM when all retries exhausted
     - Stops on unrecoverable error to avoid cascading broken state
     - Records usage in procedure_store after completion
+
+    Requires EXECUTE. A procedure is a stored keystroke/click/app-launch
+    program -- `_execute_app_step` drives `automation.native` and `pyautogui`
+    itself and never passes through `actions.execute()`, so nothing downstream
+    of here re-checks. That makes this a backstop rather than the boundary:
+    the boundary is the caller (main.py's replay branch, the scheduler), and
+    this is what catches a *third* caller nobody has written yet. Both were
+    open at once when the 6a.5 review found this, which is the argument for
+    having both.
     """
+    # Deferred import: `actions` pulls in the whole handler package, and this
+    # module is imported by main.py and the scheduler at startup. The same
+    # deferral pattern the rest of the codebase uses for `..io.audio.tts`.
+    from .actions import capability_refusal
+    from .core.capabilities import Capability
+
+    _refusal = capability_refusal(Capability.EXECUTE)
+    if _refusal is not None:
+        logger.info(
+            f"[PROC] Refused '{proc.get('name', '?')}': caller lacks execute")
+        return _refusal
+
     steps = proc.get("steps", [])
     if not steps:
         return "Procedure has no steps."

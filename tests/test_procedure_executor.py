@@ -36,6 +36,30 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def run_granted(coro):
+    """Run a coroutine with the grant set a real caller of `run_procedure`
+    carries.
+
+    `run_procedure` checks EXECUTE itself as of 6a.5 -- it drives
+    `automation.native` and `pyautogui` directly and never re-enters
+    `actions.execute()`, so nothing downstream of it would otherwise check
+    anything, and it is reachable from `scheduler.py` as well as from the turn
+    pipeline. Both real callers state their grants (main.py from the turn,
+    scheduler.py explicitly); these tests are about step orchestration, so they
+    state the same thing rather than testing an unreachable call shape.
+    """
+    from assistant.actions import LOCAL_GRANTS, current_grants, set_grants
+
+    async def _wrapped():
+        token = set_grants(LOCAL_GRANTS)
+        try:
+            return await coro
+        finally:
+            current_grants.reset(token)
+
+    return asyncio.run(_wrapped())
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Pure helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -365,7 +389,7 @@ class TestRunProcedure(unittest.TestCase):
         return ps.get_procedure(trigger)
 
     def _run(self, proc, text="my workflow"):
-        return run(pe.run_procedure(proc, text))
+        return run_granted(pe.run_procedure(proc, text))
 
     def test_empty_steps(self):
         proc = {"id": 1, "name": "Empty", "trigger": "empty", "steps": []}
@@ -492,7 +516,7 @@ class TestWindowContextTracking(unittest.TestCase):
             patch("assistant.procedure_executor._execute_browser_step_via_app", new=_mock_browser),
             patch("assistant.procedure_executor._execute_app_step", new=_mock_app),
         ):
-            run(pe.run_procedure(proc, "yt search"))
+            run_granted(pe.run_procedure(proc, "yt search"))
 
         self.assertEqual(captured_windows, ["brave"])
 
@@ -507,7 +531,7 @@ class TestWindowContextTracking(unittest.TestCase):
 
         with patch("assistant.procedure_executor._execute_app_step",
                    new=AsyncMock(side_effect=["Opened notepad", "Clicked File"])):
-            run(pe.run_procedure(proc, "notepad flow"))
+            run_granted(pe.run_procedure(proc, "notepad flow"))
 
         self._fg_mock.assert_called_with("notepad")
 
