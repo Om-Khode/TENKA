@@ -394,11 +394,20 @@ The second call is a memory/fact-extraction synthesis run that summarises prior 
 
 ---
 
-## KI-12: Secrets pasted into the chat are written to debug.log in plaintext
+## KI-12: ~~Secrets pasted into the chat are written to debug.log in plaintext~~ FIXED
 
 **Priority:** Medium (security / privacy hygiene — not correctness)
 **Effort:** Low–Medium (redaction at the transcription + intent logging boundary)
 **Discovered:** 2026-06-19, KI-1/6/7/8 live-test session
+**Fixed:** 2026-08-16, milestone 6a.5 — in two parts, because the ticket only described half the problem.
+
+*Redaction* was the part this ticket asked for, and `redact_secrets` was already wired into both named sites. 6a.5 found it leaked on nine realistic shapes an adversarial review proved: pretty-printed JSON with a strong label, lowercase snake_case compounds (`db_pass`, `client_secret`), camelCase, PEM key bodies, values split by a hard line-wrap, `user:pass@host` URLs, all-digit tokens, docker-compose `- VAR=` leads, and `:=`. All nine closed. Over-redaction was fixed in the same pass — a naive fix had blanked 90 working source lines, and an unterminated `BEGIN PRIVATE KEY` marker used to blank every line after it.
+
+*Framing* was the part nobody had noticed. The log lines interpolated without `!r`, so `redact_secrets` — which is about secrets, not newlines — passed `\n` straight through, and 8,000 characters of chat text could write as many fabricated log lines as it liked into the file an operator greps after an incident. All four sites (`main.py` ×2, `intent.py`, `io/audio/tts.py`) now use `{…!r}`, matching what `routes/pairing.py` already did.
+
+Tests: `tests/test_security_pass_6a5_redaction.py`, `tests/test_6a5_api_fixes.py`, `tests/test_redact.py`.
+
+**Still open, tracked separately as [KI-15](#ki-15):** redaction runs at log and preview sites, never at storage-write sites. A secret that reaches `save_typed_fact` or the knowledge graph is stored in plaintext.
 
 **Symptom:** When the user pastes a credential-shaped string into the chat console — e.g. a Spotify OAuth **authorization code** during the `code_executor` Spotify setup flow — it is logged verbatim at INFO level, twice:
 
@@ -431,3 +440,76 @@ Prefer gating on **pending-state context** over a pure regex where possible: whe
 3. Expect the handler to still receive the full literal value (functionality intact)
 ```
 
+
+---
+
+## KI-13: Pending state has no owner — cross-device confused deputy
+
+**Priority:** Medium (security)
+**Effort:** Medium (a `current_principal` contextvar plus a field on `PendingState`, touching every arming site)
+**Discovered:** 2026-08-16, milestone 6a.5 adversarial review
+**Pinned by:** `tests/test_6a5_predispatch_gate.py`, as a strict `xfail`
+
+**Symptom:** Pending state is process-global — not per-device, not per-session — so the device that *answers* a confirmation need not be the device that asked. The operator says "delete my downloads folder" at the keyboard, TENKA arms `pending_destructive` and waits for "yes", and a remote device can answer it. Same shape for the backup restore/unlock phrases and the OAuth paste.
+
+**Why 6a.5 did not close it:** the pre-dispatch gate now charges each pending row its own capability, which stops a device that *lacks* the capability. It cannot stop a confused deputy that *holds* it — a tunnel device legitimately holding `FILES` can still answer a locally-armed file confirmation. Forcing a stronger capability would break ordinary local confirmations and buy nothing.
+
+**Recommended fix:** record a principal on `PendingState` at arm time, from a `current_principal` contextvar set alongside `current_grants`, and compare it at answer time. Refuse a mismatch rather than silently ignoring it, so the operator sees that something else tried to answer.
+
+---
+
+## KI-14: A URL delegated to a file is still chosen by the file
+
+**Priority:** Medium (security)
+**Effort:** Medium (a pending state plus a resolver, following the existing pending-handler pattern)
+**Discovered:** 2026-08-16, milestone 6a.5 adversarial review
+
+**Symptom:** "Read notes.txt and open the site named in it" is a legitimate request, and 6a.5 keeps it working. But the file picks the destination, and a query string on that URL carries data outward. Reduction (one public http(s) URL, no userinfo, no private hosts) and authorisation (the user's own words must carry a navigation verb) narrow it; neither closes it.
+
+**Recommended fix:** a consent gate — show the resolved URL and require confirmation before the first navigation to a host the user did not name themselves. Deliberately out of 6a.5's scope: it needs a new pending state, and the milestone was already three times its planned size.
+
+---
+
+## KI-15: `KNOWN FACTS ABOUT THE USER` is replayed into the system prompt unfenced
+
+**Priority:** Medium (security)
+**Effort:** Low (fence the block, as `render_untrusted_block` already does elsewhere)
+**Discovered:** 2026-08-16, milestone 6a.5 adversarial review
+
+**Symptom:** `_build_facts_context` concatenates stored facts into `build_personality_prompt()` with no delimiter and no untrusted label — the most trusted position in the tree — on every subsequent turn.
+
+**What 6a.5 did:** cut the supply. `store_memory` left the payload class, so planted step output can no longer become a stored fact. The read side is untouched, so anything already stored, or stored by another route, still replays unfenced.
+
+---
+
+## KI-16: Topic resolution rewrites pronouns with the previous turn's trailing noun
+
+**Priority:** Medium (correctness / usability, not security)
+**Effort:** Unknown — needs diagnosis before a fix is proposed
+**Discovered:** 2026-08-16, during 6a.5 live testing
+
+**Symptom:** "it" is replaced with a noun phrase lifted from the previous turn, frequently the wrong one. Observed in one session:
+
+| Typed | Classified as |
+| --- | --- |
+| `...the site named in it` | `...the site named in a public` |
+| `...the site named in it` | `...the site named in the site` |
+| `...the site named in it` | `...the site named in the shell command` |
+
+The third injected the word "shell", which the then-live `DANGEROUS_PATTERNS` deny-list refused — so the turn failed for a reason unrelated to anything the user typed. It broke three live tests before being recognised as a feature misfiring rather than a test error.
+
+**Related:** `main` @ `228602a` is "fix: stop topic resolution rewriting pasted code" — the same mechanism, a different input class. Worth asking whether the feature earns its keep before repairing it again.
+
+---
+
+## KI-17: A 6b tunnel pointed at the existing port inherits the `local` policy
+
+**Priority:** **High — a landmine for the next milestone, not a live defect**
+**Effort:** Low if done deliberately in 6b; catastrophic if missed
+**Discovered:** 2026-08-16, milestone 6a.5 adversarial review
+
+**Symptom:** `policy_for_port` keys on the local port a connection was accepted on. If 6b points `tailscale serve`/`funnel`/`cloudflared` at the **existing** Studio port, every tunnelled request resolves to `POLICIES["local"]` — `admin=True`, `allow_bearer=True`, and a ceiling containing `EXECUTE` and `SYSTEM_CONTROL`. Every ceiling 6a.5 built is bypassed, not by a bug but by a deployment choice.
+
+Nothing in the code prevents it, and `serve()`'s hard refusal of a non-loopback host makes reusing the port the *natural* implementation.
+
+**Required in 6b:** each transport binds its **own** listener on its **own** port, registered in `listener_policies` with its own policy name. A test must assert that no two entries in `listener_policies` share a port and that no non-`local` transport is ever registered against the port `local` holds.
