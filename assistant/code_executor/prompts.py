@@ -75,6 +75,25 @@ def _neutralise(content: str, nonce: str) -> str:
     return cleaned
 
 
+# Letters only, deliberately. The nonce was `secrets.token_hex(4)` until a
+# live test asked TENKA to total the numbers in a file and she answered 856
+# instead of 27: the generated code copied the whole fenced block into a
+# string and regex-summed every `\d+` in it, so the nonce's own digits --
+# `d4e409d1` -> 4, 409, 1, counted at BEGIN and again at END -- became part
+# of the arithmetic. The fence has to be inert with respect to whatever the
+# task extracts, and numbers are the commonest thing anyone extracts.
+#
+# 8 letters from a 26-letter alphabet is ~37.6 bits, against 32 for the hex
+# it replaces, so this is not a strength trade. `secrets.choice` rather than
+# `random`, because guessing the nonce is how content escapes its own fence.
+_NONCE_ALPHABET = "abcdefghijklmnopqrstuvwxyz"
+
+
+def _fence_nonce(length: int = 8) -> str:
+    """An unguessable delimiter that contributes no digits to the content."""
+    return "".join(_secrets.choice(_NONCE_ALPHABET) for _ in range(length))
+
+
 def render_untrusted_block(content: str, label: str = "DATA") -> str:
     """Render `content` in a labelled, explicitly-untrusted position.
 
@@ -84,7 +103,7 @@ def render_untrusted_block(content: str, label: str = "DATA") -> str:
     if not content:
         return ""
     tag = f"untrusted_{label.lower()}"
-    nonce = _secrets.token_hex(4)
+    nonce = _fence_nonce()
     body = _neutralise(content, nonce)
     return (
         f"{_UNTRUSTED_NOTICE}\n"
