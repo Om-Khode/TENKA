@@ -9,7 +9,6 @@ Layering: io/api — core + config only.
 """
 from __future__ import annotations
 
-import enum
 import hmac
 import json
 import logging
@@ -22,6 +21,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from pathlib import Path
+
+from ...core.capabilities import Capability
 
 logger = logging.getLogger(__name__)
 
@@ -41,39 +42,15 @@ _SCHEMA_VERSION = 1
 _TOUCH_THROTTLE = timedelta(seconds=60)
 
 
-class Capability(str, enum.Enum):
-    """What a device is allowed to ask for. Granted per device, never implied."""
-
-    # Watching her work: status, telemetry, the live /v1/events stream, and
-    # the routes that describe how she is configured (settings, personality,
-    # the command catalogue, whether backups run). Everything here is about
-    # the assistant herself, and none of it is something a user told her.
-    OBSERVE = "observe"
-    # Reading what she stored: conversation transcripts, the knowledge graph,
-    # preferences, taught procedures, the names of the people she recognises.
-    #
-    # Split out of the old `CHAT`, which meant both of these at once. That
-    # ambiguity let the `quick` ceiling -- the Cloudflare tunnel, where a
-    # third party terminates TLS and reads the plaintext -- look like
-    # "observation only" while actually admitting the entire knowledge graph
-    # and every transcript. `read_screen` and `camera_look` are intents, so
-    # her narration of what was on screen lands in a transcript: excluding
-    # SCREEN from that ceiling while admitting RECALL was excluding the
-    # photograph and shipping the description.
-    #
-    # Neither implies the other. A wall display may watch without reading a
-    # word she was told; an archive tool may read history without a live view.
-    RECALL = "recall"
-    # POST /v1/chat hands text to the same pipeline voice uses, so it reaches
-    # every intent -- code_executor, file_task, shutdown, manage_backup --
-    # not just conversation. Neither read capability may carry that: both gate
-    # routes a device should be able to hold without being able to drive her.
-    # Split so a device can be trusted to read a transcript without being
-    # trusted to act on the machine through one.
-    CHAT_SEND = "chat_send"
-    SCREEN = "screen"
-    FILES = "files"
-    SYSTEM_CONTROL = "system_control"
+# `Capability` is imported at the top of this module and re-exported here (see
+# `__all__`) so every existing `from .vault import Capability` keeps working.
+# It moved to `core/capabilities.py` because `actions/` has to read it to
+# enforce the EXECUTE check at the dispatch choke point, and
+# `actions/ -> io/api/` is not a legal import edge while `actions/ -> core/`
+# is. The enum's own docstring, including the OBSERVE/RECALL split reasoning,
+# travelled with it.
+__all__ = ["Capability", "Device", "TokenVault", "VaultUnavailableError",
+           "VaultReadError", "VaultWriteError"]
 
 
 @dataclass(frozen=True)
