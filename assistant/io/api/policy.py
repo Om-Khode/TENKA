@@ -23,6 +23,15 @@ rejected:
 A listening socket's own address cannot be forged by a client. Binding policy
 to the port the daemon chose to listen on, rather than to anything carried in
 the request, is what makes this fail closed instead of fail open.
+
+Milestone 6b adds `raisable`, a second explicit literal beside `ceiling`: what
+a transport may EVER carry if a device's ceiling on it is deliberately, and
+temporarily, lifted. `POLICIES` stays frozen module data -- a raise is a live
+record kept elsewhere, scoped to one device and one policy, never a mutation
+of the dict below. `effective()`'s third argument, `raised`, folds that record
+in: `device_grants & (policy.ceiling | (policy.raisable & raised))`. A ceiling
+still only narrows; `raisable` only says what narrowing is even reversible,
+and only for the one transport where a raise was ever argued for.
 """
 from __future__ import annotations
 
@@ -57,6 +66,7 @@ class ListenerPolicy:
     allow_bearer: bool               # may authenticate with an Authorization header
     secure_cookie: bool              # sets the Secure flag
     ceiling: frozenset[Capability]
+    raisable: frozenset[Capability]  # what this transport may EVER carry under a raise
 
 
 POLICIES: dict[str, ListenerPolicy] = {
@@ -78,6 +88,8 @@ POLICIES: dict[str, ListenerPolicy] = {
             Capability.SCREEN, Capability.FILES, Capability.SYSTEM_CONTROL,
             Capability.EXECUTE,
         }),
+        # Already holds everything; there is nothing left for a raise to add.
+        raisable=frozenset(),
     ),
     # Tailscale tunnel: WireGuard end-to-end, the operator's own tailnet.
     # Trusted with every capability a device might hold, but never with admin
@@ -99,6 +111,15 @@ POLICIES: dict[str, ListenerPolicy] = {
             Capability.OBSERVE, Capability.RECALL, Capability.CHAT_SEND,
             Capability.SCREEN, Capability.FILES,
         }),
+        # The only transport raisable at all, and the reason is a second
+        # credential, not the tunnel's encryption. Reaching this listener
+        # already required a Tailscale login before a TENKA device
+        # credential was even presented -- an independent gate a leaked pair
+        # code cannot pass on its own. That is what makes lifting EXECUTE and
+        # SYSTEM_CONTROL here, deliberately and temporarily, a decision about
+        # a vetted machine on the operator's own tailnet, not a hole opened
+        # in a listener anyone with a URL can reach.
+        raisable=frozenset({Capability.EXECUTE, Capability.SYSTEM_CONTROL}),
     ),
     # `tailscale funnel` -- a top-level command, not a `serve` flag; there is
     # no `tailscale serve --funnel`. Publicly reachable from the open
@@ -122,6 +143,12 @@ POLICIES: dict[str, ListenerPolicy] = {
             Capability.OBSERVE, Capability.RECALL, Capability.CHAT_SEND,
             Capability.SCREEN, Capability.FILES,
         }),
+        # Never raisable: this URL is publicly reachable by anyone who holds
+        # it, with no second credential gating the connection the way a
+        # tailnet login gates `tailnet`. There is no vetted machine on the
+        # other end to decide to trust further -- only "whoever has the
+        # link" -- so there is nothing here a raise could safely lift.
+        raisable=frozenset(),
     ),
     # Cloudflare quick tunnel: Cloudflare terminates TLS and can read the
     # plaintext. The ceiling is OBSERVE alone -- watching her work. Even a
@@ -153,6 +180,12 @@ POLICIES: dict[str, ListenerPolicy] = {
         # next new capability would then be granted automatically over
         # exactly the listener that must never get one for free.
         ceiling=frozenset({Capability.OBSERVE}),
+        # Never raisable: Cloudflare terminates TLS and reads the plaintext
+        # of everything this listener carries. A raise widens what a raised
+        # device may do, not who else can read it -- and on this transport a
+        # third party reads it regardless, so there is no capability whose
+        # exposure a raise could make acceptable.
+        raisable=frozenset(),
     ),
 }
 
@@ -172,11 +205,20 @@ def policy_for_port(port: int, registry: dict[int, str]) -> ListenerPolicy | Non
     return POLICIES.get(name)
 
 
-def effective(device_grants: frozenset[Capability], policy: ListenerPolicy) -> frozenset[Capability]:
+def effective(
+    device_grants: frozenset[Capability],
+    policy: ListenerPolicy,
+    raised: frozenset[Capability] = frozenset(),
+) -> frozenset[Capability]:
     """What a device may actually do on this listener: the intersection of
     what it was issued and what this transport is willing to carry.
 
-    Never a union -- a policy's ceiling can only take capabilities away from
-    a device, never add ones the device was never granted.
+    Never a union over `device_grants` -- a policy can only take capabilities
+    away from a device, never add ones the device was never granted. `raised`
+    is the one thing that can widen the *transport* side of that intersection,
+    and only within `raisable`, which is itself a fixed, per-policy ceiling on
+    what a raise could ever reach. `raised` defaults to empty, so calling this
+    with two arguments -- every call site before Milestone 6b -- is identical
+    to 6a.5's behaviour: no raise, no change.
     """
-    return device_grants & policy.ceiling
+    return device_grants & (policy.ceiling | (policy.raisable & raised))
