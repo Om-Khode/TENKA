@@ -9,7 +9,7 @@ what each one *is* stays declarative. An adapter declares, and nothing else:
 - the argv to spawn for a given port;
 - how to recognise its public hostname in the process output;
 - its preflight check, if any (spec §2.3 L2);
-- how to stop.
+- how to stop (`stop_command`).
 
 Nothing outside `transports/` branches on which transport it is talking to --
 that is what makes a fourth provider a new module and nothing else, the same
@@ -75,15 +75,22 @@ class TransportAdapter(Protocol):
         reader to wonder whether the check was forgotten."""
         ...
 
-    def stop(self, port: int) -> list[str] | None:
-        """How to stop what `command()` started. `None` means the spawned
-        subprocess's own lifetime *is* the tunnel's lifetime, so terminating
-        it is enough (a long-running foreground process, e.g. `cloudflared
-        tunnel --url ...`). A returned argv is a second command that must
-        run to undo a provider whose spawn already detached -- `tailscale
-        serve --bg` daemonises and its invoking process exits on its own, so
-        killing that process again touches nothing; only an explicit
-        `... off` un-serves it."""
+    def stop_command(self, port: int) -> list[str] | None:
+        """The argv of a second command needed to undo what `command()`
+        started, or `None` if none is needed. This method only *names* a
+        command -- it does not run anything or perform the stop itself;
+        running it (or, when `None`, simply terminating the tracked
+        subprocess) is the caller's job, exactly like `command()` names
+        the start argv without spawning it.
+
+        `None` means the spawned subprocess's own lifetime *is* the
+        tunnel's lifetime, so terminating it is enough (a long-running
+        foreground process, e.g. `cloudflared tunnel --url ...`). A
+        returned argv is required to undo a provider whose spawn already
+        detached -- `tailscale serve --bg` daemonises and its invoking
+        process exits on its own, so killing that process again touches
+        nothing; only running the explicit `... off` argv this returns
+        un-serves it."""
         ...
 
 
@@ -116,3 +123,14 @@ class TransportSession:
     sock: socket.socket
     serve_task: asyncio.Task
     hostname: str | None = None
+
+    @property
+    def url(self) -> str | None:
+        """The session's public URL, or `None` before a hostname has been
+        announced. Spec §5.3-§5.4 fix the scheme as `https://` for all three
+        tunnels -- Tasks 12 (QR encoding) and 13 (an API payload) both need
+        exactly this string, so it is derived once here rather than in two
+        places that could drift apart."""
+        if self.hostname is None:
+            return None
+        return f"https://{self.hostname}"

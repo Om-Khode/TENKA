@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from assistant.io.api.transports import TransportRegistry, transport_registry
-from assistant.io.api.transports.base import TransportAdapter
+from assistant.io.api.transports.base import TransportAdapter, TransportSession
 
 
 class _FakeAdapter:
@@ -30,7 +30,7 @@ class _FakeAdapter:
     def preflight(self, port: int) -> str | None:
         return None
 
-    def stop(self, port: int) -> list[str] | None:
+    def stop_command(self, port: int) -> list[str] | None:
         return None
 
 
@@ -87,3 +87,28 @@ def test_names_are_stable_and_sorted():
     assert transport_registry.names() == ["funnel", "quick", "tailnet"]
     # Stable: calling again in a different registration order still sorts.
     assert transport_registry.names() == sorted(transport_registry.names())
+
+
+def _make_session(*, hostname: str | None) -> TransportSession:
+    """A bare `TransportSession` for exercising `.url` -- `process`, `sock`
+    and `serve_task` are never touched by the property, so plain sentinels
+    stand in for the real runtime objects a `TransportManager` (Task 9)
+    would supply."""
+    return TransportSession(
+        policy_name="funnel",
+        port=8789,
+        owner="session-1",
+        process=object(),
+        sock=object(),
+        serve_task=object(),
+        hostname=hostname,
+    )
+
+
+def test_url_is_none_before_a_hostname_is_announced():
+    assert _make_session(hostname=None).url is None
+
+
+def test_url_is_the_https_hostname_once_announced():
+    session = _make_session(hostname="laptop.tail1234.ts.net")
+    assert session.url == "https://laptop.tail1234.ts.net"
