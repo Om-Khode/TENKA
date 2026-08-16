@@ -117,7 +117,10 @@ def _run_handler(task: dict) -> str:
 
 
 async def _async_run_handler(task: dict) -> str:
-    from assistant.actions import LOCAL_GRANTS, current_grants, execute, set_grants
+    from assistant.actions import (
+        LOCAL_GRANTS, LOCAL_PRINCIPAL, current_grants, current_principal,
+        execute, set_grants, set_principal,
+    )
 
     task_type = task["task_type"]
     goal = task["task_goal"]
@@ -128,10 +131,17 @@ async def _async_run_handler(task: dict) -> str:
         # fails closed by design. Stated explicitly here: scheduling one
         # requires EXECUTE (`manage_schedule` in core/intent_capabilities.py),
         # so whoever installed this task already held it.
+        #
+        # The principal is the same argument with the same answer: whatever
+        # this task arms is the operator's question to answer, and an unset
+        # principal would arm it for nobody -- a confirmation she could not
+        # answer at her own keyboard. See core/principal.py.
         token = set_grants(LOCAL_GRANTS)
+        ptoken = set_principal(LOCAL_PRINCIPAL)
         try:
             return await execute("web_search", {"query": goal})
         finally:
+            current_principal.reset(ptoken)
             current_grants.reset(token)
     elif task_type == "http_check":
         return await _http_check(goal)
@@ -147,11 +157,14 @@ async def _async_run_handler(task: dict) -> str:
         # this the scheduler would run every stored procedure with
         # `current_grants` unset and be refused. Installing the schedule
         # required EXECUTE (`manage_schedule`), so the grant being spent here
-        # is the installer's, stated rather than inherited.
+        # is the installer's, stated rather than inherited. The principal
+        # rides along for the reason the web_search branch above gives.
         token = set_grants(LOCAL_GRANTS)
+        ptoken = set_principal(LOCAL_PRINCIPAL)
         try:
             return await run_procedure(proc, goal)
         finally:
+            current_principal.reset(ptoken)
             current_grants.reset(token)
     else:
         logger.warning(f"[scheduler] Unknown task_type: {task_type}")

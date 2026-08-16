@@ -286,17 +286,33 @@ class EventBus:
                 logger.info("[event-monitor] Code executor fired: %s", payload[:80])
 
     async def _run_code_executor(self, goal: str) -> str:
-        from assistant.actions import LOCAL_GRANTS, current_grants, execute, set_grants
+        from assistant.actions import (
+            LOCAL_GRANTS, LOCAL_PRINCIPAL, current_grants, current_principal,
+            execute, set_grants, set_principal,
+        )
         # A fired monitor is not a request from anyone -- there is no turn
         # around it, so `current_grants` would be unset and `execute()` would
         # refuse (it fails closed by design). The grant is stated here
         # instead: installing a monitor requires EXECUTE (`manage_monitor` in
         # core/intent_capabilities.py), so whoever installed this one already
         # held it, and the machine it fires on is this one.
+        #
+        # The principal is stated for the matching reason, and as
+        # defence-in-depth rather than to fix a live path: nothing armed from
+        # here today asks the user anything (`pending_monitor_disambig` is
+        # armed by `event_monitoring._set_disambig`, reached from
+        # `pause_monitor` and its siblings under the `manage_monitor` intent,
+        # inside an ordinary turn that already has a principal). But
+        # `code_executor` can arm one -- `_arm_knowledge_approval` does -- and
+        # a state armed here without a principal would be owned by nobody and
+        # answerable by nobody, which reads as TENKA forgetting rather than as
+        # a bug.
         token = set_grants(LOCAL_GRANTS)
+        ptoken = set_principal(LOCAL_PRINCIPAL)
         try:
             return await execute("code_executor", {"goal": goal}, "")
         finally:
+            current_principal.reset(ptoken)
             current_grants.reset(token)
 
     def _on_action_complete(self, future: asyncio.Future) -> None:

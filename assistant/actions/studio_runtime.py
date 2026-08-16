@@ -39,8 +39,15 @@ class ChatDispatch(Protocol):
     # what it would otherwise have run with, before 6a.5, was everything.
     # "Forgot to say what this device may do" must never be spelled the same
     # way as "this device may do anything".
-    async def submit(self, text: str,
-                     grants: frozenset[Capability]) -> tuple[str, str, bool, str]: ...
+    #
+    # `principal` follows the same rule for the same reason, one question
+    # over: it says *who* this device is, and a turn that arrives without one
+    # owns no pending state and can answer no confirmation. Defaulting it
+    # would have to default to something, and both available defaults are
+    # wrong -- "local" hands a device of unknown provenance the operator's own
+    # questions, and "nobody" is a dead end that reads as a timeout.
+    async def submit(self, text: str, grants: frozenset[Capability],
+                     principal: str) -> tuple[str, str, bool, str]: ...
     async def abort(self) -> bool: ...
     # Whether a submitted turn is currently in flight -- read by
     # LiveSystemRuntime for StatusInfo.busy. A plain attribute/property, not
@@ -81,12 +88,14 @@ class LiveChatRuntime:
     def __init__(self, dispatch: ChatDispatch) -> None:
         self._dispatch = dispatch
 
-    async def send(self, text: str, grants: frozenset[Capability]) -> TurnRef:
-        # `grants` travels with the text rather than being read from anywhere
-        # here: the route is the only place that knows *which device* asked,
-        # and the turn runs later, on the queue consumer's task, where the
-        # request is long gone.
-        turn_id, conversation_id, accepted, reason = await self._dispatch.submit(text, grants)
+    async def send(self, text: str, grants: frozenset[Capability],
+                   principal: str) -> TurnRef:
+        # `grants` and `principal` travel with the text rather than being read
+        # from anywhere here: the route is the only place that knows *which
+        # device* asked, and the turn runs later, on the queue consumer's
+        # task, where the request is long gone.
+        turn_id, conversation_id, accepted, reason = await self._dispatch.submit(
+            text, grants, principal)
         return TurnRef(turn_id, conversation_id, accepted, reason)
 
     async def conversations(self) -> list[ConversationRef]:

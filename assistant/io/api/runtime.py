@@ -288,7 +288,15 @@ class ChatRuntime(Protocol):
     # the listener ceiling. It has no default: a route that forgets it fails
     # at the call rather than running the turn with whatever the pipeline
     # would have assumed. See core/capabilities.py.
-    async def send(self, text: str, grants: frozenset[Capability]) -> TurnRef: ...
+    #
+    # `principal` is *which* device it is, spelled `f"device:{device_id}"`,
+    # and it has no default for a sharper version of the same reason: a turn
+    # with no principal owns no pending state, so a route that forgets it
+    # would produce a device that can chat but can never answer its own
+    # confirmations -- a silent dead end rather than a loud failure. See
+    # core/principal.py and KI-13.
+    async def send(self, text: str, grants: frozenset[Capability],
+                   principal: str) -> TurnRef: ...
     async def conversations(self) -> list[ConversationRef]: ...
     async def conversation(self, conversation_id: str) -> ConversationDetail | None: ...
     async def abort(self) -> bool: ...

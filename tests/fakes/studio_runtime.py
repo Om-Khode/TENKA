@@ -22,6 +22,11 @@ class FakeChatRuntime:
         # the device's effective grants actually reached the pipeline rather
         # than being computed and dropped.
         self.sent_grants: list[frozenset] = []
+        # Same reason as sent_grants, one question over: a route that computes
+        # the device's principal and drops it produces a device that can chat
+        # and can never answer its own confirmation, which no other assertion
+        # here would notice.
+        self.sent_principals: list[str] = []
         self.aborted = 0
         self._messages = [
             ChatMessage("m1", "user", "what did I ask you yesterday", "2026-08-07T09:00:00Z"),
@@ -29,11 +34,13 @@ class FakeChatRuntime:
                         "2026-08-07T09:00:04Z", intent="memory_query"),
         ]
 
-    async def send(self, text: str, grants: frozenset) -> TurnRef:
+    async def send(self, text: str, grants: frozenset,
+                   principal: str) -> TurnRef:
         if self.busy:
             return TurnRef("", "c1", accepted=False, reason="busy")
         self.sent.append(text)
         self.sent_grants.append(grants)
+        self.sent_principals.append(principal)
         return TurnRef(f"t{len(self.sent)}", "c1", accepted=True)
 
     async def conversations(self) -> list[ConversationRef]:
