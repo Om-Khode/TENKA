@@ -83,3 +83,65 @@ def test_effective_can_only_narrow():
     for policy in POLICIES.values():
         assert effective(every, policy) <= policy.ceiling
         assert effective(frozenset(), policy) == frozenset()
+
+
+# ─── A3: the intent -> capability table ──────────────────────────────────
+def test_default_is_the_strongest_capability():
+    """An intent nobody classified must be refused over a transport, not
+    admitted. Fail closed, same reasoning as `quick`'s literal ceiling."""
+    from assistant.core.capabilities import Capability
+    from assistant.core.intent_capabilities import DEFAULT_REQUIRED
+    assert DEFAULT_REQUIRED is Capability.EXECUTE
+
+
+def test_every_configured_intent_has_a_row():
+    """A missing row still fails closed, but silently. This makes adding an
+    intent without classifying it a loud test failure instead."""
+    from assistant import config
+    from assistant.core.intent_capabilities import REQUIRED_CAPABILITY
+    missing = set(config.INTENTS) - set(REQUIRED_CAPABILITY)
+    assert not missing, f"intents with no capability row: {sorted(missing)}"
+
+
+def test_no_row_names_an_intent_that_does_not_exist():
+    from assistant import config
+    from assistant.core.intent_capabilities import REQUIRED_CAPABILITY
+    stale = set(REQUIRED_CAPABILITY) - set(config.INTENTS)
+    assert not stale, f"rows for intents that no longer exist: {sorted(stale)}"
+
+
+def test_the_installing_intents_require_execute():
+    """A monitor's _fire_action calls execute("code_executor", ...) directly, so
+    gating the installed thing and not the installer would be theatre."""
+    from assistant.core.capabilities import Capability
+    from assistant.core.intent_capabilities import REQUIRED_CAPABILITY
+    for intent in ("manage_monitor", "manage_schedule",
+                   "manage_procedure", "manage_shortcut"):
+        assert REQUIRED_CAPABILITY[intent] is Capability.EXECUTE
+
+
+def test_code_execution_intents_require_execute():
+    from assistant.core.capabilities import Capability
+    from assistant.core.intent_capabilities import REQUIRED_CAPABILITY
+    for intent in ("code_executor", "computer_task", "planner",
+                   "find_and_click", "manifest_dispatch", "shutdown"):
+        assert REQUIRED_CAPABILITY[intent] is Capability.EXECUTE
+
+
+def test_conversation_stays_chat_send():
+    from assistant.core.capabilities import Capability
+    from assistant.core.intent_capabilities import REQUIRED_CAPABILITY
+    for intent in ("small_talk", "unknown", "get_time", "web_search"):
+        assert REQUIRED_CAPABILITY[intent] is Capability.CHAT_SEND
+
+
+def test_intent_capabilities_imports_only_the_enum():
+    """Pure data, same as core/intent_scopes.py. It may not grow a dependency
+    on config or storage -- `actions/` imports it on the dispatch path."""
+    src = (_ROOT / "assistant" / "core" / "intent_capabilities.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            raise AssertionError(f"unexpected plain import: {ast.dump(node)}")
+        if isinstance(node, ast.ImportFrom):
+            assert node.module in ("capabilities", "__future__"), node.module
