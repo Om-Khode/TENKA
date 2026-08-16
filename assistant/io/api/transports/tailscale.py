@@ -104,7 +104,12 @@ them create, change or reset a mapping):
   (`EXECUTE`, `SYSTEM_CONTROL`), which makes this the highest-value single
   check `parse_serve_status` can make from a document it already parses.
   `TailnetAdapter` alone sets `_forbid_funnel = True`; `FunnelAdapter`
-  leaves it `False` since funnel being funnelled is the point.
+  leaves it `False` since funnel being funnelled is the point. **Fix round
+  4** moved that check out of the `Web` loop: an `AllowFunnel` flag is a
+  top-level key in its own right, so a *leftover* flag whose `Web` entry
+  has already been removed -- the exact case the check was written for --
+  was invisible while the check required a surviving mapping to hang off.
+  TENKA's own subsequent `serve --https 8443` would then inherit it.
 - **Preflight reads `tailscale serve status --json` for both adapters**
   (fix round 3 cheap fix). Both verbs return the same document on this
   machine's Tailscale 1.102.2, but that was never verified as a guarantee
@@ -114,7 +119,9 @@ them create, change or reset a mapping):
   costs nothing and removes the unverified assumption. `verb` (`"serve"`
   or `"funnel"`) is still adapter-specific and still selects only the
   *wording* of a refusal -- the command an operator would actually run to
-  fix that adapter's own mapping.
+  fix that adapter's own mapping. Fix round 4 finished the job: the
+  status runner takes no verb at all any more (`_run_serve_status`), so
+  the assumption cannot be re-introduced by a caller passing `"funnel"`.
 
 `preflight()` **blocks the calling thread** (`subprocess.run`, a
 `_PREFLIGHT_TIMEOUT_SECONDS` ceiling): if `TransportManager` (Task 9) calls
@@ -129,8 +136,10 @@ landmine). This module avoids it: `preflight(port)` only ever receives
 this transport's own already-resolved port, so `port - LISTENER_OFFSETS
 [self.name]` recovers the base port without a `config` import -- but what
 port `local` itself holds is then looked up through `..listeners.
-local_port(base_port)`, the helper that exists for exactly this, rather
-than assumed equal to the base port by a comment relying on
+local_port(base_port)` (imported here as `loopback_listener_port`, since
+`parse_serve_status` takes a `local_port` parameter that would shadow the
+bare name -- fix round 4 fold-in), the helper that exists for exactly
+this, rather than assumed equal to the base port by a comment relying on
 `LISTENER_OFFSETS["local"] == 0` (fix round 3 cheap fix: that assumption
 now lives in code the reader can follow, in the one module that already
 owns it). `subprocess`, `json`, `logging`, `re` and `urllib.parse` are
@@ -145,7 +154,12 @@ import re
 import subprocess
 from urllib.parse import urlparse
 
-from ..listeners import LISTENER_OFFSETS, local_port
+# Imported under an alias: `parse_serve_status` takes a keyword-only
+# `local_port: int` parameter, and the bare name would be shadowed by it
+# inside that function (fix round 4 fold-in). Harmless today only because
+# `parse_serve_status` never calls the helper -- a trap for the next editor,
+# so the two names are kept distinct rather than kept apart by luck.
+from ..listeners import LISTENER_OFFSETS, local_port as loopback_listener_port
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +177,7 @@ _FUNNEL_PUBLIC_PORT = 443
 # daemon query -- fast in practice. The timeout exists so a hung
 # `tailscaled` cannot hang a transport start indefinitely; a timeout
 # degrades to a warning exactly like any other unparseable output (see
-# `_run_status`). `preflight()` blocks for up to this long.
+# `_run_serve_status`). `preflight()` blocks for up to this long.
 _PREFLIGHT_TIMEOUT_SECONDS = 10.0
 
 # A `*.ts.net` MagicDNS name: one or more dot-separated labels (letters,
@@ -191,10 +205,75 @@ def _public_port_from_key(key: object) -> str | None:
     """The public-port half of a `Web` dict key (`"<hostname>:<port>"`), or
     `None` if *key* is not that shape. Used only to name *which* mapping a
     refusal concerns -- never the hostname half (spec §2.3 L2: name the
-    misconfiguration, never a hostname, a token or a path)."""
+    misconfiguration, never a hostname, a token or a path).
+
+    The trailing half must be **all digits** (fix round 4 fold-in). Without
+    that guard this returned whatever followed the last colon, so a key of
+    an unexpected shape -- `"weird:host.ts.net"` -- put a *hostname* into a
+    refusal sentence, which is precisely what this helper's own docstring
+    and spec §2.3 L2 forbid. A non-numeric half is not a public port, so
+    there is nothing here worth naming: the caller falls back to `"?"`.
+    """
     if not isinstance(key, str) or ":" not in key:
         return None
-    return key.rsplit(":", 1)[-1] or None
+    tail = key.rsplit(":", 1)[-1]
+    if not tail.isdigit():
+        return None
+    return tail
+
+
+def _proxy_port(proxy: object, *, verb: str, entry_port: str) -> int | None:
+    """The local port a `Web` handler's `Proxy` target forwards to, or
+    `None` when this handler carries no port this function can recognise.
+
+    Both of `parse_serve_status`'s `Proxy`-reading loops go through here so
+    they cannot drift apart in what they tolerate -- which is exactly how
+    fix round 4's regression happened.
+
+    **Tolerance is per-handler and never propagates** (fix round 4, Must
+    fix). `Proxy` is documented as a URL string, but a status document is
+    JSON: any scalar can appear there, and `urlparse` raises
+    `AttributeError` -- not `ValueError` -- on every non-string it is
+    handed (`int`, `float`, `bool`, `list`, `dict` all fail inside
+    `urlparse`'s `_decode_args` with "object has no attribute 'decode'").
+    Fix round 3 narrowed the caught exception to `ValueError` alone, which
+    let a single non-string `Proxy` on *any* entry propagate out of
+    `parse_serve_status` entirely, abandoning the rest of the KI-17 sweep
+    -- including a sibling entry proxying straight into `local`'s port.
+
+    Two defences, deliberately both: an explicit `isinstance(proxy, str)`
+    guard states the contract in the code rather than leaving it implied by
+    an exception list, and the `except` around the parse itself stays wide
+    (`AttributeError`, `TypeError`, `ValueError`) so the tolerance does not
+    depend on this module's enumeration of what `urlparse` can raise being
+    complete. The guard is what a reader learns the contract from; the wide
+    `except` is what keeps the sweep alive when the enumeration is wrong.
+    """
+    if proxy is None:
+        logger.debug(
+            "tailscale %s status --json entry on port %s has a handler "
+            "with no recognised 'Proxy' target (a file/text mapping, "
+            "perhaps) -- skipped",
+            verb, entry_port,
+        )
+        return None
+    if not isinstance(proxy, str):
+        logger.warning(
+            "tailscale %s status --json entry on port %s has a 'Proxy' "
+            "value that is not a string (got %s) -- skipped, sweep "
+            "continues",
+            verb, entry_port, type(proxy).__name__,
+        )
+        return None
+    try:
+        return urlparse(proxy).port
+    except (AttributeError, TypeError, ValueError) as exc:
+        logger.warning(
+            "tailscale %s status --json entry on port %s has an "
+            "unparseable Proxy port (%s) -- skipped, sweep continues",
+            verb, entry_port, exc,
+        )
+        return None
 
 
 def parse_serve_status(
@@ -228,7 +307,13 @@ def parse_serve_status(
     entry; it never aborts the whole check and returns a false "clear",
     which is what a single `try` around the entire sweep did before this
     fix, and which the `ValueError` added for a malformed `Proxy` port
-    would otherwise have made easier to trigger, not harder):
+    would otherwise have made easier to trigger, not harder). Every
+    `Proxy` value goes through `_proxy_port`, which owns that tolerance for
+    both loops at once so they cannot drift apart in what they survive --
+    fix round 3 narrowed one of them to `ValueError` alone and a non-string
+    `Proxy` (which raises `AttributeError` from `urlparse`) then propagated
+    out of this function entirely, abandoning the sweep before it reached
+    the dangerous entry (fix round 4, Must fix):
 
     1. **The actual KI-17 scenario, checked across every `Web` entry
        regardless of public port:** any mapping that proxies straight to
@@ -238,13 +323,18 @@ def parse_serve_status(
        configuration, however old or under whichever public port, that
        forwards public traffic into the loopback listener holding admin
        and `EXECUTE`.
-    2. **This adapter's own mapping, and only its own, must not be
-       publicly funnelled when *forbid_funnel* is set:** the `Web` entry
-       whose key ends `:{public_port}` is checked against the sibling
-       `AllowFunnel` document for the exact same key.
-    3. **This adapter's own mapping's proxy target:** if the same entry's
-       proxy target is not *target_port*, that is refused too (a stale
-       local target under a mapping this adapter itself is meant to own).
+    2. **This adapter's own public port must not be marked `AllowFunnel`
+       when *forbid_funnel* is set:** the `AllowFunnel` document is read
+       directly for any key ending `:{public_port}`, **independently of
+       whether a `Web` entry still exists under that key** (fix round 4
+       fold-in -- nesting this inside the `Web` loop, as fix round 3 did,
+       missed the "leftover flag, mapping already removed" half of the very
+       threat it was written for, and TENKA's own subsequent `serve --https
+       {public_port}` would inherit that flag).
+    3. **This adapter's own mapping's proxy target:** if the `Web` entry
+       keyed under `:{public_port}` has a proxy target that is not
+       *target_port*, that is refused too (a stale local target under a
+       mapping this adapter itself is meant to own).
        A sibling transport's legitimate mapping, under a *different*
        public port, is never inspected by checks 2 or 3 -- that is
        precisely the bug fix round 2 corrects: `tailnet` and `funnel`
@@ -310,24 +400,9 @@ def parse_serve_status(
         for handler in handlers.values():
             if not isinstance(handler, dict):
                 continue
-            proxy = handler.get("Proxy")
-            if proxy is None:
-                logger.debug(
-                    "tailscale %s status --json entry on port %s has a "
-                    "handler with no recognised 'Proxy' target (a "
-                    "file/text mapping, perhaps) -- skipped",
-                    verb, entry_port,
-                )
-                continue
-            try:
-                proxy_port = urlparse(proxy).port
-            except ValueError as exc:
-                logger.warning(
-                    "tailscale %s status --json entry on port %s has an "
-                    "unparseable Proxy port (%s) -- skipped, sweep "
-                    "continues", verb, entry_port, exc,
-                )
-                continue
+            proxy_port = _proxy_port(
+                handler.get("Proxy"), verb=verb, entry_port=entry_port,
+            )
             if proxy_port == local_port:
                 return (
                     f"tailscale {verb} already forwards a public mapping "
@@ -337,21 +412,36 @@ def parse_serve_status(
                     f"to start until that mapping is corrected or removed"
                 )
 
-    # 2 and 3. This adapter's own mapping, and only its own.
     our_suffix = f":{public_port}"
+
+    # 2. AllowFunnel on our own public port -- read from the `AllowFunnel`
+    # document *directly*, never from inside the `Web` loop (fix round 4
+    # fold-in). Fix round 3 nested this check under a surviving `Web` entry,
+    # which covered only half its own threat: the "leftover" case it was
+    # written for is an `AllowFunnel` flag whose `Web` entry is already gone,
+    # and TENKA's own subsequent `serve --https {public_port}` would then
+    # inherit the flag. `AllowFunnel` is its own top-level key, so checking
+    # it independently costs one loop and covers both halves.
+    if forbid_funnel:
+        for key, funnelled in allow_funnel.items():
+            if not isinstance(key, str) or not key.endswith(our_suffix):
+                continue
+            if not funnelled:
+                continue
+            return (
+                f"tailscale {verb}'s own public port {public_port} is "
+                f"marked AllowFunnel -- refusing to start until Funnel is "
+                f"disabled for that port ('tailscale funnel --https "
+                f"{public_port} off'); a leftover flag counts, with or "
+                f"without a mapping still under it"
+            )
+
+    # 3. This adapter's own mapping's proxy target, and only its own.
     for key, mapping in web.items():
         if not isinstance(key, str) or not key.endswith(our_suffix):
             continue
         if not isinstance(mapping, dict):
             continue
-
-        if forbid_funnel and allow_funnel.get(key):
-            return (
-                f"tailscale {verb}'s own mapping on public port "
-                f"{public_port} is marked AllowFunnel -- refusing to "
-                f"start until Funnel is disabled for this mapping "
-                f"('tailscale funnel --https {public_port} off')"
-            )
 
         handlers = mapping.get("Handlers")
         if not isinstance(handlers, dict):
@@ -359,18 +449,9 @@ def parse_serve_status(
         for handler in handlers.values():
             if not isinstance(handler, dict):
                 continue
-            proxy = handler.get("Proxy")
-            if proxy is None:
-                continue
-            try:
-                port = urlparse(proxy).port
-            except ValueError as exc:
-                logger.warning(
-                    "tailscale %s status --json entry on port %s has an "
-                    "unparseable Proxy port (%s) -- skipped, sweep "
-                    "continues", verb, public_port, exc,
-                )
-                continue
+            port = _proxy_port(
+                handler.get("Proxy"), verb=verb, entry_port=str(public_port),
+            )
             if port is not None and port != target_port:
                 return (
                     f"tailscale {verb} already has a mapping on public "
@@ -386,13 +467,25 @@ def parse_serve_status(
     return None
 
 
-def _run_status(verb: str) -> dict | None:
-    """Run `tailscale {verb} status --json` and parse it, or `None` on any
+def _run_serve_status() -> dict | None:
+    """Run `tailscale serve status --json` and parse it, or `None` on any
     failure to run or parse -- a missing binary, a timeout, or output that
-    is not valid JSON all degrade the same way as an unrecognised shape."""
+    is not valid JSON all degrade the same way as an unrecognised shape.
+
+    Takes no verb (fix round 4 fold-in). Fix round 3 left this
+    verb-parameterised for generality after making both adapters call it
+    with `"serve"`, and generality nothing exercises is a trap here rather
+    than a convenience: the one other value it would accept, `"funnel"`, is
+    exactly the call that could one day return a funnel-filtered document
+    and blind `FunnelAdapter`'s own KI-17 sweep to a serve-only mapping --
+    the assumption the round-3 fix removed. Dropping the parameter makes
+    "both adapters read the one unfiltered document" structural instead of
+    conventional. An adapter that genuinely needs a different verb should
+    add its own function and say why, not re-widen this one.
+    """
     try:
         result = subprocess.run(
-            ["tailscale", verb, "status", "--json"],
+            ["tailscale", "serve", "status", "--json"],
             capture_output=True,
             text=True,
             timeout=_PREFLIGHT_TIMEOUT_SECONDS,
@@ -401,9 +494,9 @@ def _run_status(verb: str) -> dict | None:
         return json.loads(result.stdout)
     except (OSError, subprocess.SubprocessError, ValueError) as exc:
         logger.warning(
-            "could not read 'tailscale %s status --json' (%s); degrading "
-            "to a warning rather than blocking the transport from "
-            "starting", verb, exc,
+            "could not read 'tailscale serve status --json' (%s); "
+            "degrading to a warning rather than blocking the transport "
+            "from starting", exc,
         )
         return None
 
@@ -444,8 +537,8 @@ class _TailscaleAdapterBase:
         shape rather than relying on it. `_status_verb` still selects only
         the *wording* `parse_serve_status` uses in a refusal."""
         base_port = port - LISTENER_OFFSETS[self.name]
-        local = local_port(base_port)
-        payload = _run_status("serve")
+        local = loopback_listener_port(base_port)
+        payload = _run_serve_status()
         if payload is None:
             return None
         return parse_serve_status(

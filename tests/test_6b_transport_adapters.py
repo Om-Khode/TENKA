@@ -292,6 +292,83 @@ def test_preflight_still_catches_the_danger_entry_despite_a_malformed_sibling():
     assert "example-tailnet" not in refusal
 
 
+@pytest.mark.parametrize(
+    "bad_proxy", [8787, 1.5, True, ["http://127.0.0.1:8787"], {"port": 8787}],
+)
+def test_preflight_still_catches_the_danger_entry_despite_a_non_string_proxy(
+    bad_proxy, caplog,
+):
+    """Fix round 4, Must fix -- a regression relative to fix round 2.
+
+    Round 3 replaced a single `try` around the whole sweep with per-entry
+    handling, which was right, but narrowed the caught exception from
+    `(AttributeError, TypeError, ValueError)` to `ValueError` alone. A
+    status document is JSON, so `Proxy` can hold any scalar -- and
+    `urlparse` raises **`AttributeError`**, not `ValueError`, on every
+    non-string it is handed (`'int' object has no attribute 'decode'`,
+    from `urlparse`'s own `_decode_args`). The narrowed `except` therefore
+    let the exception propagate out of `parse_serve_status` entirely: not
+    merely a false "clear", but a hard failure in the exact direction spec
+    §2.3 forbids, and with the second entry -- a mapping proxying straight
+    into `local`'s port, the KI-17 danger itself -- never inspected.
+
+    No test covered a non-string `Proxy`, which is how the narrowing
+    survived a round. This one covers every JSON scalar type that reaches
+    it: `int`, `float`, `bool`, `list`, `dict`."""
+    payload = {
+        "Web": {
+            "bad-entry.example-tailnet.ts.net:9999": {
+                "Handlers": {"/": {"Proxy": bad_proxy}}
+            },
+            "danger-entry.example-tailnet.ts.net:8443": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}}
+            },
+        }
+    }
+    with caplog.at_level(logging.WARNING):
+        refusal = parse_serve_status(
+            payload, verb="serve", public_port=_FUNNEL_PUBLIC,
+            target_port=_FUNNEL_TARGET, local_port=_LOCAL_PORT,
+        )
+    assert refusal is not None
+    assert str(_LOCAL_PORT) in refusal
+    assert "8443" in refusal
+    assert "example-tailnet" not in refusal
+    # The unrecognised entry is not silently swallowed either -- it is
+    # visible as a warning, so an operator can see which entry preflight
+    # could not read.
+    assert any("9999" in record.message for record in caplog.records)
+
+
+def test_a_refusal_never_leaks_a_hostname_from_a_key_of_unexpected_shape():
+    """Fix round 4 fold-in: `_public_port_from_key` returned everything
+    after the last colon without checking it was numeric, so a `Web` key
+    of an unexpected shape put the *hostname* into the refusal -- against
+    the helper's own docstring and spec §2.3 L2, which requires a refusal
+    to name the misconfiguration and never a hostname, token or path.
+    Before the `.isdigit()` guard, the key below produced "... already
+    forwards a public mapping on port host.example-tailnet.ts.net straight
+    to port 8787 ..."."""
+    payload = {
+        "Web": {
+            "weird:host.example-tailnet.ts.net": {
+                "Handlers": {"/": {"Proxy": "http://127.0.0.1:8787"}}
+            }
+        }
+    }
+    refusal = parse_serve_status(
+        payload, verb="serve", public_port=_TAILNET_PUBLIC,
+        target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+    )
+    # The danger is still refused -- the key's shape does not excuse it.
+    assert refusal is not None
+    assert str(_LOCAL_PORT) in refusal
+    # But nothing of the hostname reaches the sentence.
+    assert "host.example-tailnet" not in refusal
+    assert "ts.net" not in refusal
+    assert "weird" not in refusal
+
+
 def test_preflight_refuses_our_own_mapping_pointed_elsewhere():
     """A mapping under *this adapter's own* public port, proxying to some
     local port that is neither `local`'s nor this adapter's own target, is
@@ -386,6 +463,40 @@ def test_preflight_refuses_tailnets_own_mapping_marked_allowfunnel():
     assert parse_serve_status(
         payload, verb="serve", public_port=_TAILNET_PUBLIC,
         target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+    ) is None
+
+
+def test_preflight_refuses_a_leftover_allowfunnel_with_no_web_entry():
+    """Fix round 4 fold-in -- the other half of round 3's own threat.
+
+    Round 3's `AllowFunnel` check sat inside the `Web` loop, so it could
+    only fire when a `Web` entry still existed under `tailnet`'s public
+    port. But `AllowFunnel` is a top-level document keyed the same way, and
+    the *leftover* case the check was written for is precisely a surviving
+    flag whose mapping has already been removed -- TENKA's own subsequent
+    `tailscale serve --https 8443 ...` would inherit it and publish the one
+    raisable listener to the open internet. Nothing in the document here is
+    keyed under 8443 except the flag itself."""
+    payload = _load_fixture("serve_status_leftover_allowfunnel_no_web_entry.json")
+    assert "example-host.example-tailnet.ts.net:8443" not in payload["Web"]
+
+    refusal = parse_serve_status(
+        payload, verb="serve", public_port=_TAILNET_PUBLIC,
+        target_port=_TAILNET_TARGET, local_port=_LOCAL_PORT,
+        forbid_funnel=True,
+    )
+    assert refusal is not None
+    assert "AllowFunnel" in refusal
+    assert "8443" in refusal
+    assert "example-host" not in refusal
+    assert "ts.net" not in refusal
+
+    # `funnel`'s own surviving entry, correctly targeted and legitimately
+    # marked AllowFunnel, still reads as clear from funnel's side -- the
+    # new independent check must not have become a blanket rule.
+    assert parse_serve_status(
+        payload, verb="funnel", public_port=_FUNNEL_PUBLIC,
+        target_port=_FUNNEL_TARGET, local_port=_LOCAL_PORT,
     ) is None
 
 

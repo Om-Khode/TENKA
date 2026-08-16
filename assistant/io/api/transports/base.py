@@ -116,8 +116,20 @@ class TransportAdapter(Protocol):
         that public port, fail loudly rather than report success -- an
         internet-facing listener that silently stayed up is the worst
         failure mode this milestone can produce, worse than a stop that
-        visibly failed. See `transports/tailscale.py`'s two adapters for
-        the concrete case this obligation exists for."""
+        visibly failed.
+
+        Note what that obligation costs the caller: **nothing on this
+        Protocol yields the public port it names.** `name`, `command`,
+        `hostname_from`, `preflight` and `stop_command` are the whole
+        surface, and `port` throughout means the *local* port a transport
+        forwards to, never the public one it is published on -- so the
+        manager must recover the public port from the argv this method
+        returns (the value following `--https`), which is the only place
+        an adapter states it. That is deliberate: the port to check is
+        then read off the same command whose effect is being checked, so
+        the two cannot drift apart the way a separately-declared constant
+        could. See `transports/tailscale.py`'s two adapters for the
+        concrete case this obligation exists for."""
         ...
 
 
