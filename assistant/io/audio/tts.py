@@ -272,7 +272,12 @@ async def speak(text: str, bridge=None, emotion: str = "neutral") -> bool:
     # complementary fix that keeps a pair code off the *first line* of its
     # response in the first place, which is the only text that ever reaches
     # this function for a non-chat source).
-    logger.info(f'Speaking: "{redact_secrets(text)}"')
+    # `!r` as well as redact_secrets(): the two close different classes.
+    # redact_secrets() takes out what looks like a credential; repr() takes
+    # out the newline that would otherwise let spoken text -- a slash
+    # command's response, a chat reply -- forge a whole extra line in
+    # debug.log. Same shape as routes/pairing.py and intent.py.
+    logger.info(f"Speaking: {redact_secrets(text)!r}")
 
     # surface "Speaking" in the status pill — set RIGHT BEFORE the
     # audio actually plays (not at function entry) so the pill appears

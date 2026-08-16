@@ -67,7 +67,13 @@ async def detect_intent(
     if not transcribed_text or not transcribed_text.strip():
         return IntentResult(intent="unknown", response="I didn't catch that.")
 
-    logger.info(f'Classifying: "{redact_secrets(transcribed_text)}"')
+    # `!r`, not bare interpolation: `redact_secrets` is about secrets, not
+    # framing, and passes a newline straight through. Chat text runs to 8,000
+    # characters, so one turn could otherwise write as many fabricated log
+    # lines as it liked into the file an operator greps after an incident.
+    # `repr()` escapes the newline; both jobs are still done, by the two
+    # different things that do them. Same shape as routes/pairing.py.
+    logger.info(f"Classifying: {redact_secrets(transcribed_text)!r}")
 
     try:
         user_prompt = f"User said: {transcribed_text.strip()}"
