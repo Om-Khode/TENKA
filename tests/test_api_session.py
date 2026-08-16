@@ -4,7 +4,7 @@ Task 5 moved the device credential into an httpOnly cookie, so JavaScript can
 no longer read a token out of `localStorage` to decide whether Studio's `/app`
 tree should render. This route answers "who am I, and what can I do on this
 connection" instead -- 401 when there is no valid credential at all, 200 with
-two capability lists otherwise.
+`grants`, `effective` and (Milestone 6b) `raised` otherwise.
 
 The two lists matter for different reasons: `grants` is what the device was
 *issued* at pairing, `effective` is what survives the listener's ceiling on
@@ -23,7 +23,9 @@ channel, and it does not mint, re-grant, or enrol anything.
 import pytest
 from starlette.websockets import WebSocketDisconnect
 
+from assistant.io.api import raises as raises_module
 from assistant.io.api.app import create_app
+from assistant.io.api.raises import RaiseStore
 from assistant.io.api.security import COOKIE_NAME, CSRF_HEADER
 from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.api_client import BASE_URL, ApiTestClient
@@ -73,6 +75,87 @@ def test_session_needs_no_capability(tmp_path):
     client = _client(vault, policies={8787: "local"})
     client.cookies.set(COOKIE_NAME, token)
     assert client.get("/v1/session").status_code == 200
+
+
+# ─── raises ───────────────────────────────────────────────────────────────
+def _fake_clock(monkeypatch, start=1_000.0):
+    """Replace `raises.time.monotonic` with a controllable counter -- the
+    same helper `test_6b_raise_store.py` uses for the store's own tests."""
+    box = {"now": start}
+    monkeypatch.setattr(raises_module.time, "monotonic", lambda: box["now"])
+    return box
+
+
+def test_session_reports_no_raise_when_none_is_live(tmp_path):
+    """A live store is attached and the listener (tailnet) is raisable at
+    all -- but nothing was ever granted for this device. `raised` must read
+    empty, not merely be absent."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("Pixel 8", frozenset(Capability))
+    client = _client(vault, policies={8787: "tailnet"})
+    client.app.state.raises = RaiseStore()
+    client.cookies.set(COOKIE_NAME, token)
+    data = client.get("/v1/session").json()["data"]
+    assert data["raised"] == []
+    assert data["raiseExpiresInSeconds"] is None
+
+
+def test_session_reports_the_raised_capabilities_and_the_time_left(tmp_path, monkeypatch):
+    clock = _fake_clock(monkeypatch)
+    vault = TokenVault(tmp_path)
+    token = vault.issue("Pixel 8", frozenset(Capability))
+    device_id = vault.devices()[0].device_id
+    store = RaiseStore()
+    store.grant(device_id, "tailnet", frozenset({Capability.EXECUTE}),
+                seconds=300, granted_by="laptop-device", reason="fixing the printer")
+
+    client = _client(vault, policies={8787: "tailnet"})
+    client.app.state.raises = store
+    client.cookies.set(COOKIE_NAME, token)
+
+    clock["now"] += 10  # some time passes before Studio asks
+    data = client.get("/v1/session").json()["data"]
+    assert data["raised"] == ["execute"]
+    assert data["raiseExpiresInSeconds"] == 290
+
+
+def test_session_still_separates_issued_from_effective(tmp_path, monkeypatch):
+    """`raised` is a third story, not a rename of either existing list. The
+    device's issued grants are unaffected by the raise, and this route must
+    not fold the raise into `effective` on its own -- narrowing the listener
+    ceiling with a live raise is `authenticate()`'s job (a separate task), and
+    this route reporting the two as already merged would race ahead of it and
+    make the merge unobservable to a test pinning that boundary."""
+    _fake_clock(monkeypatch)
+    vault = TokenVault(tmp_path)
+    token = vault.issue("Pixel 8", frozenset(Capability))
+    device_id = vault.devices()[0].device_id
+    store = RaiseStore()
+    store.grant(device_id, "tailnet", frozenset({Capability.EXECUTE}),
+                seconds=60, granted_by="laptop-device", reason="testing")
+
+    client = _client(vault, policies={8787: "tailnet"})
+    client.app.state.raises = store
+    client.cookies.set(COOKIE_NAME, token)
+    data = client.get("/v1/session").json()["data"]
+
+    assert "execute" in data["grants"]          # issued: the device holds it
+    assert "execute" not in data["effective"]   # tailnet's fixed ceiling excludes it
+    assert data["raised"] == ["execute"]        # reported on its own, third list
+
+
+def test_the_raise_fields_are_absent_for_an_unraisable_transport(tmp_path):
+    """'Absent' means present-and-empty, not a shape that varies by
+    transport: three of the four listener policies have no `raisable` set at
+    all, so this is the common case a client has to handle, not the edge
+    case -- the keys must still be there, just empty."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("Pixel 8", frozenset(Capability))
+    client = _client(vault, policies={8787: "quick"})
+    client.cookies.set(COOKIE_NAME, token)
+    data = client.get("/v1/session").json()["data"]
+    assert "raised" in data and data["raised"] == []
+    assert "raiseExpiresInSeconds" in data and data["raiseExpiresInSeconds"] is None
 
 
 # ─── POST /v1/session/cookie ─────────────────────────────────────────────
