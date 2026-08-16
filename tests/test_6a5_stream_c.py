@@ -517,3 +517,42 @@ async def test_read_screen_still_handles_an_empty_screen(monkeypatch):
     result = await da_handlers.handle_read_screen({}, "what's on my screen")
     assert "prompt" not in capture
     assert result
+
+
+# ─── The seam ────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["code_executor", "read_screen"])
+async def test_the_key_the_executor_writes_is_the_key_the_handler_reads(
+        tool, monkeypatch):
+    """The whole fence is a string agreeing in two packages. Renaming
+    `context_key` in the manifest without touching the handler would drop the
+    data silently -- safe, but the legitimate flow would break with no signal.
+    This fails loudly instead."""
+    import assistant.actions as actions_mod
+    from assistant.actions.planner.planner import Plan, PlanStep, TOOL_MANIFEST
+    from assistant.actions.planner.executor import execute_step
+
+    seen = {}
+
+    async def _fake_execute(intent, params, llm_response, **kw):
+        seen["params"] = params
+        return "ok, done"
+
+    monkeypatch.setattr(actions_mod, "execute", _fake_execute)
+
+    done = PlanStep(step_id=1, tool="file_task", goal="read it",
+                    status="success", output="the data")
+    step = PlanStep(step_id=2, tool=tool, goal="use $step_1")
+    await execute_step(step, Plan(original_goal="x", steps=[done, step]),
+                       llm_func=None)
+
+    key = TOOL_MANIFEST[tool]["context_key"]
+    assert key in seen["params"], f"{tool}: executor wrote no {key}"
+
+    import inspect
+    from assistant.actions import da_handlers
+    handler = {"code_executor": da_handlers.handle_code_executor,
+               "read_screen": da_handlers.handle_read_screen}[tool]
+    assert f'params.get("{key}"' in inspect.getsource(handler), (
+        f"{tool}: handler never reads params[{key!r}]")
