@@ -1527,11 +1527,15 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             # CAPABILITY-EXEMPT: this branch is itself a refusal
             # Nothing runs on this path, so there is no effect to charge for.
             # Note what this branch is NOT: a security control the gate may
-            # lean on. `evaluate_policy` judges `intent_result.params["goal"]`,
-            # and the goal-override below overwrites that same field with the
-            # raw transcription for six intents afterwards -- so the string the
-            # policy approved is not always the string that runs. The
-            # capability gate is deliberately independent of it.
+            # lean on. It was one, badly, until 6a.5 removed the regex
+            # deny-list it ran on -- that list judged this same
+            # `params["goal"]`, which the goal-override below overwrites with
+            # the raw transcription for six intents afterwards, so the string
+            # it approved was not the string that ran. What is left is three
+            # positive checks (intent whitelist, sandbox containment, URL
+            # scheme), each of which answers "is this one of the permitted
+            # things" rather than "does this text look scary". The capability
+            # gate stays deliberately independent of all of them.
             logger.warning(f"Policy DENIED: {policy.reason}")
             await bridge.send_command("set_expression", value="worried")
             if source == "studio":
