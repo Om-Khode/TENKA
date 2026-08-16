@@ -27,7 +27,7 @@ from ..payloads import (
     UnlockPayload,
 )
 from ..schemas import Envelope, RestoreRequest, UnlockRequest
-from ..security import require, throttle
+from ..security import require, require_admin, throttle
 from ..vault import Capability
 
 router = APIRouter()
@@ -204,7 +204,23 @@ async def forget_enrolled(kind: EnrollmentKind, item_id: str, request: Request,
 
 @router.get("/audit")
 async def audit(request: Request,
-                _=Depends(require(Capability.SYSTEM_CONTROL))) -> Envelope[AuditPayload]:
+                _=Depends(require_admin(Capability.SYSTEM_CONTROL))) -> Envelope[AuditPayload]:
+    # `require_admin`, not `require`: the audit log is a strictly richer
+    # answer than `GET /v1/devices`, which is admin-only. It carries every
+    # device id that has made a request since process start, plus the method,
+    # path and outcome for each -- so it says not only how many credentials
+    # exist but what each one does, which the device list itself does not
+    # even carry. `routes/devices.py`'s own docstring already names this
+    # route as the same class of thing; the gate had not caught up.
+    #
+    # This is the second, independent control. The capability ceilings keep a
+    # non-loopback listener away from SYSTEM_CONTROL at all; the admin gate is
+    # what holds if a ceiling is ever widened by mistake.
+    #
+    # Nothing here may move into the route's docstring: docstrings are
+    # published as the OpenAPI `description` and `ui.contract_hash()`
+    # fingerprints the schema, so editing one takes the vendored Studio
+    # bundle dark with a stale-contract 503.
     entries = request.app.state.auth.audit.entries()
     return Envelope(data=AuditPayload(entries=[
         AuditEntryPayload(at=e.at, device_id=e.device_id, method=e.method,
