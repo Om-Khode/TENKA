@@ -783,17 +783,23 @@ on exactly that reasoning.
 # `pending_incoming_messages`, so the derivation is already broken on row nine
 # and would fail open exactly where nobody looks.
 #
-# THE INVARIANT THAT COLUMN DEPENDS ON: a handler may not arm its own state as
-# a side effect of being asked. The loop checks ownership by reading
-# `state.active` *before* calling the handler, so a handler that arms itself
-# when it finds the state inactive is exempt from the check by construction --
-# it is False at the only moment anyone looks, and the owner is then recorded
-# a frame later by whoever just spoke. Row ten did precisely that until
-# `code_executor.retry._arm_knowledge_approval` took the arming over, and a
-# device saying "yes" to something else could walk the table and have row ten
-# turn it into a write to the operator's knowledge base.
-# `tests/test_6b_principal.py::test_no_pending_handler_arms_its_own_state_lazily`
-# is what stops the next row copying the pattern.
+# THE INVARIANT THAT COLUMN DEPENDS ON: the loop reads `state.active` *before*
+# calling the handler, so a handler that arms its own state on finding it
+# inactive is exempt from the loop's check by construction -- the state is
+# False at the only moment anyone looks, and the owner is recorded a frame
+# later. Row ten does arm lazily and cannot stop: its proposal is produced
+# deep inside a code_executor run and arming it there suspends running plans
+# and stalls announcements (see `retry._queue_knowledge_proposal`).
+#
+# So the rule is not "never arm lazily". It is: **a handler may arm its own
+# state lazily only if it arms with a principal carried from the work that
+# created the question -- never the ambient one -- and checks ownership itself
+# before treating the message as an answer.** Row ten does both. Without them
+# a device saying "yes" to something else could walk the table and have row
+# ten turn it into a write to the operator's knowledge base.
+# `tests/test_6b_principal.py::test_a_lazily_arming_handler_carries_an_owner_and_checks_it`
+# enforces both halves; the behavioural half is
+# `test_a_foreign_yes_cannot_write_a_knowledge_entry`.
 
 from .actions import (
     handle_pending_destructive, handle_pending_camera_settings,

@@ -517,13 +517,7 @@ async def _save_success_knowledge(service: str, slug: str,
 
         # Return proposal for immediate mode (appended to task response)
         # Store the pending entry so actions.py can handle yes/no
-        _pending_knowledge_queue.append({
-            "service": service,
-            "slug": slug,
-            "pattern": pattern,
-            "reason": reason,
-        })
-        _arm_knowledge_approval()
+        _queue_knowledge_proposal(service, slug, pattern, reason)
         from .. import knowledge
         return knowledge.render_for_user(pattern, reason)
 
@@ -536,56 +530,59 @@ async def _save_success_knowledge(service: str, slug: str,
 _pending_knowledge_queue: list[dict] = []
 
 
-# (Empty - _queue_knowledge_approval logic was merged into caller)
+def _queue_knowledge_proposal(service: str, slug: str,
+                              pattern: str, reason: str) -> None:
+    """Queue a lesson for approval, stamped with who the lesson belongs to.
+
+    **Queues. It does not arm anything**, and that restraint is the whole
+    point of this function existing separately.
+
+    KI-13's fix for this row first tried arming `pending_knowledge_approval`
+    right here, so the state would carry an owner before `main.py`'s dispatch
+    loop ever saw it. That closed the ownership hole and broke three things,
+    because a pending state going active is a signal several unrelated systems
+    read:
+
+    - `planner/executor.py` snapshots pending states around every step and
+      treats inactive->active as "this step is waiting on the user". Any
+      planner code step that self-healed through retry -- which is exactly
+      when this runs -- suspended the plan and abandoned its remaining steps.
+    - `main.py`'s notification flusher defers every announcement while a
+      pending state is active, so it stalled for the full 60s timeout.
+    - A second proposal inside that window replaced the first, where the queue
+      preserves both in order.
+
+    And `orchestrator.py` discards the rendered proposal, so nobody was ever
+    asked the question the plan was suspended waiting for.
+
+    So the timing goes back to what it was and only the *identity* moves: the
+    principal is captured here, at the moment the lesson is created, and rides
+    on the entry. `handle_pending_knowledge_approval` arms lazily as it always
+    did, but with `principal=entry["principal"]` instead of the ambient one --
+    which was the actual defect. The ambient principal at arm time is whoever
+    happened to speak next; the principal captured here is whoever ran the
+    code that learned the lesson, and only they may approve it.
+
+    `current_principal` comes from `core/`, the bottom layer, so this costs
+    `code_executor/` no new dependency on anything above it.
+    """
+    from ..core.principal import current_principal
+    _pending_knowledge_queue.append({
+        "service": service,
+        "slug": slug,
+        "pattern": pattern,
+        "reason": reason,
+        "principal": current_principal.get(),
+    })
 
 
 def pop_pending_knowledge() -> dict | None:
-    """Pop the next pending knowledge entry.
+    """Pop the next pending knowledge entry. Called by actions.py.
 
-    Called by `_arm_knowledge_approval` below, and no longer by
-    `handle_pending_knowledge_approval` -- see that function's own comment for
-    why the pop moved up here.
+    The entry carries a `principal` key -- see `_queue_knowledge_proposal`.
+    The caller must arm with it rather than letting `PendingState.set()` fall
+    back to the ambient one.
     """
     if _pending_knowledge_queue:
         return _pending_knowledge_queue.pop(0)
     return None
-
-
-def _arm_knowledge_approval() -> None:
-    """Arm `pending_knowledge_approval` here, inside the turn that produced it.
-
-    `handle_pending_knowledge_approval` used to do this itself: when the state
-    was inactive it popped the queue, armed the state, and treated the *same*
-    message as the yes/no answer, all in one call. That made row ten of
-    `main.py`'s `_PENDING_HANDLERS` structurally exempt from the owner check
-    that closes KI-13 -- the loop asks `state.active`, which was False at that
-    instant, so the check was a no-op every single time and the owner was then
-    recorded a frame later by whoever had just spoken. A paired device saying
-    "yes" to something else entirely could walk down the table and have row
-    ten turn it into a write to the operator's knowledge base.
-
-    Arming at the moment the proposal is *created* fixes the shape rather than
-    the symptom: this runs inside `execute_code_task`, which every caller
-    reaches through `actions.execute()`, so the ambient `current_principal` is
-    the person or device whose run produced the lesson -- and only they can
-    approve it. A handler that arms its own state as a side effect of being
-    asked cannot be owner-checked by anything, so no row may do it.
-
-    Reached through `pending_registry` rather than by importing
-    `assistant.actions`: `code_executor/` sits below `actions/`, and the
-    registry is exactly the by-name handle that exists so it does not have to.
-    """
-    entry = pop_pending_knowledge()
-    if entry is None:
-        return
-    from ..pending import pending_registry
-    state = pending_registry.get("knowledge_approval")
-    if state is None:
-        # Only reachable if `assistant.actions` was never imported, which no
-        # real turn can manage. Loud rather than silent: the proposal would
-        # otherwise be unapprovable and look like TENKA forgot it.
-        logger.warning(
-            "[CODE] knowledge_approval state is not registered -- the "
-            "proposal cannot be approved")
-        return
-    state.set(entry)

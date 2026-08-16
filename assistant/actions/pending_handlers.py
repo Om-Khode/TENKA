@@ -493,21 +493,54 @@ async def handle_pending_knowledge_approval(text: str, bridge=None) -> str | Non
     """
     import assistant.actions as _act
 
-    # Inactive means "no proposal is waiting", full stop. This used to pop
-    # `code_executor`'s queue and arm the state right here, in the same call
-    # that then read the message as the answer -- which made this row
-    # structurally exempt from the owner check in `main.py`'s dispatch loop.
-    # That check asks `state.active`, and `state.active` was False at exactly
-    # the moment it was asked, every time; the owner was then recorded a frame
-    # later by whoever had just spoken. So any caller that could reach this row
-    # became the owner of the operator's knowledge proposal by answering it.
+    # ── Lazy arming, with the owner carried rather than assumed ─────────
+    # This row arms its own state: the proposal is produced deep inside a
+    # code_executor run and only becomes a *question* on a later turn. Arming
+    # it at creation time was tried and reverted -- a pending state going
+    # active is read by the planner as "this step is waiting on the user" and
+    # by the notification flusher as "stay quiet", so it suspended plans
+    # mid-flight and stalled announcements for 60s. See
+    # `code_executor.retry._queue_knowledge_proposal`.
     #
-    # The arming moved to `code_executor.retry._arm_knowledge_approval`, which
-    # runs inside the turn that produced the proposal and therefore records
-    # that turn's principal. See KI-13.
+    # What was actually wrong was never the timing. It was `set(entry)` with
+    # no principal, which takes the *ambient* one -- whoever happened to speak
+    # next. That is the confused deputy in KI-13: any caller reaching this row
+    # became the owner of the operator's knowledge proposal by answering it,
+    # and `main.py`'s loop could not stop it, because the loop tests
+    # `state.active` and the state was inactive at exactly that instant.
+    #
+    # So the entry carries the principal of the run that learned the lesson,
+    # and the state is armed with THAT.
     if _act.pending_knowledge_approval.payload is None:
+        from ..code_executor import pop_pending_knowledge
+        entry = pop_pending_knowledge()
+        if entry is None:
+            return None
+        _act.pending_knowledge_approval.set(
+            entry, principal=entry.get("principal"))
+
+    # ── The owner check the dispatch loop cannot make for this row ──────
+    # Every other row is checked by the loop before its handler is called.
+    # This one arms inside the handler, so it has to ask the question itself,
+    # and it answers it the same way the loop does: skip, returning None, so
+    # the message takes an ordinary turn. The state stays armed with its real
+    # owner, who can still answer it afterwards -- a foreign "yes" costs the
+    # operator nothing but a note that somebody reached for her question.
+    from ..core.principal import current_principal
+    if not _act.pending_knowledge_approval.owned_by(current_principal.get()):
+        logger.warning(
+            "[KNOWLEDGE] Foreign answer skipped: proposal belongs to another "
+            "principal")
+        _act.pending_knowledge_approval.note_foreign_attempt()
         return None
 
+    # ── The owner check the dispatch loop cannot make for this row ──────
+    # Every other row is checked by the loop before its handler is called.
+    # This one arms inside the handler, so it has to ask the question itself,
+    # and it answers it the same way the loop does: skip, returning None, so
+    # the message takes an ordinary turn. The state stays armed with its real
+    # owner, who can still answer it afterwards -- a foreign "yes" costs the
+    # operator nothing but a note that somebody reached for her question.
     text_low = text.strip().lower()
 
     is_yes = any(w in text_low for w in (

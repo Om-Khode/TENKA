@@ -789,9 +789,19 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
         if slug and not template_was_cached and not _needs_retry(result) and not result.startswith("NEEDS_OAUTH|"):
             _save_template(slug, code, goal=goal, params=params)
 
-        # Extract knowledge after successful retry. The proposal return value
-        # is intentionally discarded — _save_success_knowledge writes the entry
-        # itself; we do not append it to TTS output (would bloat spoken response).
+        # Extract knowledge after successful retry.
+        #
+        # The proposal return value is discarded here and we do not append it
+        # to TTS output (it would bloat the spoken response).
+        #
+        # It does NOT mean the lesson has been saved. `_save_success_knowledge`
+        # *queues* the entry for approval; nothing is written until the user
+        # says yes and `handle_pending_knowledge_approval` calls
+        # `knowledge.add_works_entry`. Since the rendered proposal is dropped
+        # right here, nobody is ever actually asked -- so the approval flow is
+        # armed and unanswerable. That is a pre-existing defect, filed rather
+        # than fixed in this change; the comment that used to sit here claimed
+        # the entry was already written, which is what made it invisible.
         if _svc and slug and len(history) > 1:
             await _save_success_knowledge(
                 _svc, slug, _original_broken_code, code, history, llm_func

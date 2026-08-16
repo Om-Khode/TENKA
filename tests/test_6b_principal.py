@@ -29,6 +29,7 @@ legitimate confirmation would pass the other seven.
 Run with:  py -3.11 -m pytest tests/test_6b_principal.py -v
 """
 import ast
+import asyncio
 import contextvars
 import pathlib
 import sys
@@ -648,21 +649,41 @@ def test_every_arming_site_records_a_principal():
         "nobody, which reads as a timeout.")
 
 
-def test_no_pending_handler_arms_its_own_state_lazily():
-    """The invariant the sixth column depends on, and the one row ten broke.
+def test_a_lazily_arming_handler_carries_an_owner_and_checks_it():
+    """The invariant the sixth column depends on, stated as what it protects.
 
-    The dispatch loop asks `state.active` BEFORE calling the handler. A
-    handler that responds to an inactive state by arming it -- and then reads
-    the same message as the answer, in the same call -- is exempt from the
-    owner check by construction: the check looked at the only moment the
-    answer was False, and the owner gets recorded a frame later by whoever
-    just spoke. `handle_pending_knowledge_approval` did exactly that; a device
-    saying "yes" to something else could walk the table and have row ten turn
-    it into a write to the operator's knowledge base.
+    The dispatch loop asks `state.active` BEFORE calling the handler, so a
+    handler that responds to an inactive state by arming it is exempt from the
+    loop's owner check by construction: the check looked at the only moment
+    the answer was False, and the owner would be recorded a frame later by
+    whoever just spoke. That was the KI-13 hole in row ten.
 
-    Structural, because a comment saying "don't do this" is what the next row
-    that copies the pattern will not read. The shape is unmistakable: a `.set(`
-    inside an `if` whose test asks whether the state is inactive.
+    "Never arm lazily" is the wrong rule, though, and trying it broke three
+    things: arming `knowledge_approval` at proposal-creation time made the
+    planner read the step as waiting on the user and abandon the rest of the
+    plan, made the notification flusher stall for the 60s timeout, and let a
+    second proposal replace the first. Some questions genuinely only become
+    questions on a later turn.
+
+    So the rule is the pair that makes a lazy arm safe:
+
+    1. it arms with a principal **carried from the work that created the
+       question** (`principal=` on the `.set(`), never the ambient one, and
+    2. it **checks ownership itself** (`owned_by`) before treating the message
+       as an answer.
+
+    LIMIT, stated here rather than only in a report: this is a shape matcher.
+    It sees `state.set(...)` inside an `if` that asks whether the state is
+    inactive, which is the shape row ten has and the shape a copy would have.
+    An *indirect* self-arm -- a helper function, a `pending_registry.get(name)`
+    lookup, anything one call away -- slips past it. A fuzzier rule (any `.set(`
+    anywhere in a handler) was rejected rather than overlooked: it fires on
+    `pending_handlers.py:330`, where `handle_pending_messaging_disambig`
+    legitimately arms `pending_messaging_send` *after* the loop has already
+    owner-checked the row it was called for. A matcher that cries wolf on the
+    legitimate chained arm would be turned off, and then it protects nothing.
+    `test_a_foreign_yes_cannot_write_a_knowledge_entry` is the behavioural half
+    that does not depend on spelling.
     """
     import inspect
     import textwrap
@@ -677,6 +698,7 @@ def test_no_pending_handler_arms_its_own_state_lazily():
         except (OSError, TypeError):  # pragma: no cover - stdlib-less handler
             continue
         tree = ast.parse(src)
+        lazy_arms = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.If):
                 continue
@@ -684,20 +706,160 @@ def test_no_pending_handler_arms_its_own_state_lazily():
             if not (("payload" in test_src or "active" in test_src)
                     and any(t in test_src for t in _INACTIVE_TESTS)):
                 continue
-            arms = [n for n in ast.walk(node)
-                    if isinstance(n, ast.Call)
-                    and isinstance(n.func, ast.Attribute)
-                    and n.func.attr == "set"]
-            if arms:
-                offenders.append((label, handler.__name__, test_src))
+            lazy_arms += [n for n in ast.walk(node)
+                          if isinstance(n, ast.Call)
+                          and isinstance(n.func, ast.Attribute)
+                          and n.func.attr == "set"]
+        if not lazy_arms:
+            continue
+
+        # Half one: every lazy arm names the owner explicitly.
+        unowned = [ast.unparse(n) for n in lazy_arms
+                   if not any(kw.arg == "principal" for kw in n.keywords)]
+        if unowned:
+            offenders.append(
+                (label, handler.__name__, "arms without principal=", unowned))
+
+        # Half two: the handler asks whether it may act on what it just armed.
+        if "owned_by(" not in src:
+            offenders.append(
+                (label, handler.__name__, "never calls owned_by()", []))
 
     assert not offenders, (
-        "pending handlers that arm their own state when they find it "
-        f"inactive: {offenders}. The dispatch loop reads `state.active` "
-        "before calling the handler, so such a row can never be owner-checked "
-        "-- arm the state where the thing being confirmed is produced, inside "
-        "the turn that produced it, the way "
-        "`code_executor.retry._arm_knowledge_approval` does.")
+        "handlers that arm their own state lazily without both halves of the "
+        f"invariant: {offenders}. The dispatch loop reads `state.active` "
+        "before calling the handler, so a lazily-armed row is never checked "
+        "by the loop and must check itself: arm with a principal carried from "
+        "the work that created the question (never the ambient one -- that is "
+        "whoever spoke next), then `owned_by(current_principal.get())` before "
+        "treating the message as an answer. See "
+        "`handle_pending_knowledge_approval`.")
+
+
+def test_a_foreign_yes_cannot_write_a_knowledge_entry(monkeypatch):
+    """The behavioural half, which does not care how the check is spelled.
+
+    A code-executor run learns a lesson and queues it for approval. A paired
+    device then says "yes" -- to something else entirely, or to this. It must
+    not become a write to the operator's knowledge base, and the operator must
+    still be able to approve it afterwards: a foreign answer may not consume
+    the question either."""
+    import assistant.actions as _act
+    from assistant import knowledge
+    from assistant.actions import LOCAL_PRINCIPAL, current_principal, set_principal
+    from assistant.actions.pending_handlers import handle_pending_knowledge_approval
+    from assistant.code_executor import retry as _retry
+
+    writes: list = []
+    monkeypatch.setattr(knowledge, "add_works_entry",
+                        lambda *a, **k: writes.append(a) or True)
+    monkeypatch.setattr(_retry, "_pending_knowledge_queue", [])
+
+    # The operator's own run produces the lesson.
+    token = set_principal(LOCAL_PRINCIPAL)
+    try:
+        _retry._queue_knowledge_proposal("svc", "slug", "a pattern", "a reason")
+    finally:
+        current_principal.reset(token)
+
+    # A device answers first.
+    token = set_principal(_A_DEVICE)
+    try:
+        resp = asyncio.run(handle_pending_knowledge_approval("yes"))
+    finally:
+        current_principal.reset(token)
+
+    assert resp is None, (
+        f"the device's answer was treated as an approval: {resp!r}")
+    assert writes == [], (
+        f"a device wrote to the operator's knowledge base: {writes}")
+    assert _act.pending_knowledge_approval.active, (
+        "the device's answer consumed the operator's proposal -- she can no "
+        "longer approve her own lesson")
+    assert _act.pending_knowledge_approval.principal == LOCAL_PRINCIPAL, (
+        "the state recorded the device that answered rather than the run that "
+        "learned the lesson -- this is KI-13's confused deputy exactly")
+
+    # And the operator, afterwards, still can.
+    token = set_principal(LOCAL_PRINCIPAL)
+    try:
+        resp = asyncio.run(handle_pending_knowledge_approval("yes"))
+    finally:
+        current_principal.reset(token)
+
+    assert writes == [("svc", "slug", "a pattern", "a reason")], (
+        f"the owner could not approve her own lesson: {writes}")
+    assert resp is not None
+
+
+@pytest.mark.asyncio
+async def test_a_plan_step_that_learns_a_lesson_runs_to_completion(monkeypatch):
+    """Queueing a proposal must not look like "this step is waiting on you".
+
+    `planner/executor.py` snapshots every registered pending state around each
+    step and treats inactive->active as an interactive flow: the step is
+    marked `"waiting"` and `planner._suspend_plan` abandons the remaining
+    steps. `_save_success_knowledge` runs on any code step that self-healed
+    through retry, which is common rather than exotic -- and the rendered
+    proposal is discarded by the orchestrator, so the plan would have
+    suspended waiting for an answer to a question nobody was asked.
+
+    This drives the real `execute_step` with a stubbed tool whose only side
+    effect is queueing a proposal, and asserts on the real suspension
+    predicate."""
+    from assistant.actions.planner.executor import execute_step
+    from assistant.actions.planner.planner import Plan, PlanStep
+    from assistant.code_executor import retry as _retry
+    from assistant.pending import pending_registry
+
+    monkeypatch.setattr(_retry, "_pending_knowledge_queue", [])
+
+    async def _execute(intent, params, llm_response="", bridge=None, **kw):
+        # What a self-healed code step does on its way out.
+        _retry._queue_knowledge_proposal("svc", "slug", "a pattern", "a reason")
+        return "Played it."
+
+    import assistant.actions as _actions_pkg
+    monkeypatch.setattr(_actions_pkg, "execute", _execute)
+
+    step = PlanStep(step_id=1, tool="code_executor", goal="play some music")
+    plan = Plan(original_goal="play some music", steps=[step])
+
+    async def _llm(*a, **k):
+        return "ok"
+
+    await execute_step(step, plan, llm_func=_llm)
+
+    assert step.status != "waiting", (
+        "queueing a knowledge proposal suspended the plan -- the remaining "
+        "steps would be abandoned waiting for a question nobody was asked")
+    assert step.status == "success", step.status
+    assert not pending_registry.get("knowledge_approval").active, (
+        "the proposal armed a pending state at creation time")
+
+    # The queue, not a state: order preserved, nothing replaced.
+    _retry._queue_knowledge_proposal("svc2", "slug2", "second", "second reason")
+    assert [e["slug"] for e in _retry._pending_knowledge_queue] == ["slug", "slug2"], (
+        "a second proposal inside the window replaced the first")
+    assert all(e["principal"] is None for e in _retry._pending_knowledge_queue)
+
+
+def test_a_queued_proposal_does_not_stall_notification_announcements():
+    """The other system that reads "a pending state is active": `main.py`'s
+    notification flusher defers every announcement while one is, and
+    `knowledge_approval` has a 60-second timeout. Queueing must not trip it."""
+    from assistant.code_executor import retry as _retry
+    from assistant.pending import pending_registry
+
+    _retry._pending_knowledge_queue.clear()
+    _retry._queue_knowledge_proposal("svc", "slug", "a pattern", "a reason")
+    try:
+        assert not pending_registry.any_active(
+            exclude={"incoming_messages", "teaching_session"}), (
+            "queueing a proposal made the notification flusher go quiet for "
+            "the state's full timeout")
+    finally:
+        _retry._pending_knowledge_queue.clear()
 
 
 def test_a_studio_item_with_no_principal_slot_owns_nothing():
