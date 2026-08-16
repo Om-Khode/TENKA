@@ -358,6 +358,10 @@ async def handle_code_executor(params: dict, llm_response: str, bridge=None,
     _task_id = f"code_executor:{_uuid.uuid4().hex[:8]}"
 
     goal = params.get("goal", "")
+    # Prior-step output the planner fenced out of the goal. Untrusted, and it
+    # stays in its own variable all the way to its own prompt block — merging
+    # it back into `goal` here would undo the split (spec §5.3).
+    context = params.get("context", "")
     if not _from_planner:
         abort.reset()
         abort.register_task(_task_id)
@@ -396,6 +400,7 @@ async def handle_code_executor(params: dict, llm_response: str, bridge=None,
             tts_func=agent_tts,
             _from_planner=_from_planner,
             preference_hints=pref_hints,
+            context=context,
         )
 
         # OAuth setup signal

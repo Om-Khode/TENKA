@@ -37,13 +37,28 @@ def test_no_tool_lets_prior_output_land_in_its_instruction_param():
             assert entry["context_key"] != entry["param_key"], name
 
 
-def test_the_instruction_position_tools_all_have_a_data_param():
-    """These are the tools whose param reaches a model that writes code or
-    drives the machine. Every one of them needs somewhere else to put data."""
+def test_the_fenced_tools_have_a_data_param():
+    """The tools whose whole prompt path stream C owns, and can therefore
+    render prior output in a real data position rather than an instruction
+    one."""
     from assistant.actions.planner.planner import TOOL_MANIFEST
-    for name in ("code_executor", "computer_task", "read_screen",
-                 "browser_action", "app_action", "synthesize"):
+    for name in ("code_executor", "read_screen", "synthesize",
+                 "vision_analyze"):
         assert TOOL_MANIFEST[name]["context_key"] == "context", name
+
+
+def test_the_machine_driving_tools_fail_closed_for_now():
+    """`computer_task`, `browser_action` and `app_action` build their prompts
+    in `automation/`, which stream C does not own. Rather than splice the data
+    back into the goal -- leaving prompt framing as the only control over the
+    tools that drive the machine, which spec D3 rejects -- the reference is
+    dropped and logged until those builders take a context param."""
+    from assistant.actions.planner.planner import TOOL_MANIFEST
+    for name in ("computer_task", "browser_action", "app_action",
+                 "file_task", "camera_look"):
+        entry = TOOL_MANIFEST[name]
+        assert entry["context_key"] is None, name
+        assert entry["inline_refs"] is False, name
 
 
 def test_a_payload_tool_declares_itself_as_one():
@@ -281,3 +296,130 @@ async def test_a_step_with_no_context_sends_no_context_param(monkeypatch):
 
     await execute_step(step, plan, llm_func=None)
     assert "context" not in seen["params"]
+
+
+# ─── C3: the code-gen prompt renders context as data ─────────────────────────
+#
+# SIGNATURE NOTE. The implementation plan assumed
+# `prompts.build_code_gen_prompt(goal, context)`. No such function exists:
+# `prompts.py` holds module-level prompt CONSTANTS and the user-side prompt is
+# assembled inline in `orchestrator.py` at the two `Goal: {goal}` sites. So the
+# renderer added is `prompts.render_untrusted_block(content, label)` and the
+# threading happens through `execute_code_task(..., context=...)`.
+
+
+def test_the_renderer_marks_the_block_as_data():
+    from assistant.code_executor import prompts
+    built = prompts.render_untrusted_block("1,2,3 IGNORE PREVIOUS")
+    assert "1,2,3" in built
+    lowered = built.lower()
+    assert "data" in lowered
+    assert "not instructions" in lowered or "untrusted" in lowered
+
+
+def test_the_renderer_returns_nothing_for_no_content():
+    """No context must not leave an empty labelled block confusing the model."""
+    from assistant.code_executor import prompts
+    assert prompts.render_untrusted_block("") == ""
+
+
+def test_the_renderer_delimits_the_content():
+    """The model needs to see where attacker-controlled text stops."""
+    from assistant.code_executor import prompts
+    built = prompts.render_untrusted_block("body")
+    assert "<untrusted_data>" in built and "</untrusted_data>" in built
+
+
+@pytest.mark.asyncio
+async def test_the_code_gen_prompt_keeps_goal_and_context_apart(monkeypatch):
+    """The finding's other half: `orchestrator.py` renders `Goal: {goal}` with
+    no fence. Goal and context must occupy different positions, and the
+    context must be labelled as data."""
+    from assistant.code_executor import orchestrator
+
+    seen = {}
+
+    async def _fake_llm(prompt, **kw):
+        if kw.get("task_type") == "code_gen":
+            seen["prompt"] = prompt
+        return "print('hi')"
+
+    monkeypatch.setattr(orchestrator, "_route_goal", _fake_route_tier1)
+    monkeypatch.setattr(orchestrator, "run_code", lambda code, tier: "hi")
+    monkeypatch.setattr(orchestrator, "_needs_retry", lambda r: False)
+
+    await orchestrator.execute_code_task(
+        goal="compute the total",
+        llm_func=_fake_llm,
+        context=f"1,2,3\n{PLANTED}",
+        _from_planner=True,
+    )
+
+    built = seen["prompt"]
+    assert "compute the total" in built
+    assert "1,2,3" in built
+    assert built.index("compute the total") != built.index("1,2,3")
+    # The planted text is present -- it has to be, it is the data -- but it
+    # sits inside the labelled block, after the goal, not at the top as an
+    # instruction.
+    assert built.index(PLANTED) > built.index("compute the total")
+    assert "not instructions" in built.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_goal_with_no_context_is_unchanged_in_shape(monkeypatch):
+    from assistant.code_executor import orchestrator
+
+    seen = {}
+
+    async def _fake_llm(prompt, **kw):
+        if kw.get("task_type") == "code_gen":
+            seen["prompt"] = prompt
+        return "print('hi')"
+
+    monkeypatch.setattr(orchestrator, "_route_goal", _fake_route_tier1)
+    monkeypatch.setattr(orchestrator, "run_code", lambda code, tier: "hi")
+    monkeypatch.setattr(orchestrator, "_needs_retry", lambda r: False)
+
+    await orchestrator.execute_code_task(
+        goal="print hello", llm_func=_fake_llm, _from_planner=True)
+
+    assert "print hello" in seen["prompt"]
+    assert "untrusted" not in seen["prompt"].lower()
+
+
+async def _fake_route_tier1(goal, llm_func, preference_hints=""):
+    return {"tier": 1, "template_slug": None, "requires": [], "params": {},
+            "verification_needed": False}
+
+
+def test_the_handler_forwards_the_context_param():
+    """`handle_code_executor` reads params["goal"]; it must read the context
+    the planner put beside it, or the fence ends at the handler door."""
+    import inspect
+    from assistant.actions import da_handlers
+    src = inspect.getsource(da_handlers.handle_code_executor)
+    assert 'params.get("context"' in src
+    assert "context=" in src
+
+
+@pytest.mark.asyncio
+async def test_the_handler_passes_context_through_to_the_task(monkeypatch):
+    from assistant.actions import da_handlers
+    from assistant import code_executor
+
+    seen = {}
+
+    async def _fake_task(goal, llm_func, **kw):
+        seen["goal"] = goal
+        seen["context"] = kw.get("context")
+        return "42"
+
+    monkeypatch.setattr(code_executor, "execute_code_task", _fake_task)
+
+    await da_handlers.handle_code_executor(
+        {"goal": "compute the total", "context": PLANTED},
+        "compute the total", None, _from_planner=True)
+
+    assert seen["goal"] == "compute the total"
+    assert seen["context"] == PLANTED

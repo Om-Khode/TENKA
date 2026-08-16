@@ -135,7 +135,14 @@ def _suspend_plan(plan, resume_from_index, llm_func, tts_func, bridge):
 #
 #  A tool with `context_key: None` and `inline_refs: False` accepts no prior
 #  output at all; a `$step_N` aimed at it is dropped with a warning rather
-#  than silently delivered.
+#  than silently delivered. `computer_task`, `browser_action`, `app_action`,
+#  `file_task` and `camera_look` are in that state deliberately: each hands
+#  its goal to a prompt built in `automation/` or another package, so there
+#  is nowhere yet to render the data as data. Splicing it back into the goal
+#  would leave prompt framing as the only control over the three tools that
+#  literally drive the machine — the thing spec §5.3 / D3 rejects. Giving
+#  them a real fenced data path means threading `context` through those
+#  prompt builders; until then this drops the reference and logs it.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 TOOL_MANIFEST = {
@@ -154,7 +161,7 @@ TOOL_MANIFEST = {
         "description": "Control the computer via GUI — click buttons, type in fields, "
                        "navigate menus, interact with visible application windows.",
         "param_key": "goal",
-        "context_key": "context",
+        "context_key": None,
         "inline_refs": False,
         "interactive": False,
     },
@@ -166,7 +173,7 @@ TOOL_MANIFEST = {
                        "reliable than computer_task for any web task. Opens its "
                        "own browser — does not interfere with the user's browser.",
         "param_key": "goal",
-        "context_key": "context",
+        "context_key": None,
         "inline_refs": False,
         "interactive": False,
     },
@@ -177,7 +184,7 @@ TOOL_MANIFEST = {
                        "selectors — faster and more reliable than computer_task "
                        "for tasks targeting specific app UI elements.",
         "param_key": "goal",
-        "context_key": "context",
+        "context_key": None,
         "inline_refs": False,
         "interactive": False,
     },
@@ -200,14 +207,14 @@ TOOL_MANIFEST = {
                        "NOTE: write/rename/move/delete require user confirmation "
                        "and cannot be auto-confirmed in a plan.",
         "param_key": "goal",
-        "context_key": "context",
+        "context_key": None,
         "inline_refs": False,
         "interactive": True,  # destructive ops need confirmation
     },
     "camera_look": {
         "description": "Capture an image from the webcam and describe what is seen.",
         "param_key": "goal",
-        "context_key": "context",
+        "context_key": None,
         "inline_refs": False,
         "interactive": False,
     },
