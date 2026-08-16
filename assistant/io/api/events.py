@@ -60,6 +60,7 @@ import asyncio
 import contextlib
 import logging
 import threading
+import time
 from typing import Any, Callable
 
 from .routes.system import telemetry_body
@@ -96,6 +97,58 @@ _REVALIDATE_INTERVAL_SECONDS = 2.0
 # The cost is paid once per bad socket, not once per frame: a timeout drops
 # the socket, so it is never awaited again.
 _SEND_TIMEOUT_SECONDS = 2.0
+
+# How many sockets one device may hold at once, and how many the hub will
+# hold in total.
+#
+# The arithmetic, because the number is the whole finding. `app.py`'s socket
+# handler spends the shared `RateLimiter` budget on every handshake, keyed per
+# device: `security._MAX_PER_WINDOW` = 120 attempts per `_WINDOW_SECONDS` = 60.
+# Lens 5 F6's attack is not a burst -- the limiter already stops that -- it is
+# *accumulation*: 120 successful handshakes a minute, none of them ever closed,
+# is ~7,200 live entries an hour that `_pump` iterates on every published
+# frame.
+#
+# So the cap has to be the binding constraint, not the limiter. At 8 per
+# device the cap is reached after 8 of that minute's 120 permitted handshakes
+# -- roughly four seconds of a device's budget -- and the remaining 112 are
+# refused here rather than accumulating. Any value at or above 120 would leave
+# the limiter as the only bound and change nothing.
+#
+# 8 is also comfortably above honest use: Studio in several browser tabs plus
+# a phone plus a wall display is four or five, and each reload replaces its
+# predecessor as the old socket's `detach()` runs.
+#
+# The global cap is 8 devices' worth. It bounds the fan-out `_pump` performs
+# per frame, which matters because delivery is sequential and each send is
+# bounded by `_SEND_TIMEOUT_SECONDS` -- 64 is the worst-case number of
+# timeouts a single frame could pay, and each one is paid at most once because
+# a timed-out socket is dropped.
+#
+# Every bound below is applied with `asyncio.timeout`, never
+# `asyncio.wait_for`. On 3.11 `wait_for` swallows an *outer* cancellation
+# whenever the awaited future happens to already be done
+# (`asyncio/tasks.py:477-479`, `if fut.done(): return fut.result()`), which
+# turned `stop()` into a hang: cancelling `_revalidate` while it sat in a
+# bounded `close()` left the loop running and `await task` waiting on it
+# forever. `asyncio.timeout` only converts the cancellation it raised itself.
+_MAX_SOCKETS_PER_DEVICE = 8
+_MAX_SOCKETS_TOTAL = 64
+
+# How long a socket may go without traffic in either direction before the hub
+# stops holding it open.
+#
+# Two minutes, against a telemetry sampler that publishes to every attached
+# socket every `_interval` (2.0) seconds while at least one is attached: a
+# healthy connection on a running daemon refreshes this sixty times over
+# before it could expire, so this can only fire on a socket nothing is
+# reaching -- the sampler stopped, the runtime is absent, or the peer is
+# attached to a hub that has genuinely gone quiet.
+#
+# Inbound traffic counts too, via `note_activity()`. The receive loop lives in
+# `app.py`'s socket handler, so that call is the hook rather than something
+# this module can observe for itself.
+_IDLE_TIMEOUT_SECONDS = 120.0
 
 # The same bound on the courtesy close. Task 17's `_drop(close=True)` added a
 # second awaited call inside the same loop, which widened the wedge by one
@@ -272,6 +325,15 @@ class EventHub:
         # on the other end of this socket" is now something the hub has to be
         # able to answer per socket, not just per fan-out.
         self._sockets: dict[Any, Callable[[], frozenset[Capability] | None] | None] = {}
+        # socket -> the device that opened it, for the per-device cap. `None`
+        # for a caller that attached without naming one (test scaffolding, and
+        # any call site not yet passing it): such a socket is not attributable
+        # to a device, so only the global cap can apply to it.
+        self._device_of: dict[Any, str | None] = {}
+        # socket -> `time.monotonic()` of the last traffic in either
+        # direction. Wall time would let a clock change reap every socket at
+        # once.
+        self._last_active: dict[Any, float] = {}
         self._queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=1_000)
         self._telemetry_task: asyncio.Task | None = None
         self._revalidate_task: asyncio.Task | None = None
@@ -294,8 +356,9 @@ class EventHub:
         return self._telemetry_task is not None and not self._telemetry_task.done()
 
     async def attach(self, socket,
-                     viewer: Callable[[], frozenset[Capability] | None] | None = None) -> None:
-        """Start delivering to `socket`.
+                     viewer: Callable[[], frozenset[Capability] | None] | None = None,
+                     *, device_id: str | None = None) -> bool:
+        """Start delivering to `socket`. `False` if the hub refused it.
 
         `viewer` is re-consulted, not cached: it must answer "what may this
         connection see now", by whatever means its owner considers
@@ -303,22 +366,73 @@ class EventHub:
         the socket. Left unset -- test scaffolding attaching a bare object --
         the socket is delivered to unconditionally and unfiltered, exactly as
         before this parameter existed.
+
+        `device_id` names who is holding the socket, for the per-device cap.
+        A caller that does not pass one gets the global cap only: a socket
+        nobody attributed cannot be counted against a device without guessing
+        which, and guessing wrong locks out a device that did nothing.
         """
         # Captured here too, not just in start(): a test harness (or a
         # deployment that never calls start() before the first connection)
         # still needs publish() to land on the loop actually running this
         # socket's pump, not on whatever loop happened to exist first.
         self._set_loop(asyncio.get_running_loop())
+        # Refused *before* the socket joins `_sockets`, and closed rather than
+        # left dangling: the handshake already succeeded upstream, so the only
+        # honest answer this layer can still give is to end the connection.
+        if not self._has_room_for(device_id):
+            logger.warning(
+                f"[API] refusing an event socket at the concurrency cap "
+                f"(device={device_id!r}, attached={len(self._sockets)})")
+            await self._close_quietly(socket)
+            return False
         self._sockets[socket] = viewer
+        self._device_of[socket] = device_id
+        self._last_active[socket] = time.monotonic()
         if self._pump_task is None:
             self._pump_task = asyncio.create_task(self._pump())
         if self._revalidate_task is None:
             self._revalidate_task = asyncio.create_task(self._revalidate())
         if self._telemetry_task is None and self._runtime is not None:
             self._telemetry_task = asyncio.create_task(self._sample_telemetry())
+        return True
+
+    def _has_room_for(self, device_id: str | None) -> bool:
+        if len(self._sockets) >= _MAX_SOCKETS_TOTAL:
+            return False
+        if device_id is None:
+            return True
+        held = sum(1 for owner in self._device_of.values() if owner == device_id)
+        return held < _MAX_SOCKETS_PER_DEVICE
+
+    def note_activity(self, socket) -> None:
+        """Record that `socket` is alive, from the receive side.
+
+        The hub sees only what it sends. A device that holds the socket open
+        and talks -- an `abort` frame, anything a later protocol adds -- is
+        active by any honest definition, and `app.py`'s receive loop is the
+        only place that can say so. Silently ignores a socket that is not (or
+        is no longer) attached, so a frame racing a `detach()` is not an error.
+        """
+        if socket in self._sockets:
+            self._last_active[socket] = time.monotonic()
+
+    def _forget(self, socket) -> None:
+        """Drop every per-socket record together. A cap whose counter outlives
+        the socket it counted locks a device out after eight page reloads."""
+        self._sockets.pop(socket, None)
+        self._device_of.pop(socket, None)
+        self._last_active.pop(socket, None)
+
+    async def _close_quietly(self, socket) -> None:
+        try:
+            async with asyncio.timeout(_CLOSE_TIMEOUT_SECONDS):
+                await socket.close(code=1008)
+        except Exception:
+            pass
 
     async def detach(self, socket) -> None:
-        self._sockets.pop(socket, None)
+        self._forget(socket)
         if not self._sockets:
             for name in ("_telemetry_task", "_revalidate_task"):
                 task = getattr(self, name)
@@ -379,7 +493,7 @@ class EventHub:
         `detach()` awaits the cancellation of the revalidate task, which from
         inside that task is a wait on itself.
         """
-        self._sockets.pop(socket, None)
+        self._forget(socket)
         if not close:
             return
         try:
@@ -388,8 +502,8 @@ class EventHub:
             # accepts a data frame, and an unbounded await here would wedge the
             # fan-out at the exact moment the hub was trying to shed the socket
             # causing it.
-            await asyncio.wait_for(socket.close(code=1008),
-                                   timeout=_CLOSE_TIMEOUT_SECONDS)
+            async with asyncio.timeout(_CLOSE_TIMEOUT_SECONDS):
+                await socket.close(code=1008)
         except Exception:
             # Already gone, half-closed, too slow to say goodbye (3.11's
             # `TimeoutError` is an ordinary `Exception`, so the bound above
@@ -425,9 +539,9 @@ class EventHub:
                     # critical section: delivery is sequential, so a send
                     # that never resolves is not a slow client, it is every
                     # client. See `_SEND_TIMEOUT_SECONDS` for the number.
-                    await asyncio.wait_for(
-                        socket.send_json(visible_frame(event, grants)),
-                        timeout=_SEND_TIMEOUT_SECONDS)
+                    async with asyncio.timeout(_SEND_TIMEOUT_SECONDS):
+                        await socket.send_json(visible_frame(event, grants))
+                    self.note_activity(socket)
                 except asyncio.TimeoutError:
                     # Dead, not slow: the peer has not accepted a frame for
                     # the whole window. Closed as well as forgotten, so the
@@ -440,7 +554,8 @@ class EventHub:
                     await self._drop(socket, close=False)
 
     async def _revalidate(self) -> None:
-        """Close sockets whose device stopped being authorised, on a timer.
+        """Close sockets whose device stopped being authorised, or that have
+        gone silent, on a timer.
 
         The per-frame check in `_pump` covers every socket a frame reaches.
         This covers the one it does not: a device that only listens sends
@@ -449,10 +564,20 @@ class EventHub:
         come. This is the outbound half of "an accepted socket is not a
         credential" -- without it, the loudest devices are cut off first and
         the silent ones last, which is exactly backwards.
+
+        The idle sweep rides the same timer rather than a second task: both
+        answer "should this socket still be attached?", and one loop over
+        `_sockets` is cheaper than two running out of phase with each other.
         """
         while True:
             await asyncio.sleep(_REVALIDATE_INTERVAL_SECONDS)
+            now = time.monotonic()
             for socket, viewer in list(self._sockets.items()):
+                if now - self._last_active.get(socket, now) > _IDLE_TIMEOUT_SECONDS:
+                    logger.info("[API] closing an event socket with no traffic "
+                                "in either direction for the idle window")
+                    await self._drop(socket, close=True)
+                    continue
                 if viewer is None:
                     continue
                 try:
@@ -494,3 +619,5 @@ class EventHub:
         self._revalidate_task = None
         self._pump_task = None
         self._sockets.clear()
+        self._device_of.clear()
+        self._last_active.clear()

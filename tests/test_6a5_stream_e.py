@@ -175,3 +175,145 @@ async def test_a_slow_but_working_socket_is_not_dropped():
         assert not slow.closed
     finally:
         await hub.stop()
+
+
+# ─── E2 / G6: cap and time out sockets ───────────────────────────────────
+@pytest.mark.asyncio
+async def test_a_single_device_cannot_hold_unlimited_sockets(monkeypatch):
+    """Lens 5 F6: new handshakes are metered at ~120/min per device, but
+    nothing capped how many one device *accumulates* over hours."""
+    monkeypatch.setattr(events_mod, "_MAX_SOCKETS_PER_DEVICE", 3, raising=False)
+    hub = EventHub()
+    try:
+        held = [_HealthySocket() for _ in range(3)]
+        for socket in held:
+            assert await hub.attach(socket, device_id="phone") is True
+        refused = _HealthySocket()
+        assert await hub.attach(refused, device_id="phone") is False
+        assert refused not in hub._sockets
+        assert refused.closed, "a refused socket must be closed, not left open"
+        assert hub.subscriber_count() == 3
+    finally:
+        await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_second_device_is_not_blocked_by_the_first_devices_cap(monkeypatch):
+    """Control: the per-device cap must not collapse into a global one and
+    lock the operator's own laptop out because a phone filled its share."""
+    monkeypatch.setattr(events_mod, "_MAX_SOCKETS_PER_DEVICE", 2, raising=False)
+    hub = EventHub()
+    try:
+        for _ in range(2):
+            assert await hub.attach(_HealthySocket(), device_id="phone") is True
+        assert await hub.attach(_HealthySocket(), device_id="phone") is False
+        assert await hub.attach(_HealthySocket(), device_id="laptop") is True
+    finally:
+        await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_global_socket_cap_exists(monkeypatch):
+    """A per-device cap alone is multiplied by however many devices a vault
+    holds; `_pump` iterates every one of them on every published frame."""
+    monkeypatch.setattr(events_mod, "_MAX_SOCKETS_PER_DEVICE", 4, raising=False)
+    monkeypatch.setattr(events_mod, "_MAX_SOCKETS_TOTAL", 4, raising=False)
+    hub = EventHub()
+    try:
+        for index in range(4):
+            assert await hub.attach(_HealthySocket(),
+                                    device_id=f"device-{index}") is True
+        refused = _HealthySocket()
+        assert await hub.attach(refused, device_id="device-late") is False
+        assert hub.subscriber_count() == 4
+    finally:
+        await hub.stop()
+
+
+def test_the_per_device_cap_binds_before_the_rate_limit_does():
+    """The spec's constraint on the number itself: one device must not be able
+    to accumulate sockets faster than the handshake limiter lets it open them.
+
+    The limiter allows `_MAX_PER_WINDOW` handshakes per `_WINDOW_SECONDS` per
+    device. If the concurrent cap were the larger of the two, the limiter would
+    still be what bounds accumulation and the cap would be decoration.
+    """
+    from assistant.io.api.security import _MAX_PER_WINDOW
+
+    assert events_mod._MAX_SOCKETS_PER_DEVICE < _MAX_PER_WINDOW
+    assert events_mod._MAX_SOCKETS_TOTAL >= events_mod._MAX_SOCKETS_PER_DEVICE
+
+
+@pytest.mark.asyncio
+async def test_an_idle_socket_is_closed_by_the_timeout(monkeypatch):
+    """Nothing ever closed a socket that simply sat there. One that has neither
+    accepted a frame nor said anything for the whole window is not a live view,
+    it is an entry `_pump` pays for on every publish."""
+    monkeypatch.setattr(events_mod, "_IDLE_TIMEOUT_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(events_mod, "_REVALIDATE_INTERVAL_SECONDS", 0.02)
+    hub = EventHub()
+    try:
+        socket = _HealthySocket()
+        await hub.attach(socket, device_id="phone")
+        assert await _until(lambda: socket not in hub._sockets), (
+            "an idle socket was never reaped"
+        )
+        assert socket.closed
+    finally:
+        await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_active_socket_is_never_closed_by_the_idle_timeout(monkeypatch):
+    """Control: the operator's own live view must survive a quiet period."""
+    monkeypatch.setattr(events_mod, "_IDLE_TIMEOUT_SECONDS", 0.1, raising=False)
+    monkeypatch.setattr(events_mod, "_REVALIDATE_INTERVAL_SECONDS", 0.02)
+    hub = EventHub()
+    try:
+        socket = _HealthySocket()
+        await hub.attach(socket, device_id="phone")
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            hub.publish({"type": "status", "phase": "WORKING"})
+            await asyncio.sleep(0.02)
+        assert socket in hub._sockets, "a socket receiving frames was reaped"
+        assert not socket.closed
+        assert len(socket.frames) > 1
+    finally:
+        await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_inbound_frame_also_counts_as_activity(monkeypatch):
+    """The receive half lives in `app.py`'s socket handler, which this stream
+    does not own. `note_activity()` is the hook it calls; a socket whose only
+    traffic is inbound must not be reaped as idle."""
+    monkeypatch.setattr(events_mod, "_IDLE_TIMEOUT_SECONDS", 0.1, raising=False)
+    monkeypatch.setattr(events_mod, "_REVALIDATE_INTERVAL_SECONDS", 0.02)
+    hub = EventHub()
+    try:
+        socket = _HealthySocket()
+        await hub.attach(socket, device_id="phone")
+        deadline = time.monotonic() + 0.4
+        while time.monotonic() < deadline:
+            hub.note_activity(socket)
+            await asyncio.sleep(0.02)
+        assert socket in hub._sockets
+    finally:
+        await hub.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_detached_socket_leaves_no_bookkeeping_behind(monkeypatch):
+    """The caps are only real if their counters shrink again -- a per-device
+    tally that never decremented would lock a device out after eight reloads."""
+    monkeypatch.setattr(events_mod, "_MAX_SOCKETS_PER_DEVICE", 2, raising=False)
+    hub = EventHub()
+    try:
+        for _ in range(4):
+            socket = _HealthySocket()
+            assert await hub.attach(socket, device_id="phone") is True
+            await hub.detach(socket)
+        assert hub.subscriber_count() == 0
+    finally:
+        await hub.stop()
