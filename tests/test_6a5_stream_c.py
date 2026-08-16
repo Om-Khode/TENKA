@@ -423,3 +423,97 @@ async def test_the_handler_passes_context_through_to_the_task(monkeypatch):
 
     assert seen["goal"] == "compute the total"
     assert seen["context"] == PLANTED
+
+
+# ─── C4: read_screen's OCR output ────────────────────────────────────────────
+#
+# Lens 7 names OCR text as the same class of exposure: `handle_read_screen`
+# keys off "goal" like the others, its output is equally chainable via
+# $step_N, and the text itself is whatever happens to be on screen -- an
+# attacker's web page is on screen as readily as the user's own notes.
+
+
+def test_ocr_text_is_not_chained_into_an_instruction_param():
+    from assistant.actions.planner.planner import TOOL_MANIFEST
+    entry = TOOL_MANIFEST["read_screen"]
+    assert entry["context_key"] == "context"
+    assert entry["context_key"] != entry["param_key"]
+
+
+def _patch_screen(monkeypatch, ocr_text, capture):
+    """Point read_screen at fixed OCR text and capture the synthesis prompt."""
+    import assistant.io.screen as screen_mod
+    import assistant.llm.contracts as contracts_mod
+
+    monkeypatch.setattr(screen_mod, "ocr_screen", lambda: ocr_text)
+
+    async def _fake_synth(prompt, *a, **kw):
+        capture["prompt"] = prompt
+        return "a summary"
+
+    monkeypatch.setattr(contracts_mod, "ask_for_synthesis", _fake_synth)
+
+
+@pytest.mark.asyncio
+async def test_ocr_text_goes_into_the_synthesis_prompt_as_data(monkeypatch):
+    """It was interpolated bare between two instruction sentences."""
+    from assistant.actions import da_handlers
+    capture = {}
+    _patch_screen(monkeypatch, f"Inbox — 3 unread\n{PLANTED}", capture)
+
+    await da_handlers.handle_read_screen({}, "what's on my screen")
+
+    built = capture["prompt"]
+    assert "Inbox" in built
+    assert "<untrusted_data>" in built
+    assert "not instructions" in built.lower()
+
+
+@pytest.mark.asyncio
+async def test_the_ocr_block_comes_after_every_instruction(monkeypatch):
+    """Planted text placed before the real instruction reads as preceding
+    context for it. The data block goes last."""
+    from assistant.actions import da_handlers
+    capture = {}
+    _patch_screen(monkeypatch, PLANTED, capture)
+
+    await da_handlers.handle_read_screen({}, "what's on my screen")
+
+    built = capture["prompt"]
+    assert built.index("summary") < built.index(PLANTED)
+
+
+@pytest.mark.asyncio
+async def test_read_screen_accepts_a_chained_context_param(monkeypatch):
+    """read_screen declares context_key, so a $step_N aimed at it must land
+    somewhere rather than being silently discarded by the handler."""
+    from assistant.actions import da_handlers
+    capture = {}
+    _patch_screen(monkeypatch, "on-screen text", capture)
+
+    await da_handlers.handle_read_screen(
+        {"context": "earlier-step-output"}, "compare it to the screen")
+
+    assert "earlier-step-output" in capture["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_read_screen_still_summarises_the_screen(monkeypatch):
+    """Control: the fence must not break what read_screen is for."""
+    from assistant.actions import da_handlers
+    capture = {}
+    _patch_screen(monkeypatch, "Inbox — 3 unread", capture)
+
+    result = await da_handlers.handle_read_screen({}, "what's on my screen")
+    assert result == "a summary"
+
+
+@pytest.mark.asyncio
+async def test_read_screen_still_handles_an_empty_screen(monkeypatch):
+    from assistant.actions import da_handlers
+    capture = {}
+    _patch_screen(monkeypatch, "", capture)
+
+    result = await da_handlers.handle_read_screen({}, "what's on my screen")
+    assert "prompt" not in capture
+    assert result

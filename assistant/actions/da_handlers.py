@@ -193,20 +193,32 @@ async def handle_computer_task(params: dict, llm_response: str, bridge=None,
 async def handle_read_screen(params: dict, llm_response: str, bridge=None) -> str:
     """OCR the screen and return a natural language summary."""
     from ..io import screen
-    from ..llm.contracts import ask_for_synthesis
+    from ..llm import contracts
+    from ..code_executor.prompts import render_untrusted_block
 
     ocr_text = screen.ocr_screen()
 
     if not ocr_text:
         return "I can't read this. It's either too dark or you're blocking my view!"
 
+    # OCR text is UNTRUSTED (milestone 6a.5, spec §5.3). Whatever is on screen
+    # is on screen — an attacker's page as readily as the user's own notes —
+    # and it used to be interpolated bare between two instruction sentences.
+    # Every instruction now precedes it, and it is delimited and labelled as
+    # data, so text inside it has no instruction position to occupy.
+    prior = params.get("context", "")
     summary_prompt = (
-        f"The user asked what's on their screen. Here's the OCR text:\n\n"
-        f"{ocr_text[:3000]}\n\n"
-        f"Provide a brief, helpful summary of what's currently on their screen."
+        "The user asked what's on their screen. Provide a brief, helpful "
+        "summary of what is currently on it, using only the data below."
     )
+    if prior:
+        summary_prompt += (
+            "\n\n" + render_untrusted_block(prior, label="prior_step_output")
+        )
+    summary_prompt += "\n\n" + render_untrusted_block(
+        ocr_text[:3000], label="data")
 
-    summary = await ask_for_synthesis(summary_prompt)
+    summary = await contracts.ask_for_synthesis(summary_prompt)
     if summary == "__LLM_UNAVAILABLE__":
         if len(ocr_text) > 500:
             ocr_text = ocr_text[:500] + "..."
