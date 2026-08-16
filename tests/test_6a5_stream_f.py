@@ -233,6 +233,31 @@ def test_a_git_hash_is_not_redacted():
     assert "228602a" in out, out
 
 
+def test_ordinary_python_source_survives_the_snake_case_rule():
+    """The lowercase-identifier rule fires on the exact names ordinary source
+    uses for ordinary things. Without the configuration-vs-code test in
+    `_is_configuration_value`, previewing this repo's own modules blanks 90
+    lines of working code -- measured, not guessed."""
+    # `key = hashlib.sha256(...)` is deliberately absent: the bare word `key`
+    # already trips the pre-existing weak-label rule, with or without this
+    # change, and pinning it here would claim a regression that is not one.
+    for line in ("client_secret = text.strip()",
+                 "auth_url = parts[2]",
+                 'auth_url = parsed["auth_url"].split("?")[0]',
+                 "goal_tokens = {t for t in goal.lower().split() if len(t) >= 3}",
+                 "key = 0xAF if command_id == 'volume_up' else 0xAE",
+                 "is_secret = _looks_secret(value, min_len=8)"):
+        assert redact_secrets_strict(line) == line, line
+
+
+def test_a_switch_is_not_a_credential():
+    """`enabled: true` is the most common configuration line there is, and a
+    boolean has nothing to hide. Excluding it is a three-word exact list, not
+    an entropy test creeping back in."""
+    for line in ("allow_bearer=False,", "auth_enabled: true", "token_cache: none"):
+        assert redact_secrets_strict(line) == line, line
+
+
 def test_the_new_rules_name_no_brand():
     """THE rule, restated for the mechanisms this task adds."""
     source = pathlib.Path("assistant/core/redact.py").read_text(encoding="utf-8")
