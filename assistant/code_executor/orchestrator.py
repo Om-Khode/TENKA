@@ -750,6 +750,17 @@ async def execute_code_task(goal: str, llm_func, tts_func=None,
                 logger.info("[CODE] Retries exhausted on action goal → escalating to planner")
                 return "__ESCALATE_PLANNER__"
 
+            # A sandbox refusal is a policy decision, not a bug in the code,
+            # and escalation is exhausted by construction here — tier 2 IS the
+            # permissive tier, so there is nowhere further to go. No wording an
+            # LLM produces changes the outcome, and the refusal is deliberately
+            # phrased to read the same whether or not the variable exists, so
+            # paraphrasing it would spend a call to weaken it. Return it as-is,
+            # with nothing appended: an echoed goal is a probe channel.
+            if result.startswith("BLOCKED"):
+                logger.info("[CODE] Sandbox refusal is terminal — returned verbatim")
+                return result
+
             fb = await llm_func(
                 f'The user asked: "{goal}"\n'
                 f'The action FAILED after multiple attempts. Error: {result[:200]}\n'

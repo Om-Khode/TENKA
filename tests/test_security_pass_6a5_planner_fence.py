@@ -788,6 +788,111 @@ async def test_a_planted_write_still_cannot_execute_without_the_user(
     assert TOOL_MANIFEST["file_task"]["interactive"] is True
 
 
+# ─── C6: a sandbox refusal is terminal, not a bug to rewrite ─────────────────
+#
+# Stream B's scrubbed tier-2 environment makes a withheld-secret goal end in a
+# `BLOCKED:` refusal. A refusal is a policy decision, and no rewrite satisfies
+# a policy -- so any LLM call spent reacting to one is spent for nothing.
+#
+# WHERE THE COST ACTUALLY IS, measured rather than assumed. The reported site
+# was the tier-1 fix-prompt, gated on `_escalated`. That gate can never fire:
+# `_escalated and tier == 1` forces tier to 2 at orchestrator.py:199, and the
+# `if tier == 2:` block ends in an unconditional `return` at its own level, so
+# the tier-1 block is unreachable whenever `_escalated` is true. The tier-2
+# retry loop is also already clean -- `_classify_error` maps any "BLOCKED"
+# prefix to category "blocked" and the loop breaks before its first fix
+# attempt. The one call actually being wasted is the apology-synthesis at the
+# end of tier 2, which also paraphrases the refusal.
+
+_WITHHELD = ("BLOCKED: secret-looking environment variables are hidden from "
+             "the sandbox, set or not.")
+
+_GENERATED = (
+    "import os\n"
+    "import sys\n"
+    "import json\n"
+    "sys.stdout.reconfigure(encoding='utf-8')\n"
+    "value = os.environ.get('SERVICE_TOKEN')\n"
+    "payload = {'token': value}\n"
+    "text = json.dumps(payload)\n"
+    "print(text)\n"
+)
+
+
+async def _run_code_task(monkeypatch, sandbox_result, from_planner=False):
+    """Drive execute_code_task with a fixed sandbox result; count LLM calls."""
+    from assistant.code_executor import orchestrator
+
+    calls = []
+
+    async def _fake_llm(prompt, **kw):
+        calls.append(kw.get("task_type"))
+        return _GENERATED
+
+    monkeypatch.setattr(orchestrator, "_route_goal", _fake_route_tier1)
+    monkeypatch.setattr(orchestrator, "run_code", lambda code, tier: sandbox_result)
+    monkeypatch.setattr(orchestrator, "_run_tier2", lambda code, **kw: sandbox_result)
+    monkeypatch.setattr(orchestrator, "_ensure_packages", lambda *a, **k: (True, ""))
+
+    out = await orchestrator.execute_code_task(
+        goal="read my API key", llm_func=_fake_llm, _from_planner=from_planner)
+    return calls, out
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_refusal_costs_no_call_to_react_to_it(monkeypatch):
+    """Two code_gen calls are legitimate -- tier 1, then the escalation to
+    tier 2. A third call reacting to the refusal buys nothing."""
+    calls, _ = await _run_code_task(monkeypatch, _WITHHELD)
+    assert "synthesis" not in calls, calls
+    assert len(calls) == 2, calls
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_reaches_the_user_word_for_word(monkeypatch):
+    """B worded it to read the same whether or not the variable exists, so it
+    cannot be used to probe which credentials this machine holds.
+    Paraphrasing it through an LLM destroys that property."""
+    _, out = await _run_code_task(monkeypatch, _WITHHELD)
+    assert out == _WITHHELD, out
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_carries_no_goal_or_variable_name(monkeypatch):
+    """Nothing may be appended to it -- an echoed goal is a probe channel."""
+    _, out = await _run_code_task(monkeypatch, _WITHHELD)
+    assert "API key" not in out
+    assert "SERVICE_TOKEN" not in out
+
+
+@pytest.mark.asyncio
+async def test_the_first_escalation_to_tier_two_still_happens(monkeypatch):
+    """Control: escalating a tier-1 BLOCKED is how a goal needing socket or
+    requests reaches the tier that allows them. Untouched."""
+    calls, _ = await _run_code_task(monkeypatch, _WITHHELD)
+    assert calls.count("code_gen") == 2, calls
+
+
+@pytest.mark.asyncio
+async def test_a_genuine_code_error_still_gets_the_fix_treatment(monkeypatch):
+    """Control, and the reason this is not "make BLOCKED terminal". A real
+    traceback after escalation IS fixable, so it must still spend calls."""
+    traceback = ("Traceback (most recent call last):\n"
+                 "  File \"x.py\", line 3, in <module>\n"
+                 "TypeError: unsupported operand type(s)")
+    calls, _ = await _run_code_task(monkeypatch, traceback)
+    assert len(calls) > 2, calls
+
+
+@pytest.mark.asyncio
+async def test_the_planner_path_was_already_terminal(monkeypatch):
+    """Regression pin: it returned the refusal without synthesis before this
+    change, and must still."""
+    calls, out = await _run_code_task(monkeypatch, _WITHHELD, from_planner=True)
+    assert "synthesis" not in calls, calls
+    assert _WITHHELD[:40] in out
+
+
 @pytest.mark.asyncio
 async def test_reading_a_file_is_untouched_by_all_of_this(monkeypatch):
     """Control: the ordinary non-planner read path, which is most of what

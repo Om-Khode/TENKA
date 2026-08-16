@@ -351,12 +351,18 @@ class TestBug1CodeExecutorPlannerGuard(unittest.TestCase):
         exhausted_idx = source.find("retries exhausted")
         self.assertNotEqual(exhausted_idx, -1, "retries exhausted marker not found")
 
-        after_exhausted = source[exhausted_idx:exhausted_idx + 1200]
-        planner_guard_idx = after_exhausted.find("if _from_planner:")
-        synthesis_idx = after_exhausted.find("task_type=\"synthesis\"")
+        # Search forward from the marker rather than inside a fixed-size
+        # window. The invariant is the ORDER of the two statements; a byte
+        # budget between them is not part of it, and a window silently turns
+        # "synthesis not found" into a passing -1 comparison the moment a
+        # comment is added.
+        planner_guard_idx = source.find("if _from_planner:", exhausted_idx)
+        synthesis_idx = source.find("task_type=\"synthesis\"", exhausted_idx)
 
         self.assertNotEqual(planner_guard_idx, -1,
                             "_from_planner guard missing after retry exhaustion")
+        self.assertNotEqual(synthesis_idx, -1,
+                            "synthesis call not found after retry exhaustion")
         self.assertLess(planner_guard_idx, synthesis_idx,
                         "_from_planner guard must come BEFORE synthesis call")
 
