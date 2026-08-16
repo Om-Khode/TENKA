@@ -2,17 +2,22 @@
 import pytest
 
 from assistant.actions.studio_runtime import build_studio_runtime
+from assistant.core.capabilities import Capability
 from assistant.io.api import runtime as rt
+
+CHAT_ONLY = frozenset({Capability.CHAT_SEND})
 
 
 class StubDispatch:
     def __init__(self, accept=True, busy=False):
         self.accept = accept
         self.submitted = []
+        self.granted = []
         self.busy = busy
 
-    async def submit(self, text: str):
+    async def submit(self, text: str, grants: frozenset):
         self.submitted.append(text)
+        self.granted.append(grants)
         if not self.accept:
             return ("", "", False, "busy")
         return (f"t{len(self.submitted)}", "c1", True, "")
@@ -35,15 +40,26 @@ def test_bundle_satisfies_every_protocol(runtime):
 
 @pytest.mark.asyncio
 async def test_chat_send_goes_through_the_dispatch(runtime):
-    ref = await runtime.chat.send("what is on my calendar")
+    ref = await runtime.chat.send("what is on my calendar", CHAT_ONLY)
     assert ref.accepted is True
     assert ref.turn_id == "t1"
 
 
 @pytest.mark.asyncio
+async def test_chat_send_hands_the_grant_set_to_the_dispatch_unchanged():
+    """The runtime is a pass-through here on purpose: narrowing already
+    happened in `authenticate()`, and narrowing twice is a second chance to
+    narrow differently."""
+    dispatch = StubDispatch()
+    runtime = build_studio_runtime(dispatch)
+    await runtime.chat.send("hello", CHAT_ONLY)
+    assert dispatch.granted == [CHAT_ONLY]
+
+
+@pytest.mark.asyncio
 async def test_chat_send_reports_a_refusal_without_raising():
     runtime = build_studio_runtime(StubDispatch(accept=False))
-    ref = await runtime.chat.send("hello")
+    ref = await runtime.chat.send("hello", CHAT_ONLY)
     assert ref.accepted is False
     assert ref.reason == "busy"
 

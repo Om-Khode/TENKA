@@ -237,3 +237,71 @@ async def test_the_refusal_does_not_say_what_the_intent_would_have_done():
     finally:
         actions.current_grants.reset(token)
     assert "shutdown" not in result.lower(), result
+
+
+# ─── A5: carrying grants from the request into the turn ──────────────────
+def test_submit_requires_grants_with_no_default():
+    """'Forgot to pass grants' must be a TypeError, not full access."""
+    import inspect
+    from assistant.actions.studio_runtime import ChatDispatch
+    sig = inspect.signature(ChatDispatch.submit)
+    assert "grants" in sig.parameters
+    assert sig.parameters["grants"].default is inspect.Parameter.empty
+
+
+def test_the_chat_route_passes_the_devices_effective_grants():
+    """Not the device's issued grants -- the intersection with the listener
+    ceiling, which is what `effective()` returns and what the ceiling exists
+    to enforce. `require()` already narrows before it hands the Device back,
+    so `device.grants` *is* that intersection; recomputing it would be a
+    second chance to get it wrong."""
+    import inspect
+    import assistant.io.api.routes.chat as chat_route
+    src = inspect.getsource(chat_route.send_chat)
+    assert "grants" in src
+
+
+@pytest.mark.asyncio
+async def test_a_studio_turn_runs_with_only_its_own_grants():
+    """End-to-end: a CHAT_SEND-only device driving a turn must not have
+    EXECUTE inside the pipeline."""
+    from assistant.core.capabilities import Capability
+    import queue as _queue
+    from assistant import main as main_mod
+    # `_input_queue` is module-level and shared: another test file that
+    # submitted without draining leaves an item ahead of this one.
+    while True:
+        try:
+            main_mod._input_queue.get_nowait()
+        except _queue.Empty:
+            break
+    dispatch = main_mod._StudioDispatch()
+    limited = frozenset({Capability.CHAT_SEND})
+    turn_id, conv_id, accepted, reason = await dispatch.submit("hello", limited)
+    assert accepted
+    source, text, grants = main_mod._input_queue.get_nowait()
+    assert source == "studio"
+    assert grants == limited
+    assert Capability.EXECUTE not in grants
+
+
+@pytest.mark.asyncio
+async def test_a_studio_turn_with_no_grants_on_the_queue_gets_none():
+    """The consumer accepts the local 2-tuple too, but a *studio* item that
+    somehow arrives without a grant set must not be read as the local one.
+    Fail closed: an empty set, refused by every intent."""
+    from assistant import main as main_mod
+    grants, stt_ms = main_mod._grants_for_item(("studio", "hello"))
+    assert grants == frozenset()
+    assert stt_ms is None
+
+
+@pytest.mark.asyncio
+async def test_a_local_source_keeps_the_full_set_and_its_stt_timing():
+    """The 3rd slot of a local item is stt_ms, not grants. Reading it as
+    grants would both lose the timing and hand a number to the gate."""
+    from assistant import main as main_mod
+    from assistant.core.capabilities import Capability
+    grants, stt_ms = main_mod._grants_for_item(("stt", "hello", 250))
+    assert grants == frozenset(Capability)
+    assert stt_ms == 250
