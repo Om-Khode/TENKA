@@ -148,7 +148,28 @@ def test_the_funnel_command_is_the_top_level_funnel_verb_not_a_serve_flag():
     assert argv[1] == "funnel"
     assert "serve" not in argv
     assert "--funnel" not in argv
-    assert str(8789) in argv
+    assert "http://127.0.0.1:8789" in argv
+
+
+def test_the_two_transports_never_share_a_public_port():
+    """Fix round 1, F2: Tailscale keys a serve/funnel mapping on the public
+    `--https` port, not on the local target it forwards to. Both adapters
+    defaulting to 443 would let starting one silently overwrite the other's
+    mapping -- and this milestone requires both to run at once, each with
+    its own capability ceiling. Pinned so a future edit cannot collapse the
+    two back onto one port."""
+    tailnet_argv = TailnetAdapter().command(8788)
+    funnel_argv = FunnelAdapter().command(8789)
+
+    def _https_port(argv: list[str]) -> str:
+        return argv[argv.index("--https") + 1]
+
+    tailnet_port = _https_port(tailnet_argv)
+    funnel_port = _https_port(funnel_argv)
+    assert tailnet_port != funnel_port
+    # Funnel is restricted by Tailscale itself to 443, 8443 or 10000
+    # (https://tailscale.com/kb/1223/funnel).
+    assert funnel_port in {"443", "8443", "10000"}
 
 
 def test_no_caller_supplied_string_reaches_the_command_line():

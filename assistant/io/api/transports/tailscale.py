@@ -14,25 +14,69 @@ socket to the open internet -- and therefore in `command()` and their
 recognition and the KI-17 layer-2 preflight.
 
 **Verified command forms**, against the binary actually installed on this
-machine (`tailscale --version` -> `1.102.2`), via `tailscale serve --help`
-and `tailscale funnel --help` on 2026-08-16:
+machine (`tailscale --version` -> `1.102.2`), via `tailscale serve --help`,
+`tailscale funnel --help`, `tailscale serve status --json` and
+`tailscale funnel status --json` on 2026-08-16 (all read-only -- none of
+them create, change or reset a mapping):
 
 - `tailscale serve <target>` -- `--bg` backgrounds (daemonises) the command;
-  `--https value` selects the public HTTPS port (443 is the documented
-  default). `serve --help` reads verbatim: "To share a local server on the
-  internet, use `tailscale funnel`" -- confirming there is no `--funnel` flag
-  on `serve`.
+  `--https value` selects the public HTTPS port. `serve --help` reads
+  verbatim: "To share a local server on the internet, use `tailscale
+  funnel`" -- confirming there is no `--funnel` flag on `serve`.
 - `tailscale funnel <target>` -- its own top-level command (`USAGE
   tailscale funnel <target>`), not a flag on `serve`. Same `--bg` and
-  `--https` flags exist on `funnel` too, but the documented example
-  (`tailscale funnel --bg 3000`) passes the local port bare, which is the
-  form used below.
-- Un-serving: Tailscale's own docs (and the `serve`/`funnel status --json`
-  shape) confirm turning a mapping off means re-issuing the same identifying
-  flags with `off` appended, not just killing the process that requested the
-  mapping -- `--bg` daemonises and the invoking process exits on its own, so
-  killing it again touches nothing. Both adapters' `stop_command` therefore
-  return an argv rather than `None`.
+  `--https` flags exist on `funnel` too.
+- **Public port split (fix round 1).** `--https value` defaults to 443 for
+  *both* verbs, and Tailscale keys a serve/funnel mapping on the public
+  port, not on which local target it forwards to. The first draft of this
+  module let both adapters default to 443, which would have made starting
+  `funnel` silently overwrite the `tailnet` mapping (or vice versa) --
+  running both simultaneously, which this milestone requires, is exactly
+  the scenario that collides. Both adapters now pass `--https` explicitly
+  and to *different* ports: `tailnet` takes `8443`, `funnel` takes `443`.
+  Funnel is restricted by Tailscale itself to ports 443, 8443 or 10000
+  (confirmed against Tailscale's own Funnel docs,
+  https://tailscale.com/kb/1223/funnel: "Funnel can only listen on ports
+  443, 8443, and 10000"); 443 is assigned to it because its URL is the one
+  that might be typed or pasted by hand and needs no port suffix, while
+  `tailnet`'s URL is always generated and copied, never typed.
+  `test_the_two_transports_never_share_a_public_port` pins the two apart so
+  a future edit cannot collapse them back onto one.
+- Un-serving. `tailscale serve --help`'s own `SUBCOMMANDS` list (`status`,
+  `reset`, `drain`, `clear`, `advertise`, `get-config`, `set-config`) has no
+  `off` entry, and the `<target>` grammar it documents ("a file, directory,
+  text, or ... a service") means an unqualified `off` risks being parsed as
+  literal text to serve rather than a request to stop serving. `off` is not
+  a guess, though: Tailscale's own current CLI reference pages document it
+  explicitly and give this exact shape --
+  https://tailscale.com/docs/reference/tailscale-cli/serve: "To turn off a
+  `tailscale serve` command, you can add `off` to the end of the command
+  you used to turn it on... You can omit the `<target>` argument, so these
+  2 commands are equivalent" -- and the identical wording appears on
+  https://tailscale.com/docs/reference/tailscale-cli/funnel for `funnel`.
+  It is absent from `--help`'s `SUBCOMMANDS` because it is not a subcommand
+  -- it is a special form of the primary `<target>` grammar, the same way a
+  bare port number or a URL is a `<target>` without appearing in that list.
+  `reset` was considered and rejected: it wipes the *entire* serve config,
+  including any mapping the operator set up by hand for something
+  unrelated -- the KI-17 hazard pointed the other way, clobbering
+  configuration this adapter does not own. `off`, re-issuing the same
+  `--https` flag `command()` used, is the targeted alternative.
+  This was **not** run on this machine to confirm empirically -- doing so
+  would require an active mapping to toggle off, which the read-only
+  constraint on this fix round rules out. Because of that, `stop_command`
+  cannot be trusted on documentation alone: its docstring below states the
+  verification obligation explicitly, and it is on the caller
+  (`TransportManager`, Task 9) to discharge it by re-reading `... status
+  --json` after running this argv and confirming the mapping is actually
+  gone before treating the stop as successful.
+- Both adapters' `stop_command` return an argv rather than `None`: `--bg`
+  daemonises and the invoking process exits on its own, so killing it again
+  touches nothing; only the `off` argv un-serves it.
+- Both `command()` forms are now the same shape (verb, `--bg`, `--https`,
+  public port, local target URL) differing only in the verb and the public
+  port -- the earlier asymmetry (a full URL for `tailnet`, a bare port for
+  `funnel`) was gratuitous once both carry an explicit public port.
 
 Layering: `io/api/` may import `core/` and `config` only. This module imports
 neither -- `subprocess`, `json`, `logging`, `re` and `urllib.parse` are
@@ -47,6 +91,16 @@ import subprocess
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+# Tailscale keys a serve/funnel mapping on the *public* port (`--https`),
+# not on the local target it forwards to -- so `tailnet` and `funnel` must
+# never share one, or starting the second silently overwrites the first's
+# mapping (fix round 1, F2). Funnel may only ever use 443, 8443 or 10000
+# (https://tailscale.com/kb/1223/funnel); 443 goes to `funnel` because its
+# URL is the one an operator might type or paste by hand and needs no port
+# suffix, `tailnet`'s URL being always generated rather than typed.
+_TAILNET_PUBLIC_PORT = 8443
+_FUNNEL_PUBLIC_PORT = 443
 
 # `tailscale serve status --json` is a local, already-running daemon query --
 # fast in practice. The timeout exists so a hung `tailscaled` cannot hang a
@@ -179,24 +233,41 @@ class TailnetAdapter(_TailscaleAdapterBase):
     name = "tailnet"
 
     def command(self, port: int) -> list[str]:
-        """`tailscale serve --bg --https 443 http://127.0.0.1:{port}` --
+        """`tailscale serve --bg --https 8443 http://127.0.0.1:{port}` --
         verified against `tailscale serve --help` on the installed 1.102.2
-        binary (see module docstring). Built from the integer *port* and
-        module constants only; a non-numeric *port* raises rather than
-        reaching the argv (spec §8's subprocess-injection row)."""
+        binary (see module docstring). Public port `8443` (module constant
+        `_TAILNET_PUBLIC_PORT`), never `funnel`'s `443` -- Tailscale keys a
+        mapping on the public port, so sharing one with `funnel` would let
+        starting either overwrite the other's mapping while both transports
+        must run at once. Built from the integer *port* and module
+        constants only; a non-numeric *port* raises rather than reaching
+        the argv (spec §8's subprocess-injection row)."""
         port = int(port)
         return [
-            "tailscale", "serve", "--bg", "--https", "443",
+            "tailscale", "serve", "--bg", "--https", str(_TAILNET_PUBLIC_PORT),
             f"http://127.0.0.1:{port}",
         ]
 
     def stop_command(self, port: int) -> list[str] | None:
-        """`tailscale serve --https 443 off` -- `--bg` daemonises and the
-        spawning process exits on its own, so only the explicit `off` form
-        un-serves it. Identified by the public `--https` port, the same
-        flag `command()` used to create the mapping; *port* (the local
-        target) plays no part in which mapping `off` removes."""
-        return ["tailscale", "serve", "--https", "443", "off"]
+        """`tailscale serve --https 8443 off` -- re-issues the same
+        `--https` flag `command()` used to create the mapping, with `off`
+        appended, per Tailscale's own documented form (module docstring);
+        *port* (the local target) plays no part in which mapping `off`
+        removes. `--bg` daemonises and the spawning process exits on its
+        own, so only this explicit form un-serves it.
+
+        **Caller obligation (unverified on documentation alone -- fix round
+        1, F1):** this argv was not exercised against a live mapping on this
+        machine, because doing so would require creating one, which this
+        fix round's read-only constraint ruled out. The caller
+        (`TransportManager`, Task 9) MUST run this, then re-read `tailscale
+        serve status --json` and confirm no `Web` mapping still proxies to
+        this transport's own port, before treating the stop as successful.
+        If the mapping is still present, the stop must fail loudly -- an
+        internet-facing listener that silently stayed up is the worst
+        failure mode in this milestone, worse than a stop that visibly
+        failed."""
+        return ["tailscale", "serve", "--https", str(_TAILNET_PUBLIC_PORT), "off"]
 
 
 # ─── Funnel adapter ───────────────────────────────────────────────────────────
@@ -210,20 +281,42 @@ class FunnelAdapter(_TailscaleAdapterBase):
     name = "funnel"
 
     def command(self, port: int) -> list[str]:
-        """`tailscale funnel --bg {port}` -- verified against `tailscale
-        funnel --help` on the installed 1.102.2 binary: `funnel` is its own
-        top-level command (`USAGE  tailscale funnel <target>`), not a flag
-        on `serve` -- there is no `tailscale serve --funnel`. Built from the
-        integer *port* and module constants only, exactly like
-        `TailnetAdapter.command`."""
+        """`tailscale funnel --bg --https 443 http://127.0.0.1:{port}` --
+        verified against `tailscale funnel --help` on the installed 1.102.2
+        binary: `funnel` is its own top-level command (`USAGE  tailscale
+        funnel <target>`), not a flag on `serve` -- there is no `tailscale
+        serve --funnel`. Public port `443` (module constant
+        `_FUNNEL_PUBLIC_PORT`), never `tailnet`'s `8443`, for the same
+        mapping-collision reason documented on `TailnetAdapter.command`; 443
+        is one of the three ports Tailscale Funnel is restricted to
+        (443/8443/10000) and is the one assigned here because a funnel URL
+        may be typed or pasted by hand and needs no port suffix. Same shape
+        as `TailnetAdapter.command` (verb, `--bg`, `--https`, public port,
+        local target URL) -- the earlier asymmetry (a bare port instead of a
+        URL) was gratuitous once both carry an explicit public port. Built
+        from the integer *port* and module constants only; a non-numeric
+        *port* raises rather than reaching the argv (spec §8's
+        subprocess-injection row)."""
         port = int(port)
-        return ["tailscale", "funnel", "--bg", str(port)]
+        return [
+            "tailscale", "funnel", "--bg", "--https", str(_FUNNEL_PUBLIC_PORT),
+            f"http://127.0.0.1:{port}",
+        ]
 
     def stop_command(self, port: int) -> list[str] | None:
-        """`tailscale funnel {port} off` -- the target argument that
-        identified the mapping, with `off` appended; `--bg` daemonises so,
-        as with `tailnet`, only this explicit form un-serves it."""
-        return ["tailscale", "funnel", str(int(port)), "off"]
+        """`tailscale funnel --https 443 off` -- re-issues the same
+        `--https` flag `command()` used, with `off` appended, mirroring
+        `TailnetAdapter.stop_command`; *port* plays no part in which mapping
+        `off` removes. `--bg` daemonises so, as with `tailnet`, only this
+        explicit form un-serves it.
+
+        **Caller obligation -- identical to `TailnetAdapter.stop_command`,
+        see its docstring:** not exercised against a live mapping on this
+        machine (fix round 1, F1); `TransportManager` (Task 9) MUST verify
+        via `tailscale funnel status --json` that the mapping is actually
+        gone before treating the stop as successful, and fail loudly if it
+        is not."""
+        return ["tailscale", "funnel", "--https", str(_FUNNEL_PUBLIC_PORT), "off"]
 
 
 # ─── Registration ────────────────────────────────────────────────────────────
