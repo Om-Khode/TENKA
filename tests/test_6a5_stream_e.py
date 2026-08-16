@@ -21,6 +21,7 @@ export it exists for.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 
 import pytest
@@ -317,3 +318,131 @@ async def test_a_detached_socket_leaves_no_bookkeeping_behind(monkeypatch):
         assert hub.subscriber_count() == 0
     finally:
         await hub.stop()
+
+
+# ─── E3 / G7: coalesce and offload the UI bundle read ────────────────────
+@pytest.fixture()
+def bundle(tmp_path):
+    """A real zip-backed bundle. The contract hash is irrelevant here: these
+    tests drive `UiBundle` directly rather than through the route, so the
+    stale-bundle 503 never enters into it."""
+    from assistant.io.api.ui import UiBundle
+    from tests.fakes.studio_ui import write_ui_zip
+
+    built = UiBundle.open(
+        zip_path=write_ui_zip(tmp_path / "studio-ui.zip", "any"), dir_path=None)
+    assert built is not None
+    return built
+
+
+def _counting_read(bundle_obj, *, delay: float = 0.0):
+    """Replace `_read_bytes` with a counting, deliberately slow stand-in.
+
+    Slow *synchronously*, because that is exactly what a real decompression is:
+    lens 5 F4 measured 47-97ms of blocking work for an 8 MiB member.
+    """
+    calls: list[str] = []
+    original = bundle_obj._read_bytes
+
+    def _read(safe: str):
+        calls.append(safe)
+        if delay:
+            time.sleep(delay)
+        return original(safe)
+
+    bundle_obj._read_bytes = _read
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_requests_decompress_once_not_n_times(bundle):
+    """Ten threads racing the same cache miss produced ten decompressions.
+
+    Nothing coalesced two callers racing to populate the cache: the lock is
+    held only around the cache dict's get and set, and the read itself runs
+    outside it.
+    """
+    calls = _counting_read(bundle, delay=0.05)
+    results = await asyncio.gather(
+        *[bundle.read_async("index.html") for _ in range(10)])
+    assert len(calls) == 1, f"the same cache miss was read {len(calls)} times"
+    assert all(result == results[0] for result in results)
+    assert results[0] is not None
+
+
+@pytest.mark.asyncio
+async def test_decompression_does_not_block_the_event_loop(bundle):
+    """An async route calling `bundle.read()` with no await blocks everything.
+
+    The daemon shares its loop with TENKA herself, so tens of milliseconds of
+    synchronous zip work is tens of milliseconds nothing else runs -- on a
+    route that requires no credential at all.
+    """
+    _counting_read(bundle, delay=0.3)
+    ticks = 0
+
+    async def _tick() -> None:
+        nonlocal ticks
+        for _ in range(100):
+            await asyncio.sleep(0.005)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    await bundle.read_async("index.html")
+    ticker.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await ticker
+    assert ticks > 5, (
+        f"the loop advanced only {ticks} ticks during a 300ms read: the "
+        f"decompression is still running on the event loop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cached_member_is_still_nearly_free(bundle):
+    """Control: the coalescing must not add cost to the warm path.
+
+    A cached re-read measured ~0.01-0.02ms before any of this existed. The
+    assertion that matters is not the microseconds but that the warm path
+    reaches neither the archive nor a worker thread.
+    """
+    warm = await bundle.read_async("index.html")
+    assert warm is not None
+    calls = _counting_read(bundle, delay=0.5)
+    started = time.perf_counter()
+    for _ in range(50):
+        assert await bundle.read_async("index.html") == warm
+    elapsed = time.perf_counter() - started
+    assert not calls, "a cached member went back to the archive"
+    assert elapsed < 0.1, f"50 cached reads took {elapsed:.3f}s"
+
+
+@pytest.mark.asyncio
+async def test_a_member_that_does_not_exist_is_still_a_miss_not_a_cached_none(bundle):
+    """`UiBundle`'s per-member cache never caches a miss -- lens 5 named that
+    as one of the controls that already held. The in-flight map must not
+    quietly become a negative cache."""
+    assert await bundle.read_async("nope.js") is None
+    assert await bundle.read_async("nope.js") is None
+    assert bundle.read("index.html") is not None
+
+
+@pytest.mark.asyncio
+async def test_the_in_flight_map_does_not_leak_an_entry_per_member(bundle):
+    """An in-flight map that is never emptied is the memory leak the cache was
+    already careful not to be."""
+    await asyncio.gather(*[bundle.read_async(name)
+                           for name in ("index.html", "app.html", "nope.js")])
+    assert bundle._inflight == {}
+
+
+def test_the_ui_route_awaits_the_bundle_instead_of_blocking_on_it():
+    """The route is `async def`, so a synchronous `bundle.read()` inside it is
+    the blocking call this task exists to remove."""
+    import inspect
+
+    from assistant.io.api import ui as ui_mod
+
+    source = inspect.getsource(ui_mod.mount_ui)
+    assert "await bundle.read_async(" in source
+    assert "bundle.read(" not in source.replace("bundle.read_async(", "")

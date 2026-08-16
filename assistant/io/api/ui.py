@@ -29,6 +29,7 @@ Layering: io/api -- core + config only.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -249,6 +250,13 @@ class UiBundle:
         self._dir_path = dir_path
         self._cache: dict[str, tuple[bytes, str]] = {}
         self._lock = threading.Lock()
+        # member -> the one task currently reading it. Two requests racing the
+        # same cache miss await the same task instead of each paying for the
+        # decompression; see `read_async`. Guarded by `_lock`, the same lock
+        # the cache dict uses, because "is it cached?" and "is somebody
+        # already fetching it?" have to be answered as one decision -- two
+        # locks would leave a window in which both answers are no.
+        self._inflight: dict[str, asyncio.Future] = {}
 
     # ─── opening ─────────────────────────────────────────────────────────
     @classmethod
@@ -369,14 +377,75 @@ class UiBundle:
                 cached = self._cache.get(safe)
                 if cached is not None:
                     return cached
-        body = self._read_bytes(safe)
-        if body is None:
-            return None
-        entry = (body, content_type_for(safe))
-        if cacheable:
+        entry = self._read_entry(safe)
+        if entry is not None and cacheable:
             with self._lock:
                 self._cache[safe] = entry
         return entry
+
+    async def read_async(self, member: str) -> tuple[bytes, str] | None:
+        """`read()`, off the event loop and coalesced. What the route calls.
+
+        Two things this fixes, both measured by lens 5 F4 against the largest
+        member this daemon will hand out (8 MiB, `MAX_MEMBER_BYTES`):
+
+        * a first read cost 47-97ms of *synchronous* work on the loop the
+          assistant herself runs on, from a route with no credential
+          requirement at all -- so `asyncio.to_thread`;
+        * ten concurrent first-requests for the same member produced ten
+          independent full decompressions, because the lock is held only
+          around the cache dict's get and set -- so the in-flight map.
+
+        A miss is still never cached (`_read_entry` returning `None` populates
+        nothing), which is what keeps a flood of requests for paths that do
+        not exist from being a cache-churn primitive. The in-flight entry is
+        cleared either way, so it does not become a negative cache by accident.
+        """
+        safe = normalise_member(member)
+        if not safe:
+            return None
+        cacheable = self._dir_path is None
+        with self._lock:
+            if cacheable:
+                cached = self._cache.get(safe)
+                if cached is not None:
+                    return cached
+            task = self._inflight.get(safe)
+            if task is None:
+                task = asyncio.ensure_future(
+                    asyncio.to_thread(self._read_entry, safe))
+                self._inflight[safe] = task
+                task.add_done_callback(
+                    lambda done, key=safe: self._settle(key, done))
+        # Shielded: a client that disconnects mid-read cancels *its* await,
+        # and cancelling the shared task would fail every other request racing
+        # the same member for a reason none of them caused.
+        return await asyncio.shield(task)
+
+    def _settle(self, safe: str, task: asyncio.Future) -> None:
+        """Retire an in-flight read and cache what it produced, if anything."""
+        with self._lock:
+            if self._inflight.get(safe) is task:
+                del self._inflight[safe]
+            if self._dir_path is not None or task.cancelled():
+                return
+            if task.exception() is not None:
+                return
+            entry = task.result()
+            if entry is not None:
+                self._cache[safe] = entry
+
+    def _read_entry(self, safe: str) -> tuple[bytes, str] | None:
+        """The whole read, cache aside: bytes plus the type they are served as.
+
+        One function so the sync and async paths cannot drift -- and so the
+        thing handed to `asyncio.to_thread` is the entire piece of blocking
+        work, not most of it.
+        """
+        body = self._read_bytes(safe)
+        if body is None:
+            return None
+        return body, content_type_for(safe)
 
     def _read_bytes(self, safe: str) -> bytes | None:
         if self._dir_path is not None:
@@ -457,6 +526,16 @@ class UiBundle:
         """
         return (self.read(f"{segment}.html") is not None
                 or self.read(segment) is not None)
+
+    async def is_route_prefix_async(self, segment: str) -> bool:
+        """`is_route_prefix`, on the route's own non-blocking path.
+
+        The fallback runs on a cache miss, which is exactly the case where the
+        synchronous version would decompress on the event loop -- the one
+        thing this route may not do.
+        """
+        return (await self.read_async(f"{segment}.html") is not None
+                or await self.read_async(segment) is not None)
 
 
 # ─── mounting ────────────────────────────────────────────────────────────
@@ -628,7 +707,7 @@ def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
         for candidate in candidates:
             if _is_private(candidate):
                 continue
-            found = bundle.read(candidate)
+            found = await bundle.read_async(candidate)
             if found is not None:
                 body, content_type = found
                 immutable = member.startswith(_IMMUTABLE_PREFIX)
@@ -642,8 +721,8 @@ def mount_ui(app: FastAPI, bundle: UiBundle | None) -> None:
         leaf = member.rsplit("/", 1)[-1]
         if member and "." not in leaf:
             first = member.split("/", 1)[0]
-            if bundle.is_route_prefix(first):
-                shell = bundle.read("index.html")
+            if await bundle.is_route_prefix_async(first):
+                shell = await bundle.read_async("index.html")
                 if shell is not None:
                     body, content_type = shell
                     return _stamp(Response(content=body, media_type=content_type))
