@@ -798,21 +798,94 @@ async def _attempt_recovery(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _STEP_REF_RE = re.compile(r'\$step_(\d+)')
+_EMOTION_TAG_RE = re.compile(
+    r'^\[(?:neutral|happy|excited|sad|angry|sarcastic|worried|surprised)\]\s*'
+)
+
+#  Prior-step output is UNTRUSTED. `file_task` returns the raw bytes of a file
+#  the user may not have written, `read_screen` returns OCR of whatever is on
+#  screen, `browse_url` returns a fetched page. Anything that can be planted
+#  can be planted there.
+_MAX_REF_CHARS = 1500
+
+
+def _step_output(step_id: int, plan: Plan) -> str | None:
+    """Return the truncated, tag-stripped output of a succeeded step, or None."""
+    for step in plan.steps:
+        if step.step_id == step_id and step.status == "success":
+            output = _EMOTION_TAG_RE.sub('', step.output)
+            if len(output) > _MAX_REF_CHARS:
+                output = output[:_MAX_REF_CHARS] + "\n... (truncated)"
+            return output
+    return None
 
 
 def _resolve_references(text: str, plan: Plan) -> str:
-    """Replace $step_N references with actual outputs from completed steps."""
+    """Replace $step_N references with actual outputs from completed steps.
+
+    Inline substitution. Correct for `_evaluate_condition`, which builds a
+    local haystack for a string comparison that never reaches a model, and for
+    the payload tools declared `inline_refs` in TOOL_MANIFEST. Everything that
+    reaches a prompt goes through `_split_references` instead.
+    """
+    def _replace(match):
+        output = _step_output(int(match.group(1)), plan)
+        return match.group(0) if output is None else output
+    return _STEP_REF_RE.sub(_replace, text)
+
+
+def _split_references(text: str, plan: Plan, tool: str) -> tuple[str, str]:
+    """Split a step's goal into (instruction, context) for `tool`.
+
+    The milestone 6a.5 data fence, spec §5.3 / decision D3. A `$step_N` token
+    is removed from the instruction and the referenced output is accumulated
+    into a separate context blob, so untrusted prior-step output never shares
+    a field with the user's own words. The instruction keeps a bare "the
+    output of step N" so the sentence still has a referent -- erasing the
+    reference outright would leave "summarise" with nothing to summarise.
+
+    Returns ("", "") shapes rather than raising: a tool with no manifest row
+    fails closed, dropping the reference, because inheriting inlining by
+    omission is exactly how this hole was reachable.
+    """
+    entry = TOOL_MANIFEST.get(tool, {})
+
+    # Payload tools: the param is written to disk, stored, or handed to a
+    # search API -- not interpreted as an instruction. "save $step_1 as a
+    # note" is the feature.
+    if entry.get("inline_refs"):
+        return _resolve_references(text, plan), ""
+
+    context_key = entry.get("context_key")
+    collected: list[tuple[int, str]] = []
+    seen: set[int] = set()
+
     def _replace(match):
         step_id = int(match.group(1))
-        for step in plan.steps:
-            if step.step_id == step_id and step.status == "success":
-                output = step.output
-                output = re.sub(r'^\[(?:neutral|happy|excited|sad|angry|sarcastic|worried|surprised)\]\s*', '', output)
-                if len(output) > 1500:
-                    output = output[:1500] + "\n... (truncated)"
-                return output
-        return match.group(0)
-    return _STEP_REF_RE.sub(_replace, text)
+        output = _step_output(step_id, plan)
+        if output is None:
+            return match.group(0)
+        if step_id not in seen:
+            seen.add(step_id)
+            collected.append((step_id, output))
+        return f"the output of step {step_id}"
+
+    instruction = _STEP_REF_RE.sub(_replace, text)
+
+    if not collected:
+        return instruction, ""
+
+    if context_key is None:
+        logger.warning(
+            f"[PLANNER] Tool '{tool}' accepts no prior-step output — dropping "
+            f"{len(collected)} reference(s) rather than splicing them in"
+        )
+        return instruction, ""
+
+    context = "\n\n".join(
+        f"--- output of step {sid} ---\n{out}" for sid, out in collected
+    )
+    return instruction, context
 
 
 def _evaluate_condition(condition: str, plan: Plan) -> bool:

@@ -47,7 +47,7 @@ async def execute_step(
     Pseudo-tools are handled via pseudo_tools module.
     """
     from .planner import (
-        _evaluate_condition, _resolve_references, _step_failed,
+        _evaluate_condition, _split_references, _step_failed,
         _brief, _extract_note_params, TOOL_MANIFEST,
     )
     from .pseudo_tools import (
@@ -63,7 +63,12 @@ async def execute_step(
         return
 
     # ── Resolve $step_N references in the goal ─────────────────────
-    resolved_goal = _resolve_references(step.goal, plan)
+    # The fence (milestone 6a.5, spec §5.3). Prior-step output is untrusted --
+    # a planted file, OCR of the screen, a fetched page -- so it is split out
+    # of the instruction and carried separately in `step_context`. Everything
+    # downstream of here (TTS, logging, llm_response, the cache key) uses the
+    # instruction, which is the user's own words.
+    resolved_goal, step_context = _split_references(step.goal, plan, step.tool)
     step.status = "running"
 
     logger.info(f"[PLANNER] Step {step.step_id} RUNNING: [{step.tool}] "
@@ -87,9 +92,11 @@ async def execute_step(
     try:
         # ── Handle pseudo-tools internally ─────────────────────────
         if step.tool == "synthesize":
-            result = await run_synthesize_step(resolved_goal, llm_func)
+            result = await run_synthesize_step(resolved_goal, llm_func,
+                                               context=step_context)
         elif step.tool == "vision_analyze":
-            result = await run_vision_analyze_step(resolved_goal, tts_func)
+            result = await run_vision_analyze_step(resolved_goal, tts_func,
+                                                   context=step_context)
         elif step.tool == "camera_preview":
             result = await run_camera_preview_step(resolved_goal, tts_func)
         elif step.tool == "prompt_user":
@@ -98,8 +105,16 @@ async def execute_step(
             # ── Dispatch to existing tool via actions.execute() ────
             import assistant.actions as _actions_mod
 
-            param_key = TOOL_MANIFEST.get(step.tool, {}).get("param_key", "goal")
+            _entry = TOOL_MANIFEST.get(step.tool, {})
+            param_key = _entry.get("param_key", "goal")
             params = {param_key: resolved_goal}
+
+            # Prior-step output travels in its own param, never merged back
+            # into the instruction. Omitted entirely when there is none, so a
+            # single-step goal does not carry an empty labelled block.
+            context_key = _entry.get("context_key")
+            if step_context and context_key:
+                params[context_key] = step_context
 
             if step.tool in ("browser_action", "app_action"):
                 params["_planner_goal"] = plan.original_goal
