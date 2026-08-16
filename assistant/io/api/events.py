@@ -76,6 +76,34 @@ logger = logging.getLogger(__name__)
 # cadence: the same order as "the next thing that would have reached it".
 _REVALIDATE_INTERVAL_SECONDS = 2.0
 
+# How long one socket may hold the fan-out before it is judged dead.
+#
+# `_pump` delivers sequentially, so whatever this number is, it is also the
+# worst-case delay every *other* client pays for one peer that stopped
+# reading. Before this bound existed there was no worst case at all: lens 5 F3
+# proved that a `send_json` which never resolves stops the pump returning to
+# the top of its loop, so a healthy socket attached afterwards received
+# nothing, ever.
+#
+# Two seconds, matching `_REVALIDATE_INTERVAL_SECONDS` and the telemetry
+# sampler's cadence: the longest a frame may take to be accepted is the
+# interval before the next one would have arrived anyway. It is also generous
+# for the slow-but-working case this must not evict -- uvicorn resolves a send
+# as soon as the frame reaches the transport's buffer, so two seconds means
+# the peer's receive window has been full for that entire time, which a phone
+# on a bad tunnel does not do and a client that stopped reading always does.
+#
+# The cost is paid once per bad socket, not once per frame: a timeout drops
+# the socket, so it is never awaited again.
+_SEND_TIMEOUT_SECONDS = 2.0
+
+# The same bound on the courtesy close. Task 17's `_drop(close=True)` added a
+# second awaited call inside the same loop, which widened the wedge by one
+# more place to enter it -- the socket being closed here has already been
+# judged dead or unauthorised, so the handshake is a courtesy and one second
+# is more than it is owed.
+_CLOSE_TIMEOUT_SECONDS = 1.0
+
 # Fields on a wire frame that carry what the *user* said, as opposed to facts
 # about the assistant, and the grant it therefore takes to see them.
 #
@@ -355,10 +383,18 @@ class EventHub:
         if not close:
             return
         try:
-            await socket.close(code=1008)
+            # Bounded, because this runs inside `_pump`'s own loop: a peer that
+            # is not reading does not accept a close frame any faster than it
+            # accepts a data frame, and an unbounded await here would wedge the
+            # fan-out at the exact moment the hub was trying to shed the socket
+            # causing it.
+            await asyncio.wait_for(socket.close(code=1008),
+                                   timeout=_CLOSE_TIMEOUT_SECONDS)
         except Exception:
-            # Already gone, half-closed, or a stub in a test. The socket is
-            # out of `_sockets` either way, which is the part that matters.
+            # Already gone, half-closed, too slow to say goodbye (3.11's
+            # `TimeoutError` is an ordinary `Exception`, so the bound above
+            # lands here), or a stub in a test. The socket is out of
+            # `_sockets` either way, which is the part that matters.
             pass
 
     async def _pump(self) -> None:
@@ -385,7 +421,21 @@ class EventHub:
                         await self._drop(socket, close=True)
                         continue
                 try:
-                    await socket.send_json(visible_frame(event, grants))
+                    # Bounded. This one `await` is the whole fan-out's
+                    # critical section: delivery is sequential, so a send
+                    # that never resolves is not a slow client, it is every
+                    # client. See `_SEND_TIMEOUT_SECONDS` for the number.
+                    await asyncio.wait_for(
+                        socket.send_json(visible_frame(event, grants)),
+                        timeout=_SEND_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    # Dead, not slow: the peer has not accepted a frame for
+                    # the whole window. Closed as well as forgotten, so the
+                    # far end learns the stream ended instead of holding a
+                    # socket nothing will ever write to again.
+                    logger.info("[API] dropping an event socket that did not "
+                                "accept a frame within the send timeout")
+                    await self._drop(socket, close=True)
                 except Exception:
                     await self._drop(socket, close=False)
 
