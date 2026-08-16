@@ -50,9 +50,20 @@ DEV_ORIGINS = ["http://localhost:3000"]
 # Names a real provider hands out, kept as constants so a test that asserts a
 # refusal and a test that asserts an acceptance cannot drift onto different
 # spellings of "the tunnel's public name".
+#
+# There is deliberately no separate `FUNNEL_NAME`, and the absence is a fact
+# about the deployment rather than an omission: `tailscale serve` and
+# `tailscale funnel` publish the **same** MagicDNS name. So between those two
+# listeners the cross-listener `Host` refusal below is vacuous in production --
+# the same string is legitimately published on both -- and what separates them
+# is the port alone, which is the field a client cannot forge and the reason
+# policy was keyed on it in the first place. Do not "fix" this by inventing a
+# distinct funnel hostname: it would make the tests assert a separation the
+# real deployment does not have. `quick` is the listener used below wherever a
+# genuinely distinct public name is needed, because Cloudflare really does
+# hand out its own.
 TAILNET_NAME = "laptop.tail1234.ts.net"
 QUICK_NAME = "abc-def.trycloudflare.com"
-FUNNEL_NAME = "laptop.tail1234.ts.net"
 
 
 def _app(tmp_path, *, policies: dict[int, str] | None = None):
@@ -79,6 +90,17 @@ def _client_on(app, token: str, port: int) -> ApiTestClient:
     base URL, so `scope["server"]` carries the port policy resolution reads and
     the default `Host` is a loopback name. Only the port differs here, because
     the whole point is that four sockets answer differently.
+
+    **HTTP only. Do not open a WebSocket through a client from this helper
+    with a relative URL.** `ApiTestClient.websocket_connect` in
+    `tests/fakes/api_client.py` rewrites a leading `/` to the hard-coded
+    `ws://127.0.0.1:8787` -- the *local* port -- regardless of the client's
+    own `base_url`. A socket test written against `_client_on(app, token,
+    QUICK_PORT)` would therefore arrive on the local listener and assert
+    nothing about the quick one, silently and while passing. Pass an absolute
+    `ws://127.0.0.1:<port>/v1/events`, which `urljoin` leaves untouched, or
+    fix the fake to honour `base_url`. Every test in this file uses HTTP, so
+    none of them is currently exposed to it.
     """
     client = ApiTestClient(app, base_url=f"http://127.0.0.1:{port}")
     client.cookies.set(COOKIE_NAME, token)
@@ -218,6 +240,43 @@ def test_unpublishing_a_session_stops_its_names_immediately(tmp_path):
     assert quick.get("/v1/status",
                      headers={"Host": QUICK_NAME}).status_code == 421
     assert app.state.published_hosts.hosts_for(QUICK_PORT) == frozenset()
+
+
+def test_dropping_a_listener_from_the_registry_stops_its_names_immediately(tmp_path):
+    """`HostGate` holds `app.state.listener_policies` itself, not a snapshot.
+
+    The sibling of `test_unpublishing_a_session_stops_its_names_immediately`,
+    on the other axis, and it needs its own pin because reading the call site
+    is not a test: `registry=dict(app.state.listener_policies)` would pass
+    every other assertion in this file and every adjacent suite, while
+    quietly breaking this.
+
+    It matters because a transport's stop sequence drops its registry entry.
+    Snapshotted, a stopped transport's port keeps its policy name and keeps
+    accepting the names published against it -- stale trust surviving the
+    thing that earned it, which is the exact class `PublishedHosts` exists to
+    prevent, arrived at from the registry side instead and with no published
+    entry left to look wrong.
+    """
+    app, token = _app(tmp_path)
+    quick = _client_on(app, token, QUICK_PORT)
+    app.state.published_hosts.publish(QUICK_NAME, owner="cf-1",
+                                      listener=QUICK_PORT)
+    assert quick.get("/v1/status",
+                     headers={"Host": QUICK_NAME}).status_code == 200
+
+    # The name is still published; only the listener stopped being declared.
+    app.state.listener_policies.pop(QUICK_PORT)
+    assert quick.get("/v1/status",
+                     headers={"Host": QUICK_NAME}).status_code == 421
+    assert app.state.published_hosts.hosts_for(QUICK_PORT) == frozenset({QUICK_NAME})
+
+    # The ratified half of "an unknown port refuses", pinned here beside it: a
+    # loopback name still passes this gate on a port nobody declares, and is
+    # answered 401 by `authenticate()` rather than 421 by the gate. Spec §2.4
+    # item 4 and `test_api_cookie_auth.py::test_a_request_on_an_unregistered_
+    # port_is_refused` both depend on that being the shape of the refusal.
+    assert quick.get("/v1/status").status_code == 401
 
 
 def test_a_restarted_tunnel_does_not_leave_its_previous_name_trusted(tmp_path):

@@ -671,8 +671,18 @@ class PublishedHosts:
         same key `policy_for_port` resolves a policy from, so a name and the
         permissions it can reach are scoped by the one piece of addressing a
         client cannot forge.
+
+        Normalised through `hostname_of`, which is what `host_is_allowed`
+        compares an incoming `Host` with. Both sides therefore agree by
+        construction rather than by two spellings of "lowercase and strip"
+        happening to stay in step: a name published as `Host.Example:8443`
+        and a header reading `host.example` are the same name here. The
+        adapter contract already obliges a bare hostname and the mismatch
+        failed *closed*, so this removes a way to be surprised rather than a
+        live hole -- but a gate whose two halves normalise differently is a
+        gate waiting for the day one of them is edited.
         """
-        name = str(hostname).strip().lower()
+        name = hostname_of(str(hostname))
         if not name:
             return
         self._by_owner.setdefault(str(owner), set()).add((int(listener), name))
@@ -705,8 +715,12 @@ class PublishedHosts:
         "which socket is this name for?" has no sensible answer to guess at,
         and a default would put every scaffolding name on one listener that
         the next reader would then have to discover was arbitrary.
+
+        The owner is the normalised name itself, through the same
+        `hostname_of` `publish` uses, so `unpublish(hostname_of(name))`
+        removes what `add(name)` created however the caller spelled it.
         """
-        self.publish(hostname, owner=str(hostname).strip().lower(),
+        self.publish(hostname, owner=hostname_of(str(hostname)),
                      listener=listener)
 
     def hosts_for(self, listener: int | None) -> frozenset[str]:
@@ -803,6 +817,17 @@ def host_is_allowed(host_header: str | None, published: PublishedHosts, *,
     `authenticate()`, which is the refusal that has always covered it -- but
     it accepts no *published* name at all, because "nobody declared what this
     socket is" is not a listener a name can belong to.
+
+    That reading of "an unknown port refuses" -- refuse its published names,
+    not its loopback ones -- was **reviewed and ratified**, and is recorded
+    here so it is not "repaired" back. Spec §2.4 item 4 re-pins 401 for an
+    unregistered port and
+    `test_api_cookie_auth.py::test_a_request_on_an_unregistered_port_is_refused`
+    asserts it; answering 421 here instead would have moved an existing
+    assertion, and it would have bought nothing against KI-17, whose whole
+    premise is a tunnel aimed at a port that very much *is* registered.
+    `tests/test_6b_host_scoping.py::test_dropping_a_listener_from_the_registry_
+    stops_its_names_immediately` pins both halves of the behaviour together.
 
     The port in `Host` is ignored. It carries no security meaning here (the
     real port is `port`, the one the socket was accepted on) while insisting

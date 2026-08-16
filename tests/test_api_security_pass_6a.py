@@ -51,13 +51,18 @@ from tests.fakes.api_client import BASE_URL, LOCAL_PORT, ApiTestClient, build_ap
 from tests.fakes.studio_runtime import build_fake_runtime
 
 
-def _client(vault, *, policies, runtime=None, pair_store=None, published=()):
+def _client(vault, *, policies, runtime=None, pair_store=None):
+    # No `published=` parameter. It existed, defaulted to `()`, and no test in
+    # this file ever passed one -- so when `PublishedHosts.add` grew a required
+    # `listener=` in Milestone 6b, the dead loop inside it went on calling the
+    # old signature and nothing failed. A helper nobody exercises is a helper
+    # that quietly rots into a lie about the API it wraps; the two tests that
+    # do publish call `app.state.published_hosts.publish(...)` directly, where
+    # the listener they mean is visible at the call site.
     app = create_app(runtime or build_fake_runtime(), vault,
                      origins=["http://localhost:3000"],
                      listener_policies=policies,
                      pair_store=pair_store)
-    for host in published:
-        app.state.published_hosts.add(host)
     return ApiTestClient(app, base_url=BASE_URL)
 
 
