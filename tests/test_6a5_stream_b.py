@@ -271,6 +271,37 @@ def test_the_regex_fallback_also_blocks_a_spawn_primitive():
     assert sandbox._regex_scan_fallback(broken, tier=2) is not None
 
 
+def test_process_control_names_are_banned_as_one_set():
+    """`kill` and `killpg` were banned while `terminate` was not: an
+    inconsistency in the set rather than a considered boundary. The primitive it
+    left reachable stops TENKA's own process, or anything else the user's token
+    can touch."""
+    for name in ("kill", "killpg", "terminate", "send_signal"):
+        assert _ast_scan(f"import psutil\npsutil.Process(1234).{name}()",
+                         tier=2) is not None, name
+
+
+def test_tier1_cannot_reach_a_process_control_primitive():
+    out = run_code("import psutil\nprint(psutil.Process().terminate)", tier=1)
+    assert "BLOCKED" in out or "ERROR" in out, out
+
+
+def test_binding_the_primitive_to_a_local_first_does_not_evade_the_check():
+    """Found while closing `terminate`: the call-site check reads a name, and
+    `t = p.terminate` leaves a bare ast.Name at the call. So the *reference* is
+    what has to be refused, not only the call."""
+    for tier in (1, 2):
+        assert _ast_scan("import psutil\np = psutil.Process(1)\n"
+                         "t = p.terminate\nt()", tier=tier) is not None, tier
+        assert _ast_scan("import psutil\nspawn = psutil.Popen\n"
+                         "spawn(['cmd'])", tier=tier) is not None, tier
+
+
+def test_the_regex_fallback_also_blocks_process_control():
+    broken = "import psutil\npsutil.Process(1).terminate()\nthis is not python("
+    assert sandbox._regex_scan_fallback(broken, tier=2) is not None
+
+
 # Controls: over-blocking here breaks real Tier 2 goals.
 
 def test_psutil_still_works_for_what_it_is_on_the_list_for():

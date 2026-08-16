@@ -45,7 +45,11 @@ _BANNED_BUILTINS: frozenset[str] = frozenset({"eval", "exec", "compile", "__impo
 # package is named anywhere here: the ban is on the capability.
 _BANNED_CALL_ATTRS: frozenset[str] = frozenset({
     "Popen", "popen", "startfile", "check_output", "check_call",
-    "fork", "forkpty", "kill", "killpg",
+    # Process control, banned as one set. Banning `kill`/`killpg` while leaving
+    # `terminate`/`send_signal` reachable was an inconsistency in the set, not a
+    # boundary: the same object offers all four, and the sandbox proved it by
+    # handing back a bound terminate for its own interpreter.
+    "fork", "forkpty", "kill", "killpg", "terminate", "send_signal",
     "execl", "execle", "execlp", "execlpe",
     "execv", "execve", "execvp", "execvpe",
     "spawnl", "spawnle", "spawnlp", "spawnlpe",
@@ -173,9 +177,15 @@ def _ast_scan(code: str, tier: int) -> str | None:
                 if alias.name.split(".")[-1] in _BANNED_CALL_ATTRS:
                     return f"BLOCKED: import of '{alias.name}' not allowed"
 
-        if tier == 1 and isinstance(node, ast.Attribute):
-            if node.attr in _TIER1_ESCAPE_ATTRS:
+        if isinstance(node, ast.Attribute):
+            if tier == 1 and node.attr in _TIER1_ESCAPE_ATTRS:
                 return f"BLOCKED: attribute '{node.attr}' not allowed in Tier 1"
+            # Checked on the *reference*, not only the call. Binding the bound
+            # method to a local first — `t = p.terminate` then `t()` — leaves an
+            # ast.Name at the call site, which no name-based check can see.
+            if node.attr in _BANNED_CALL_ATTRS:
+                return (f"BLOCKED: attribute '{node.attr}' not allowed — "
+                        f"process spawning or control")
 
         if isinstance(node, ast.Call):
             func = node.func
