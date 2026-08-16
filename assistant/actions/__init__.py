@@ -153,6 +153,24 @@ def set_grants(grants: "frozenset[Capability]") -> "_contextvars.Token":
     return current_grants.set(grants)
 
 
+# ─── Who the turn in flight is ───────────────────────────────────────────
+# The other half of the pair above, and re-exported rather than defined here
+# for one structural reason: `pending.py` reads `current_principal` at arm
+# time, and domain code importing `actions/` would invert the layering. The
+# definitions and the reasoning live in `core/principal.py`; these names exist
+# so the two contextvars are installed side by side at every call site that
+# installs them, which is the property `main.py`'s turn bracket depends on.
+#
+# `current_grants` answers what a caller may do. `current_principal` answers
+# who it is. 6a.5 asked only the first, which is why a device legitimately
+# holding FILES could answer a file confirmation the operator armed -- see
+# KI-13, and `PendingState.owned_by`.
+
+from ..core.principal import (  # noqa: F401  (re-exported by design)
+    LOCAL_PRINCIPAL, current_principal, set_principal,
+)
+
+
 def _refuse(required: Capability) -> str:
     """The refusal a caller sees when its grant set does not cover the intent.
 

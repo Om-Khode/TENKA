@@ -286,17 +286,27 @@ class EventBus:
                 logger.info("[event-monitor] Code executor fired: %s", payload[:80])
 
     async def _run_code_executor(self, goal: str) -> str:
-        from assistant.actions import LOCAL_GRANTS, current_grants, execute, set_grants
+        from assistant.actions import (
+            LOCAL_GRANTS, LOCAL_PRINCIPAL, current_grants, current_principal,
+            execute, set_grants, set_principal,
+        )
         # A fired monitor is not a request from anyone -- there is no turn
         # around it, so `current_grants` would be unset and `execute()` would
         # refuse (it fails closed by design). The grant is stated here
         # instead: installing a monitor requires EXECUTE (`manage_monitor` in
         # core/intent_capabilities.py), so whoever installed this one already
         # held it, and the machine it fires on is this one.
+        #
+        # The principal is stated for the matching reason: a monitor that
+        # fires and asks a question (`pending_monitor_disambig` is armed from
+        # exactly this path) must arm it as somebody, or the operator cannot
+        # answer the thing her own machine just asked her.
         token = set_grants(LOCAL_GRANTS)
+        ptoken = set_principal(LOCAL_PRINCIPAL)
         try:
             return await execute("code_executor", {"goal": goal}, "")
         finally:
+            current_principal.reset(ptoken)
             current_grants.reset(token)
 
     def _on_action_complete(self, future: asyncio.Future) -> None:

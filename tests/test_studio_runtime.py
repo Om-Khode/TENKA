@@ -6,6 +6,7 @@ from assistant.core.capabilities import Capability
 from assistant.io.api import runtime as rt
 
 CHAT_ONLY = frozenset({Capability.CHAT_SEND})
+A_DEVICE = "device:phone"
 
 
 class StubDispatch:
@@ -13,11 +14,13 @@ class StubDispatch:
         self.accept = accept
         self.submitted = []
         self.granted = []
+        self.principals = []
         self.busy = busy
 
-    async def submit(self, text: str, grants: frozenset):
+    async def submit(self, text: str, grants: frozenset, principal: str):
         self.submitted.append(text)
         self.granted.append(grants)
+        self.principals.append(principal)
         if not self.accept:
             return ("", "", False, "busy")
         return (f"t{len(self.submitted)}", "c1", True, "")
@@ -40,7 +43,7 @@ def test_bundle_satisfies_every_protocol(runtime):
 
 @pytest.mark.asyncio
 async def test_chat_send_goes_through_the_dispatch(runtime):
-    ref = await runtime.chat.send("what is on my calendar", CHAT_ONLY)
+    ref = await runtime.chat.send("what is on my calendar", CHAT_ONLY, A_DEVICE)
     assert ref.accepted is True
     assert ref.turn_id == "t1"
 
@@ -52,14 +55,18 @@ async def test_chat_send_hands_the_grant_set_to_the_dispatch_unchanged():
     narrow differently."""
     dispatch = StubDispatch()
     runtime = build_studio_runtime(dispatch)
-    await runtime.chat.send("hello", CHAT_ONLY)
+    await runtime.chat.send("hello", CHAT_ONLY, A_DEVICE)
     assert dispatch.granted == [CHAT_ONLY]
+    # The identity is a pass-through for the same reason and with a
+    # sharper consequence: it decides whose confirmations this turn may
+    # answer, so rewriting it here would be rewriting who is asking.
+    assert dispatch.principals == [A_DEVICE]
 
 
 @pytest.mark.asyncio
 async def test_chat_send_reports_a_refusal_without_raising():
     runtime = build_studio_runtime(StubDispatch(accept=False))
-    ref = await runtime.chat.send("hello", CHAT_ONLY)
+    ref = await runtime.chat.send("hello", CHAT_ONLY, A_DEVICE)
     assert ref.accepted is False
     assert ref.reason == "busy"
 

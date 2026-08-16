@@ -250,20 +250,21 @@ class _StudioDispatch:
     def busy(self) -> bool:
         return self._busy
 
-    async def submit(self, text: str,
-                     grants: "frozenset[Capability]") -> tuple[str, str, bool, str]:
+    async def submit(self, text: str, grants: "frozenset[Capability]",
+                     principal: "str | None") -> tuple[str, str, bool, str]:
         if self._busy:
             return ("", "", False, "busy")
         self._busy = True
         from . import session as session_mod
         self._counter += 1
         turn_id = f"studio-{self._counter}"
-        # A 3-tuple, not the local sources' 2-tuple: the grant set has to
-        # travel with the turn, because the turn runs later on the consumer's
-        # task and the request that authorised it is gone by then.
-        # `_grants_for_item` is what reads it back, and it reads the third
-        # slot by source -- for a local item that slot is stt_ms.
-        _input_queue.put(("studio", text, grants))
+        # A 4-tuple, not the local sources' 2-tuple: the grant set and the
+        # principal both have to travel with the turn, because the turn runs
+        # later on the consumer's task and the request that authorised it is
+        # gone by then. `_grants_for_item` and `_principal_for_item` read them
+        # back, and they read by source -- for a local item the third slot is
+        # stt_ms and there is no fourth.
+        _input_queue.put(("studio", text, grants, principal))
         return (turn_id, session_mod.get_current_session_id(), True, "")
 
     def mark_done(self) -> None:
@@ -612,14 +613,23 @@ async def _drain_and_announce_notifications(bridge: UnityBridge):
         await tts.speak(announcement, bridge, emotion="neutral")
 
         # Set pending state so user can say "read it"
+        #
+        # `principal=` is stated, not inherited: this runs on the notification
+        # poller's own task with no turn around it, so `current_principal` is
+        # unset here and an inherited owner would be nobody -- the operator
+        # could not answer an announcement TENKA made in her own room. The
+        # announcement was spoken on the local speaker, so the person who
+        # heard it is the one at this machine, and that is who may answer it.
         msgs = _actions.pending_incoming_messages.payload or []
         msgs.append(batch)
-        _actions.pending_incoming_messages.set(msgs)
+        _actions.pending_incoming_messages.set(
+            msgs, principal=_actions.LOCAL_PRINCIPAL)
 
     # Keep only the most recent 5 batches to prevent unbounded growth
     msgs = _actions.pending_incoming_messages.payload
     if msgs and len(msgs) > 5:
-        _actions.pending_incoming_messages.set(msgs[-5:])
+        _actions.pending_incoming_messages.set(
+            msgs[-5:], principal=_actions.LOCAL_PRINCIPAL)
 
 
 # ─── Implicit procedure management (no "procedure" keyword) ─────────────────
@@ -731,7 +741,8 @@ on exactly that reasoning.
 # simply never called, and its state silently expires. Module-level (not
 # function-local) so tests can assert every exported handle_pending_* is here.
 #
-# Each entry: (handler_func, log_label, memory_intent, needs_bridge, capability)
+# Each entry:
+#   (handler_func, log_label, memory_intent, needs_bridge, capability, state)
 #
 # The fifth column is what the handler's *effect* costs, and the dispatch loop
 # skips any row the turn's grants do not cover. It is a column rather than a
@@ -761,6 +772,16 @@ on exactly that reasoning.
 #   KNOWLEDGE              — approves storing a fact → CHAT_SEND, matching
 #                            `store_memory`.
 #   MONITOR / BACKUP       — `manage_monitor` / `manage_backup` → EXECUTE.
+#
+# The sixth column is the PendingState the handler reads, and it exists so the
+# dispatch loop can ask *who armed this* before it lets a caller answer it
+# (KI-13). It is the state object rather than its name for the same reason the
+# fifth column is a Capability rather than a string: a typo is an ImportError
+# at startup instead of a lookup that silently matches nothing and a check
+# that silently passes. Deriving it from the handler's name was the
+# alternative and it is wrong -- `handle_pending_incoming_message` reads
+# `pending_incoming_messages`, so the derivation is already broken on row nine
+# and would fail open exactly where nobody looks.
 
 from .actions import (
     handle_pending_destructive, handle_pending_camera_settings,
@@ -772,24 +793,60 @@ from .actions import (
     handle_pending_backup_oauth, handle_pending_backup_unlock_phrase,
     handle_pending_backup_restore_phrase,
 )
+from .actions import (
+    pending_destructive as _s_destructive,
+    pending_camera_settings as _s_camera_settings,
+    pending_forget_face as _s_forget_face,
+    pending_file_search as _s_file_search,
+    pending_oauth_setup as _s_oauth_setup,
+    pending_device_auth as _s_device_auth,
+    pending_messaging_disambig as _s_messaging_disambig,
+    pending_messaging_send as _s_messaging_send,
+    pending_incoming_messages as _s_incoming_messages,
+    pending_knowledge_approval as _s_knowledge_approval,
+    pending_monitor_disambig as _s_monitor_disambig,
+    pending_backup_confirm_phrase as _s_backup_confirm_phrase,
+    pending_backup_oauth as _s_backup_oauth,
+    pending_backup_unlock_phrase as _s_backup_unlock_phrase,
+    pending_backup_restore_phrase as _s_backup_restore_phrase,
+)
 
 _PENDING_HANDLERS = [
-    (handle_pending_destructive,        "DESTRUCTIVE",  "file_task",          False, Capability.FILES),
-    (handle_pending_camera_settings,    "CAMERA",       "camera_look",        False, Capability.SCREEN),
-    (handle_pending_forget_face,        "FACE",         "forget_face",        False, Capability.SCREEN),
-    (handle_pending_file_search,        "FILE",         "file_task",          False, Capability.FILES),
-    (handle_pending_oauth_setup,        "OAUTH",        "oauth_setup",        True,  Capability.SYSTEM_CONTROL),
-    (handle_pending_device_auth,        "DEVICE_AUTH",  "device_auth",        True,  Capability.SYSTEM_CONTROL),
-    (handle_pending_messaging_disambig, "MESSAGING",    "messaging_disambig", True,  Capability.EXECUTE),
-    (handle_pending_messaging_send,     "MESSAGING",    "messaging_send",     False, Capability.EXECUTE),
-    (handle_pending_incoming_message,   "INCOMING",     "incoming_message",   False, Capability.RECALL),
-    (handle_pending_knowledge_approval, "KNOWLEDGE",    "knowledge_approval", True,  Capability.CHAT_SEND),
-    (handle_pending_monitor_disambig,   "MONITOR",      "manage_monitor",     False, Capability.EXECUTE),
-    (handle_pending_backup_confirm_phrase, "BACKUP",    "manage_backup",      False, Capability.EXECUTE),
-    (handle_pending_backup_oauth,       "BACKUP",       "manage_backup",      False, Capability.EXECUTE),
-    (handle_pending_backup_unlock_phrase, "BACKUP",     "manage_backup",      False, Capability.EXECUTE),
-    (handle_pending_backup_restore_phrase, "BACKUP",    "manage_backup",      False, Capability.EXECUTE),
+    (handle_pending_destructive,        "DESTRUCTIVE",  "file_task",          False, Capability.FILES,          _s_destructive),
+    (handle_pending_camera_settings,    "CAMERA",       "camera_look",        False, Capability.SCREEN,         _s_camera_settings),
+    (handle_pending_forget_face,        "FACE",         "forget_face",        False, Capability.SCREEN,         _s_forget_face),
+    (handle_pending_file_search,        "FILE",         "file_task",          False, Capability.FILES,          _s_file_search),
+    (handle_pending_oauth_setup,        "OAUTH",        "oauth_setup",        True,  Capability.SYSTEM_CONTROL, _s_oauth_setup),
+    (handle_pending_device_auth,        "DEVICE_AUTH",  "device_auth",        True,  Capability.SYSTEM_CONTROL, _s_device_auth),
+    (handle_pending_messaging_disambig, "MESSAGING",    "messaging_disambig", True,  Capability.EXECUTE,        _s_messaging_disambig),
+    (handle_pending_messaging_send,     "MESSAGING",    "messaging_send",     False, Capability.EXECUTE,        _s_messaging_send),
+    (handle_pending_incoming_message,   "INCOMING",     "incoming_message",   False, Capability.RECALL,         _s_incoming_messages),
+    (handle_pending_knowledge_approval, "KNOWLEDGE",    "knowledge_approval", True,  Capability.CHAT_SEND,      _s_knowledge_approval),
+    (handle_pending_monitor_disambig,   "MONITOR",      "manage_monitor",     False, Capability.EXECUTE,        _s_monitor_disambig),
+    (handle_pending_backup_confirm_phrase, "BACKUP",    "manage_backup",      False, Capability.EXECUTE,        _s_backup_confirm_phrase),
+    (handle_pending_backup_oauth,       "BACKUP",       "manage_backup",      False, Capability.EXECUTE,        _s_backup_oauth),
+    (handle_pending_backup_unlock_phrase, "BACKUP",     "manage_backup",      False, Capability.EXECUTE,        _s_backup_unlock_phrase),
+    (handle_pending_backup_restore_phrase, "BACKUP",    "manage_backup",      False, Capability.EXECUTE,        _s_backup_restore_phrase),
 ]
+
+
+# ─── What a caller hears when it answers someone else's question ─────────
+_FOREIGN_ANSWER_REFUSAL = (
+    "Someone else is in the middle of answering me. "
+    "I'll wait for them before I take this one."
+)
+"""The refusal for a pending state armed by a different principal (KI-13).
+
+Refused rather than silently skipped, deliberately: a dropped confirmation
+reads as a timeout to whoever armed it and as nothing at all to whoever tried
+to answer, and "nothing happened" is the one outcome that teaches the operator
+nothing. This says something happened.
+
+It is spoken, so it carries the usual constraints -- under 120 characters, no
+paths, no error codes -- plus one of its own: it never names the device, the
+state, or what the question was. Saying *that* something else is answering is
+the point; saying *what* would hand a caller the confirmation it was refused.
+"""
 
 
 # ─── Wake Word Listener (global reference) ───────────────────────────────────
@@ -934,7 +991,8 @@ def _publish_turn_status(source: str, phase: StatusPhase) -> None:
 
 async def process_text_from_queue(source: str, transcription: str, bridge: UnityBridge,
                                   stt_ms: int | None = None,
-                                  grants: "frozenset[Capability] | None" = None):
+                                  grants: "frozenset[Capability] | None" = None,
+                                  principal: "str | None" = None):
     """
     Run Intent → Policy → Action/LLM → TTS → Unity animations
 
@@ -943,6 +1001,13 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     that state -- it is not a synonym for the local full set. Callers that
     know the answer state it; `_grants_for_item` is the one that decides for
     a queued item.
+
+    `principal` is *who* that caller is, and it fails closed the same way:
+    `None` means "nobody said", it owns no pending state, and a turn carrying
+    it can answer no confirmation. `_principal_for_item` decides for a queued
+    item. The pair is what closes KI-13 -- grants say what a caller may do,
+    the principal says whose question it may answer, and 6a.5 could only ask
+    the first.
     """
     global _turn_counter
     from . import session as session_mod
@@ -961,6 +1026,15 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     # Pause wake word detection during execution
     if _wake_listener:
         _wake_listener.pause()
+
+    # The principal's token, set in the same statement group as the grant
+    # token below and reset in the same `finally`. It goes *above* the comment
+    # that follows rather than between it and `set_grants` because that
+    # comment's constraint is literal: nothing may sit between the grant token
+    # and the `try`. The ordering also fails in the safer direction -- a raise
+    # in `set_grants` would strand an identity, and an identity with no grants
+    # can do nothing, whereas the reverse would strand privilege.
+    _principal_token = _actions_module.set_principal(principal)
 
     # Set LAST, immediately before the `try` whose `finally` resets it, and
     # after `_wake_listener.pause()` rather than before. An adversarial
@@ -1174,6 +1248,23 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # person who started it.
         if _actions_module.teaching_session.active and \
                 _actions_module.capability_refusal(Capability.EXECUTE) is None:
+            # Answer site one of two. The capability check above stopped the
+            # caller that cannot teach; this stops the one that can but was
+            # not the one teaching. Refused rather than skipped, unlike the
+            # capability case: a caller that reaches this line already holds
+            # EXECUTE and could open its own session, so being told that
+            # somebody else is mid-session discloses nothing it could not
+            # discover by trying -- and being told is the difference between
+            # a session that looks broken and one that looks busy.
+            if not _actions_module.teaching_session.owned_by(
+                    _actions_module.current_principal.get()):
+                logger.info("[TEACH] Refused: session armed by another principal")
+                _tracker.intent_detected = "teaching"
+                _tracker.intent_source = "regex"
+                _tracker.action_outcome = "refused"
+                await _respond(_FOREIGN_ANSWER_REFUSAL, "teach", "worried")
+                _tracker.latency_intent_ms = int((_time.monotonic() - _t0_intent) * 1000)
+                return
             from .actions import handle_pending_teaching
             _teach_resp = await handle_pending_teaching(transcription)
             if _teach_resp is not None:
@@ -1407,7 +1498,9 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         pending_handled = False
         pending_response = None
 
-        for handler, label, mem_intent, needs_bridge, required in _PENDING_HANDLERS:
+        _principal = _actions_module.current_principal.get()
+
+        for handler, label, mem_intent, needs_bridge, required, state in _PENDING_HANDLERS:
             # Skipped, not refused. Pending state is process-global, so the
             # device that ANSWERS a confirmation need not be the one that
             # ASKED: the operator says "delete my downloads" at the keyboard,
@@ -1416,14 +1509,6 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             # the effect costs closes the cases where the answering device
             # holds less than the handler needs.
             #
-            # It does NOT close the case where it holds exactly enough -- a
-            # tunnel device holds FILES, so it can still answer a locally
-            # armed file confirmation. That residual is a missing owner on
-            # PendingState, not a missing capability, and forcing a stronger
-            # capability here to paper over it would break ordinary local
-            # confirmations for no security gain. See the xfail in
-            # tests/test_6a5_predispatch_gate.py.
-            #
             # Skipping rather than refusing is deliberate twice over: the
             # caller did not ask for this handler, so its text deserves an
             # ordinary turn; and a refusal would disclose to a device that
@@ -1431,6 +1516,31 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             if _actions_module.capability_refusal(required) is not None:
                 logger.info(f"[{label}] Skipped: caller lacks {required.value}")
                 continue
+            # Answer site two of two, and the one KI-13 is named for. The
+            # check above cannot close a confused deputy that *holds* the
+            # capability -- a tunnel device holds FILES, so it could answer a
+            # locally armed file confirmation -- because nothing in a
+            # capability set distinguishes two devices that carry the same
+            # ceiling. Only the identity does.
+            #
+            # This refuses the whole turn rather than skipping the row, and it
+            # therefore also refuses a caller who was not answering anything
+            # and merely spoke while somebody else's confirmation was open.
+            # That is accepted knowingly: whether a message is an answer is
+            # not knowable before running the handler, and running it is the
+            # effect. Refusing costs a non-owner one turn inside a window that
+            # is 30-300 seconds and only exists while a question is genuinely
+            # open; the other direction costs the operator a deletion she
+            # never confirmed. The capability skip above still runs first, so
+            # a caller that could not have driven this row is never told the
+            # window exists.
+            if state.active and not state.owned_by(_principal):
+                logger.info(
+                    f"[{label}] Refused: armed by another principal")
+                _tracker.action_dispatched = f"pending_{label.lower()}"
+                _tracker.action_outcome = "refused"
+                await _respond(_FOREIGN_ANSWER_REFUSAL, mem_intent, "worried")
+                return
             if needs_bridge:
                 resp = await handler(transcription, bridge)
             else:
@@ -1906,6 +2016,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         _tracker.save()
         _telemetry.reset_current_tracker(_tracker_token)
         _actions_module.current_grants.reset(_grants_token)
+        _actions_module.current_principal.reset(_principal_token)
         # The turn this "studio" item started is only now actually over --
         # success, failure or an early return above all reach this
         # `finally`. Clearing the busy flag here, not at the instant
@@ -1946,6 +2057,41 @@ def _grants_for_item(item: tuple) -> "tuple[frozenset[Capability], int | None]":
     return frozenset(Capability), extra
 
 
+def _principal_for_item(item: tuple) -> "str | None":
+    """Read a queued item's principal out of its fourth slot.
+
+    The identity half of `_grants_for_item`, and it decides the same way:
+
+    - Local sources ("stt", "chat") are the person at this machine, stated
+      explicitly as `LOCAL_PRINCIPAL`. They have no fourth slot -- their third
+      is stt_ms -- and inventing one for them would be a second place that
+      could disagree about what "local" means.
+    - Studio enqueues `("studio", text, grants, principal)`, where the
+      principal is `f"device:{device_id}"` for the device the route
+      authenticated.
+
+    A "studio" item without a fourth slot gets `None`, never
+    `LOCAL_PRINCIPAL`. `None` owns nothing, so such a turn can answer no
+    confirmation: a lost principal is refused, never assumed, exactly as
+    `_grants_for_item` treats a lost grant set. Promoting it to the local
+    identity would hand a device whose provenance was lost the right to answer
+    the operator's own questions, which is the defect rather than the fix.
+
+    The one place this deliberately does *not* mirror `_grants_for_item`: the
+    local case is decided by `_LOCAL_SOURCES`, the literal allow-list, rather
+    than by "not studio". A source nobody has added yet gets `None` and owns
+    nothing. That is what `_LOCAL_SOURCES`' own docstring asks of everything
+    that hangs off it, and the fail-closed direction for a question whose
+    answer decides whose confirmations a turn may answer.
+    """
+    if item[0] in _LOCAL_SOURCES:
+        return _actions_module.LOCAL_PRINCIPAL
+    if item[0] == "studio":
+        carried = item[3] if len(item) > 3 else None
+        return carried if isinstance(carried, str) else None
+    return None
+
+
 async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
     """Handle exactly one item already pulled off `_input_queue`.
 
@@ -1974,6 +2120,7 @@ async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
     """
     source, text = item[0], item[1]
     grants, stt_ms = _grants_for_item(item)
+    principal = _principal_for_item(item)
     # The status bracket is mirrored here for the same reason mark_done() is,
     # and it has to be *both* halves: a raise before the inner try: leaves the
     # bus at whatever the previous turn ended on, and a lone closing IDLE
@@ -1984,7 +2131,7 @@ async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
     _publish_turn_status(source, StatusPhase.THINKING)
     try:
         await process_text_from_queue(source, text, bridge, stt_ms=stt_ms,
-                                      grants=grants)
+                                      grants=grants, principal=principal)
     finally:
         _publish_turn_status(source, StatusPhase.IDLE)
         if source == "studio" and _studio_dispatch is not None:

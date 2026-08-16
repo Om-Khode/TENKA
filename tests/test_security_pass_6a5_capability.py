@@ -247,6 +247,10 @@ def test_submit_requires_grants_with_no_default():
     sig = inspect.signature(ChatDispatch.submit)
     assert "grants" in sig.parameters
     assert sig.parameters["grants"].default is inspect.Parameter.empty
+    # And 'forgot to say who' must not be spelled the same way as "the person
+    # at the keyboard" -- same rule, one question over. See KI-13.
+    assert "principal" in sig.parameters
+    assert sig.parameters["principal"].default is inspect.Parameter.empty
 
 
 def test_the_chat_route_passes_the_devices_effective_grants():
@@ -277,12 +281,17 @@ async def test_a_studio_turn_runs_with_only_its_own_grants():
             break
     dispatch = main_mod._StudioDispatch()
     limited = frozenset({Capability.CHAT_SEND})
-    turn_id, conv_id, accepted, reason = await dispatch.submit("hello", limited)
+    turn_id, conv_id, accepted, reason = await dispatch.submit(
+        "hello", limited, "device:probe")
     assert accepted
-    source, text, grants = main_mod._input_queue.get_nowait()
+    source, text, grants, principal = main_mod._input_queue.get_nowait()
     assert source == "studio"
     assert grants == limited
     assert Capability.EXECUTE not in grants
+    # The identity rides the same item, in its own slot (KI-13). It is not
+    # `LOCAL_PRINCIPAL`, and it never can be: the route builds it as
+    # `f"device:{device_id}"`, so the operator's own confirmations stay hers.
+    assert principal == "device:probe"
 
 
 @pytest.mark.asyncio

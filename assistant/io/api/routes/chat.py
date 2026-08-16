@@ -33,7 +33,16 @@ async def send_chat(body: ChatRequest, request: Request,
     # CHAT_SEND alone used to reach every intent through this route, because
     # the pipeline behind it applied no further check. It is the entry
     # permission now, and what the turn may actually *do* travels with it.
-    ref = await request.app.state.runtime.chat.send(body.text, device.grants)
+    #
+    # The principal is built here for the same reason the grants are passed
+    # here: this is the only place that knows *which* device authenticated,
+    # and by the time the turn runs the request is gone. The `device:` prefix
+    # is added on this side, never taken from the caller, so a device cannot
+    # name itself `"local"` and inherit the operator's own confirmations.
+    # `device_id` is the vault's identifier for the pairing, not anything the
+    # request supplied. See core/principal.py and KI-13.
+    ref = await request.app.state.runtime.chat.send(
+        body.text, device.grants, f"device:{device.device_id}")
     if not ref.accepted:
         # Deliberately generic: a caller that cannot authenticate any further
         # than "holds a read token" should not learn *what* she is doing --

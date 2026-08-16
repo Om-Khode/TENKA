@@ -48,6 +48,10 @@ from assistant.core.capabilities import Capability
 
 _MAIN_PY = _ROOT / "assistant" / "main.py"
 
+_UNSET = object()
+"""Sentinel for `turn(principal=...)`. `None` is a meaningful principal -- it
+is the one that owns nothing -- so it cannot double as "you did not say"."""
+
 
 def _remote_grants() -> "frozenset[Capability]":
     """Built from policy.py rather than hand-written, so this file tracks the
@@ -156,10 +160,20 @@ def turn(monkeypatch):
             self.tracker = None
             self.bridge = None
 
-        async def __call__(self, text, grants, source="studio", bridge=None):
+        async def __call__(self, text, grants, source="studio", bridge=None,
+                           principal=_UNSET):
             bridge = bridge or _FakeBridge()
+            # Derived from the source the way `_principal_for_item` derives
+            # it, so a turn through this harness carries the identity a real
+            # queued item of the same source would. Overridable, because two
+            # devices with the same ceiling are only distinguishable by it.
+            if principal is _UNSET:
+                from assistant.actions import LOCAL_PRINCIPAL
+                principal = (LOCAL_PRINCIPAL
+                             if source in main_mod._LOCAL_SOURCES else None)
             await main_mod.process_text_from_queue(source, text, bridge,
-                                                   grants=grants)
+                                                   grants=grants,
+                                                   principal=principal)
             self.tracker = tracker_box.get("t")
             self.bridge = bridge
             return self
@@ -371,7 +385,9 @@ async def test_an_open_teaching_session_ignores_a_caller_without_execute(
     monkeypatch.setattr(main_mod, "handle_pending_teaching", _spy_teaching,
                         raising=False)
     monkeypatch.setattr(actions_pkg, "handle_pending_teaching", _spy_teaching)
-    actions_pkg.teaching_session.set({"trigger": "sync files", "steps": []})
+    actions_pkg.teaching_session.set(
+        {"trigger": "sync files", "steps": []},
+        principal=actions_pkg.LOCAL_PRINCIPAL)
     monkeypatch.setattr(main_mod.regex_router, "pre_route", lambda t: None)
 
     from assistant.intent import IntentResult
@@ -403,7 +419,9 @@ async def test_an_open_teaching_session_still_takes_local_steps(turn, monkeypatc
         return "next step?"
 
     monkeypatch.setattr(actions_pkg, "handle_pending_teaching", _spy_teaching)
-    actions_pkg.teaching_session.set({"trigger": "sync files", "steps": []})
+    actions_pkg.teaching_session.set(
+        {"trigger": "sync files", "steps": []},
+        principal=actions_pkg.LOCAL_PRINCIPAL)
     try:
         await turn("open cmd", _local_grants(), source="stt")
         assert fed == ["open cmd"], "the local teaching session stopped working"
@@ -539,12 +557,19 @@ def test_the_chat_door_and_the_settings_route_demand_the_same_capability():
 def test_every_pending_row_declares_a_capability():
     """The fix is data, not a bolt-on: `_PENDING_HANDLERS` gained a fifth
     column naming what the handler's effect costs. A row added without one is a
-    `ValueError` on the loop's unpack, and this test names it earlier."""
+    `ValueError` on the loop's unpack, and this test names it earlier.
+
+    6b added a sixth -- the PendingState the handler reads -- for the owner
+    check that closes KI-13. Both are asserted here, because a row is only
+    complete when it says what the effect costs *and* whose question it is."""
     from assistant import main as main_mod
+    from assistant.pending import PendingState
 
     for entry in main_mod._PENDING_HANDLERS:
-        assert len(entry) == 5, f"row is not (handler, label, intent, bridge, cap): {entry}"
+        assert len(entry) == 6, (
+            f"row is not (handler, label, intent, bridge, cap, state): {entry}")
         assert isinstance(entry[4], Capability), entry
+        assert isinstance(entry[5], PendingState), entry
 
 
 @pytest.mark.asyncio
@@ -568,7 +593,7 @@ async def test_pending_handler_is_skipped_when_the_caller_lacks_its_capability(
 
     monkeypatch.setattr(main_mod, "_PENDING_HANDLERS",
                         [(_spy_destructive, "DESTRUCTIVE", "file_task", False,
-                          Capability.EXECUTE)])
+                          Capability.EXECUTE, main_mod._s_destructive)])
     monkeypatch.setattr(main_mod.regex_router, "pre_route", lambda t: None)
 
     async def _detect(*a, **k):
@@ -593,7 +618,7 @@ async def test_pending_handler_still_runs_for_a_caller_that_holds_it(
 
     monkeypatch.setattr(main_mod, "_PENDING_HANDLERS",
                         [(_spy_destructive, "DESTRUCTIVE", "file_task", False,
-                          Capability.EXECUTE)])
+                          Capability.EXECUTE, main_mod._s_destructive)])
     monkeypatch.setattr(main_mod.regex_router, "pre_route", lambda t: None)
 
     async def _detect(*a, **k):
@@ -604,17 +629,23 @@ async def test_pending_handler_still_runs_for_a_caller_that_holds_it(
     assert answered == ["yes"], "the local confirmation chain stopped working"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN RESIDUAL, deliberately not fixed here. A capability check cannot "
-    "close a confused deputy that holds the capability: a tunnel device holds "
-    "FILES, so it can still answer a locally-armed pending_file_search. The "
-    "real defect is that PendingState has no owner -- see the report's "
-    "'what I did not fix'. The right fix is a principal recorded on the "
-    "state at arm time and compared at answer time, which is a pending.py "
-    "design change, not a gate."))
 @pytest.mark.asyncio
 async def test_pending_state_remembers_which_principal_armed_it(turn, monkeypatch):
+    """6a.5's known residual, closed in 6b. A capability check cannot close a
+    confused deputy that *holds* the capability: a tunnel device holds FILES,
+    so it could answer a locally-armed `pending_file_search`. The fix is an
+    owner on the state, compared at answer time -- see KI-13 and
+    `tests/test_6b_principal.py`, which covers the four ownership directions.
+
+    This was a strict `xfail` and the marker is gone. Its body arms the state
+    it is talking about, which the xfail version never did: with nothing
+    armed, the assertion held only because the spy answered unconditionally,
+    and no principal design can distinguish a remote caller from a local one
+    when there is no armed question for either to answer. The claim it makes
+    is unchanged and now actually exercised.
+    """
     from assistant import main as main_mod
+    from assistant.actions import LOCAL_PRINCIPAL
     from assistant.intent import IntentResult
 
     answered = []
@@ -623,16 +654,21 @@ async def test_pending_state_remembers_which_principal_armed_it(turn, monkeypatc
         answered.append(text)
         return "Opened it."
 
+    state = main_mod._s_file_search
+    state.set({"name": "notes", "tier": 1}, principal=LOCAL_PRINCIPAL)
     monkeypatch.setattr(main_mod, "_PENDING_HANDLERS",
                         [(_spy_file_search, "FILE", "file_task", False,
-                          Capability.FILES)])
+                          Capability.FILES, state)])
     monkeypatch.setattr(main_mod.regex_router, "pre_route", lambda t: None)
 
     async def _detect(*a, **k):
         return IntentResult(intent="small_talk", response="ok", params={})
     monkeypatch.setattr(main_mod, "detect_intent", _detect)
 
-    await turn("the first one", _remote_grants())
+    try:
+        await turn("the first one", _remote_grants())
+    finally:
+        state.clear()
     assert answered == [], (
         "a remote device answered a confirmation it did not arm")
 

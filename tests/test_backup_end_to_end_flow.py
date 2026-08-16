@@ -46,7 +46,7 @@ class _FakeProvider:
 
 async def _dispatch(text: str) -> str | None:
     """Mirror main.py's pending loop: first non-None response owns the turn."""
-    for handler, _label, _mem_intent, needs_bridge, _cap in main_module._PENDING_HANDLERS:
+    for handler, _label, _mem_intent, needs_bridge, _cap, _state in main_module._PENDING_HANDLERS:
         resp = await handler(text, None) if needs_bridge else await handler(text)
         if resp is not None:
             return resp

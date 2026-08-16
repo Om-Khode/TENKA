@@ -2,8 +2,9 @@
 
 A PendingState owns one interactive dialog state (destructive op confirmation,
 oauth setup, messaging disambiguation, teaching session, etc.). It carries a
-payload, a touch timestamp, and a timeout; reading the payload after the
-timeout has elapsed auto-clears the state.
+payload, a touch timestamp, a timeout, and — since KI-13 — the principal that
+armed it; reading the payload after the timeout has elapsed auto-clears the
+state.
 
 Eventually relocates to `actions/pending/base.py` once `actions.py` is split
 into a package.
@@ -29,6 +30,8 @@ Usage:
 import time
 from typing import Generic, Optional, TypeVar
 
+from .core.principal import current_principal
+
 T = TypeVar("T")
 
 
@@ -40,14 +43,35 @@ class PendingState(Generic[T]):
         self.timeout = timeout
         self._payload: Optional[T] = None
         self._ts: float = 0.0
+        self._principal: Optional[str] = None
 
-    def set(self, payload: T) -> None:
-        """Start (or replace) the pending state."""
+    def set(self, payload: T, *, principal: Optional[str] = None) -> None:
+        """Start (or replace) the pending state, recording who armed it.
+
+        `principal` defaults to the turn in flight (`current_principal`)
+        rather than to "no owner", and that default is the mechanism, not a
+        convenience. Almost every arming site in the tree sits inside a
+        handler several frames below the turn that authorised it; asking each
+        of them to pass an identity down would put the whole property one
+        forgotten argument away from an unowned confirmation, which is a
+        silent dead end rather than a loud one. Sites that arm *outside* a
+        turn -- `main.py`'s notification flusher, where no principal is
+        installed -- have to state one, and
+        `tests/test_6b_principal.py::test_every_arming_site_records_a_principal`
+        walks `main.py`'s AST to make sure they do.
+        """
         self._payload = payload
         self._ts = time.time()
+        self._principal = (principal if principal is not None
+                           else current_principal.get())
 
     def touch(self) -> None:
-        """Reset the timeout without changing the payload (for re-prompts)."""
+        """Reset the timeout without changing the payload (for re-prompts).
+
+        Deliberately does not re-read `current_principal`: a re-prompt is the
+        same question asked again, not a new one, so it must not silently
+        transfer ownership to whoever happened to trigger the re-prompt.
+        """
         if self._payload is not None:
             self._ts = time.time()
 
@@ -55,6 +79,7 @@ class PendingState(Generic[T]):
         """End the pending state."""
         self._payload = None
         self._ts = 0.0
+        self._principal = None
 
     @property
     def payload(self) -> Optional[T]:
@@ -68,6 +93,34 @@ class PendingState(Generic[T]):
             self.clear()
             return None
         return self._payload
+
+    @property
+    def principal(self) -> Optional[str]:
+        """Who armed this state, or None if nobody said.
+
+        Deliberately not folded into `payload`: ownership and expiry are
+        different questions, and answering them through one property would
+        make "someone else is answering" indistinguishable from "you took too
+        long" -- which is the silent failure KI-13 exists to end.
+        """
+        return self._principal
+
+    def owned_by(self, principal: Optional[str]) -> bool:
+        """May `principal` answer this state?
+
+        True only when both sides are set and equal. An unset principal owns
+        nothing and an unowned state is answerable by nobody -- in both
+        directions, the absence of a decision is not a decision to allow,
+        exactly as `current_grants`' default of `None` refuses everything.
+
+        Note what this deliberately does *not* do: `LOCAL_PRINCIPAL` is not a
+        master key. A confirmation armed from a phone is the phone's to
+        answer, and a "yes" typed at the console is as much a different voice
+        as a remote one is.
+        """
+        return (self._principal is not None
+                and principal is not None
+                and self._principal == principal)
 
     @property
     def active(self) -> bool:

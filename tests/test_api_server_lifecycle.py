@@ -223,11 +223,12 @@ async def test_studio_dispatch_puts_the_shape_the_consumer_loop_expects():
     """main.py's queue consumer does `source, text = item[0], item[1]`, the
     same first two slots the existing "chat" source uses.
 
-    The third slot is the studio turn's grant set (Milestone 6a.5): it has to
-    travel with the turn, because the turn runs later on the consumer's task
-    and the request that authorised it is gone by then. Local sources still
-    enqueue 2-tuples (or a 3-tuple whose third slot is stt_ms);
-    `_grants_for_item` is what tells the two apart, by source."""
+    The third slot is the studio turn's grant set (Milestone 6a.5) and the
+    fourth is its principal (6b, KI-13): both have to travel with the turn,
+    because the turn runs later on the consumer's task and the request that
+    authorised them is gone by then. Local sources still enqueue 2-tuples (or
+    a 3-tuple whose third slot is stt_ms); `_grants_for_item` and
+    `_principal_for_item` are what tell the two apart, by source."""
     import assistant.main as m
 
     while True:
@@ -237,13 +238,13 @@ async def test_studio_dispatch_puts_the_shape_the_consumer_loop_expects():
             break
 
     dispatch = m._StudioDispatch()
-    turn_id, session_id, accepted, reason = await dispatch.submit("hello studio", _ALL_GRANTS)
+    turn_id, session_id, accepted, reason = await dispatch.submit("hello studio", _ALL_GRANTS, "device:probe")
     assert (accepted, reason) == (True, "")
     assert turn_id == "studio-1"
     assert isinstance(session_id, str)  # get_current_session_id()'s real return type
 
     item = m._input_queue.get_nowait()
-    assert item == ("studio", "hello studio", _ALL_GRANTS)
+    assert item == ("studio", "hello studio", _ALL_GRANTS, "device:probe")
 
 
 @pytest.mark.asyncio
@@ -268,7 +269,7 @@ async def test_studio_dispatch_refuses_rather_than_queues_a_concurrent_submit():
     dispatch = m._StudioDispatch()
 
     results = await asyncio.gather(
-        dispatch.submit("first", _ALL_GRANTS), dispatch.submit("second", _ALL_GRANTS),
+        dispatch.submit("first", _ALL_GRANTS, "device:probe"), dispatch.submit("second", _ALL_GRANTS, "device:probe"),
     )
     accepted = [r for r in results if r[2] is True]
     refused = [r for r in results if r[2] is False]
@@ -278,11 +279,11 @@ async def test_studio_dispatch_refuses_rather_than_queues_a_concurrent_submit():
 
     # Still busy: the accepted turn has not finished (mark_done() has not
     # run) -- a third submit must still be refused.
-    still_busy = await dispatch.submit("third", _ALL_GRANTS)
+    still_busy = await dispatch.submit("third", _ALL_GRANTS, "device:probe")
     assert still_busy[2] is False
 
     dispatch.mark_done()
-    now_free = await dispatch.submit("fourth", _ALL_GRANTS)
+    now_free = await dispatch.submit("fourth", _ALL_GRANTS, "device:probe")
     assert now_free[2] is True
 
 
@@ -351,7 +352,7 @@ async def test_a_raise_before_process_text_from_queues_own_try_still_clears_busy
     # in the "skips the finally entirely" window the review named.
     monkeypatch.setattr(m._telemetry, "TurnTracker", _boom)
 
-    turn_id, _, accepted, _ = await dispatch.submit("first", _ALL_GRANTS)
+    turn_id, _, accepted, _ = await dispatch.submit("first", _ALL_GRANTS, "device:probe")
     assert accepted is True
     assert dispatch.busy is True
 
@@ -362,7 +363,7 @@ async def test_a_raise_before_process_text_from_queues_own_try_still_clears_busy
         "a raise before process_text_from_queue's own try: left the busy flag stranded"
     )
 
-    second = await dispatch.submit("second", _ALL_GRANTS)
+    second = await dispatch.submit("second", _ALL_GRANTS, "device:probe")
     assert second[2] is True, (
         "the studio channel is still refusing after the raise -- exactly the "
         "permanent lockout the review flagged"
@@ -382,12 +383,13 @@ async def test_a_normal_turn_through_the_consumer_seam_still_clears_busy(monkeyp
     dispatch = m._StudioDispatch()
     monkeypatch.setattr(m, "_studio_dispatch", dispatch)
 
-    async def _fake_process(source, text, bridge, stt_ms=None, grants=None):
+    async def _fake_process(source, text, bridge, stt_ms=None, grants=None,
+                            principal=None):
         return None
 
     monkeypatch.setattr(m, "process_text_from_queue", _fake_process)
 
-    await dispatch.submit("hello", _ALL_GRANTS)
+    await dispatch.submit("hello", _ALL_GRANTS, "device:probe")
     assert dispatch.busy is True
 
     await m._process_one_queued_item(("studio", "hello"), bridge=None)
@@ -410,16 +412,17 @@ async def test_the_seam_does_not_clear_busy_before_the_turn_actually_finishes(mo
 
     release = asyncio.Event()
 
-    async def _slow_process(source, text, bridge, stt_ms=None, grants=None):
+    async def _slow_process(source, text, bridge, stt_ms=None, grants=None,
+                            principal=None):
         await release.wait()
 
     monkeypatch.setattr(m, "process_text_from_queue", _slow_process)
 
-    await dispatch.submit("hello", _ALL_GRANTS)
+    await dispatch.submit("hello", _ALL_GRANTS, "device:probe")
     task = asyncio.create_task(m._process_one_queued_item(("studio", "hello"), bridge=None))
     await asyncio.sleep(0)  # let the task actually start awaiting release
 
-    still_busy = await dispatch.submit("second", _ALL_GRANTS)
+    still_busy = await dispatch.submit("second", _ALL_GRANTS, "device:probe")
     assert still_busy[2] is False, "the seam cleared busy before the turn actually finished"
 
     release.set()
