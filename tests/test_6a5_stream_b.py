@@ -274,6 +274,49 @@ def test_the_readonly_proxy_still_hides_the_value_itself():
     assert "hidden" in out, out
 
 
+def test_tier2_says_a_secret_was_withheld_rather_than_reporting_success():
+    """Found auditing B5's own reach. Tier 1's refusal is a `BLOCKED:` string,
+    and `orchestrator.py:798` escalates any Tier 1 BLOCKED to Tier 2. There the
+    scrubbed environment means the key is absent too, the script prints nothing,
+    and `_run_tier2` returned "(completed successfully)" -- which `_needs_retry`
+    reads as success. So B5 turned a misleading retry into a confident empty
+    answer one tier down. Both tiers have to say the same thing."""
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "sk-real-secret-value"}):
+        out = sandbox.run_code(
+            "import os\nprint(os.environ.get('GEMINI_API_KEY', ''))", tier=2)
+    assert "sk-real-secret-value" not in out, out
+    assert out.startswith("BLOCKED:"), out
+
+
+def test_both_tiers_word_the_refusal_identically():
+    from unittest.mock import patch
+    probe = "import os\nprint(os.environ.get('GEMINI_API_KEY', ''))"
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "sk-real-secret-value"}):
+        assert sandbox.run_code(probe, tier=1) == sandbox.run_code(probe, tier=2)
+
+
+def test_tier2_still_reports_success_when_an_injected_credential_was_present():
+    """Control: the credential the orchestrator injected on purpose is present,
+    so a silent run is a real silent run, not a withheld one."""
+    out = sandbox._run_tier2(
+        "import os\nv = os.environ.get('SERVICE_TOKEN', '')",
+        env_vars={"SERVICE_TOKEN": "injected-on-purpose"})
+    assert out == "(completed successfully)", out
+
+
+def test_tier2_still_reports_success_for_an_ordinary_silent_script():
+    out = sandbox.run_code("import os\nv = os.environ.get('PATH')", tier=2)
+    assert out == "(completed successfully)", out
+
+
+def test_tier2_output_is_untouched_when_the_script_printed_something():
+    out = sandbox.run_code(
+        "import os\nprint('ok:', os.environ.get('SOME_API_KEY', 'hidden'))", tier=2)
+    assert "ok: hidden" in out, out
+    assert "BLOCKED" not in out, out
+
+
 # ─── B2b: a spawn primitive is a capability, not a spelling ──────────────────
 # The stdlib scoping in B2 admitted any non-stdlib import on the reasoning that
 # it could only resolve to something `_ensure_packages` deliberately installed.
@@ -413,6 +456,62 @@ def test_the_legitimate_sdk_imports_still_pass():
     was never the problem, spawning from one was."""
     assert _ast_scan("import spotipy\nfrom docx import Document\n"
                      "import requests\nrequests.get('https://x')", tier=2) is None
+
+
+# ─── B6: the allow-list must not refuse TENKA's own first-party scripts ──────
+# Live regression from B2. `discovery.py:222` assembles a probe script that
+# reads an SDK method's signature after a TypeError. That is first-party code
+# from a template, not something a model wrote, and the Tier 2 allow-list
+# refused it -- so SDK discovery silently produced nothing:
+#
+#   [CODE] Discovery produced no data.
+#   Output: BLOCKED: import of 'inspect' not allowed in Tier 2
+
+_DISCOVERY_SNIPPET = (
+    "try:\n"
+    "    _r = client.list_items()\n"
+    "except TypeError as e:\n"
+    "    try:\n"
+    "        import inspect as _insp\n"
+    "        _sig = _insp.signature(client.list_items)\n"
+    "        print(f'DISCOVERY:signature={_sig}')\n"
+    "    except (ValueError, TypeError):\n"
+    "        pass\n"
+)
+
+
+def test_tier2_admits_the_discovery_probe_script():
+    assert _ast_scan(_DISCOVERY_SNIPPET, tier=2) is None
+
+
+def test_tier2_admits_the_real_generated_discovery_script():
+    """Built through discovery.py's own builder rather than a copied snippet, so
+    a future edit to the template is checked against the allow-list too."""
+    from assistant.code_executor.discovery import _build_discovery_script
+    sample = ("import spotipy\n"
+              "sp = spotipy.Spotify(auth='x')\n"
+              "res = sp.current_user_playlists()\n"
+              "print(res)\n")
+    script = _build_discovery_script(sample, {}, error_category="")
+    assert script is not None, "builder produced nothing; the test would be vacuous"
+    assert "import inspect" in script, script[:400]
+    assert _ast_scan(script, tier=2) is None, _ast_scan(script, tier=2)
+
+
+def test_tier1_still_refuses_inspect():
+    """Control, and the reason this is a tier split rather than a concession.
+    Tier 1 is an in-process exec sharing the daemon's interpreter, so `inspect`
+    there walks frames into TENKA's own stack and reaches live globals."""
+    assert _ast_scan("import inspect", tier=1) is not None
+    out = run_code("import inspect\nprint(inspect.currentframe())", tier=1)
+    assert "BLOCKED" in out or "ERROR" in out, out
+
+
+def test_tier2_still_refuses_the_import_that_started_all_this():
+    """Control: admitting `inspect` must not have loosened the list generally."""
+    assert _ast_scan("import ctypes", tier=2) is not None
+    assert _ast_scan("import multiprocessing", tier=2) is not None
+    assert _ast_scan("import importlib", tier=2) is not None
 
 
 # ─── B3: the Tier 2 environment allow-list ───────────────────────────────────

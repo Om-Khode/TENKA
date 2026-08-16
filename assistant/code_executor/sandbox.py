@@ -70,6 +70,11 @@ _ARGUMENT_SENSITIVE_CALL_ATTRS: frozenset[str] = frozenset({"system"})
 _BANNED_IMPORTS_TIER1: frozenset[str] = frozenset({
     "subprocess", "shutil", "socket", "http", "urllib",
     "requests", "httpx", "ctypes", "multiprocessing",
+    # `inspect` is allowed at Tier 2 and refused here — see the note on
+    # `_TIER2_ALLOWED_MODULES` for why the two tiers differ. The runtime
+    # allow-list in `_safe_import` already refused it; naming it here makes the
+    # split visible at scan time too, and gives the clearer message.
+    "inspect",
 })
 
 # ─── Tier 2 import allow-list ────────────────────────────────────────────────
@@ -107,6 +112,17 @@ _TIER2_ALLOWED_MODULES: frozenset[str] = frozenset({
     "logging", "warnings", "pprint", "argparse", "mimetypes",
     "zipfile", "tarfile", "sqlite3",
     "asyncio", "queue", "threading", "contextlib", "abc",
+    # `inspect` — Tier 2 only, and the asymmetry is deliberate. TENKA's own
+    # discovery probe (`discovery.py`) reads an SDK method's signature after a
+    # TypeError, so refusing it here silently broke first-party SDK discovery.
+    #
+    # It stays banned at Tier 1 because the tiers are not the same kind of
+    # thing: Tier 1 is an in-process exec sharing the daemon's interpreter, so
+    # frame walking there reaches TENKA's own stack and its live globals. Tier 2
+    # is a separate subprocess with a scrubbed environment — there is nothing of
+    # TENKA's in it to introspect, so the same capability reaches only the
+    # script's own frames and the SDK it just imported.
+    "inspect",
 })
 # Deliberately absent, and each absence is the point: subprocess, ctypes,
 # multiprocessing, importlib, winreg, pty, signal, gc, inspect, marshal,
@@ -410,9 +426,28 @@ _ENV_WITHHELD_MESSAGE = (
 )
 
 
+_SENSITIVE_ENV_PATTERNS = ('TOKEN', 'SECRET', 'KEY', 'PASSWORD', 'CREDENTIAL')
+
+# Where a script asks for a named environment variable. Used by Tier 2, which
+# has no proxy to record withholding — it is a subprocess, and B3 scrubbed the
+# variable out of its environment before it ever started.
+_ENV_LOOKUP_RE = re.compile(
+    r"""(?:environ\s*\.\s*get\s*\(|environ\s*\[|getenv\s*\()\s*['"]([A-Za-z_]\w*)['"]""")
+
+
+def _is_sensitive_env_name(key) -> bool:
+    return any(p in str(key).upper() for p in _SENSITIVE_ENV_PATTERNS)
+
+
+def _withheld_env_names(code: str, provided) -> list[str]:
+    """Sensitive-looking variables the script asked for and did not receive."""
+    return [n for n in dict.fromkeys(_ENV_LOOKUP_RE.findall(code))
+            if _is_sensitive_env_name(n) and n not in provided]
+
+
 class _ReadOnlyEnvProxy:
     """Read-only proxy for os.environ that hides sensitive keys."""
-    _SENSITIVE_PATTERNS = ('TOKEN', 'SECRET', 'KEY', 'PASSWORD', 'CREDENTIAL')
+    _SENSITIVE_PATTERNS = _SENSITIVE_ENV_PATTERNS
 
     def __init__(self, real_environ):
         self._env = real_environ
@@ -421,7 +456,7 @@ class _ReadOnlyEnvProxy:
         self.withheld: list[str] = []
 
     def _is_sensitive(self, key: str) -> bool:
-        return any(p in key.upper() for p in self._SENSITIVE_PATTERNS)
+        return _is_sensitive_env_name(key)
 
     def _withhold(self, key) -> None:
         if key not in self.withheld:
@@ -637,6 +672,14 @@ def _run_tier2(code: str, env_vars: dict | None = None, timeout: int = 30) -> st
             # Success — return stdout, or a success indicator if empty.
             # Action commands (pause, play, mute, etc.) often produce no output.
             # Previously "(no output)" caused _needs_retry to retry after success.
+            if not stdout and _withheld_env_names(code, env):
+                # B3 scrubbed the variable out of this subprocess's environment,
+                # so the script read nothing and exited 0. Reporting that as
+                # success is worse than Tier 1's old empty string: `_needs_retry`
+                # is False for it, so a refused read became a confident empty
+                # answer. Tier 1 escalates its BLOCKED here, so both tiers have
+                # to say the same thing or the escalation just relocates the lie.
+                return _ENV_WITHHELD_MESSAGE
             return stdout if stdout else "(completed successfully)"
         elif stderr:
             return f"ERROR: {stderr}"
