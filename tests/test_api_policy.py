@@ -37,9 +37,21 @@ def test_quick_carries_observation_but_no_stored_data():
     assert POLICIES["quick"].ceiling == frozenset({Capability.OBSERVE})
 
 
-def test_full_ceilings_are_every_capability():
-    for name in ("local", "tailnet", "funnel"):
-        assert POLICIES[name].ceiling == frozenset(Capability), name
+def test_the_local_ceiling_is_every_capability():
+    """The operator at the keyboard keeps full power. Milestone 6a.5 narrowed
+    the two tunnel ceilings; it did not downgrade the local path."""
+    assert POLICIES["local"].ceiling == frozenset(Capability)
+
+
+def test_no_tunnel_ceiling_carries_execute_or_system_control():
+    """Was `ceiling == frozenset(Capability)` for all three until 6a.5. That
+    spelling is what would have handed `EXECUTE` to the funnel listener the
+    moment the capability joined the enum -- a leaked pair code becoming a
+    remote shell, with nobody having decided to allow it."""
+    for name in ("tailnet", "funnel"):
+        assert Capability.EXECUTE not in POLICIES[name].ceiling, name
+        assert Capability.SYSTEM_CONTROL not in POLICIES[name].ceiling, name
+        assert Capability.CHAT_SEND in POLICIES[name].ceiling, name
 
 
 def test_effective_is_an_intersection_never_a_widening():

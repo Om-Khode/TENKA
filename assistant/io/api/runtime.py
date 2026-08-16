@@ -15,6 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from ...core.capabilities import Capability
+
 MemoryScope = Literal["knowledge", "preferences", "procedures"]
 SettingValue = str | int | float | bool
 
@@ -282,7 +284,11 @@ class StatusInfo:
 # ─── Protocols ───────────────────────────────────────────────────────────
 @runtime_checkable
 class ChatRuntime(Protocol):
-    async def send(self, text: str) -> TurnRef: ...
+    # `grants` is what the *authenticated device* may do, already narrowed by
+    # the listener ceiling. It has no default: a route that forgets it fails
+    # at the call rather than running the turn with whatever the pipeline
+    # would have assumed. See core/capabilities.py.
+    async def send(self, text: str, grants: frozenset[Capability]) -> TurnRef: ...
     async def conversations(self) -> list[ConversationRef]: ...
     async def conversation(self, conversation_id: str) -> ConversationDetail | None: ...
     async def abort(self) -> bool: ...

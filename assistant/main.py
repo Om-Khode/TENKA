@@ -57,6 +57,7 @@ from . import telemetry as _telemetry
 from . import knowledge_graph
 from datetime import datetime as _dt
 from .core.abort import abort
+from .core.capabilities import Capability
 from .core.redact import redact_secrets
 from .io.esc_monitor import esc_monitor
 from .io.status_broadcaster import status, StatusPhase
@@ -249,17 +250,20 @@ class _StudioDispatch:
     def busy(self) -> bool:
         return self._busy
 
-    async def submit(self, text: str) -> tuple[str, str, bool, str]:
+    async def submit(self, text: str,
+                     grants: "frozenset[Capability]") -> tuple[str, str, bool, str]:
         if self._busy:
             return ("", "", False, "busy")
         self._busy = True
         from . import session as session_mod
         self._counter += 1
         turn_id = f"studio-{self._counter}"
-        # Same 2-tuple shape process_text_from_queue's consumer loop
-        # already expects from the "chat" source (main.py:~1379) --
-        # not a third invented shape.
-        _input_queue.put(("studio", text))
+        # A 3-tuple, not the local sources' 2-tuple: the grant set has to
+        # travel with the turn, because the turn runs later on the consumer's
+        # task and the request that authorised it is gone by then.
+        # `_grants_for_item` is what reads it back, and it reads the third
+        # slot by source -- for a local item that slot is stt_ms.
+        _input_queue.put(("studio", text, grants))
         return (turn_id, session_mod.get_current_session_id(), True, "")
 
     def mark_done(self) -> None:
@@ -393,6 +397,16 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
 
         _studio_vault = TokenVault(config.SANDBOX_DIR)
         if not _studio_vault.devices():
+            # `frozenset(Capability)` is the same enum-derived spelling that
+            # Milestone 6a.5 deleted from policy.py's ceilings -- and here it
+            # is correct. This is the operator's own desktop Studio, on the
+            # loopback listener, and it should hold every capability
+            # including any added later; that is what "the person is at the
+            # machine" means. Do not "fix" it by applying policy.py's lesson
+            # uniformly: an explicit literal here would silently strip the
+            # operator's own client of EXECUTE the next time the enum grows,
+            # and it would read as a bug, not as a policy change. The ceiling
+            # is where transports are decided; this is a device.
             _studio_token = _studio_vault.issue("studio", frozenset(Capability))
             # The raw token goes to stdout ONLY -- a browser can't read a
             # file, so this is the one and only time the operator can
@@ -870,9 +884,17 @@ def _publish_turn_status(source: str, phase: StatusPhase) -> None:
         pass
 
 
-async def process_text_from_queue(source: str, transcription: str, bridge: UnityBridge, stt_ms: int | None = None):
+async def process_text_from_queue(source: str, transcription: str, bridge: UnityBridge,
+                                  stt_ms: int | None = None,
+                                  grants: "frozenset[Capability] | None" = None):
     """
     Run Intent → Policy → Action/LLM → TTS → Unity animations
+
+    `grants` is what the caller driving this turn is allowed to ask for.
+    `None` means "nobody said", and `actions.execute()` refuses everything in
+    that state -- it is not a synonym for the local full set. Callers that
+    know the answer state it; `_grants_for_item` is the one that decides for
+    a queued item.
     """
     global _turn_counter
     from . import session as session_mod
@@ -883,6 +905,11 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     )
     _tracker.latency_stt_ms = stt_ms
     _tracker_token = _telemetry.set_current_tracker(_tracker)
+    # Same token pattern as the tracker above, and reset in the same
+    # `finally`. Every intent this turn dispatches -- including the ones a
+    # planner step re-enters with -- is checked against this set.
+    _grants_token = _actions_module.set_grants(
+        frozenset() if grants is None else grants)
     _t0_intent = _time.monotonic()
 
     # Pause wake word detection during execution
@@ -890,10 +917,17 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         _wake_listener.pause()
 
     try:
+        # `!r`, not hand-written quotes. A newline in the text used to end the
+        # log line and start a second one that an operator grepping debug.log
+        # after an incident would read as a real entry -- attacker-authored
+        # text choosing what the audit trail says. repr() escapes the newline
+        # to `\n` and keeps the whole thing on one quoted line. redact_secrets
+        # is the other half and does not cover this: it removes secrets, not
+        # line breaks.
         if source == "stt":
-            logger.info(f'Transcription (STT): "{redact_secrets(transcription)}"')
+            logger.info(f'Transcription (STT): {redact_secrets(transcription)!r}')
         else:
-            logger.info(f'Transcription (Chat): "{redact_secrets(transcription)}"')
+            logger.info(f'Transcription (Chat): {redact_secrets(transcription)!r}')
 
         # The turn has begun. See _publish_turn_status: this is a no-op for
         # every local source, and for "studio" it is the frame that replaces
@@ -1623,6 +1657,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     finally:
         _tracker.save()
         _telemetry.reset_current_tracker(_tracker_token)
+        _actions_module.current_grants.reset(_grants_token)
         # The turn this "studio" item started is only now actually over --
         # success, failure or an early return above all reach this
         # `finally`. Clearing the busy flag here, not at the instant
@@ -1638,6 +1673,29 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # (resume() auto-clears ring buffer to prevent TTS audio bleed)
         if _wake_listener:
             _wake_listener.resume()
+
+
+def _grants_for_item(item: tuple) -> "tuple[frozenset[Capability], int | None]":
+    """Read a queued item's grant set and its STT timing out of its third slot.
+
+    Two producers put items on `_input_queue` and they mean different things
+    by that slot, which is why this is a function and not an inline unpack:
+
+    - Local sources ("stt", "chat") enqueue `(source, text)` or
+      `(source, text, stt_ms)`. They get the full set, stated explicitly --
+      the person is at this machine, and that is a deliberate grant, not the
+      absence of one.
+    - Studio enqueues `(source, text, grants)`, the set the authenticated
+      device holds after the listener ceiling narrowed it.
+
+    A "studio" item without a third slot -- which nothing produces today --
+    gets the *empty* set, not the full one. It means the grant was lost in
+    transit, and a lost grant is refused, never assumed.
+    """
+    extra = item[2] if len(item) > 2 else None
+    if item[0] == "studio":
+        return (extra if isinstance(extra, frozenset) else frozenset()), None
+    return frozenset(Capability), extra
 
 
 async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
@@ -1667,7 +1725,7 @@ async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
     all.
     """
     source, text = item[0], item[1]
-    stt_ms = item[2] if len(item) > 2 else None
+    grants, stt_ms = _grants_for_item(item)
     # The status bracket is mirrored here for the same reason mark_done() is,
     # and it has to be *both* halves: a raise before the inner try: leaves the
     # bus at whatever the previous turn ended on, and a lone closing IDLE
@@ -1677,7 +1735,8 @@ async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
     # already documents.
     _publish_turn_status(source, StatusPhase.THINKING)
     try:
-        await process_text_from_queue(source, text, bridge, stt_ms=stt_ms)
+        await process_text_from_queue(source, text, bridge, stt_ms=stt_ms,
+                                      grants=grants)
     finally:
         _publish_turn_status(source, StatusPhase.IDLE)
         if source == "studio" and _studio_dispatch is not None:
