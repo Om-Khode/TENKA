@@ -109,6 +109,96 @@ import queue as _queue
 _search_result_queue: _queue.Queue = _queue.Queue()
 
 
+# ─── Capability grants for the turn in flight ────────────────────────────
+
+import contextvars as _contextvars
+
+from ..core.capabilities import Capability
+from ..core.intent_capabilities import DEFAULT_REQUIRED, REQUIRED_CAPABILITY
+
+current_grants: _contextvars.ContextVar["frozenset[Capability] | None"] = \
+    _contextvars.ContextVar("tenka_current_grants", default=None)
+"""What the caller driving this turn is allowed to ask for.
+
+A contextvar rather than a parameter for the same reason
+`_telemetry.set_current_tracker` is one: `execute()` re-enters itself through
+`planner/executor.py`, and threading a grant set through every handler
+signature would mean every future handler is one forgotten argument away from
+running unchecked. A contextvar is inherited by nested tasks automatically.
+
+**The default is `None`, and `None` refuses.** Not "no restriction" -- the
+absence of a decision is not a decision to allow. A turn that reaches dispatch
+without anyone setting this is a bug, and the safe behaviour for that bug is
+to do nothing.
+"""
+
+LOCAL_GRANTS: "frozenset[Capability]" = frozenset(Capability)
+"""What a caller physically at this machine holds: everything.
+
+Voice, the console, and the background automation runners (the scheduler and
+the event bus) all set this explicitly. Setting it is a deliberate grant --
+the person is at the keyboard, or the thing firing was installed by someone
+who held EXECUTE at the time. It is never what an unset contextvar falls back
+to; see `current_grants`.
+"""
+
+
+def set_grants(grants: "frozenset[Capability]") -> "_contextvars.Token":
+    """Declare what the turn about to run may do. Reset the token when it ends.
+
+    Deliberately a plain setter with no default: every call site has to name a
+    grant set, so "which caller is this?" is answered once, visibly, at the
+    place that knows.
+    """
+    return current_grants.set(grants)
+
+
+def _refuse(required: Capability) -> str:
+    """The refusal a caller sees when its grant set does not cover the intent.
+
+    Names the capability -- the operator needs to know which one to grant --
+    and nothing else. It must not leak what the intent would have done: a
+    device that cannot reach `shutdown` should not learn that shutdown is a
+    thing she can do. Under 120 chars with no paths and no error codes,
+    because it may be spoken.
+    """
+    return (f"That needs the {required.value} permission, "
+            f"which this device doesn't have.")
+
+
+def capability_refusal(required: Capability) -> "str | None":
+    """May the turn in flight do a thing that costs `required`?
+
+    Returns `None` when it may, and the refusal sentence when it may not.
+
+    **This is the only predicate in the tree that answers that question.**
+    `execute()` below calls it, and so does every branch of
+    `main.py:process_text_from_queue` that produces an effect and returns
+    before dispatch, and so does `procedure_executor.run_procedure` as a
+    backstop for the scheduler. That matters more than it looks: the 6a.5
+    review found the gate guarding the last door while five earlier ones stood
+    open, and the reason a second door could be built unguarded is that the
+    check lived *inside* `execute()` rather than beside it as something a
+    caller could ask. A separate re-implementation at each site would be the
+    same mistake with more code.
+
+    Fails closed twice over: an unset grant set (`None`) refuses everything --
+    the absence of a decision is not a decision to allow -- and any caller that
+    wants a capability the turn does not hold is refused rather than warned.
+
+    Deliberately synchronous and side-effect free apart from a log line, so a
+    branch can consult it in an `if` condition without restructuring itself.
+    """
+    granted = current_grants.get()
+    if granted is not None and required in granted:
+        return None
+    logger.info(
+        f"Refused: needs {required.value}, caller holds "
+        f"{'nothing (grants unset)' if granted is None else sorted(c.value for c in granted)}"
+    )
+    return _refuse(required)
+
+
 # â"€â"€â"€ Preference-Aware Defaults â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€â"€
 
 
@@ -266,6 +356,25 @@ async def execute(intent: str, params: dict, llm_response: str = "",
     """
     if intent == "read_file":
         intent = "file_task"
+
+    # ── The capability gate ──────────────────────────────────────────────
+    # This is the only site in the tree that resolves a handler, and
+    # planner/executor.py re-enters through it, so a planned step is checked
+    # by the same rule as a direct turn, recursively -- without the planner
+    # knowing the rule exists.
+    #
+    # Placed above _apply_preference_defaults deliberately: a refused intent
+    # must not first read the preference store and mutate its params. The
+    # refusal costs one dict lookup and touches nothing.
+    #
+    # An unclassified intent requires EXECUTE, and an unset grant set refuses
+    # everything. Both are the fail-closed direction; see
+    # core/intent_capabilities.py and `current_grants`.
+    _required = REQUIRED_CAPABILITY.get(intent, DEFAULT_REQUIRED)
+    _refusal = capability_refusal(_required)
+    if _refusal is not None:
+        logger.info(f"Refused intent '{intent}'")
+        return _refusal
 
     # Apply preference defaults before routing
     params = _apply_preference_defaults(intent, params)

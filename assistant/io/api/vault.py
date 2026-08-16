@@ -9,7 +9,6 @@ Layering: io/api — core + config only.
 """
 from __future__ import annotations
 
-import enum
 import hmac
 import json
 import logging
@@ -20,8 +19,10 @@ import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
+from hashlib import pbkdf2_hmac, sha256
 from pathlib import Path
+
+from ...core.capabilities import Capability
 
 logger = logging.getLogger(__name__)
 
@@ -40,40 +41,78 @@ _SCHEMA_VERSION = 1
 # rate.
 _TOUCH_THROTTLE = timedelta(seconds=60)
 
+# ─── a non-hex TENKA_SECRET ──────────────────────────────────────────────
+# `instance_secret()`'s docstring says a `TENKA_SECRET` that is not a 32-byte
+# key is refused, because "silently accepting a weak key ... would hide the
+# operator's mistake instead of surfacing it." On the hex branch that was true.
+# On the *non-hex* branch it was not: `TENKA_SECRET=hunter2` is not hex, so it
+# fell past the length check entirely and one unsalted SHA-256 turned it into
+# the HMAC key for every device token this daemon ever issues -- and made the
+# ValueError guard app.py advertises unreachable for the likeliest
+# misconfiguration there is.
+#
+# Two things were wrong with that and only one of them is the derivation.
+#
+# The derivation is fixed here. A single SHA-256 of a passphrase costs an
+# attacker who has read `devices.json` one hash per guess; PBKDF2-HMAC-SHA256
+# at 600,000 iterations (OWASP's 2023 figure for this construction) costs the
+# same attacker 600,000. It does not make `hunter2` a good key -- nothing can
+# -- but it moves an offline recovery of the operator's passphrase from
+# instant to expensive, and `devices.json` holds exactly the `token_hmac`
+# values such an attack needs.
+#
+# The salt is a fixed label and that is forced, not lazy: the entire point of
+# the env override is that the same value yields the same key on every machine
+# and every restart, so there is nowhere to store a random salt that would not
+# also have to be shared. A per-installation salt would break the one workflow
+# this variable exists for. The label is domain-separating -- this key is never
+# confused with a hash of the same passphrase computed for anything else --
+# which is what a salt buys when it cannot be random.
+#
+# The other thing wrong was silence, and a stronger KDF does not fix silence.
+# `_stretch_passphrase` logs a WARNING naming the mistake and what to do about
+# it. It is deliberately not a refusal: an operator setting a passphrase on
+# purpose -- to share one secret across two machines, which is the documented
+# reason this variable is read before the file -- would otherwise find the
+# daemon dead at startup, and the value has already been chosen deliberately
+# enough to be typed into an environment.
+#
+# Cached, because it is not cheap. 600,000 iterations is ~250ms, and
+# `instance_secret()` is called from `_hash()`, which `verify()` calls on
+# every single request. Keyed on the passphrase itself, so an operator who
+# changes the variable gets the new key rather than the cached old one -- the
+# precedence `test_env_var_wins_over_both_the_stored_and_the_cached_secret`
+# pins.
+_PASSPHRASE_ITERATIONS = 600_000
+_PASSPHRASE_SALT = b"tenka:instance-secret:v1"
+_passphrase_cache: dict[str, bytes] = {}
 
-class Capability(str, enum.Enum):
-    """What a device is allowed to ask for. Granted per device, never implied."""
 
-    # Watching her work: status, telemetry, the live /v1/events stream, and
-    # the routes that describe how she is configured (settings, personality,
-    # the command catalogue, whether backups run). Everything here is about
-    # the assistant herself, and none of it is something a user told her.
-    OBSERVE = "observe"
-    # Reading what she stored: conversation transcripts, the knowledge graph,
-    # preferences, taught procedures, the names of the people she recognises.
-    #
-    # Split out of the old `CHAT`, which meant both of these at once. That
-    # ambiguity let the `quick` ceiling -- the Cloudflare tunnel, where a
-    # third party terminates TLS and reads the plaintext -- look like
-    # "observation only" while actually admitting the entire knowledge graph
-    # and every transcript. `read_screen` and `camera_look` are intents, so
-    # her narration of what was on screen lands in a transcript: excluding
-    # SCREEN from that ceiling while admitting RECALL was excluding the
-    # photograph and shipping the description.
-    #
-    # Neither implies the other. A wall display may watch without reading a
-    # word she was told; an archive tool may read history without a live view.
-    RECALL = "recall"
-    # POST /v1/chat hands text to the same pipeline voice uses, so it reaches
-    # every intent -- code_executor, file_task, shutdown, manage_backup --
-    # not just conversation. Neither read capability may carry that: both gate
-    # routes a device should be able to hold without being able to drive her.
-    # Split so a device can be trusted to read a transcript without being
-    # trusted to act on the machine through one.
-    CHAT_SEND = "chat_send"
-    SCREEN = "screen"
-    FILES = "files"
-    SYSTEM_CONTROL = "system_control"
+def _stretch_passphrase(passphrase: str) -> bytes:
+    cached = _passphrase_cache.get(passphrase)
+    if cached is not None:
+        return cached
+    logger.warning(
+        "[API] TENKA_SECRET is not 64 hex characters, so it is being treated "
+        "as a passphrase and stretched into a key. That is weaker than a real "
+        "256-bit secret: generate one with "
+        "`py -3.11 -c \"import secrets; print(secrets.token_hex(32))\"` and "
+        "set TENKA_SECRET to it.")
+    derived = pbkdf2_hmac("sha256", passphrase.encode("utf-8"),
+                          _PASSPHRASE_SALT, _PASSPHRASE_ITERATIONS)
+    _passphrase_cache[passphrase] = derived
+    return derived
+
+
+# `Capability` is imported at the top of this module and re-exported here (see
+# `__all__`) so every existing `from .vault import Capability` keeps working.
+# It moved to `core/capabilities.py` because `actions/` has to read it to
+# enforce the EXECUTE check at the dispatch choke point, and
+# `actions/ -> io/api/` is not a legal import edge while `actions/ -> core/`
+# is. The enum's own docstring, including the OBSERVE/RECALL split reasoning,
+# travelled with it.
+__all__ = ["Capability", "Device", "TokenVault", "VaultUnavailableError",
+           "VaultReadError", "VaultWriteError"]
 
 
 @dataclass(frozen=True)
@@ -331,6 +370,12 @@ class TokenVault:
         an explicit override -- silently accepting a weak key, or silently
         substituting a different secret than the one asked for, would both
         hide the operator's mistake instead of surfacing it.
+
+        A value that is not hex at all is a passphrase, and it is stretched
+        rather than refused -- but by `_stretch_passphrase`, not by the single
+        unsalted SHA-256 that used to sit here. See that function for the
+        argument; the short version is that the paragraph above promised the
+        weak-key case does not happen, and on the non-hex branch it did.
         """
         env = os.getenv("TENKA_SECRET")
         if env:
@@ -338,7 +383,7 @@ class TokenVault:
             try:
                 secret = bytes.fromhex(stripped)
             except ValueError:
-                return sha256(stripped.encode("utf-8")).digest()
+                return _stretch_passphrase(stripped)
             if len(secret) != 32:
                 raise ValueError(
                     f"TENKA_SECRET decodes to {len(secret)} bytes; a 256-bit "

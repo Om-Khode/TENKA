@@ -11,6 +11,13 @@ import re
 
 logger = logging.getLogger("planner")
 
+_STEP_REF_RE = re.compile(r'\$step_(\d+)')
+
+#: `_planner_goal` becomes the Tavily recon query in `automation/router.py`,
+#: which is network egress. A user goal is a sentence; anything longer is
+#: something else having got in.
+_MAX_PLANNER_GOAL_CHARS = 400
+
 
 # --- Pending state snapshotting ---
 
@@ -47,8 +54,8 @@ async def execute_step(
     Pseudo-tools are handled via pseudo_tools module.
     """
     from .planner import (
-        _evaluate_condition, _resolve_references, _step_failed,
-        _brief, _extract_note_params, TOOL_MANIFEST,
+        _evaluate_condition, _split_references, _step_failed,
+        _brief, _extract_note_params, TOOL_MANIFEST, EGRESS_REFUSED,
     )
     from .pseudo_tools import (
         run_synthesize_step, run_vision_analyze_step,
@@ -63,7 +70,27 @@ async def execute_step(
         return
 
     # ── Resolve $step_N references in the goal ─────────────────────
-    resolved_goal = _resolve_references(step.goal, plan)
+    # The fence (milestone 6a.5, spec §5.3). Prior-step output is untrusted --
+    # a planted file, OCR of the screen, a fetched page -- so it is split out
+    # of the instruction and carried separately in `step_context`. Everything
+    # downstream of here (TTS, logging, llm_response, the cache key) uses the
+    # instruction, which is the user's own words.
+    resolved_goal, step_context = _split_references(step.goal, plan, step.tool)
+
+    # An egress param (a URL to navigate to, a query shipped to a search
+    # provider) would not reduce to one -- 6a.5 review H1. Fail the step here
+    # rather than hand a planted document to the network. The reason is the
+    # step's error, so recovery and the final synthesis both see it.
+    if resolved_goal.startswith(EGRESS_REFUSED):
+        reason = resolved_goal[len(EGRESS_REFUSED):].strip()
+        step.status = "failed"
+        step.error = f"blocked: {reason}"
+        step.output = step.error
+        logger.warning(
+            f"[PLANNER] Step {step.step_id} BLOCKED [{step.tool}]: {reason}"
+        )
+        return
+
     step.status = "running"
 
     logger.info(f"[PLANNER] Step {step.step_id} RUNNING: [{step.tool}] "
@@ -87,9 +114,11 @@ async def execute_step(
     try:
         # ── Handle pseudo-tools internally ─────────────────────────
         if step.tool == "synthesize":
-            result = await run_synthesize_step(resolved_goal, llm_func)
+            result = await run_synthesize_step(resolved_goal, llm_func,
+                                               context=step_context)
         elif step.tool == "vision_analyze":
-            result = await run_vision_analyze_step(resolved_goal, tts_func)
+            result = await run_vision_analyze_step(resolved_goal, tts_func,
+                                                   context=step_context)
         elif step.tool == "camera_preview":
             result = await run_camera_preview_step(resolved_goal, tts_func)
         elif step.tool == "prompt_user":
@@ -98,11 +127,28 @@ async def execute_step(
             # ── Dispatch to existing tool via actions.execute() ────
             import assistant.actions as _actions_mod
 
-            param_key = TOOL_MANIFEST.get(step.tool, {}).get("param_key", "goal")
+            _entry = TOOL_MANIFEST.get(step.tool, {})
+            param_key = _entry.get("param_key", "goal")
             params = {param_key: resolved_goal}
 
+            # Prior-step output travels in its own param, never merged back
+            # into the instruction. Omitted entirely when there is none, so a
+            # single-step goal does not carry an empty labelled block.
+            context_key = _entry.get("context_key")
+            if step_context and context_key:
+                params[context_key] = step_context
+
             if step.tool in ("browser_action", "app_action"):
-                params["_planner_goal"] = plan.original_goal
+                # 6a.5 review H3. This is a SECOND string reaching two tools
+                # whose manifest rows say they accept no prior-step output,
+                # and `_split_references` never sees it. Two things make it
+                # safe rather than one: the 3D continuation no longer splices
+                # a step's output into `original_goal` (planner.py), and the
+                # value is scrubbed here so a future path that reintroduces a
+                # reference cannot deliver it. `$step_N` is dropped rather
+                # than resolved -- this field is the user's words or nothing.
+                _pg = _STEP_REF_RE.sub("", plan.original_goal or "")
+                params["_planner_goal"] = _pg[:_MAX_PLANNER_GOAL_CHARS]
 
             if step.tool == "create_note":
                 params = _extract_note_params(resolved_goal)

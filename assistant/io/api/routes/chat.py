@@ -14,7 +14,7 @@ from ..payloads import (
 )
 from ..schemas import ChatRequest, Envelope
 from ..security import require
-from ..vault import Capability
+from ..vault import Capability, Device
 
 router = APIRouter()
 
@@ -22,8 +22,18 @@ router = APIRouter()
 # ─── Sending a turn ──────────────────────────────────────────────────────
 @router.post("/chat", status_code=status.HTTP_202_ACCEPTED)
 async def send_chat(body: ChatRequest, request: Request,
-                    _=Depends(require(Capability.CHAT_SEND))) -> Envelope[ChatSendPayload]:
-    ref = await request.app.state.runtime.chat.send(body.text)
+                    device: Device = Depends(require(Capability.CHAT_SEND))
+                    ) -> Envelope[ChatSendPayload]:
+    # `device.grants` is already `effective(issued, listener ceiling)` --
+    # `authenticate()` narrows before `require()` hands the Device back -- so
+    # this is the intersection the ceiling exists to enforce, not the device's
+    # issued set. It is passed rather than recomputed: a second computation is
+    # a second chance to compute it differently.
+    #
+    # CHAT_SEND alone used to reach every intent through this route, because
+    # the pipeline behind it applied no further check. It is the entry
+    # permission now, and what the turn may actually *do* travels with it.
+    ref = await request.app.state.runtime.chat.send(body.text, device.grants)
     if not ref.accepted:
         # Deliberately generic: a caller that cannot authenticate any further
         # than "holds a read token" should not learn *what* she is doing --

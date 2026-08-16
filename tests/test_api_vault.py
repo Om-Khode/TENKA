@@ -3,7 +3,7 @@ import json
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
+from hashlib import pbkdf2_hmac, sha256
 from pathlib import Path
 
 import pytest
@@ -361,16 +361,67 @@ def test_env_var_with_wrong_length_hex_raises_loudly(tmp_path, monkeypatch):
         vault.instance_secret()
 
 
-def test_env_var_that_is_not_hex_is_hashed_into_a_key(tmp_path, monkeypatch):
+def test_env_var_that_is_not_hex_is_stretched_into_a_key(tmp_path, monkeypatch):
     # A passphrase is not a 256-bit key, but it is unambiguously deliberate, so
     # it is stretched into one rather than rejected. Nothing is persisted: the
     # override lives in the environment, and writing it to disk would outlive
     # the variable that set it.
+    #
+    # Amended on `fix/6a5-api-review`. The decision -- stretch, do not refuse
+    # -- is unchanged; the derivation is not. This used to assert a single
+    # unsalted `sha256`, which is one hash per guess for anyone who has read
+    # the `token_hmac` values out of devices.json, and the review's P2-10
+    # named it against `instance_secret()`'s own promise that a weak key is
+    # never silently accepted. It is PBKDF2-HMAC-SHA256 now, with a fixed
+    # domain-separating label as the salt because a random one could not be
+    # shared across the machines this override exists to share a secret
+    # between. `_stretch_passphrase` also logs a WARNING naming the mistake,
+    # which is the half a stronger KDF cannot supply.
+    from assistant.io.api.vault import (_PASSPHRASE_ITERATIONS,
+                                        _PASSPHRASE_SALT, _passphrase_cache)
+
+    _passphrase_cache.clear()
     monkeypatch.setenv("TENKA_SECRET", "  correct horse battery staple  ")
     vault = TokenVault(tmp_path)
 
-    assert vault.instance_secret() == sha256(b"correct horse battery staple").digest()
+    secret = vault.instance_secret()
+    assert secret == pbkdf2_hmac("sha256", b"correct horse battery staple",
+                                 _PASSPHRASE_SALT, _PASSPHRASE_ITERATIONS)
+    assert secret != sha256(b"correct horse battery staple").digest(), (
+        "a passphrase must not be one unsalted hash away from the HMAC key "
+        "for every device token")
+    assert len(secret) == 32
     assert not (tmp_path / "instance_secret").exists()
+
+
+def test_a_stretched_passphrase_is_derived_once_and_reused(tmp_path, monkeypatch):
+    """600,000 PBKDF2 iterations is ~250ms, and `instance_secret()` is on the
+    path of every `verify()` -- so every request. The cache is what keeps the
+    stronger derivation from being a denial of service against the daemon
+    itself, and it is keyed on the passphrase so that changing the variable
+    still changes the key."""
+    from assistant.io.api import vault as vault_mod
+
+    vault_mod._passphrase_cache.clear()
+    calls: list[int] = []
+    real = vault_mod.pbkdf2_hmac
+
+    def _counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(vault_mod, "pbkdf2_hmac", _counted)
+    monkeypatch.setenv("TENKA_SECRET", "correct horse battery staple")
+    vault = TokenVault(tmp_path)
+
+    first = vault.instance_secret()
+    for _ in range(5):
+        assert vault.instance_secret() == first
+    assert len(calls) == 1, f"derived {len(calls)} times, not once"
+
+    monkeypatch.setenv("TENKA_SECRET", "a completely different passphrase")
+    assert vault.instance_secret() != first, (
+        "the cache outranked an explicit operator override")
 
 
 def test_env_var_wins_over_both_the_stored_and_the_cached_secret(tmp_path, monkeypatch):

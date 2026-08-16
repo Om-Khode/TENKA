@@ -445,14 +445,17 @@ KG_QUERY_INJECTION_ENABLED = os.environ.get("KG_QUERY_INJECTION_ENABLED", "true"
 # substring-match inside "form with" / "alarm went off", which broke any goal
 # mentioning a form field. Patterns with mandatory punctuation (rm/, exec()
 # already self-anchor and don't need \b.
-DANGEROUS_PATTERNS = [
-    r"\brm\b", r"rm/", r"\brmdir\b",
-    r"\bshell\b", r"exec\(", r"eval\(", r"execute\(", r"\bcmd\b", r"\bcommand\b",
-    r"\bsudo\b", r"\badmin\b", r"\broot\b",
-    r"\bformat\b", r"\bfdisk\b", r"\bmkfs\b",
-    r"\bshutdown\b", r"\breboot\b", r"\brestart\b",
-    r"\bkill\b", r"\bterminate\b", r"\btaskkill\b",
-]
+# DANGEROUS_PATTERNS was removed in milestone 6a.5. It was a regex deny-list
+# over intent parameters -- \brm\b, \bshell\b, \bformat\b, \bkill\b, \badmin\b,
+# \broot\b and friends -- and `policy.py`'s module docstring records in full
+# why it was deleted rather than extended. The short version: it judged a
+# string `main.py` overwrote immediately afterwards, it was evadable with one
+# Cyrillic character, and it refused ordinary English like "format this as a
+# table" and "restart the music".
+#
+# Do not reintroduce it. If a new class of harm needs blocking, the boundary
+# is a capability in `core/capabilities.py` enforced at dispatch, not a list
+# of words a user may not say.
 
 
 # ─── Wake Word (openWakeWord) ─────────────────────────────────────────────────

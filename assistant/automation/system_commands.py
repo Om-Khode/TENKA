@@ -8,6 +8,7 @@ Handles bluetooth/wifi toggles, shell command validation, and elevated PowerShel
 import logging
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import uuid
@@ -23,7 +24,10 @@ ALLOWED_EXECUTABLES = frozenset({
     "systeminfo", "shutdown",
 })
 
-_SHELL_METACHAR_RE = re.compile(r'[&|;`$\n\r]')
+# '>' and '<' were absent, and _run_shell used shell=True: that was arbitrary
+# file create/overwrite with the compound-command guard fully satisfied.
+# '%' closes cmd.exe variable expansion.
+_SHELL_METACHAR_RE = re.compile(r'[&|;`$><%\n\r]')
 
 # ─── Banned Command Patterns ────────────────────────────────────────────────
 # Commands that can brick hardware, destroy data, or make the system unrecoverable.
@@ -69,8 +73,12 @@ _BANNED_CMD_PATTERNS: list[tuple[re.Pattern, str]] = [
      "Set-Service can permanently disable services"),
     (re.compile(r'\bsc\s+(delete|stop|config)\b', re.IGNORECASE),
      "sc delete/stop/config can disable or remove services"),
+    (re.compile(r'\bsc\s+create\b', re.IGNORECASE),
+     "sc create installs a service that runs at boot — persistence"),
     (re.compile(r'\bnet\s+stop\b', re.IGNORECASE),
      "net stop can disable critical services"),
+    (re.compile(r'\bnet\s+use\b', re.IGNORECASE),
+     "net use mounts a remote share and can carry credentials to it"),
 
     # --- User / privilege escalation ---
     (re.compile(r'\bNew-LocalUser\b', re.IGNORECASE),
@@ -87,6 +95,8 @@ _BANNED_CMD_PATTERNS: list[tuple[re.Pattern, str]] = [
      "reg delete can corrupt the registry"),
     (re.compile(r'\breg\s+add\b', re.IGNORECASE),
      "reg add can modify critical registry settings"),
+    (re.compile(r'\breg\s+import\b', re.IGNORECASE),
+     "reg import writes arbitrary registry keys from a file, Run keys included"),
 
     # --- Arbitrary code execution / payload download ---
     (re.compile(r'\bInvoke-Expression\b', re.IGNORECASE),
@@ -109,7 +119,9 @@ _BANNED_CMD_PATTERNS: list[tuple[re.Pattern, str]] = [
      "Set-MpPreference can disable Windows Defender"),
 
     # --- PowerShell encoded command bypass ---
-    (re.compile(r'\b-EncodedCommand\b', re.IGNORECASE),
+    # No leading \b: the character before '-' is a space, and neither is a word
+    # character, so there is no boundary there and the pattern never matched.
+    (re.compile(r'-EncodedCommand\b', re.IGNORECASE),
      "EncodedCommand can hide any payload in base64"),
     (re.compile(r'\s-Enc\b', re.IGNORECASE),
      "Abbreviated -EncodedCommand bypass"),
@@ -223,15 +235,46 @@ def _validate_shell_command(cmd: str) -> str | None:
         return banned
     if _SHELL_METACHAR_RE.search(cmd):
         return "Blocked: compound commands not allowed"
-    tok = cmd.split()[0].lower().rstrip(".exe")
+    # removesuffix, not rstrip: rstrip takes a character *set*, so
+    # "regex.exe" lost its trailing run of '.', 'e' and 'x' and normalised to
+    # "reg" — an allow-listed name satisfied by an executable that is not on
+    # the list.
+    tok = cmd.split()[0].lower().removesuffix(".exe")
     if tok not in ALLOWED_EXECUTABLES:
         return f"Blocked: '{tok}' not allowed."
     return None
 
 
-def _run_shell(cmd):
+def _split_command(cmd: str) -> list[str]:
+    """Split an already-validated command string into an argv list.
+
+    posix=False because Windows paths are full of backslashes and posix mode
+    treats them as escapes — `reg query HKLM\\SOFTWARE` would lose its
+    separators. The cost is that quote characters stay inside the token, so
+    they are stripped back off here; otherwise the child process would see
+    literal quotes where the shell used to remove them.
+    """
+    argv = []
+    for part in shlex.split(cmd, posix=False):
+        if len(part) >= 2 and part[0] == part[-1] and part[0] in ('"', "'"):
+            part = part[1:-1]
+        argv.append(part)
+    return argv
+
+
+def _run_shell(argv):
+    """Run a validated command as an argv list, with no shell in the way.
+
+    shell=False is the point. `_validate_shell_command` already forbids
+    compound commands, so a shell bought nothing and cost the entire
+    metacharacter class — redirection, expansion, quoting tricks, and every
+    variant nobody thought to add to the regex. An argv list deletes the class
+    instead of enumerating it; the regex stays as depth.
+    """
+    if isinstance(argv, str):
+        argv = _split_command(argv)
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+        r = subprocess.run(argv, shell=False, capture_output=True, text=True,
                            encoding='utf-8', errors='replace', timeout=10)
         if r.returncode == 0:
             return True, r.stdout.strip() or "Done."
@@ -314,7 +357,7 @@ def _run_known_command(e):
         return _run_elevated_ps(e["script"])
     if "script" in e:
         return _run_ps_script(e["script"])
-    return _run_shell(e["cmd"])
+    return _run_shell(_split_command(e["cmd"]))
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -337,7 +380,7 @@ async def run_system_command(goal, llm_func):
         if err.startswith("BANNED:"):
             return "Blocked: command is banned for safety."
         return err
-    ok, out = _run_shell(cmd)
+    ok, out = _run_shell(_split_command(cmd))
     if ok:
         return out
     retry = await llm_func(f"Failed: {out}\nCorrected command for: {goal_safe}\nOnly the command.", task_type="code_gen")
@@ -349,5 +392,5 @@ async def run_system_command(goal, llm_func):
         if err2.startswith("BANNED:"):
             return "Blocked: command is banned for safety."
         return _clean_error_for_user_sync(out)
-    ok2, out2 = _run_shell(retry)
+    ok2, out2 = _run_shell(_split_command(retry))
     return out2 if ok2 else _clean_error_for_user_sync(out2)

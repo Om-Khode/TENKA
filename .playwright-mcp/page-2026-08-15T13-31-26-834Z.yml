@@ -1,0 +1,10 @@
+- main [ref=e2]:
+  - generic [ref=e3]: TENKA STUDIO
+  - generic [ref=e4]:
+    - heading "Pair this device" [level=1] [ref=e5]
+    - paragraph [ref=e6]: Scan the QR she showed you, or type the code printed alongside it.
+  - generic [ref=e7]:
+    - generic [ref=e8]: pairing code
+    - textbox "pairing code" [ref=e9]:
+      - /placeholder: XXXX-XXXX
+    - button "pair" [ref=e10]

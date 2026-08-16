@@ -30,14 +30,21 @@ from dataclasses import dataclass
 
 from .vault import Capability
 
-# `local`, `tailnet`, and `funnel` derive their ceiling from the enum itself,
-# so a capability added to `Capability` later flows into all three
-# automatically -- appropriate for transports already trusted with
-# everything. `quick` spells its ceiling out as an explicit literal instead
-# (see below) precisely so that inheritance does NOT happen there: a
-# disclosure-limited transport must never silently gain a capability nobody
-# vetted for it just because the enum grew.
-_ALL_CAPABILITIES = frozenset(Capability)
+# Every ceiling below is an explicit literal, and a test asserts that no
+# enum-derived shorthand comes back.
+#
+# One used to stand here and feed `local`, `tailnet` and `funnel`, which meant
+# a capability added to the enum flowed into the public listener for free.
+# `EXECUTE` was exactly that capability: adding it would have handed a
+# publicly reachable URL the right to run code on this machine without anyone
+# deciding to. `quick` already spelled its ceiling out for this reason (the
+# comment on it argues the point); Milestone 6a.5 extends that discipline to
+# all four, so the *next* capability is also granted nowhere by default and
+# must be added by name after someone vets it for each transport.
+#
+# `local` is spelled out too, even though it does hold everything today: a
+# derived ceiling there would keep re-introducing the same inheritance, and a
+# reader comparing the four should be able to read them the same way.
 
 
 @dataclass(frozen=True)
@@ -62,7 +69,15 @@ POLICIES: dict[str, ListenerPolicy] = {
         admin=True,
         allow_bearer=True,
         secure_cookie=False,   # plain http on loopback; there is no TLS to require
-        ceiling=_ALL_CAPABILITIES,
+        # All seven, named. The operator at the keyboard keeps full power --
+        # 6a.5 is not a downgrade of the local path -- but naming them is what
+        # makes the *other* three ceilings meaningful: a new capability has to
+        # be added in four places, and three of those are a decision.
+        ceiling=frozenset({
+            Capability.OBSERVE, Capability.RECALL, Capability.CHAT_SEND,
+            Capability.SCREEN, Capability.FILES, Capability.SYSTEM_CONTROL,
+            Capability.EXECUTE,
+        }),
     ),
     # Tailscale tunnel: WireGuard end-to-end, the operator's own tailnet.
     # Trusted with every capability a device might hold, but never with admin
@@ -73,7 +88,17 @@ POLICIES: dict[str, ListenerPolicy] = {
         admin=False,
         allow_bearer=False,
         secure_cookie=True,
-        ceiling=_ALL_CAPABILITIES,
+        # Everything except EXECUTE and SYSTEM_CONTROL. WireGuard protects the
+        # bytes, not the endpoint: a phone on the tailnet is a phone somebody
+        # can pick up, and "read her transcripts" and "run code on her
+        # machine" are not the same trust. SYSTEM_CONTROL is dropped for the
+        # same reason -- PATCH /v1/settings turns the camera on and speaker
+        # verification off, which is a change to the machine, not a request
+        # of it.
+        ceiling=frozenset({
+            Capability.OBSERVE, Capability.RECALL, Capability.CHAT_SEND,
+            Capability.SCREEN, Capability.FILES,
+        }),
     ),
     # `tailscale funnel` -- a top-level command, not a `serve` flag; there is
     # no `tailscale serve --funnel`. Publicly reachable from the open
@@ -88,7 +113,15 @@ POLICIES: dict[str, ListenerPolicy] = {
         admin=False,
         allow_bearer=False,
         secure_cookie=True,
-        ceiling=_ALL_CAPABILITIES,
+        # Same set as tailnet, and the same two omissions, for a stronger
+        # reason: this URL is reachable by anyone who has it. CHAT_SEND alone
+        # reaches every intent through POST /v1/chat, so without the EXECUTE
+        # split a leaked pair code was a remote shell. The ceiling is what
+        # makes it only a conversation.
+        ceiling=frozenset({
+            Capability.OBSERVE, Capability.RECALL, Capability.CHAT_SEND,
+            Capability.SCREEN, Capability.FILES,
+        }),
     ),
     # Cloudflare quick tunnel: Cloudflare terminates TLS and can read the
     # plaintext. The ceiling is OBSERVE alone -- watching her work. Even a
@@ -111,7 +144,7 @@ POLICIES: dict[str, ListenerPolicy] = {
         admin=False,
         allow_bearer=False,
         secure_cookie=True,
-        # Deliberately an explicit literal, not `_ALL_CAPABILITIES - {...}`.
+        # Deliberately an explicit literal, not "everything minus {...}".
         # Spelling out what IS allowed, rather than what is excluded, means a
         # future capability added to the enum is granted nowhere by default
         # and must be added here by name after someone vets it for the one

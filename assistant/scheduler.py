@@ -117,13 +117,22 @@ def _run_handler(task: dict) -> str:
 
 
 async def _async_run_handler(task: dict) -> str:
-    from assistant.actions import execute
+    from assistant.actions import LOCAL_GRANTS, current_grants, execute, set_grants
 
     task_type = task["task_type"]
     goal = task["task_goal"]
 
     if task_type == "web_search":
-        return await execute("web_search", {"query": goal})
+        # A scheduled task has no requester attached to it, so
+        # `current_grants` would be unset and `execute()` would refuse -- it
+        # fails closed by design. Stated explicitly here: scheduling one
+        # requires EXECUTE (`manage_schedule` in core/intent_capabilities.py),
+        # so whoever installed this task already held it.
+        token = set_grants(LOCAL_GRANTS)
+        try:
+            return await execute("web_search", {"query": goal})
+        finally:
+            current_grants.reset(token)
     elif task_type == "http_check":
         return await _http_check(goal)
     elif task_type == "procedure":
@@ -133,7 +142,17 @@ async def _async_run_handler(task: dict) -> str:
             logger.warning(f"[scheduler] Procedure not found: {goal}")
             return ""
         from assistant.procedure_executor import run_procedure
-        return await run_procedure(proc, goal)
+        # Same reasoning as the web_search branch above, and now load-bearing
+        # rather than tidy: `run_procedure` checks EXECUTE itself, so without
+        # this the scheduler would run every stored procedure with
+        # `current_grants` unset and be refused. Installing the schedule
+        # required EXECUTE (`manage_schedule`), so the grant being spent here
+        # is the installer's, stated rather than inherited.
+        token = set_grants(LOCAL_GRANTS)
+        try:
+            return await run_procedure(proc, goal)
+        finally:
+            current_grants.reset(token)
     else:
         logger.warning(f"[scheduler] Unknown task_type: {task_type}")
         return ""

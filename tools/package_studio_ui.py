@@ -65,6 +65,7 @@ from assistant.io.api.ui import (                             # noqa: E402
     MARKER_NAME,
     MAX_MEMBER_BYTES,
     UI_MANIFEST_VERSION,
+    is_hidden_member,
     normalise_member,
 )
 
@@ -173,16 +174,45 @@ def _collect(source: Path) -> list[tuple[str, bytes]]:
         raise ValueError(f"{source} has no index.html; it is not a Studio export")
 
     members: list[tuple[str, bytes]] = []
+    seen: set[str] = set()
     for path in sorted(source.rglob("*")):
         if not path.is_file():
             continue
         member = path.relative_to(source).as_posix()
-        # The daemon drops a member whose stored name does not survive
-        # `normalise_member`, silently and one WARNING at a time. Refusing here
-        # turns "this asset 404s in production" into "packaging failed", which
-        # is the same information at a point where somebody is looking.
+        # Hidden entries are skipped, not refused, and the distinction is the
+        # whole of this gate's usefulness.
+        #
+        # `rglob("*")` is a faithful walk of a developer's working directory,
+        # so it picks up `.env`, `.git/`, an editor's swap file, and -- the one
+        # that actually shipped -- the `.tenka-ui.json` that `--marker` wrote
+        # into that same directory earlier. The last of those is why this is a
+        # skip: a second copy of the marker landed in the archive alongside the
+        # one `package()` writes, `zipfile` resolves a repeated name to the
+        # last entry, and the daemon has been reading the stale one ever since.
+        # Refusing outright would turn the documented `--marker` workflow into
+        # a packaging failure; skipping leaves it working and ships neither
+        # copy but the computed one.
+        #
+        # It is also the honest reading of the daemon's own rule: since
+        # `is_hidden_member` a dot member is not a member at all, so there is
+        # nothing here to fail about. Names that are malformed for other
+        # reasons still raise below -- those are build accidents, and a
+        # 404-in-production is worth converting into a packaging error at a
+        # point where somebody is looking.
+        if is_hidden_member(member):
+            continue
         if normalise_member(member) != member:
             raise ValueError(f"{member} is not a name the daemon can serve")
+        # Two source paths cannot normally fold to one member name, but a
+        # case-insensitive filesystem and a future normalisation step both
+        # could -- and the daemon refuses a bundle with a repeated name
+        # outright, so shipping one would take the whole UI dark.
+        if member in seen:
+            raise ValueError(
+                f"{member} appears twice; the daemon refuses an archive that "
+                f"stores one name more than once, because what it serves for "
+                f"that name is whichever entry came last")
+        seen.add(member)
         body = path.read_bytes()
         if len(body) > MAX_MEMBER_BYTES:
             raise ValueError(
@@ -290,7 +320,27 @@ def _verify(destination: Path) -> None:
     """
     found_base = False
     with zipfile.ZipFile(destination) as archive:
-        names = set(archive.namelist())
+        stored = archive.namelist()
+        names = set(stored)
+        # Read off the finished archive rather than trusted from `_collect`,
+        # because this is the check the daemon's `_from_zip` also makes and a
+        # bundle that fails it mounts as no bundle at all. A duplicate is how
+        # the shipped artifact came to carry two markers with different
+        # `builtAt` stamps, and `zipfile` answers `read()` with the last one --
+        # so the contract guard was measuring a document nobody wrote on
+        # purpose.
+        if len(stored) != len(names):
+            duplicated = sorted({n for n in stored if stored.count(n) > 1})
+            raise ValueError(
+                f"the archive stores these names more than once: {duplicated}")
+        # `MARKER_NAME` is the one dot member that belongs here: it is written
+        # by `package()` and read by literal name, never by `normalise_member`.
+        hidden = sorted(n for n in names
+                        if n != MARKER_NAME and is_hidden_member(n))
+        if hidden:
+            raise ValueError(
+                f"the archive carries hidden members the daemon will not "
+                f"serve: {hidden}")
         if MARKER_NAME not in names:
             raise ValueError(f"the archive carries no {MARKER_NAME}")
         if "index.html" not in names:

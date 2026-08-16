@@ -41,7 +41,10 @@ async def _mock_speak_streaming(token_stream, bridge=None, emotion: str = "neutr
     return True, full_text
 
 
-async def _mock_finish_turn(bridge) -> None:
+async def _mock_finish_turn(bridge, source: str) -> None:
+    # Signature tracks main._finish_turn, which took a required `source` in
+    # 6a.5: a follow-up listen mints the full local grant set, so no caller
+    # may finish a turn without saying which turn it is.
     pass
 
 

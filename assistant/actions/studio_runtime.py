@@ -17,6 +17,7 @@ import os
 from typing import Any, Protocol
 
 from ..core import runtime_config
+from ..core.capabilities import Capability
 from ..io.api.runtime import (
     ChatMessage, ConversationDetail, ConversationRef, Entity, Fact,
     KnowledgeGraph, MemoryScope, PersonalityState, PreferenceChange,
@@ -32,7 +33,14 @@ _KIND_BY_CAST = {bool: "toggle", int: "number", float: "slider", str: "text"}
 class ChatDispatch(Protocol):
     """Supplied by main.py — the only path from a request into the pipeline."""
 
-    async def submit(self, text: str) -> tuple[str, str, bool, str]: ...
+    # `grants` is positional and has no default, deliberately. A caller that
+    # forgets it raises TypeError at the call site instead of silently
+    # inheriting whatever the pipeline would otherwise have run with -- and
+    # what it would otherwise have run with, before 6a.5, was everything.
+    # "Forgot to say what this device may do" must never be spelled the same
+    # way as "this device may do anything".
+    async def submit(self, text: str,
+                     grants: frozenset[Capability]) -> tuple[str, str, bool, str]: ...
     async def abort(self) -> bool: ...
     # Whether a submitted turn is currently in flight -- read by
     # LiveSystemRuntime for StatusInfo.busy. A plain attribute/property, not
@@ -73,8 +81,12 @@ class LiveChatRuntime:
     def __init__(self, dispatch: ChatDispatch) -> None:
         self._dispatch = dispatch
 
-    async def send(self, text: str) -> TurnRef:
-        turn_id, conversation_id, accepted, reason = await self._dispatch.submit(text)
+    async def send(self, text: str, grants: frozenset[Capability]) -> TurnRef:
+        # `grants` travels with the text rather than being read from anywhere
+        # here: the route is the only place that knows *which device* asked,
+        # and the turn runs later, on the queue consumer's task, where the
+        # request is long gone.
+        turn_id, conversation_id, accepted, reason = await self._dispatch.submit(text, grants)
         return TurnRef(turn_id, conversation_id, accepted, reason)
 
     async def conversations(self) -> list[ConversationRef]:
