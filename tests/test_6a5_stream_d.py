@@ -106,3 +106,84 @@ def test_the_socket_also_refuses_a_duplicated_cookie(tmp_path):
                 headers={"Cookie": f"{COOKIE_NAME}={victim}; "
                                    f"{COOKIE_NAME}={attacker}"}) as ws:
             ws.receive_json()
+
+
+# ─── G4: a blank `Origin` is malformed input, not an absent header ───────
+def test_a_blank_origin_is_refused_not_ignored(tmp_path):
+    """`if origin and origin.strip():` sends `Origin: "   "` down the
+    *no-Origin* branch, which on `local` means allow. That is a fail-open
+    response to malformed input on the CSWSH gate, on the one listener that
+    also carries admin."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+    r = client.get("/v1/status", headers={"Origin": "   "})
+    assert r.status_code == 403, (
+        f"a whitespace-only Origin was answered {r.status_code} -- it took the "
+        f"absent-Origin branch")
+
+
+def test_an_empty_origin_is_refused_too(tmp_path):
+    """`Origin: ""` is the same malformed shape with nothing in it at all."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+    assert client.get("/v1/status", headers={"Origin": ""}).status_code == 403
+
+
+def test_an_absent_origin_is_still_allowed_on_local(tmp_path):
+    """Non-browser clients send no Origin at all, and the local listener
+    admits them by design. Refusing malformed input must not refuse absent
+    input -- that would break every script on loopback."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+    assert client.get("/v1/status").status_code == 200
+
+
+def test_a_known_origin_is_still_allowed(tmp_path):
+    """The other half of the control: the gate must still say yes to this
+    daemon's own front door."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+    r = client.get("/v1/status",
+                   headers={"Origin": f"http://127.0.0.1:{LOCAL_PORT}"})
+    assert r.status_code == 200
+
+
+def test_a_blank_origin_is_refused_on_the_socket(tmp_path):
+    """1008 before accept(), the same as a wrong origin. The socket's own copy
+    of the guard spells it identically, so it fails open identically."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/v1/events",
+                                      headers={"Origin": "   "}) as ws:
+            ws.receive_json()
+
+
+def test_an_absent_origin_still_opens_the_socket_on_local(tmp_path):
+    """Control: `TestClient` and every non-browser client send no Origin."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+    with client.websocket_connect("/v1/events") as ws:
+        assert ws.receive_json()["type"] == "status"
+
+
+def test_pairing_refuses_a_blank_origin(tmp_path):
+    """`POST /v1/pair` is the one unauthenticated write in the API, and it
+    reaches the same guard through `refuse_unknown_origin`."""
+    vault = TokenVault(tmp_path)
+    client = _client(vault)
+    r = client.post("/v1/pair", json={"code": "000000"},
+                    headers={"Origin": "   "})
+    assert r.status_code == 403

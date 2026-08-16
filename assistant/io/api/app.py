@@ -617,10 +617,16 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         # workflow that has to work. Over a tunnel it is anomalous: a cookie
         # is a browser artefact, so a remote client holding one but not
         # behaving like a browser is likelier a replay than a user.
+        #
+        # `is not None`, not truthiness, and for the reason spelled out in
+        # `refuse_unknown_origin`: a present-but-blank `Origin` is malformed
+        # input, and truthiness routed it into the *no Origin at all* branch --
+        # which on `local` means accept. Absent stays absent; blank is now a
+        # value that matches no front door.
         origin = websocket.headers.get("origin")
-        if origin and origin.strip():
-            allowed = origin_is_known(origin, app.state,
-                                      accepting_port(websocket.scope), policy)
+        if origin is not None:
+            allowed = bool(origin.strip()) and origin_is_known(
+                origin, app.state, accepting_port(websocket.scope), policy)
         else:
             allowed = policy.name == "local"
         if not allowed:

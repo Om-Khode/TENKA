@@ -880,9 +880,20 @@ def refuse_unknown_origin(request: Request, policy: ListenerPolicy) -> None:
     every script on loopback.
     """
     origin = request.headers.get("Origin")
-    if origin and origin.strip():
-        if not origin_is_known(origin, request.app.state,
-                               accepting_port(request.scope), policy):
+    # `is not None`, not truthiness. A *present but blank* `Origin` -- `""` or
+    # `"   "` -- is malformed input, and truthiness posted it into the
+    # absent-header branch, which on `local` means allow and on `POST /v1/pair`
+    # means redeem. Nothing legitimate is lost by refusing it: a browser sends
+    # a serialised origin, `null`, or no header at all, and `fetch` cannot set
+    # the header from script (forbidden header name), so the value is only
+    # reachable from a non-browser client -- which sends no header at all and
+    # keeps the `None` branch below. The blank is checked explicitly rather
+    # than left to the allow-list lookup so that a stray empty entry in the
+    # configured development origins could never make it match.
+    if origin is not None:
+        if not origin.strip() or not origin_is_known(
+                origin, request.app.state,
+                accepting_port(request.scope), policy):
             raise _CROSS_SITE
 
 
