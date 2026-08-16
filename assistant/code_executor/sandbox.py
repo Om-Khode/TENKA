@@ -395,28 +395,53 @@ def _build_safe_os_path() -> types.ModuleType:
     return shim
 
 
+# Returned when a run produced nothing and the only thing it asked for was a
+# withheld variable. Deliberately in `_ast_scan`'s `BLOCKED:` shape, because the
+# orchestrator already understands that prefix and will not retry it.
+#
+# The wording is identical whether the variable is set or not, and it has to
+# stay that way: a message that distinguished the two cases would be an oracle
+# for probing which credentials this machine holds. That property is structural,
+# not careful phrasing — `_withhold` is called on the *key name* matching a
+# sensitive pattern, before the real environment is consulted at all, so there
+# is nothing in the code path that could tell the two apart.
+_ENV_WITHHELD_MESSAGE = (
+    "BLOCKED: secret-looking environment variables are hidden from the sandbox, set or not."
+)
+
+
 class _ReadOnlyEnvProxy:
     """Read-only proxy for os.environ that hides sensitive keys."""
     _SENSITIVE_PATTERNS = ('TOKEN', 'SECRET', 'KEY', 'PASSWORD', 'CREDENTIAL')
 
     def __init__(self, real_environ):
         self._env = real_environ
+        # Names this run asked for and did not get. Names only — never values,
+        # and never whether the name actually exists.
+        self.withheld: list[str] = []
 
     def _is_sensitive(self, key: str) -> bool:
         return any(p in key.upper() for p in self._SENSITIVE_PATTERNS)
 
+    def _withhold(self, key) -> None:
+        if key not in self.withheld:
+            self.withheld.append(key)
+
     def get(self, key, default=None):
         if self._is_sensitive(key):
+            self._withhold(key)
             return default
         return self._env.get(key, default)
 
     def __getitem__(self, key):
         if self._is_sensitive(key):
+            self._withhold(key)
             raise KeyError(key)
         return self._env[key]
 
     def __contains__(self, key):
         if self._is_sensitive(key):
+            self._withhold(key)
             return False
         return key in self._env
 
@@ -448,6 +473,9 @@ def _run_tier1(code: str, timeout: int = 15) -> str:
         return block
 
     _real_import = __import__
+    # Built once for the whole run, so the withheld-name record survives past
+    # the `import os` that created it.
+    env_proxy = _ReadOnlyEnvProxy(os.environ)
 
     def _safe_import(name, *args, **kwargs):
         top = name.split(".")[0]
@@ -462,7 +490,7 @@ def _run_tier1(code: str, timeout: int = 15) -> str:
             safe_os.sep = _os.sep
             safe_os.getcwd = _os.getcwd
             safe_os.listdir = _os.listdir
-            safe_os.environ = _ReadOnlyEnvProxy(_os.environ)
+            safe_os.environ = env_proxy
             fromlist = args[2] if len(args) >= 3 else kwargs.get("fromlist")
             if name != "os" and fromlist:
                 # `from os.path import join` expects the submodule itself.
@@ -508,6 +536,14 @@ def _run_tier1(code: str, timeout: int = 15) -> str:
     t.join(timeout=timeout)
     if t.is_alive():
         return "TIMEOUT"
+    if not holder["result"] and env_proxy.withheld:
+        # A run that produced nothing after asking for a hidden variable was
+        # reported as an empty result or a KeyError — both of which read as
+        # "the script is broken" rather than "the sandbox refused". The
+        # orchestrator retried on that, the model guessed a different key name,
+        # and the user was handed code to try it again themselves. The control
+        # worked; only the way it reported itself did not.
+        return _ENV_WITHHELD_MESSAGE
     if holder["error"]:
         return holder["error"]
     return holder["result"] or "(no output)"

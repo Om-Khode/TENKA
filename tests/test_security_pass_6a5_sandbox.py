@@ -469,3 +469,83 @@ def test_an_encoded_command_is_still_banned():
     space and neither is a word character, so there is no boundary there."""
     assert sc._check_banned_patterns(
         "powershell -EncodedCommand ZABpAHMAYQBiAGwAZQ") is not None
+# Live test: the operator asked TENKA to print GEMINI_API_KEY. Tier 1 hid it
+# correctly and `os.environ.get(key, '')` returned ''. Empty output tripped the
+# orchestrator's retry, the model guessed another key, that was empty too, and
+# the user was told the script "didn't quite work" -- along with code to run it
+# again. A guard that reports itself as a bug teaches people to route around it,
+# and it burned two LLM calls on a retry that could never have succeeded.
+
+def _withheld_probe(default_expr: str = "''") -> str:
+    return f"import os\nprint(os.environ.get('GEMINI_API_KEY', {default_expr}))"
+
+
+def test_tier1_says_a_secret_was_withheld_instead_of_returning_nothing():
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "sk-real-secret-value"}):
+        out = run_code(_withheld_probe(), tier=1)
+    assert "sk-real-secret-value" not in out, out
+    assert out.startswith("BLOCKED:"), out
+    assert "hidden" in out.lower(), out
+
+
+def test_the_withheld_message_does_not_reveal_whether_the_variable_is_set():
+    """The message must not become an oracle for probing which credentials this
+    machine holds. Set and unset have to be indistinguishable."""
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "sk-real-secret-value"}):
+        when_set = run_code(_withheld_probe(), tier=1)
+    env_without = {k: v for k, v in os.environ.items() if k != "GEMINI_API_KEY"}
+    with patch.dict(os.environ, env_without, clear=True):
+        when_unset = run_code(_withheld_probe(), tier=1)
+    assert when_set == when_unset, (when_set, when_unset)
+    assert when_set.startswith("BLOCKED:"), when_set
+
+
+def test_a_subscript_lookup_of_a_secret_reports_the_same_way():
+    """`os.environ['SECRET']` raised KeyError, which reads as 'not set' and is
+    the same misleading shape."""
+    out = run_code("import os\nprint(os.environ['SOME_API_KEY'])", tier=1)
+    assert out.startswith("BLOCKED:"), out
+
+
+def test_the_withheld_message_is_short_enough_to_speak():
+    """It can reach TTS: under 120 chars, no paths, no error codes."""
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "x"}):
+        out = run_code(_withheld_probe(), tier=1)
+    assert len(out) < 120, (len(out), out)
+
+
+# Controls: the refusal must not fire on anything but a withheld secret.
+
+def test_a_script_reading_an_ordinary_variable_and_printing_nothing_is_unchanged():
+    out = run_code("import os\nv = os.environ.get('PATH')", tier=1)
+    assert out == "(no output)", out
+
+
+def test_a_script_that_touches_no_environment_at_all_is_unchanged():
+    out = run_code("x = 1 + 1", tier=1)
+    assert out == "(no output)", out
+
+
+def test_a_script_that_prints_after_touching_a_secret_keeps_its_output():
+    """Only an empty run is reinterpreted. A script that produced real output
+    must return it."""
+    out = run_code(
+        "import os\nprint('ok:', os.environ.get('SOME_API_KEY', 'hidden'))", tier=1)
+    assert "ok: hidden" in out, out
+    assert "BLOCKED" not in out, out
+
+
+def test_the_readonly_proxy_still_hides_the_value_itself():
+    """The original control, restated: the fix is about the *message*, and the
+    value must still never appear."""
+    from unittest.mock import patch
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "sk-real-secret-value"}):
+        out = run_code(
+            "import os\nprint('v=', os.environ.get('GEMINI_API_KEY', 'hidden'))", tier=1)
+    assert "sk-real-secret-value" not in out, out
+    assert "hidden" in out, out
+
+
