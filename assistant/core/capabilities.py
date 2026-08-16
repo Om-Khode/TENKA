@@ -49,3 +49,20 @@ class Capability(str, enum.Enum):
     SCREEN = "screen"
     FILES = "files"
     SYSTEM_CONTROL = "system_control"
+    # Running code, or installing something that will run code later.
+    # CHAT_SEND is permission to *say something to her*; EXECUTE is permission
+    # for what she says back to become a subprocess, a keystroke, a click, or
+    # a scheduled job that becomes one on a timer. The two were the same
+    # permission until 6a.5, which meant a pair code minted so a phone could
+    # chat was also a remote shell on this machine.
+    #
+    # It gates the intents that run code (`code_executor`, `computer_task`,
+    # `planner`, `find_and_click`, `manifest_dispatch`, `shutdown`) *and* the
+    # intents that install something which will (`manage_monitor`,
+    # `manage_schedule`, `manage_procedure`, `manage_shortcut`) -- a monitor's
+    # `_fire_action` calls `execute("code_executor", ...)` directly, so gating
+    # the installed thing and not the installer would be theatre.
+    #
+    # It is also the default for an intent nobody has classified: see
+    # `core/intent_capabilities.py`.
+    EXECUTE = "execute"
