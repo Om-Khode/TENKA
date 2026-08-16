@@ -446,3 +446,144 @@ def test_the_ui_route_awaits_the_bundle_instead_of_blocking_on_it():
     source = inspect.getsource(ui_mod.mount_ui)
     assert "await bundle.read_async(" in source
     assert "bundle.read(" not in source.replace("bundle.read_async(", "")
+
+
+# ─── E4 / G8: the dev-directory loader must enumerate ────────────────────
+def _reference_contract() -> str:
+    """The contract hash of a daemon built the way `_ui_client` builds one.
+
+    Computed rather than hardcoded: the hash is a function of the whole
+    OpenAPI schema, so any route change would otherwise take these tests dark
+    with a 503 that looks like the finding.
+    """
+    import tempfile
+    from pathlib import Path
+
+    from assistant.io.api.app import create_app
+    from assistant.io.api.ui import contract_hash
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    return contract_hash(create_app(
+        build_fake_runtime(), TokenVault(Path(tempfile.mkdtemp())),
+        origins=["http://localhost:3000"], ui_bundle=None))
+
+
+def _ui_client(built):
+    import tempfile
+    from pathlib import Path
+
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.api_client import build_api_client
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    return build_api_client(build_fake_runtime(),
+                            TokenVault(Path(tempfile.mkdtemp())),
+                            ui_bundle=built)
+
+
+def _dev_bundle(tmp_path, extra: dict[str, bytes] | None = None):
+    from assistant.io.api.ui import UiBundle
+    from tests.fakes.studio_ui import write_ui_dir
+
+    root = write_ui_dir(tmp_path / "out", _reference_contract())
+    for name, body in (extra or {}).items():
+        destination = root / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(body)
+    built = UiBundle.open(zip_path=None, dir_path=root)
+    assert built is not None
+    return root, built
+
+
+def test_the_dev_directory_server_only_publishes_the_export(tmp_path):
+    """Task 7 proved you cannot escape the root. It never asked whether the
+    root is a safe thing to publish wholesale.
+
+    `_from_zip` enumerates member names into `self._names` and `_read_from_zip`
+    refuses anything outside that set. `_from_dir` passed `names=frozenset()`
+    and enumerated nothing, so the only barrier between an unauthenticated
+    request and any file under the root was `_PRIVATE_MEMBERS` -- a deny-list
+    with exactly one entry. Observed: `GET /.env` returned 200 with the file's
+    contents.
+    """
+    secret = b"GEMINI_API_KEY=sk-live-not-for-the-internet"
+    _, built = _dev_bundle(tmp_path, {
+        ".env": secret,
+        ".env.local": secret,
+        ".env.production.local": secret,
+        ".DS_Store": secret,
+        ".git/config": secret,
+        ".vscode/settings.json": secret,
+    })
+    client = _ui_client(built)
+    for path in ("/.env", "/.env.local", "/.env.production.local", "/.DS_Store",
+                 "/.git/config", "/.vscode/settings.json"):
+        response = client.get(path)
+        assert secret not in response.content, path
+    for member in (".env", ".env.local", ".git/config", ".vscode/settings.json"):
+        assert built.read(member) is None, member
+
+
+def test_the_dev_directory_server_still_serves_the_export(tmp_path):
+    """Control: the dev loader must keep working for its actual purpose --
+    it wins over the zip precisely so iterating on Studio needs no
+    re-vendoring."""
+    from tests.fakes.studio_ui import CHAT, INDEX
+
+    _, built = _dev_bundle(tmp_path)
+    client = _ui_client(built)
+    assert client.get("/").content == INDEX
+    assert client.get("/app/chat").content == CHAT
+    assert client.get("/app/deep/unknown").content == INDEX   # bounded fallback
+    assert built.read("_next/static/chunks/main-deadbeef.js") is not None
+
+
+def test_an_edited_export_file_is_still_read_fresh_from_disk(tmp_path):
+    """Control: enumerating names must not turn into caching bodies. A dev
+    directory changes under the daemon -- that is the whole reason it wins
+    over the zip."""
+    root, built = _dev_bundle(tmp_path)
+    (root / "index.html").write_bytes(b"<html>first</html>")
+    assert b"first" in built.read("index.html")[0]
+    (root / "index.html").write_bytes(b"<html>second</html>")
+    assert b"second" in built.read("index.html")[0]
+
+
+def test_a_file_dropped_into_the_root_after_mount_is_not_published(tmp_path):
+    """The trade-off this fix makes, pinned rather than discovered.
+
+    Membership is decided by the walk at mount time, so a file that appears
+    afterwards is not served until the daemon restarts. That is the point: the
+    alternative -- re-walking on a miss -- would let an unauthenticated caller
+    trigger a directory walk by asking for names that do not exist, on the one
+    route with no credential requirement.
+    """
+    root, built = _dev_bundle(tmp_path)
+    (root / ".env").write_bytes(b"GEMINI_API_KEY=sk-live-later")
+    assert built.read(".env") is None
+
+
+def test_the_resolved_path_guard_is_still_there(tmp_path):
+    """A name-level membership check cannot see a symlink or an 8.3 short
+    name; only resolving the real path can. The enumeration is a second
+    control, never a replacement for the first."""
+    import inspect
+
+    from assistant.io.api.ui import UiBundle
+
+    source = inspect.getsource(UiBundle._read_from_dir)
+    assert "resolve()" in source
+    assert "is_relative_to" in source
+
+    root, _ = _dev_bundle(tmp_path)
+    outside = tmp_path / "devices.json"
+    outside.write_text("stolen", encoding="utf-8")
+    try:
+        (root / "leak.json").symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("this machine will not create symlinks")
+    # Mounted *after* the symlink exists, so the walk enumerates it and the
+    # resolved-path guard is the only thing left refusing it.
+    built = UiBundle.open(zip_path=None, dir_path=root)
+    assert built.read("leak.json") is None
