@@ -879,6 +879,39 @@ _EMOTION_TAG_RE = re.compile(
 _MAX_REF_CHARS = 1500
 
 
+_STEP_WORDS = (
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    "ten", "eleven", "twelve", "dozen-plus",
+)
+
+
+def _step_word(step_id: int) -> str:
+    """Name a step without writing a digit.
+
+    Both places a step is named -- the sentence left in the instruction, and
+    the header above its output in the context block -- end up inside text a
+    model may process as data. A live test asked for the total of 4, 8 and 15
+    and got 28: the generated code copied the fenced block into a string and
+    regex-summed every `\\d+`, so the `1` in `--- output of step 1 ---` joined
+    the arithmetic. The nonce had already been caught doing the same thing and
+    made letters-only; this is the second source, found the same way.
+
+    The rule the fence has to satisfy: scaffolding must be inert with respect
+    to whatever the task extracts, and numbers are the commonest thing anyone
+    extracts. Words carry the same meaning to a model and contribute nothing
+    to a sum.
+
+    Beyond twelve the label stops distinguishing steps, which is a legibility
+    cost, not a correctness one -- the instruction and the header still agree,
+    so the model can still match them. A plan that deep is far outside what
+    `_generate_plan` produces, and a digit-free label matters more than a
+    precise one.
+    """
+    if 1 <= step_id <= 12:
+        return _STEP_WORDS[step_id - 1]
+    return _STEP_WORDS[-1]
+
+
 def _step_output(step_id: int, plan: Plan) -> str | None:
     """Return the truncated, tag-stripped output of a succeeded step, or None."""
     for step in plan.steps:
@@ -1196,7 +1229,7 @@ def _split_references(text: str, plan: Plan, tool: str) -> tuple[str, str]:
         if step_id not in seen:
             seen.add(step_id)
             collected.append((step_id, output))
-        return f"the output of step {step_id}"
+        return f"the output of step {_step_word(step_id)}"
 
     instruction = _STEP_REF_RE.sub(_replace, text)
 
@@ -1211,7 +1244,7 @@ def _split_references(text: str, plan: Plan, tool: str) -> tuple[str, str]:
         return instruction, ""
 
     context = "\n\n".join(
-        f"--- output of step {sid} ---\n{out}" for sid, out in collected
+        f"--- output of step {_step_word(sid)} ---\n{out}" for sid, out in collected
     )
     return instruction, context
 

@@ -152,7 +152,13 @@ def test_the_instruction_still_says_which_step_the_data_came_from():
     instruction, _ = planner._split_references(
         "summarise $step_1", plan, "code_executor")
     assert "$step_1" not in instruction
-    assert "step 1" in instruction
+    # "step one", not "step 1". The step is named in words because both this
+    # sentence and the header above the output in the context block end up in
+    # text a model may process as data -- a live test asking for the total of
+    # 4, 8 and 15 got 28, because the generated code regex-summed every digit
+    # in the block and the label's own `1` joined in. The referent is what
+    # this test is about, and it survives either spelling.
+    assert "step one" in instruction
 
 
 def test_the_truncation_moved_with_the_content():
