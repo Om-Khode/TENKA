@@ -200,9 +200,6 @@ async def test_shutdown_revokes_devices_and_eventually_frees_the_port(tmp_path):
 # which socket a connection was accepted on, and `TestClient` speaks ASGI
 # directly with a scope it was handed.
 
-_SIX_B_TOKEN_COOKIE = "tenka_device"
-
-
 async def _get(port: int, path: str, token: str | None = None):
     """One real HTTP GET against a real loopback listener.
 
@@ -210,10 +207,16 @@ async def _get(port: int, path: str, token: str | None = None):
     httpx's cookie jar: a jar entry is matched by domain and path, and a
     silently unmatched cookie would turn every assertion below into "401,
     because nothing was sent" while looking like a policy refusal.
+
+    The unprefixed name, which every listener still *reads* -- `__Host-` is
+    what a secure listener writes, and a browser will not store it over the
+    plain http these tests speak (see `HOST_COOKIE_NAME` in security.py).
     """
     import httpx
 
-    headers = {} if token is None else {"Cookie": f"{_SIX_B_TOKEN_COOKIE}={token}"}
+    from assistant.io.api.security import COOKIE_NAME
+
+    headers = {} if token is None else {"Cookie": f"{COOKIE_NAME}={token}"}
     async with httpx.AsyncClient(timeout=5.0) as http:
         return await http.get(f"http://127.0.0.1:{port}{path}", headers=headers)
 
