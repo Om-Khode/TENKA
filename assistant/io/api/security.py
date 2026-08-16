@@ -241,17 +241,77 @@ class AuditEntry:
     outcome: str
 
 
-class AuditLog:
-    """Append-only, bounded, in-memory. Surfaced read-only in settings."""
+# Long enough that no real route is ever truncated -- the deepest path this
+# daemon serves is well under a hundred characters, and the record has to stay
+# readable to be worth keeping. Short enough that the field is not a place a
+# caller can park kilobytes.
+_AUDIT_PATH_MAX = 200
+_AUDIT_TRUNCATED = "..."
 
-    def __init__(self, capacity: int = 2_000) -> None:
-        self._entries: deque[AuditEntry] = deque(maxlen=capacity)
+# The device id `audit_and_tag` writes when nothing authenticated. Named here
+# rather than spelled `"-"` in two files, because `AuditLog` now routes on it.
+ANONYMOUS_DEVICE_ID = "-"
+
+
+def sanitize_audit_path(path: str) -> str:
+    """The stored form of a caller-chosen path: bounded, and printable ASCII.
+
+    Every request is audited, including the ones that never authenticate, so
+    this field is written by anyone who can reach the port. Unbounded, it was
+    a place to park kilobytes; unfiltered, it was a place to put an ANSI escape
+    or a NUL that renders in whatever terminal an operator reads the record in.
+
+    Tab, CR and LF are already gone by the time this is called -- `request.url`
+    rebuilds the URL and re-parses it through `urllib.parse.urlsplit`, which
+    strips them -- and that control is pinned by its own passing test. This is
+    the rest of the class, and the backstop if that ever changes.
+    """
+    cleaned = "".join(c if 0x20 <= ord(c) <= 0x7E else "?" for c in path)
+    if len(cleaned) > _AUDIT_PATH_MAX:
+        return cleaned[:_AUDIT_PATH_MAX - len(_AUDIT_TRUNCATED)] + _AUDIT_TRUNCATED
+    return cleaned
+
+
+class AuditLog:
+    """Append-only, bounded, in-memory. Surfaced read-only in settings.
+
+    **Two rings, not one.** A single `deque(maxlen=2000)` made eviction a
+    primitive an unauthenticated caller held: a rate-limited request is still
+    audited, so the limiter never slows the flush below one entry per request
+    and ~2,000 anonymous requests flushed every authenticated entry out of the
+    record an operator reads after an incident. Splitting the rings by whether
+    anything authenticated means a flood can only erase other floods. Both
+    halves stay bounded -- the point is that they cannot reach each other, not
+    that either is unlimited.
+
+    `entries()` merges them back into one chronological sequence, by an
+    internal counter rather than by the `at` string: two entries can share a
+    timestamp, and `GET /v1/audit` reverses this list to show newest first, so
+    the order has to be exact rather than approximately right.
+    """
+
+    def __init__(self, capacity: int = 2_000,
+                 anonymous_capacity: int = 500) -> None:
+        self._seq = 0
+        self._entries: deque[tuple[int, AuditEntry]] = deque(maxlen=capacity)
+        self._anonymous: deque[tuple[int, AuditEntry]] = deque(
+            maxlen=anonymous_capacity)
 
     def record(self, entry: AuditEntry) -> None:
-        self._entries.append(entry)
+        # Sanitised here, at the store, rather than at each call site: there
+        # are three of them (two in the HTTP middleware, one in the event
+        # socket) and a fourth added later would otherwise reintroduce the
+        # hole silently.
+        entry = replace(entry, path=sanitize_audit_path(entry.path))
+        self._seq += 1
+        ring = (self._anonymous if entry.device_id == ANONYMOUS_DEVICE_ID
+                else self._entries)
+        ring.append((self._seq, entry))
 
     def entries(self) -> list[AuditEntry]:
-        return list(self._entries)
+        merged = sorted(list(self._entries) + list(self._anonymous),
+                        key=lambda pair: pair[0])
+        return [entry for _seq, entry in merged]
 
 
 @dataclass
@@ -314,9 +374,55 @@ def cookie_kwargs(policy: ListenerPolicy) -> dict:
     }
 
 
+def _cookie_name_occurrences(connection: HTTPConnection, name: str) -> int:
+    """How many times `name` is presented in the raw `Cookie` header(s).
+
+    `connection.cookies` cannot answer this. It is Starlette's `cookie_parser`,
+    which collapses a repeated name last-wins
+    (`cookie_parser("tenka_device=GOOD; tenka_device=EVIL")` ->
+    `{"tenka_device": "EVIL"}`), so the parsed mapping has no way to express
+    "how many". Counting needs the unparsed header, and `getlist` because a
+    client may also split its jar across several `Cookie` headers.
+
+    Split on `;` and compare the name half, which is exactly the boundary
+    `cookie_parser` itself uses -- so this counts the same morsels the parser
+    would have collapsed, never more.
+    """
+    seen = 0
+    for header in connection.headers.getlist("cookie"):
+        for morsel in header.split(";"):
+            key, sep, _value = morsel.partition("=")
+            if sep and key.strip() == name:
+                seen += 1
+    return seen
+
+
 def cookie_credential(connection: HTTPConnection) -> str:
     """The cookie's value, or `""`. Separate from `credential_from` because
     *which channel* the credential arrived on decides whether CSRF applies."""
+    # More than one `tenka_device` presented on a request is never a browser
+    # doing its job, and it is refused rather than resolved. Cookies ignore
+    # ports, so any page on another port of this host can write one with
+    # `path=/`; and `Domain=` from a sibling under a shared parent -- `*.ts.net`
+    # or `*.trycloudflare.com`, the parents 6b publishes under, where the
+    # neighbours are other people's machines -- plants one inward. RFC 6265
+    # s5.4 serialises equal-path cookies oldest-first, so the *attacker's*
+    # later-set duplicate is the one a last-wins parser adopts: the operator's
+    # browser is silently moved onto a session the attacker also holds, and
+    # everything she then does through Studio is readable by it.
+    #
+    # `__Host-` is the browser-side fix and the only one that stops the cookie
+    # being stored at all, but it cannot be adopted as written: it also demands
+    # `Secure`, and the `local` policy explicitly cannot set `Secure` on
+    # plain-http loopback (see `cookie_kwargs` and `policy.py`). Per-policy
+    # names would lose the session on a listener switch. So this is the
+    # server-side half -- cheap, and it holds on every listener.
+    #
+    # Refusing the pair, rather than picking the first, is deliberate: "which
+    # of these two did the operator mean?" is not a question this daemon can
+    # answer, and guessing right is worth less than never guessing.
+    if _cookie_name_occurrences(connection, COOKIE_NAME) > 1:
+        return ""
     return (connection.cookies.get(COOKIE_NAME) or "").strip()
 
 
@@ -834,9 +940,20 @@ def refuse_unknown_origin(request: Request, policy: ListenerPolicy) -> None:
     every script on loopback.
     """
     origin = request.headers.get("Origin")
-    if origin and origin.strip():
-        if not origin_is_known(origin, request.app.state,
-                               accepting_port(request.scope), policy):
+    # `is not None`, not truthiness. A *present but blank* `Origin` -- `""` or
+    # `"   "` -- is malformed input, and truthiness posted it into the
+    # absent-header branch, which on `local` means allow and on `POST /v1/pair`
+    # means redeem. Nothing legitimate is lost by refusing it: a browser sends
+    # a serialised origin, `null`, or no header at all, and `fetch` cannot set
+    # the header from script (forbidden header name), so the value is only
+    # reachable from a non-browser client -- which sends no header at all and
+    # keeps the `None` branch below. The blank is checked explicitly rather
+    # than left to the allow-list lookup so that a stray empty entry in the
+    # configured development origins could never make it match.
+    if origin is not None:
+        if not origin.strip() or not origin_is_known(
+                origin, request.app.state,
+                accepting_port(request.scope), policy):
             raise _CROSS_SITE
 
 
