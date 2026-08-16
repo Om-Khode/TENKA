@@ -107,11 +107,19 @@ def test_a_tunnel_hostname_on_the_local_listener_is_refused(client_on_local):
                                    headers={"Host": "laptop.tail1234.ts.net"})
     assert response.status_code == 421
 
-    # And it stays 421 once that name is a *published* one -- which is the
-    # case that actually discriminates. Before this task, the assertion above
-    # passed for the wrong reason (nothing had published the name yet), and a
-    # tunnel arrives here precisely because a session of it is running and has
-    # published its public authority somewhere on this app.
+    # ── DO NOT DELETE THE THREE ASSERTIONS BELOW AS REDUNDANT. ──
+    # They are the only ones in this test that discriminate. The assertion
+    # above passes against the *pre-6b* code too, because nothing had
+    # published `laptop.tail1234.ts.net` and an unpublished name was already
+    # refused for an unrelated reason -- so on its own it reads as coverage of
+    # KI-17 while proving nothing about it.
+    #
+    # A tunnel reaches this port precisely *because* a session of it is
+    # running and has published its public authority somewhere on this app.
+    # So the real question is what `local` does with a name that IS published:
+    # once against another listener (the cross-listener case), and once
+    # against this very socket (a stale publish on the port under test, the
+    # worst case). Both must stay 421. Relax either and KI-17 is live again.
     client_on_local.app.state.published_hosts.publish(
         "laptop.tail1234.ts.net", owner="ts-1", listener=TAILNET_PORT)
     assert client_on_local.get(
@@ -269,6 +277,41 @@ def test_endpoint_origins_only_lists_hosts_published_by_the_accepting_port(tmp_p
     # to and none is offered.
     unknown = endpoint_origins(state, None, POLICIES["quick"])
     assert not any(origin.startswith("https://") for origin in unknown), unknown
+
+
+def test_endpoint_origins_withholds_published_hosts_from_the_local_listener(tmp_path):
+    """The two gates must agree about `local`, not merely both be defensible.
+
+    `host_is_allowed` refuses a published name on `local` -- that is KI-17's
+    layer 3. If `endpoint_origins` kept trusting one, the local listener would
+    refuse `https://tunnel.ts.net` as a `Host` while vouching for it as an
+    `Origin`, and a page served there could drive `http://127.0.0.1:<local>`
+    cross-origin: that request carries a loopback `Host` the gate allows and
+    an `Origin` this set would have approved. Nothing legitimate needs it --
+    Studio over a tunnel talks to the tunnel listener, never to loopback -- so
+    the rule is one rule on both sides: a name is trusted only where it was
+    published, and `local` publishes nothing.
+    """
+    state = _State()
+    state.published_hosts = PublishedHosts()
+    state.cors_origins = list(DEV_ORIGINS)
+    state.listener_policies = dict(ALL_LISTENERS)
+    # Published against the local port itself -- the strongest form of the
+    # question, and the one a stale or hand-made tunnel configuration creates.
+    state.published_hosts.publish(TAILNET_NAME, owner="ts-1",
+                                  listener=LOCAL_PORT)
+
+    local_origins = endpoint_origins(state, LOCAL_PORT, POLICIES["local"])
+    assert f"https://{TAILNET_NAME}" not in local_origins
+    # The loopback pair and the dev origins are untouched: this withholds the
+    # published half only, never the front doors `local` actually serves.
+    assert f"http://127.0.0.1:{LOCAL_PORT}" in local_origins
+    assert DEV_ORIGINS[0] in local_origins
+
+    # Same collection, same port, a transport policy: still trusted there.
+    # The listener is what changed, which is the whole claim.
+    assert f"https://{TAILNET_NAME}" in endpoint_origins(
+        state, LOCAL_PORT, POLICIES["quick"])
 
 
 def test_endpoint_origins_still_withholds_dev_origins_from_a_tunnel(tmp_path):

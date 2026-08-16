@@ -863,7 +863,16 @@ def test_a_withdrawn_host_is_no_longer_a_trusted_origin(tmp_path):
     trusted-origin set as `https://<host>`. Once stale, it was not just an
     accepted `Host` -- it was an accepted `Origin` for the cross-site
     read/CSRF checks too, which is the set `_refuse_cross_site()` consults
-    before any credential is read."""
+    before any credential is read.
+
+    On a `quick` listener since Milestone 6b, for the same reason two other
+    tests in this file moved: `endpoint_origins()` now withholds published
+    names from `local`, matching the `Host` gate, so `local` is no longer a
+    listener on which a Cloudflare hostname is a trusted origin to withdraw.
+    The proposition is untouched -- withdrawing a host withdraws its origin --
+    and both assertions below are the originals; only the listener the
+    question is asked of moved to one where a published name means anything.
+    """
     from assistant.io.api.security import unpublish_host
 
     class _State:
@@ -872,15 +881,15 @@ def test_a_withdrawn_host_is_no_longer_a_trusted_origin(tmp_path):
     state = _State()
     state.published_hosts = PublishedHosts()
     state.cors_origins = []
-    state.listener_policies = {LOCAL_PORT: "local"}
+    state.listener_policies = {LOCAL_PORT: "quick"}
     state.published_hosts.publish("abc-def.trycloudflare.com", owner="tunnel-1",
                                   listener=LOCAL_PORT)
 
     assert origin_is_known("https://abc-def.trycloudflare.com", state,
-                           LOCAL_PORT, POLICIES["local"])
+                           LOCAL_PORT, POLICIES["quick"])
     unpublish_host(state, "tunnel-1")
     assert not origin_is_known("https://abc-def.trycloudflare.com", state,
-                               LOCAL_PORT, POLICIES["local"])
+                               LOCAL_PORT, POLICIES["quick"])
 
 
 def test_a_withdrawn_host_no_longer_grants_the_event_socket(tmp_path):

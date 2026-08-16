@@ -843,13 +843,27 @@ def endpoint_origins(app_state, port: int | None,
     `hosts_for(port)` is now the only read, and a `None` port contributes no
     published name at all: a connection whose accepting port could not be
     determined belongs to no listener, so no listener's names are its own.
+
+    **`local` contributes no published name either, and that clause exists to
+    agree with `host_is_allowed`.** The two functions answer different
+    questions -- "may this name reach us?" and "is this origin one of our own
+    front doors?" -- but they answer them about the same listener, and a
+    reader who learns the rule from one will assume it holds in the other.
+    Left disagreeing, the local listener refused `https://tunnel.ts.net` as a
+    `Host` while trusting it as an `Origin`: a page there could drive
+    `http://127.0.0.1:<local port>` cross-origin, since that request carries a
+    loopback `Host` the gate allows and an `Origin` this set would have
+    vouched for. Nothing legitimate needs it -- Studio served over a tunnel
+    makes its requests to the tunnel listener, never to the loopback one -- so
+    the rule is the same on both sides: a name is trusted only where it was
+    published, and `local` publishes nothing.
     """
     origins: set[str] = set()
     published = getattr(app_state, "published_hosts", None)
     if port is not None:
         origins.add(f"http://127.0.0.1:{port}")
         origins.add(f"http://localhost:{port}")
-        if isinstance(published, PublishedHosts):
+        if policy.name != "local" and isinstance(published, PublishedHosts):
             for host in published.hosts_for(port):
                 # A published transport hostname is always reached over TLS:
                 # both Tailscale and Cloudflare terminate https for it.
