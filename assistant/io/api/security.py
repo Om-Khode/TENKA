@@ -629,60 +629,122 @@ class PublishedHosts:
 
     So membership is derived from ownership, not accumulated: every hostname
     belongs to the transport session that published it, and a transport's
-    hostnames disappear the moment that session is retracted. Reads keep the
-    `in` / iteration surface the two gates already use, so neither gate
-    changes shape.
+    hostnames disappear the moment that session is retracted.
+
+    **Ownership answers *when* a name is trusted. The listener answers
+    *where*, and Milestone 6b is where the second question starts having more
+    than one answer.** Until 6b there was a single socket, so "which listener
+    published this?" had one answer and storing it would have been ceremony.
+    With four sockets serving one app it is the difference between two
+    transports and one: a name published by the Cloudflare quick tunnel was
+    otherwise a trusted `Host` -- and, through `endpoint_origins()`, a trusted
+    `Origin` -- on the funnel port, which is a different transport with a
+    different ceiling and a different adversary. So an entry is a
+    `(listener, hostname)` pair, and every read is scoped to one listener.
+
+    There is deliberately **no unscoped read**. `__contains__` and `__iter__`
+    were both removed rather than merely left unused, because `if host in
+    published` is the shape a reader reaches for first and it is exactly the
+    bug: it answers "is this one of ours?" when the only question worth asking
+    is "is this one of *this listener's*?". `hosts_for(listener)` is the whole
+    read surface.
     """
 
     def __init__(self) -> None:
-        self._by_owner: dict[str, set[str]] = {}
+        # owner -> {(listener port, hostname)}. Keyed by owner because a
+        # session is what a name's lifetime hangs off; the listener travels
+        # with the name because it is what a *read* is scoped by.
+        self._by_owner: dict[str, set[tuple[int, str]]] = {}
 
     # ─── ownership ──────────────────────────────────────────────────────
-    def publish(self, hostname: str, *, owner: str) -> None:
-        """Trust `hostname` for as long as `owner` is running.
+    def publish(self, hostname: str, *, owner: str, listener: int) -> None:
+        """Trust `hostname` on the listener bound to `listener`, for as long
+        as `owner` is running.
 
         `owner` is any label the transport picks for one *session* of itself
         -- not the transport's type. Two successive runs of the same tunnel
         get different names from the provider, so they must be different
         owners; otherwise stopping the second would leave the first's name
         behind, which is the whole failure this class exists to prevent.
+
+        `listener` is the local port that session's socket is bound to -- the
+        same key `policy_for_port` resolves a policy from, so a name and the
+        permissions it can reach are scoped by the one piece of addressing a
+        client cannot forge.
+
+        Normalised through `hostname_of`, which is what `host_is_allowed`
+        compares an incoming `Host` with. Both sides therefore agree by
+        construction rather than by two spellings of "lowercase and strip"
+        happening to stay in step: a name published as `Host.Example:8443`
+        and a header reading `host.example` are the same name here. The
+        adapter contract already obliges a bare hostname and the mismatch
+        failed *closed*, so this removes a way to be surprised rather than a
+        live hole -- but a gate whose two halves normalise differently is a
+        gate waiting for the day one of them is edited.
         """
-        name = str(hostname).strip().lower()
+        name = hostname_of(str(hostname))
         if not name:
             return
-        self._by_owner.setdefault(str(owner), set()).add(name)
+        self._by_owner.setdefault(str(owner), set()).add((int(listener), name))
 
     def unpublish(self, owner: str) -> frozenset[str]:
-        """Withdraw everything `owner` published. Returns what was withdrawn.
+        """Withdraw everything `owner` published. Returns the hostnames that
+        were withdrawn.
 
         Idempotent: an owner that published nothing, or has already been
         withdrawn, is not an error -- a transport's stop path must be safe to
         run twice (a crash handler and an orderly shutdown both call it).
         """
-        return frozenset(self._by_owner.pop(str(owner), set()))
+        return frozenset(name for _listener, name
+                         in self._by_owner.pop(str(owner), set()))
 
     def owners(self) -> frozenset[str]:
         return frozenset(self._by_owner)
 
     # ─── the read surface the gates use ─────────────────────────────────
-    def add(self, hostname: str) -> None:
+    def add(self, hostname: str, *, listener: int) -> None:
         """A hostname with no transport behind it -- test scaffolding and the
         console, which have no session to tie a lifetime to.
 
         Owned by its own name, so it is still removable (`unpublish(name)`)
         rather than being the permanent entry this class was built to
-        abolish. Production transports call `publish(..., owner=...)`.
+        abolish. Production transports call
+        `publish(..., owner=..., listener=...)` with a real session id.
+
+        `listener` is required here too, and deliberately has no default:
+        "which socket is this name for?" has no sensible answer to guess at,
+        and a default would put every scaffolding name on one listener that
+        the next reader would then have to discover was arbitrary.
+
+        The owner is the normalised name itself, through the same
+        `hostname_of` `publish` uses, so `unpublish(hostname_of(name))`
+        removes what `add(name)` created however the caller spelled it.
         """
-        self.publish(hostname, owner=str(hostname).strip().lower())
+        self.publish(hostname, owner=hostname_of(str(hostname)),
+                     listener=listener)
 
-    def __contains__(self, hostname: object) -> bool:
-        return str(hostname).strip().lower() in set(self)
+    def hosts_for(self, listener: int | None) -> frozenset[str]:
+        """Every hostname currently published *on this listener*.
 
-    def __iter__(self):
-        return iter({name for names in self._by_owner.values() for name in names})
+        The only read. `listener` is `None` when the accepting port could not
+        be determined at all, and that answers empty rather than everything:
+        a connection nobody can place is a connection nothing was published
+        for.
+        """
+        if listener is None:
+            return frozenset()
+        port = int(listener)
+        return frozenset(name for pairs in self._by_owner.values()
+                         for entry_port, name in pairs if entry_port == port)
 
     def __len__(self) -> int:
-        return len({name for names in self._by_owner.values() for name in names})
+        """How many distinct `(listener, hostname)` pairs are live.
+
+        A count, never a membership test: nothing decides trust from this, and
+        it exists so an operator-facing summary can say how many names are
+        currently published without being handed the unscoped read above.
+        """
+        return len({pair for pairs in self._by_owner.values() for pair in pairs})
 
 
 def unpublish_host(app_state, owner: str) -> frozenset[str]:
@@ -709,8 +771,9 @@ def hostname_of(value: str) -> str:
     return value.split(":", 1)[0]
 
 
-def host_is_allowed(host_header: str | None, published) -> bool:
-    """A rejection gate, never a selection one.
+def host_is_allowed(host_header: str | None, published: PublishedHosts, *,
+                    port: int | None, policy_name: str | None) -> bool:
+    """A rejection gate, never a selection one -- scoped to one listener.
 
     A page on `evil.example` can re-resolve its own hostname to 127.0.0.1 and
     then speak to this daemon as same-origin -- the browser's origin checks
@@ -720,10 +783,56 @@ def host_is_allowed(host_header: str | None, published) -> bool:
     ours is the standard defence, and it works precisely because the attacker
     cannot alter that header from a page.
 
+    **`local` never accepts a published name, and that clause is KI-17's
+    layer 3.** `policy_for_port` keys on the accepting port, which is correct
+    and unforgeable -- but a tunnel pointed at the *existing* Studio port
+    resolves to `POLICIES["local"]`: admin, bearer, and a ceiling holding
+    `EXECUTE` and `SYSTEM_CONTROL`. Every ceiling Milestone 6a.5 built is
+    bypassed, by the obvious implementation rather than by a bug. The way out
+    is that a tunnel cannot hide what it is: `tailscale serve` and
+    `cloudflared` both forward the **public** authority in `Host`, so such a
+    request arrives on the local port carrying `something.ts.net` or
+    `something.trycloudflare.com` -- and is refused here, before
+    authentication, before policy lookup, before any route runs. Two other
+    layers (TENKA builds every tunnel's argv; a preflight refuses a stale
+    `tailscale serve` mapping) are procedural and assume the tunnel is one
+    TENKA launched or can see. This one holds against a tunnel TENKA never
+    launched and knows nothing about, and it is the only one that does. If it
+    is ever relaxed, KI-17 is live again.
+
+    **The stated gap**, recorded rather than claimed away:
+    `cloudflared --http-host-header 127.0.0.1:8787` rewrites `Host` to a
+    loopback name and defeats this. That requires an attacker already
+    executing processes on this machine, at which point the local listener is
+    not the weakest thing available to them -- and layer 2 catches the
+    honest-mistake version of the same configuration. Do not try to build
+    around it here; there is nothing left in the request to distinguish it
+    with.
+
+    Loopback names are allowed on **every** listener, including one whose port
+    nobody declared. A local process reaching a transport port gains strictly
+    less than reaching the local port, which it can already reach, so refusing
+    them would cost the loopback health check and buy nothing. An unregistered
+    port therefore passes this gate for a loopback name and is answered 401 by
+    `authenticate()`, which is the refusal that has always covered it -- but
+    it accepts no *published* name at all, because "nobody declared what this
+    socket is" is not a listener a name can belong to.
+
+    That reading of "an unknown port refuses" -- refuse its published names,
+    not its loopback ones -- was **reviewed and ratified**, and is recorded
+    here so it is not "repaired" back. Spec §2.4 item 4 re-pins 401 for an
+    unregistered port and
+    `test_api_cookie_auth.py::test_a_request_on_an_unregistered_port_is_refused`
+    asserts it; answering 421 here instead would have moved an existing
+    assertion, and it would have bought nothing against KI-17, whose whole
+    premise is a tunnel aimed at a port that very much *is* registered.
+    `tests/test_6b_host_scoping.py::test_dropping_a_listener_from_the_registry_
+    stops_its_names_immediately` pins both halves of the behaviour together.
+
     The port in `Host` is ignored. It carries no security meaning here (the
-    real port is the one the socket was accepted on, and policy already comes
-    from there), while insisting on it would reject every tunnel: a transport
-    forwards with the *public* authority, whose port is not this daemon's.
+    real port is `port`, the one the socket was accepted on) while insisting
+    on it would reject every tunnel: a transport forwards with the public
+    authority, whose port is not this daemon's.
     """
     if not host_header:
         # HTTP/1.1 requires a Host header. Something that omits it is either
@@ -734,7 +843,9 @@ def host_is_allowed(host_header: str | None, published) -> bool:
         return False
     if name in _LOOPBACK_HOSTS:
         return True
-    return name in {str(h).strip().lower() for h in published}
+    if policy_name is None or policy_name == "local":
+        return False
+    return name in published.hosts_for(port)
 
 
 # ─── the active endpoint set: what may talk to us ────────────────────────
@@ -744,20 +855,44 @@ def endpoint_origins(app_state, port: int | None,
 
     Built from the port the connection was accepted on (so a second listener
     cannot lend its origins to the first), plus whatever hostnames a running
-    transport has published, plus -- on a `local` listener only -- the
-    configured development origins. Studio runs on its own dev server during
-    development and is served same-origin in production; letting the dev list
-    through on a tunnelled listener would mean a public URL trusting an origin
-    that only ever existed on someone's laptop.
+    transport has published **on that same port**, plus -- on a `local`
+    listener only -- the configured development origins. Studio runs on its
+    own dev server during development and is served same-origin in production;
+    letting the dev list through on a tunnelled listener would mean a public
+    URL trusting an origin that only ever existed on someone's laptop.
+
+    The published half used to read the whole collection, which meant the
+    `port` argument only scoped the loopback pair while the tunnel names it
+    sat next to were shared by every listener -- the funnel port trusting a
+    quick tunnel's origin was the exact thing `port` was added to prevent.
+    `hosts_for(port)` is now the only read, and a `None` port contributes no
+    published name at all: a connection whose accepting port could not be
+    determined belongs to no listener, so no listener's names are its own.
+
+    **`local` contributes no published name either, and that clause exists to
+    agree with `host_is_allowed`.** The two functions answer different
+    questions -- "may this name reach us?" and "is this origin one of our own
+    front doors?" -- but they answer them about the same listener, and a
+    reader who learns the rule from one will assume it holds in the other.
+    Left disagreeing, the local listener refused `https://tunnel.ts.net` as a
+    `Host` while trusting it as an `Origin`: a page there could drive
+    `http://127.0.0.1:<local port>` cross-origin, since that request carries a
+    loopback `Host` the gate allows and an `Origin` this set would have
+    vouched for. Nothing legitimate needs it -- Studio served over a tunnel
+    makes its requests to the tunnel listener, never to the loopback one -- so
+    the rule is the same on both sides: a name is trusted only where it was
+    published, and `local` publishes nothing.
     """
     origins: set[str] = set()
+    published = getattr(app_state, "published_hosts", None)
     if port is not None:
         origins.add(f"http://127.0.0.1:{port}")
         origins.add(f"http://localhost:{port}")
-    for host in getattr(app_state, "published_hosts", ()) or ():
-        # A published transport hostname is always reached over TLS: both
-        # Tailscale and Cloudflare terminate https for it.
-        origins.add(f"https://{str(host).strip().lower()}")
+        if policy.name != "local" and isinstance(published, PublishedHosts):
+            for host in published.hosts_for(port):
+                # A published transport hostname is always reached over TLS:
+                # both Tailscale and Cloudflare terminate https for it.
+                origins.add(f"https://{host}")
     if policy.name == "local":
         for origin in getattr(app_state, "cors_origins", ()) or ():
             origins.add(str(origin).strip().lower().rstrip("/"))
