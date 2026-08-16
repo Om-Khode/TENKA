@@ -408,14 +408,22 @@ def test_an_unknown_host_is_refused_on_the_socket_too(tmp_path):
 
 def test_a_published_transport_hostname_is_accepted(tmp_path):
     """A tunnel's public hostname is not knowable at build time, so a running
-    transport publishes it onto the live set the gate reads."""
+    transport publishes it onto the live collection the gate reads.
+
+    On a `quick` listener since Milestone 6b, and that is the point rather
+    than an incidental: a published name is accepted on the listener that
+    published it and nowhere else, and `local` accepts none at all. See
+    `host_is_allowed` -- that clause is KI-17's layer 3, and
+    `tests/test_6b_host_scoping.py` pins both halves.
+    """
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    client = _client(vault, policies={LOCAL_PORT: "local"})
+    client = _client(vault, policies={LOCAL_PORT: "quick"})
     client.cookies.set(COOKIE_NAME, token)
     assert client.get("/v1/status",
                       headers={"Host": "abc-def.trycloudflare.com"}).status_code == 421
-    client.app.state.published_hosts.add("abc-def.trycloudflare.com")
+    client.app.state.published_hosts.add("abc-def.trycloudflare.com",
+                                         listener=LOCAL_PORT)
     assert client.get("/v1/status",
                       headers={"Host": "abc-def.trycloudflare.com"}).status_code == 200
 

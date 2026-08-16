@@ -839,11 +839,17 @@ def test_the_security_property_6b_needs_holds(tmp_path):
 
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    client = _client(vault, policies={LOCAL_PORT: "local"})
+    # A `quick` listener, not `local`, since Milestone 6b: a published name is
+    # only ever accepted on a *transport* listener (`host_is_allowed` argues
+    # why -- it is KI-17's layer 3). The property under test is unchanged; the
+    # listener is simply the one on which a Cloudflare hostname is a name this
+    # daemon could have published in the first place.
+    client = _client(vault, policies={LOCAL_PORT: "quick"})
     client.cookies.set(COOKIE_NAME, token)
 
     stale_host = "abc-def.trycloudflare.com"
-    client.app.state.published_hosts.publish(stale_host, owner="tunnel-1")
+    client.app.state.published_hosts.publish(stale_host, owner="tunnel-1",
+                                             listener=LOCAL_PORT)
     assert client.get("/v1/status", headers={"Host": stale_host}).status_code == 200
 
     withdrawn = unpublish(client.app.state, "tunnel-1")
@@ -867,7 +873,8 @@ def test_a_withdrawn_host_is_no_longer_a_trusted_origin(tmp_path):
     state.published_hosts = PublishedHosts()
     state.cors_origins = []
     state.listener_policies = {LOCAL_PORT: "local"}
-    state.published_hosts.publish("abc-def.trycloudflare.com", owner="tunnel-1")
+    state.published_hosts.publish("abc-def.trycloudflare.com", owner="tunnel-1",
+                                  listener=LOCAL_PORT)
 
     assert origin_is_known("https://abc-def.trycloudflare.com", state,
                            LOCAL_PORT, POLICIES["local"])
@@ -882,11 +889,14 @@ def test_a_withdrawn_host_no_longer_grants_the_event_socket(tmp_path):
     CORS applies to a WS handshake at all."""
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    client = _client(vault, policies={LOCAL_PORT: "local"})
+    # `quick`, for the same reason as the test above: since 6b a published
+    # name is accepted on a transport listener only.
+    client = _client(vault, policies={LOCAL_PORT: "quick"})
     client.cookies.set(COOKIE_NAME, token)
 
     stale_host = "xyz-tunnel.trycloudflare.com"
-    client.app.state.published_hosts.publish(stale_host, owner="tunnel-2")
+    client.app.state.published_hosts.publish(stale_host, owner="tunnel-2",
+                                             listener=LOCAL_PORT)
     with client.websocket_connect(
         "/v1/events",
         headers={"Host": stale_host,
@@ -913,12 +923,17 @@ def test_one_transports_withdrawal_does_not_take_anothers_hostname(tmp_path):
     """Ownership is per transport *session*, so stopping one tunnel must not
     un-publish a second one that is still running."""
     hosts = PublishedHosts()
-    hosts.publish("first.trycloudflare.com", owner="tunnel-1")
-    hosts.publish("second.ts.net", owner="tunnel-2")
+    hosts.publish("first.trycloudflare.com", owner="tunnel-1",
+                  listener=LOCAL_PORT)
+    hosts.publish("second.ts.net", owner="tunnel-2", listener=LOCAL_PORT)
 
     hosts.unpublish("tunnel-1")
-    assert "first.trycloudflare.com" not in hosts
-    assert "second.ts.net" in hosts
+    # `hosts_for(port)`, not `in hosts`: 6b deleted the unscoped read, because
+    # "is this one of ours?" is the wrong question once four listeners share
+    # one app. Same assertion, asked of the listener both names were published
+    # on.
+    assert "first.trycloudflare.com" not in hosts.hosts_for(LOCAL_PORT)
+    assert "second.ts.net" in hosts.hosts_for(LOCAL_PORT)
     # Idempotent: a crash handler and an orderly stop both call it.
     assert hosts.unpublish("tunnel-1") == frozenset()
 
@@ -943,7 +958,8 @@ def test_pairing_endpoints_still_ignore_published_hosts(tmp_path):
     client = _client(vault, policies={LOCAL_PORT: "local"}, pair_store=store)
     client.cookies.set(COOKIE_NAME, token)
     client.app.state.published_hosts.publish("abc.trycloudflare.com",
-                                             owner="tunnel-1")
+                                             owner="tunnel-1",
+                                             listener=LOCAL_PORT)
 
     response = client.post("/v1/pair/code", json={"label": "phone",
                                                   "grants": ["observe"]},

@@ -85,21 +85,43 @@ class HostGate:
 
     It is a *rejection* gate only. It never selects a policy -- letting
     `Host` do that would be attacker-controlled input choosing its own
-    permissions.
+    permissions. It *reads* the policy name, which is a different thing: the
+    name comes from the accepting port, and is used only to decide which
+    names this socket is willing to answer to.
+
+    Milestone 6b makes it port-aware, and that is KI-17's third and
+    load-bearing layer -- see `host_is_allowed`, which holds the argument.
+    The short version: `local` accepts loopback names only, so a tunnel
+    pointed at the local port arrives carrying its public authority and is
+    refused here, before anything else runs.
     """
 
-    def __init__(self, app, *, published: set[str]) -> None:
+    def __init__(self, app, *, published: PublishedHosts,
+                 registry: dict[int, str]) -> None:
         self.app = app
-        # The live set, not a copy: a transport started later publishes its
-        # public hostname onto it and this gate must see that immediately.
+        # The live collection, not a copy: a transport started later publishes
+        # its public hostname onto it and this gate must see that immediately.
         self._published = published
+        # The live registry, for the same reason and one stronger: 6b starts
+        # and stops listeners while the process runs, so a port that stops
+        # being a listener must stop being a scope for the names published
+        # against it on the very next request. A copy taken here would keep
+        # answering for a socket that no longer exists.
+        self._registry = registry
 
     async def __call__(self, scope, receive, send) -> None:
         if scope["type"] in ("http", "websocket"):
             host = next((value.decode("latin-1")
                          for key, value in scope.get("headers", ())
                          if key == b"host"), "")
-            if not host_is_allowed(host, self._published):
+            # The same derivation policy resolution uses, deliberately: if
+            # these two ever disagreed about which listener a request arrived
+            # on, the gate would be scoping names to one socket while the
+            # ceiling was resolved from another.
+            port = accepting_port(scope)
+            policy_name = None if port is None else self._registry.get(port)
+            if not host_is_allowed(host, self._published,
+                                   port=port, policy_name=policy_name):
                 if scope["type"] == "websocket":
                     # A close sent in answer to the handshake, before any
                     # accept: the connection is refused, not established and
@@ -387,6 +409,10 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # tunnel stops -- stayed an accepted `Host` and a trusted `Origin` for the
     # life of the process. See the class docstring for why that is a session
     # credential handed to a stranger rather than merely a stale entry.
+    #
+    # Every entry is scoped to the listener that published it (6b), so a name
+    # the quick tunnel announced is not a trusted `Host` on the funnel port --
+    # and `local` accepts no published name at all, which is KI-17's layer 3.
     published_hosts = PublishedHosts()
     app.state.published_hosts = published_hosts
     app.state.cors_origins = list(origins)
@@ -441,7 +467,11 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         allow_headers=["Authorization", "Content-Type", CSRF_HEADER],
     )
 
-    app.add_middleware(HostGate, published=published_hosts)
+    # `app.state.listener_policies` itself, not a copy: 6b's transport manager
+    # adds and removes entries as listeners start and stop, and this gate has
+    # to see each change on the next request.
+    app.add_middleware(HostGate, published=published_hosts,
+                       registry=app.state.listener_policies)
 
     @app.middleware("http")
     async def audit_and_tag(request: Request, call_next):
