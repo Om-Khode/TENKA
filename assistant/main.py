@@ -1305,10 +1305,27 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         policy = evaluate_policy(intent_result)
 
         if not policy.allowed:
-            # Denied — speak the safe refusal
             logger.warning(f"Policy DENIED: {policy.reason}")
             await bridge.send_command("set_expression", value="worried")
-            await tts.speak(policy.safe_response, bridge, emotion="calm")
+            if source == "studio":
+                # Studio settles a turn by re-reading the transcript
+                # (LiveChatRuntime.conversation() -> memory.get_recent),
+                # never from this function's return value -- POST /v1/chat is
+                # 202 Accepted with no body. This branch returned without
+                # recording anything, so a policy refusal left the pane
+                # showing the user's own message and no answer at all: the
+                # turn looked lost rather than refused. Same fix, same
+                # reason, as the slash-command refusal above.
+                memory.save_turn(transcription, intent_result.intent,
+                                 policy.safe_response,
+                                 session_mod.get_current_session_id())
+            else:
+                # Not spoken for "studio", for the reason the slash-command
+                # branch spells out: a remote device that can make the local
+                # speaker talk on demand is a standing way to interrupt the
+                # owner's room from off the machine. The refusal is fully
+                # visible where it was asked, via the save above.
+                await tts.speak(policy.safe_response, bridge, emotion="calm")
             await bridge.send_command("set_expression", value="neutral")
             _tracker.action_outcome = "skipped"
             return
