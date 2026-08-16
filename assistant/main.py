@@ -830,22 +830,25 @@ _PENDING_HANDLERS = [
 ]
 
 
-# ─── What a caller hears when it answers someone else's question ─────────
-_FOREIGN_ANSWER_REFUSAL = (
-    "Someone else is in the middle of answering me. "
-    "I'll wait for them before I take this one."
+# ─── What the OWNER hears when something else reached for her question ───
+_FOREIGN_ATTEMPT_NOTICE = (
+    "By the way, something else tried to answer that. I ignored it."
 )
-"""The refusal for a pending state armed by a different principal (KI-13).
+"""Appended to the owner's own answer when a non-owner reached for her pending
+state first (KI-13).
 
-Refused rather than silently skipped, deliberately: a dropped confirmation
-reads as a timeout to whoever armed it and as nothing at all to whoever tried
-to answer, and "nothing happened" is the one outcome that teaches the operator
-nothing. This says something happened.
+Aimed at the owner, not the intruder, and that direction is the whole point.
+KI-13 asks for a mismatch to be loud "so the operator sees that something else
+tried to answer" -- a sentence delivered to whoever tried is loud in the one
+conversation that already knows, and silent in the one that needs to hear it.
+The non-owner's turn is skipped rather than refused (see the dispatch loop), so
+this is the only channel the fact travels on; `PendingState` parks it and the
+owner collects it on her next answer.
 
-It is spoken, so it carries the usual constraints -- under 120 characters, no
-paths, no error codes -- plus one of its own: it never names the device, the
-state, or what the question was. Saying *that* something else is answering is
-the point; saying *what* would hand a caller the confirmation it was refused.
+It is spoken, so: under 120 characters, no paths, no error codes, and it never
+names the device that tried. "Something else" is deliberate -- the operator
+needs to know her confirmation was reached for, and naming the reacher would
+turn one leak into two.
 """
 
 
@@ -1129,6 +1132,13 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             _tracker.latency_intent_ms = int((_time.monotonic() - _t0_intent) * 1000)
             return True
 
+        # ─── Whose questions this turn may answer ────────────────────────
+        # Bound once, read at both pending answer sites (the teaching session
+        # and the dispatch chain), so the two cannot drift into asking the
+        # question differently. `None` -- "nobody said" -- owns nothing; see
+        # `PendingState.owned_by` and core/principal.py.
+        _principal = _actions_module.current_principal.get()
+
         # `!r`, not hand-written quotes. A newline in the text used to end the
         # log line and start a second one that an operator grepping debug.log
         # after an incident would read as a real entry -- attacker-authored
@@ -1246,35 +1256,46 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # the operator's procedure. Skipping sends that message through the
         # ordinary pipeline instead and leaves the session waiting for the
         # person who started it.
-        if _actions_module.teaching_session.active and \
+        _teaching = _actions_module.teaching_session
+        if _teaching.active and \
                 _actions_module.capability_refusal(Capability.EXECUTE) is None:
-            # Answer site one of two. The capability check above stopped the
-            # caller that cannot teach; this stops the one that can but was
-            # not the one teaching. Refused rather than skipped, unlike the
-            # capability case: a caller that reaches this line already holds
-            # EXECUTE and could open its own session, so being told that
-            # somebody else is mid-session discloses nothing it could not
-            # discover by trying -- and being told is the difference between
-            # a session that looks broken and one that looks busy.
-            if not _actions_module.teaching_session.owned_by(
-                    _actions_module.current_principal.get()):
-                logger.info("[TEACH] Refused: session armed by another principal")
-                _tracker.intent_detected = "teaching"
-                _tracker.intent_source = "regex"
-                _tracker.action_outcome = "refused"
-                await _respond(_FOREIGN_ANSWER_REFUSAL, "teach", "worried")
-                _tracker.latency_intent_ms = int((_time.monotonic() - _t0_intent) * 1000)
-                return
-            from .actions import handle_pending_teaching
-            _teach_resp = await handle_pending_teaching(transcription)
-            if _teach_resp is not None:
-                _teach_emo, _ = llm.parse_emotion_tag(_teach_resp)
-                await _respond(_teach_resp, "teach", _teach_emo or "happy")
-                _tracker.intent_detected = "teaching"
-                _tracker.intent_source = "regex"
-                _tracker.action_outcome = "success"
-                _tracker.latency_intent_ms = int((_time.monotonic() - _t0_intent) * 1000)
-                return
+            # Answer site one of two, and it follows exactly the same rule as
+            # the pending chain below: a non-owner is SKIPPED, never refused.
+            #
+            # Refusing was the first shape and it was wrong in a direction
+            # that has nothing to do with attackers: a session armed from the
+            # phone would have refused the person standing at the keyboard.
+            # The one at the machine denied by a remote device's open
+            # question is a worse outcome than the one being prevented. It
+            # also contradicted the capability skip two lines up, whose whole
+            # argument is that refusing here discloses that a session is
+            # waiting -- and "it could discover that by trying" is no answer,
+            # because trying is precisely what just happened.
+            #
+            # Skipping is safe: the message drops through to ordinary intent
+            # classification and reaches only what this caller's own grants
+            # allow, while the session stays armed for the person who opened
+            # it. The fact that somebody reached for it is not lost -- it is
+            # parked on the state and told to the owner below.
+            if not _teaching.owned_by(_principal):
+                logger.warning(
+                    "[TEACH] Foreign answer skipped: session armed by "
+                    "another principal")
+                _teaching.note_foreign_attempt()
+            else:
+                from .actions import handle_pending_teaching
+                _teach_resp = await handle_pending_teaching(transcription)
+                if _teach_resp is not None:
+                    _teach_foreign = _teaching.take_foreign_attempts()
+                    if _teach_foreign:
+                        _teach_resp = f"{_teach_resp} {_FOREIGN_ATTEMPT_NOTICE}"
+                    _teach_emo, _ = llm.parse_emotion_tag(_teach_resp)
+                    await _respond(_teach_resp, "teach", _teach_emo or "happy")
+                    _tracker.intent_detected = "teaching"
+                    _tracker.intent_source = "regex"
+                    _tracker.action_outcome = "success"
+                    _tracker.latency_intent_ms = int((_time.monotonic() - _t0_intent) * 1000)
+                    return
 
         # Batch teaching (multi-line paste: first line = teach trigger, rest = steps)
         _batch = _match_batch_teach(intent_input)
@@ -1498,8 +1519,6 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         pending_handled = False
         pending_response = None
 
-        _principal = _actions_module.current_principal.get()
-
         for handler, label, mem_intent, needs_bridge, required, state in _PENDING_HANDLERS:
             # Skipped, not refused. Pending state is process-global, so the
             # device that ANSWERS a confirmation need not be the one that
@@ -1523,30 +1542,56 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             # capability set distinguishes two devices that carry the same
             # ceiling. Only the identity does.
             #
-            # This refuses the whole turn rather than skipping the row, and it
-            # therefore also refuses a caller who was not answering anything
-            # and merely spoke while somebody else's confirmation was open.
-            # That is accepted knowingly: whether a message is an answer is
-            # not knowable before running the handler, and running it is the
-            # effect. Refusing costs a non-owner one turn inside a window that
-            # is 30-300 seconds and only exists while a question is genuinely
-            # open; the other direction costs the operator a deletion she
-            # never confirmed. The capability skip above still runs first, so
-            # a caller that could not have driven this row is never told the
-            # window exists.
+            # Skipped, exactly like the capability case above, and for one
+            # more reason on top of that one's two. Refusing the turn was the
+            # first shape and it denied traffic that had nothing to do with
+            # the confirmation: whether a message is an answer is not knowable
+            # before running the handler, so refusing on "a foreign state is
+            # open" refuses every unrelated word a non-owner says for the 30
+            # to 300 seconds the window lasts. Run that in the direction
+            # nobody writes down -- a *phone* arms a pending, and the person
+            # at the keyboard is refused by it -- and the cure is worse than
+            # the disease, with no attacker anywhere in the story.
+            #
+            # Skipping loses nothing: the message takes an ordinary turn and
+            # reaches only what that caller's own grants allow, and the
+            # confirmation stays armed for whoever actually asked for it. The
+            # attempt itself is not dropped -- `note_foreign_attempt` parks it
+            # on the state, and the owner is told when she answers.
+            #
+            # The same unknowability lands here instead, and this is where it
+            # belongs: a non-owner who merely spoke while a confirmation was
+            # open is counted as having reached for it. The cost is a slightly
+            # over-eager sentence to the owner rather than denied traffic, and
+            # what she learns is true either way -- somebody else was talking
+            # to TENKA while her question was open, and that is worth knowing.
             if state.active and not state.owned_by(_principal):
-                logger.info(
-                    f"[{label}] Refused: armed by another principal")
-                _tracker.action_dispatched = f"pending_{label.lower()}"
-                _tracker.action_outcome = "refused"
-                await _respond(_FOREIGN_ANSWER_REFUSAL, mem_intent, "worried")
-                return
+                logger.warning(
+                    f"[{label}] Foreign answer skipped: armed by another "
+                    f"principal")
+                state.note_foreign_attempt()
+                continue
             if needs_bridge:
                 resp = await handler(transcription, bridge)
             else:
                 resp = await handler(transcription)
             if resp is not None:
                 logger.info(f"[{label}] Handled pending state")
+                # The owner is answering, so this is where she finds out that
+                # something else reached for her question while she was
+                # deciding (KI-13). Appended rather than prepended: `resp` may
+                # open with an emotion tag that `parse_emotion_tag` below has
+                # to still find. Read-and-clear, so she is told once.
+                #
+                # Only the owner reaches this line -- the check above skipped
+                # everyone else -- so there is no path on which the notice is
+                # delivered to the party it is about.
+                _foreign = state.take_foreign_attempts()
+                if _foreign:
+                    logger.warning(
+                        f"[{label}] Reporting {_foreign} foreign answer "
+                        f"attempt(s) to the owner")
+                    resp = f"{resp} {_FOREIGN_ATTEMPT_NOTICE}"
                 parsed_emotion, _ = llm.parse_emotion_tag(resp)
                 if parsed_emotion is None:
                     # Pending responses are hardcoded strings — infer emotion cheaply

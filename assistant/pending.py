@@ -44,6 +44,7 @@ class PendingState(Generic[T]):
         self._payload: Optional[T] = None
         self._ts: float = 0.0
         self._principal: Optional[str] = None
+        self._foreign_attempts: int = 0
 
     def set(self, payload: T, *, principal: Optional[str] = None) -> None:
         """Start (or replace) the pending state, recording who armed it.
@@ -64,6 +65,7 @@ class PendingState(Generic[T]):
         self._ts = time.time()
         self._principal = (principal if principal is not None
                            else current_principal.get())
+        self._foreign_attempts = 0
 
     def touch(self) -> None:
         """Reset the timeout without changing the payload (for re-prompts).
@@ -80,6 +82,42 @@ class PendingState(Generic[T]):
         self._payload = None
         self._ts = 0.0
         self._principal = None
+        self._foreign_attempts = 0
+
+    def note_foreign_attempt(self) -> None:
+        """Somebody who does not own this state just tried to answer it.
+
+        The counter exists because the refusal has to reach the *owner*, and
+        the owner is not in the conversation where the attempt happened. KI-13
+        asks that a mismatch be loud "so the operator sees that something else
+        tried to answer" -- telling only the one who tried satisfies the
+        letter and misses the point, and a WARNING in `debug.log` is forensics
+        rather than a person being told.
+
+        So the fact is parked on the state itself and collected by
+        `take_foreign_attempts()` when the owner next answers. It counts
+        rather than flags: "somebody kept trying" and "somebody tried once"
+        are different things to learn, even if the sentence the operator hears
+        does not currently distinguish them.
+
+        A no-op when the state is not armed. An attempt on a state nobody is
+        waiting on is not something to report to a later, unrelated question.
+        """
+        if self._payload is not None:
+            self._foreign_attempts += 1
+
+    def take_foreign_attempts(self) -> int:
+        """How many foreign attempts have piled up, and reset the counter.
+
+        Read-and-clear rather than a plain property, so the owner is told
+        exactly once per batch. Called only on the path that actually delivers
+        something to the owner: if her answer was not understood, the count
+        survives to be reported on the next one rather than being burned on a
+        turn she never saw it in.
+        """
+        count = self._foreign_attempts
+        self._foreign_attempts = 0
+        return count
 
     @property
     def payload(self) -> Optional[T]:
