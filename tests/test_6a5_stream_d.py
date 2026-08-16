@@ -352,3 +352,146 @@ def test_a_control_character_never_reaches_the_stored_path():
                           path="/v1/\x1b[2Kfake\x00", outcome="404"))
     stored = log.entries()[0].path
     assert all(0x20 <= ord(c) <= 0x7E for c in stored), repr(stored)
+
+
+# ─── G11: every inbound frame re-proves the device, not just `abort` ─────
+#
+# None of these publish a hub frame while an inbound frame is in flight. Task
+# 17 recorded that `TestClient` *hangs* on that shape rather than failing, and
+# a hung test reads as a slow one. Each test below sends, then reads the reply
+# the handler is guaranteed to have queued.
+
+def test_a_revoked_device_is_closed_on_any_frame_not_only_abort(tmp_path):
+    """The re-verify sat behind `if ... frame.get("type") != "abort"`, so how
+    promptly a revoked device lost the socket depended on it choosing to send
+    the one verb that matters. A device that only ever sends `ping` kept the
+    stream until the hub's next sweep noticed."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+
+    with client.websocket_connect("/v1/events") as socket:
+        socket.receive_json()                               # connect frame
+        assert vault.revoke(vault.devices()[0].device_id) is True
+        socket.send_json({"type": "ping"})
+        reply = socket.receive_json()
+        assert reply == {"type": "error", "detail": "unauthorized"}, (
+            f"a revoked device sending a non-abort frame was answered "
+            f"{reply!r} and kept its socket")
+        # No second read here. `unauthorized` is the frame the handler sends
+        # immediately before it breaks out of the receive loop, so the frame
+        # *is* the closure -- and asking `TestClient` to observe the close
+        # itself blocks rather than raising, which reads as a slow test rather
+        # than a failing one. Same hazard Task 17 recorded for the
+        # publish-and-send shape, reached from the other direction.
+
+
+def test_a_revoked_device_is_closed_on_an_unparseable_frame_too(tmp_path):
+    """The malformed-frame branch `continue`d before the filter, so it was one
+    step further from the check than `ping` was."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+
+    with client.websocket_connect("/v1/events") as socket:
+        socket.receive_json()
+        assert vault.revoke(vault.devices()[0].device_id) is True
+        socket.send_text("{not json")
+        reply = socket.receive_json()
+        assert reply == {"type": "error", "detail": "unauthorized"}, reply
+
+
+def test_a_live_device_still_gets_the_ordinary_replies(tmp_path):
+    """Control: the check must not collapse into closing everyone. A device
+    that is still paired keeps getting `unknown frame` for a verb this daemon
+    does not know, and an `ack` for the one it does."""
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+    runtime = build_fake_runtime()
+    client = build_api_client(runtime, vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, token)
+
+    with client.websocket_connect("/v1/events") as socket:
+        socket.receive_json()
+        socket.send_json({"type": "ping"})
+        assert socket.receive_json() == {"type": "error",
+                                         "detail": "unknown frame"}
+        socket.send_text("{not json")
+        assert socket.receive_json() == {"type": "error",
+                                         "detail": "malformed frame"}
+        before = runtime.chat.aborted
+        socket.send_json({"type": "abort"})
+        assert socket.receive_json() == {"type": "ack", "of": "abort"}
+        assert runtime.chat.aborted == before + 1
+
+
+def test_a_flood_of_malformed_frames_does_not_cost_a_vault_read_each(tmp_path):
+    """The memo Task 17's note asked for.
+
+    `TokenVault.verify()` re-reads and re-parses `devices.json` from disk on
+    every call, so moving the check above the `type` filter turns a
+    malformed-frame flood -- which a client controls the rate of, unlike the
+    outbound frames -- into a disk-read flood. A short-TTL memo on the verify
+    result is what makes the move affordable.
+
+    Vacuous before the check moves (nothing verified at all); it earns its
+    keep against the unmemoised version of the fix, which reads once per frame.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+    client = _client(vault)
+    client.cookies.set(COOKIE_NAME, token)
+
+    with client.websocket_connect("/v1/events") as socket:
+        socket.receive_json()
+        reads = {"n": 0}
+        real_verify = vault.verify
+
+        def counting_verify(presented):
+            reads["n"] += 1
+            return real_verify(presented)
+
+        vault.verify = counting_verify
+        try:
+            for _ in range(40):
+                socket.send_json({"type": "ping"})
+                assert socket.receive_json()["detail"] == "unknown frame"
+        finally:
+            vault.verify = real_verify
+
+    assert reads["n"] <= 5, (
+        f"40 junk frames cost {reads['n']} vault reads -- the check moved "
+        f"above the filter without a memo, so the client sets the disk-read "
+        f"rate")
+
+
+def test_the_write_verb_still_takes_an_unmemoised_answer(tmp_path):
+    """The memo must not buy a revoked device a window on the *write* verb.
+
+    A junk frame first, so the memo holds a fresh "still valid" answer; then
+    revocation; then `abort` inside the TTL. The pre-filter check is allowed
+    to be up to one TTL stale -- the hub's sweep and the per-frame outbound
+    check are the backstops for that -- but `runtime.chat.abort()` is the
+    thing the lens found reachable after revocation, and it re-verifies
+    exactly.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+    runtime = build_fake_runtime()
+    client = build_api_client(runtime, vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, token)
+
+    with client.websocket_connect("/v1/events") as socket:
+        socket.receive_json()
+        socket.send_json({"type": "ping"})          # warms the memo
+        socket.receive_json()
+        before = runtime.chat.aborted
+        assert vault.revoke(vault.devices()[0].device_id) is True
+        socket.send_json({"type": "abort"})
+        reply = socket.receive_json()
+
+    assert runtime.chat.aborted == before, (
+        "a revoked device reached runtime.chat.abort() through the memo")
+    assert reply == {"type": "error", "detail": "unauthorized"}, reply

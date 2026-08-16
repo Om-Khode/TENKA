@@ -123,6 +123,15 @@ class HostGate:
 # knowing which route was hit is a limit that cannot.
 MAX_BODY_BYTES = 1024 * 1024
 
+# How stale the event socket's *inbound* re-verify may be. That check runs on
+# every frame a client sends, junk included, and `TokenVault.verify()` re-reads
+# devices.json from disk each call -- so unmemoised, the client sets this
+# daemon's disk-read rate. One second because the hub's revalidate sweep is
+# ~2s: the memo must not be the slowest thing deciding when a revoked socket
+# dies, or it becomes the bound instead of the backstop. Only a *positive*
+# answer is ever memoised, so a refusal is always freshly read.
+_INBOUND_REVERIFY_TTL_SECONDS = 1.0
+
 # How long the streaming refusal below is willing to keep reading a body it has
 # already decided to throw away. The drain exists so a client that is genuinely
 # mid-upload can finish writing and then read its 413 instead of seeing a
@@ -779,16 +788,49 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         # HTTP request already pays; the outbound frame rate is set by the
         # assistant's own work, not by the client, so it cannot be driven up
         # from the far end.
+        # `[when, answer]` for the memo below, in a one-slot list because this
+        # is a closure over a loop-free scope and `nonlocal` on a plain name
+        # would be the only other way. One socket, one token, so the token is
+        # not part of the key: it cannot change for the life of this handler.
+        memo: list = [0.0, None]
+
         def _reverify() -> Device | None:
             """The device as it stands right now, narrowed by this listener,
-            or `None` if this connection may no longer hold the socket."""
+            or `None` if this connection may no longer hold the socket.
+
+            Never memoised. The hub calls this before every outbound frame and
+            the write verb calls it before honouring an abort; both want the
+            exact answer, and both are driven by something other than the
+            client's frame rate, so neither is a flood risk.
+            """
             fresh = auth.vault.verify(token)
             if fresh is None or fresh.device_id != device.device_id:
-                return None
-            grants = effective(fresh.grants, policy)
-            if not grants or Capability.OBSERVE not in grants:
-                return None
-            return replace(fresh, grants=grants)
+                answer = None
+            else:
+                grants = effective(fresh.grants, policy)
+                if not grants or Capability.OBSERVE not in grants:
+                    answer = None
+                else:
+                    answer = replace(fresh, grants=grants)
+            memo[0], memo[1] = time.monotonic(), answer
+            return answer
+
+        def _reverify_memoised() -> Device | None:
+            """The same answer, at most `_INBOUND_REVERIFY_TTL_SECONDS` old.
+
+            For the inbound pre-filter check alone. That check runs on *every*
+            frame a client sends, including junk, and `TokenVault.verify()`
+            re-reads and re-parses devices.json from disk each call -- so
+            without this, a client that can open a socket can set this
+            daemon's disk-read rate. The TTL is well under the hub's ~2s
+            revalidate sweep, so the sweep stays the outer bound on how long a
+            revoked socket can live, and the exact check still stands in front
+            of the write verb.
+            """
+            if memo[1] is not None and (
+                    time.monotonic() - memo[0] < _INBOUND_REVERIFY_TTL_SECONDS):
+                return memo[1]
+            return _reverify()
 
         def _viewer() -> frozenset[Capability] | None:
             """What the hub asks: what may this socket see now, or `None`."""
@@ -848,6 +890,8 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             await _safe_send(build_status_frame(phase="connected",
                                                  detail=info.active_model))
             while True:
+                parsed = True
+                frame = None
                 try:
                     frame = await websocket.receive_json()
                 except WebSocketDisconnect:
@@ -859,6 +903,32 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                     # doesn't match this daemon must not take down the one
                     # channel carrying status and telemetry (see events.py
                     # for what actually flows here today).
+                    parsed = False
+
+                # ─── every inbound frame re-proves the device ─────────────
+                # This check used to sit below the `type != "abort"` filter,
+                # which made how promptly a revoked device lost its socket
+                # depend on it choosing to send the one verb that mattered: a
+                # client that only ever sent `ping`, or malformed JSON, held
+                # the stream until the hub's next sweep noticed. Revocation is
+                # not a thing a caller gets to schedule.
+                #
+                # Memoised, and only here. `TokenVault.verify()` re-reads and
+                # re-parses devices.json from disk every call, and inbound
+                # frame rate is set by the client -- so above the filter, an
+                # unmemoised read turns a junk-frame flood into a disk-read
+                # flood. The TTL is the window this check may be stale by, and
+                # it is bounded on both sides: the hub's outbound per-frame
+                # check and its ~2s revalidate sweep are the backstops, and the
+                # write verb below takes the exact, unmemoised answer.
+                current = _reverify_memoised()
+                if current is None:
+                    _audit("1008")
+                    await _safe_send(build_error_frame("unauthorized"))
+                    break
+                device = current
+
+                if not parsed:
                     await _safe_send(build_error_frame("malformed frame"))
                     continue
                 if not isinstance(frame, dict) or frame.get("type") != "abort":
