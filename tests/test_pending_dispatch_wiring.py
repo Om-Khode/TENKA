@@ -58,12 +58,17 @@ def test_backup_handlers_are_in_the_table():
 
 
 def test_pending_table_entries_are_well_formed():
+    from assistant.core.capabilities import Capability
+
     for entry in main_module._PENDING_HANDLERS:
-        handler, label, mem_intent, needs_bridge = entry
+        handler, label, mem_intent, needs_bridge, required = entry
         assert inspect.iscoroutinefunction(handler), handler
         assert isinstance(label, str) and label
         assert isinstance(mem_intent, str) and mem_intent
         assert isinstance(needs_bridge, bool)
+        # The fifth column is what the handler's effect costs; the dispatch
+        # loop skips a row the turn's grants do not cover.
+        assert isinstance(required, Capability), (handler.__name__, required)
 
         # needs_bridge must match the handler's real signature: the dispatch
         # loop calls handler(text) or handler(text, bridge), and a mismatch is
@@ -86,5 +91,5 @@ def test_memory_intents_are_real_intents():
 
     extra = {"oauth_setup", "device_auth", "messaging_disambig", "messaging_send",
              "incoming_message", "knowledge_approval"}
-    for _handler, _label, mem_intent, _needs_bridge in main_module._PENDING_HANDLERS:
+    for _handler, _label, mem_intent, _needs_bridge, _cap in main_module._PENDING_HANDLERS:
         assert mem_intent in config.INTENTS or mem_intent in extra, mem_intent

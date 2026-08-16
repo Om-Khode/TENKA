@@ -369,8 +369,21 @@ def _studio_pair_default_grants():
     at module top.
     """
     from .io.api.vault import Capability
-    return frozenset(Capability) - {Capability.SYSTEM_CONTROL,
-                                    Capability.EXECUTE}
+    # Enumerated, not subtracted. The previous spelling was
+    # `frozenset(Capability) - {SYSTEM_CONTROL, EXECUTE}`, which reads as
+    # narrow and behaves as "everything anyone ever adds to the enum" -- the
+    # exact trap that fired when EXECUTE joined, still armed for capability
+    # number eight. The docstring above already claimed this was an explicit
+    # set while the code was a subtraction, and the regression test only
+    # grepped for the literal "Capability.EXECUTE", which a subtraction
+    # satisfies. An adversarial review caught all three.
+    return frozenset({
+        Capability.OBSERVE,
+        Capability.RECALL,
+        Capability.CHAT_SEND,
+        Capability.SCREEN,
+        Capability.FILES,
+    })
 
 
 def _studio_vault():

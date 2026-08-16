@@ -1055,7 +1055,18 @@ async def test_chat_source_still_executes_slash_commands(monkeypatch):
         lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
     )
 
-    await m.process_text_from_queue("chat", "/studio pair phone", _FakeBridge())
+    # `grants=` is what a real "chat" item carries: `_grants_for_item` hands
+    # every local source `frozenset(Capability)`. Stated here because the
+    # slash branch grew a second, capability-based check behind the source
+    # check in the pre-dispatch gate work -- the slash surface writes runtime
+    # config, which PATCH /v1/settings charges SYSTEM_CONTROL for, so it
+    # charges the same. Calling with no grants at all means "nobody said",
+    # which refuses everything by design and is not a shape any producer
+    # actually puts on the queue.
+    from assistant.actions import LOCAL_GRANTS
+
+    await m.process_text_from_queue("chat", "/studio pair phone", _FakeBridge(),
+                                    grants=LOCAL_GRANTS)
 
     assert store.current() is not None, "the chat source must still be able to mint"
     assert any("Pair code minted" in line for line in printed)

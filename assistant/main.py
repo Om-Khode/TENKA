@@ -705,6 +705,25 @@ def _match_batch_teach(text: str) -> tuple[str, str] | None:
     return (seed, body)
 
 
+# ─── Which turn sources are a person at this machine ─────────────────────────
+
+_LOCAL_SOURCES: frozenset[str] = frozenset({"stt", "chat"})
+"""Sources that mean "someone is physically at this keyboard or microphone".
+
+Spelled as a literal allow-list, never as `!= "studio"`. Two things hang off
+it and both must fail closed on a source nobody has added yet: whether TENKA
+speaks the answer out loud in the operator's room, and whether she reopens the
+microphone for a follow-up. `_grants_for_item` hands an `stt` item the full
+local grant set, so "may this turn reopen the microphone" is the same question
+as "may this turn mint full local privilege" -- and the answer for an unknown
+source has to be no.
+
+`"studio"` is deliberately absent even though desktop Studio runs on this
+machine: it arrives over HTTP, and the slash-command branch already refuses it
+on exactly that reasoning.
+"""
+
+
 # ─── Pending Handler Table ───────────────────────────────────────────────────
 # The dispatcher in process_text_from_queue() walks this in order; the first
 # handler that returns non-None owns the turn. Registering a pending state in
@@ -712,7 +731,36 @@ def _match_batch_teach(text: str) -> tuple[str, str] | None:
 # simply never called, and its state silently expires. Module-level (not
 # function-local) so tests can assert every exported handle_pending_* is here.
 #
-# Each entry: (handler_func, log_label, memory_intent, needs_bridge)
+# Each entry: (handler_func, log_label, memory_intent, needs_bridge, capability)
+#
+# The fifth column is what the handler's *effect* costs, and the dispatch loop
+# skips any row the turn's grants do not cover. It is a column rather than a
+# lookup keyed off memory_intent for two reasons: six of the rows name a
+# pending-only label that is not an intent at all, and memory_intent is a
+# storage label — overloading it as a permission declaration would couple two
+# unrelated things and make the next handler's capability an accident rather
+# than a decision. Adding a row without one is a ValueError on the loop's
+# unpack, and tests/test_6a5_predispatch_gate.py names it earlier than that.
+#
+# The reasoning per row, since none of it is obvious from the name:
+#   DESTRUCTIVE / FILE     — confirm a delete, pick a search hit → FILES, the
+#                            same capability `file_task` itself costs.
+#   CAMERA / FACE          — the camera and the face database → SCREEN.
+#   OAUTH / DEVICE_AUTH    — these paste provider client secrets and pair
+#                            third-party accounts into the machine's own
+#                            credential store. That is reconfiguring the
+#                            machine, not using it → SYSTEM_CONTROL, the same
+#                            reasoning `enroll_voice` carries.
+#   MESSAGING (both)       — disambiguation *retries the original send*, so
+#                            both rows end in messaging_bridge driving an app
+#                            → EXECUTE.
+#   INCOMING               — reads the owner's received messages back into the
+#                            transcript → RECALL, the read capability. A
+#                            device that holds RECALL can already read the
+#                            transcript, so this is consistent, not a hole.
+#   KNOWLEDGE              — approves storing a fact → CHAT_SEND, matching
+#                            `store_memory`.
+#   MONITOR / BACKUP       — `manage_monitor` / `manage_backup` → EXECUTE.
 
 from .actions import (
     handle_pending_destructive, handle_pending_camera_settings,
@@ -726,21 +774,21 @@ from .actions import (
 )
 
 _PENDING_HANDLERS = [
-    (handle_pending_destructive,        "DESTRUCTIVE",  "file_task",          False),
-    (handle_pending_camera_settings,    "CAMERA",       "camera_look",        False),
-    (handle_pending_forget_face,        "FACE",         "forget_face",        False),
-    (handle_pending_file_search,        "FILE",         "file_task",          False),
-    (handle_pending_oauth_setup,        "OAUTH",        "oauth_setup",        True),
-    (handle_pending_device_auth,        "DEVICE_AUTH",  "device_auth",        True),
-    (handle_pending_messaging_disambig, "MESSAGING",    "messaging_disambig", True),
-    (handle_pending_messaging_send,     "MESSAGING",    "messaging_send",     False),
-    (handle_pending_incoming_message,   "INCOMING",     "incoming_message",   False),
-    (handle_pending_knowledge_approval, "KNOWLEDGE",    "knowledge_approval", True),
-    (handle_pending_monitor_disambig,   "MONITOR",      "manage_monitor",     False),
-    (handle_pending_backup_confirm_phrase, "BACKUP",    "manage_backup",      False),
-    (handle_pending_backup_oauth,       "BACKUP",       "manage_backup",      False),
-    (handle_pending_backup_unlock_phrase, "BACKUP",     "manage_backup",      False),
-    (handle_pending_backup_restore_phrase, "BACKUP",    "manage_backup",      False),
+    (handle_pending_destructive,        "DESTRUCTIVE",  "file_task",          False, Capability.FILES),
+    (handle_pending_camera_settings,    "CAMERA",       "camera_look",        False, Capability.SCREEN),
+    (handle_pending_forget_face,        "FACE",         "forget_face",        False, Capability.SCREEN),
+    (handle_pending_file_search,        "FILE",         "file_task",          False, Capability.FILES),
+    (handle_pending_oauth_setup,        "OAUTH",        "oauth_setup",        True,  Capability.SYSTEM_CONTROL),
+    (handle_pending_device_auth,        "DEVICE_AUTH",  "device_auth",        True,  Capability.SYSTEM_CONTROL),
+    (handle_pending_messaging_disambig, "MESSAGING",    "messaging_disambig", True,  Capability.EXECUTE),
+    (handle_pending_messaging_send,     "MESSAGING",    "messaging_send",     False, Capability.EXECUTE),
+    (handle_pending_incoming_message,   "INCOMING",     "incoming_message",   False, Capability.RECALL),
+    (handle_pending_knowledge_approval, "KNOWLEDGE",    "knowledge_approval", True,  Capability.CHAT_SEND),
+    (handle_pending_monitor_disambig,   "MONITOR",      "manage_monitor",     False, Capability.EXECUTE),
+    (handle_pending_backup_confirm_phrase, "BACKUP",    "manage_backup",      False, Capability.EXECUTE),
+    (handle_pending_backup_oauth,       "BACKUP",       "manage_backup",      False, Capability.EXECUTE),
+    (handle_pending_backup_unlock_phrase, "BACKUP",     "manage_backup",      False, Capability.EXECUTE),
+    (handle_pending_backup_restore_phrase, "BACKUP",    "manage_backup",      False, Capability.EXECUTE),
 ]
 
 
@@ -908,15 +956,105 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     # Same token pattern as the tracker above, and reset in the same
     # `finally`. Every intent this turn dispatches -- including the ones a
     # planner step re-enters with -- is checked against this set.
-    _grants_token = _actions_module.set_grants(
-        frozenset() if grants is None else grants)
     _t0_intent = _time.monotonic()
 
     # Pause wake word detection during execution
     if _wake_listener:
         _wake_listener.pause()
 
+    # Set LAST, immediately before the `try` whose `finally` resets it, and
+    # after `_wake_listener.pause()` rather than before. An adversarial
+    # review found this three statements higher up: a raise anywhere in that
+    # window skipped the reset entirely and left the grant set installed in
+    # the queue consumer's context after the turn ended. The documented
+    # fail-closed property inverts there -- whatever ran next inherited the
+    # last turn's grants instead of none. Nothing may be added between this
+    # line and the `try`.
+    _grants_token = _actions_module.set_grants(
+        frozenset() if grants is None else grants)
+
     try:
+        # ─── The pre-dispatch gate ───────────────────────────────────────
+        # `actions.execute()` checks a turn's grants immediately before it
+        # resolves a handler, and that is the only site in the tree that
+        # resolves one. It is still not the only site that produces an
+        # *effect*: everything between here and `execute_action(...)` below
+        # can teach a procedure, replay one, flip speaker verification, kill
+        # the process, or drive a pending confirmation, and every one of
+        # those used to `return` before the gate was ever reached.
+        #
+        # This closure is what a branch calls to say "what I am about to do
+        # costs `required`". It answers with `actions.capability_refusal` --
+        # the same predicate `execute()` uses, reading the same contextvar --
+        # so there is one source of truth about this turn's grants rather
+        # than one per door. It returns True when the branch must not run,
+        # so a call site reads:
+        #
+        #     if await _gate(Capability.EXECUTE, "shutdown", "shutdown"):
+        #         return
+        #
+        # `tests/test_6a5_predispatch_gate.py` walks this function's AST and
+        # fails if any branch that returns before dispatch calls neither this
+        # nor `capability_refusal` directly. That test, not this comment, is
+        # what stops the next branch reopening the hole.
+        #
+        # Not every branch refuses. One that the *caller* asked for refuses
+        # and says so; one that answers state the caller did not arm (the
+        # teaching session, the pending chain) skips silently instead, by
+        # consulting `capability_refusal` in its own condition -- refusing
+        # there would both hijack a reply that should get an ordinary turn
+        # and disclose that a confirmation is waiting.
+        async def _respond(text: str, mem_intent: str,
+                           emotion: str = "neutral") -> None:
+            """Deliver a pre-dispatch branch's answer to whoever asked for it.
+
+            Three defects in this region had one shape, and this is their one
+            fix.
+
+            *It always records the turn, under the session id.* Studio settles
+            a turn by re-reading the transcript
+            (`LiveChatRuntime.conversation()` -> `memory.get_recent`), never
+            from this function's return value -- `POST /v1/chat` is 202 with no
+            body. Four branches here saved under `date.today().isoformat()`
+            instead of the session id, which reads as "saved" and renders as
+            "the turn vanished"; three saved nothing at all.
+
+            *It speaks only to a local source.* A remote device that can make
+            the local speaker talk on demand has a standing way to interrupt
+            the owner's room from off the machine.
+
+            *It reopens the microphone only for a local source.* This is the
+            serious one. `_finish_turn` runs `_follow_up_listen()`, which runs
+            `record_until_silence()` and re-queues the result as
+            `("stt", ...)`, and `_grants_for_item` hands an `stt` item the
+            FULL local grant set. A remote message that merely matched the
+            teach-trigger regex therefore opened the microphone and turned the
+            next thing said in the room into a fully privileged turn. Remote
+            hot mic and remote-to-local escalation in one move. `_finish_turn`
+            refuses non-local sources itself as well; this is the near half of
+            that pair.
+            """
+            memory.save_turn(transcription, mem_intent, text,
+                             session_mod.get_current_session_id())
+            if source in _LOCAL_SOURCES:
+                await tts.speak(text, bridge, emotion=emotion)
+                await _finish_turn(bridge, source)
+
+        async def _gate(required: Capability, branch: str,
+                        mem_intent: str) -> bool:
+            refusal = _actions_module.capability_refusal(required)
+            if refusal is None:
+                return False
+            logger.info(
+                f"[GATE] Refused pre-dispatch branch {branch!r}: "
+                f"needs {required.value}"
+            )
+            await _respond(refusal, mem_intent, "calm")
+            _tracker.intent_detected = branch
+            _tracker.action_outcome = "refused"
+            _tracker.latency_intent_ms = int((_time.monotonic() - _t0_intent) * 1000)
+            return True
+
         # `!r`, not hand-written quotes. A newline in the text used to end the
         # log line and start a second one that an operator grepping debug.log
         # after an incident would read as a real entry -- attacker-authored
@@ -981,6 +1119,18 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 memory.save_turn(transcription, "slash_command", response,
                                  session_mod.get_current_session_id())
             else:
+                # Depth behind the source check above, not a replacement for
+                # it. The source check is the stricter of the two and stays
+                # first: it refuses Studio even when the device holds
+                # everything, because the slash surface reaches pairing and
+                # revocation. This second check is what covers a source that
+                # does not exist yet -- the slash surface writes runtime
+                # config, which is what PATCH /v1/settings charges
+                # SYSTEM_CONTROL for, so it charges the same. Voice and
+                # console hold LOCAL_GRANTS, so it never fires today.
+                if await _gate(Capability.SYSTEM_CONTROL, "slash_command",
+                               "slash_command"):
+                    return
                 response = slash_commands.handle(transcription)
                 outcome = "success"
             if source == "chat":
@@ -1016,16 +1166,19 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         intent_input = transcription.replace("\\", "/")
 
         # ─── Teaching session (before shortcuts so they can't fire mid-session) ────
-        if _actions_module.teaching_session.active:
+        # Skipped, not refused, for a caller without EXECUTE. `teaching_session`
+        # is process-global: a session armed at the keyboard would otherwise
+        # eat the next message from any paired device and write its words into
+        # the operator's procedure. Skipping sends that message through the
+        # ordinary pipeline instead and leaves the session waiting for the
+        # person who started it.
+        if _actions_module.teaching_session.active and \
+                _actions_module.capability_refusal(Capability.EXECUTE) is None:
             from .actions import handle_pending_teaching
             _teach_resp = await handle_pending_teaching(transcription)
             if _teach_resp is not None:
                 _teach_emo, _ = llm.parse_emotion_tag(_teach_resp)
-                await tts.speak(_teach_resp, bridge, emotion=_teach_emo or "happy")
-                from datetime import date as _date
-                memory.save_turn(transcription, "teach", _teach_resp,
-                                 _date.today().isoformat())
-                await _finish_turn(bridge)
+                await _respond(_teach_resp, "teach", _teach_emo or "happy")
                 _tracker.intent_detected = "teaching"
                 _tracker.intent_source = "regex"
                 _tracker.action_outcome = "success"
@@ -1035,10 +1188,22 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # Batch teaching (multi-line paste: first line = teach trigger, rest = steps)
         _batch = _match_batch_teach(intent_input)
         if _batch:
+            # EXECUTE, the same capability `manage_procedure` costs. A taught
+            # procedure is a stored keystroke/click/app-launch program, and
+            # `open cmd` / `type <anything>` / `press enter` all parse. That
+            # installing one is inert until it is triggered is not an argument
+            # for a weaker capability: the device that installs it is the
+            # device that can trigger it, so the pair is one privilege, and
+            # the installer is the half that is hardest to notice after the
+            # fact. Same reasoning the spec gives for the four `manage_*`
+            # intents -- gating the installed thing and not the installer
+            # would be theatre.
+            if await _gate(Capability.EXECUTE, "batch_teaching",
+                           "batch_teaching"):
+                return
             from .actions import start_batch_teaching
             _batch_resp = start_batch_teaching(_batch[0], _batch[1])
-            await tts.speak(_batch_resp, bridge, emotion="happy")
-            await _finish_turn(bridge)
+            await _respond(_batch_resp, "batch_teaching", "happy")
             _tracker.intent_detected = "batch_teaching"
             _tracker.intent_source = "regex"
             _tracker.action_outcome = "success"
@@ -1048,10 +1213,15 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # Teaching trigger detection (zero LLM cost, enters collecting state)
         _teach_match = _match_teach_trigger(intent_input)
         if _teach_match:
+            # Same capability as the batch form above, and it must be: this is
+            # the same install reached one line at a time. Leaving it cheaper
+            # would just mean the multi-turn route is the one an attacker uses.
+            if await _gate(Capability.EXECUTE, "teaching_trigger",
+                           "teaching_trigger"):
+                return
             from .actions import start_teaching_session
             _opening = start_teaching_session(_teach_match)
-            await tts.speak(_opening, bridge, emotion="happy")
-            await _finish_turn(bridge)
+            await _respond(_opening, "teaching_trigger", "happy")
             _tracker.intent_detected = "teaching_trigger"
             _tracker.intent_source = "regex"
             _tracker.action_outcome = "success"
@@ -1068,6 +1238,13 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         if not _proc_cmd:
             _proc_match = procedures.match_trigger(intent_input)
             if _proc_match:
+                # EXECUTE. `run_procedure` drives `automation.native` and
+                # `pyautogui` directly and never re-enters `actions.execute()`,
+                # so nothing downstream of this call checks anything. It now
+                # checks itself as a backstop too -- this is the boundary, that
+                # is the depth.
+                if await _gate(Capability.EXECUTE, "procedure", "procedure"):
+                    return
                 from . import procedure_executor
                 logger.info(f"[PROC] Executing '{_proc_match['name']}' ({len(_proc_match['steps'])} steps)")
                 _proc_result = await procedure_executor.run_procedure(_proc_match, transcription)
@@ -1076,11 +1253,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                     task_type="synthesis",
                 )
                 _proc_emo, _proc_clean = llm.parse_emotion_tag(_proc_spoken)
-                await tts.speak(_proc_clean, bridge, emotion=_proc_emo or "happy")
-                from datetime import date as _date_tp
-                memory.save_turn(transcription, "procedure", _proc_clean,
-                                 _date_tp.today().isoformat())
-                await _finish_turn(bridge)
+                await _respond(_proc_clean, "procedure", _proc_emo or "happy")
                 _tracker.intent_detected = "procedure"
                 _tracker.intent_source = "procedure"
                 _tracker.action_dispatched = _proc_match["name"]
@@ -1105,19 +1278,24 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             ]
 
             if any(p in _sv_lowered for p in _LISTEN_ALL):
+                # SYSTEM_CONTROL, because `PATCH /v1/settings` charges
+                # SYSTEM_CONTROL for the very same runtime-config key. Two
+                # doors onto one switch had two different prices, and this was
+                # the free one. It is also the worst switch to leave free: with
+                # verification off, anyone audible near the machine drives a
+                # *voice* turn, and voice carries LOCAL_GRANTS -- so a remote
+                # device holding only CHAT_SEND could convert itself into full
+                # local privilege via anything that can play sound in the room.
+                if await _gate(Capability.SYSTEM_CONTROL, "speaker_verify",
+                               "speaker_verify"):
+                    return
                 speaker_verify.set_listen_to_everyone(True)
                 resp = (
                     "[sarcastic] Fine, I'll listen to whoever. "
                     "Don't blame me if some random starts bossing me around."
                 )
                 parsed_emo, clean = llm.parse_emotion_tag(resp)
-                await tts.speak(clean, bridge, emotion=parsed_emo or "sarcastic")
-                from datetime import date
-                memory.save_turn(
-                    transcription, "speaker_verify", clean,
-                    date.today().isoformat()
-                )
-                await _finish_turn(bridge)
+                await _respond(clean, "speaker_verify", parsed_emo or "sarcastic")
                 _tracker.intent_detected = "speaker_verify"
                 _tracker.intent_source = "regex"
                 _tracker.action_outcome = "success"
@@ -1125,19 +1303,21 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 return
 
             if any(p in _sv_lowered for p in _LISTEN_OWNER):
+                # The same switch, gated the same way. This direction tightens
+                # rather than loosens, so it is not an escalation -- but it
+                # still lets a remote caller overwrite a setting the operator
+                # chose deliberately, and one switch with two prices depending
+                # on which way you push it is how the hole above got missed.
+                if await _gate(Capability.SYSTEM_CONTROL, "speaker_verify",
+                               "speaker_verify"):
+                    return
                 speaker_verify.set_listen_to_everyone(False)
                 resp = (
                     "[happy] Back to just you and me. "
                     "The way it should be... n-not that I prefer it or anything!"
                 )
                 parsed_emo, clean = llm.parse_emotion_tag(resp)
-                await tts.speak(clean, bridge, emotion=parsed_emo or "happy")
-                from datetime import date
-                memory.save_turn(
-                    transcription, "speaker_verify", clean,
-                    date.today().isoformat()
-                )
-                await _finish_turn(bridge)
+                await _respond(clean, "speaker_verify", parsed_emo or "happy")
                 _tracker.intent_detected = "speaker_verify"
                 _tracker.intent_source = "regex"
                 _tracker.action_outcome = "success"
@@ -1196,10 +1376,17 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
 
         # ── Shutdown intent — graceful exit ──────────────────────────
         if intent_result.intent == "shutdown":
+            # `core/intent_capabilities.py` already puts `shutdown` behind
+            # EXECUTE -- but the intent is handled here, inline, and returns
+            # before `execute_action()` is ever called, so that row was dead
+            # code and any CHAT_SEND device had a remote off switch for a
+            # security product. The row is now enforced where the intent is
+            # actually served.
+            if await _gate(Capability.EXECUTE, "shutdown", "shutdown"):
+                return
             _tracker.action_dispatched = "shutdown"
             _tracker.action_outcome = "success"
-            await tts.speak("Shutting down. See you later!", bridge, emotion="happy")
-            await _finish_turn(bridge)
+            await _respond("Shutting down. See you later!", "shutdown", "happy")
             _shutdown_event.set()
             return
 
@@ -1220,7 +1407,30 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         pending_handled = False
         pending_response = None
 
-        for handler, label, mem_intent, needs_bridge in _PENDING_HANDLERS:
+        for handler, label, mem_intent, needs_bridge, required in _PENDING_HANDLERS:
+            # Skipped, not refused. Pending state is process-global, so the
+            # device that ANSWERS a confirmation need not be the one that
+            # ASKED: the operator says "delete my downloads" at the keyboard,
+            # TENKA arms `pending_destructive`, and any paired device that
+            # sends "yes" first drives the deletion. Charging the answer what
+            # the effect costs closes the cases where the answering device
+            # holds less than the handler needs.
+            #
+            # It does NOT close the case where it holds exactly enough -- a
+            # tunnel device holds FILES, so it can still answer a locally
+            # armed file confirmation. That residual is a missing owner on
+            # PendingState, not a missing capability, and forcing a stronger
+            # capability here to paper over it would break ordinary local
+            # confirmations for no security gain. See the xfail in
+            # tests/test_6a5_predispatch_gate.py.
+            #
+            # Skipping rather than refusing is deliberate twice over: the
+            # caller did not ask for this handler, so its text deserves an
+            # ordinary turn; and a refusal would disclose to a device that
+            # cannot use it that a confirmation is waiting.
+            if _actions_module.capability_refusal(required) is not None:
+                logger.info(f"[{label}] Skipped: caller lacks {required.value}")
+                continue
             if needs_bridge:
                 resp = await handler(transcription, bridge)
             else:
@@ -1237,7 +1447,8 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                         parsed_emotion = "happy"
                     else:
                         parsed_emotion = "neutral"
-                await tts.speak(resp, bridge, emotion=parsed_emotion)
+                if source in _LOCAL_SOURCES:
+                    await tts.speak(resp, bridge, emotion=parsed_emotion)
 
                 # A pending handler (e.g. backup restore) can request a
                 # graceful exit — it already closed the live DB connection
@@ -1257,7 +1468,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                     logger.info("[SHUTDOWN] Handler requested graceful exit")
                     _tracker.action_dispatched = f"pending_{label.lower()}"
                     _tracker.action_outcome = "success"
-                    await _finish_turn(bridge)
+                    await _finish_turn(bridge, source)
                     _shutdown_event.set()
                     return
 
@@ -1270,6 +1481,10 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 break
 
         if pending_handled:
+            # CAPABILITY-EXEMPT: the pending chain gated each handler before awaiting it
+            # This is the loop's epilogue, not a door of its own -- it can only
+            # be reached by a handler the loop already charged for. The plan
+            # resume below re-enters `actions.execute()`, which charges again.
             _tracker.action_dispatched = f"pending_{label.lower()}"
             _tracker.action_outcome = "success"
             # If a planner plan is suspended, resume it now
@@ -1279,22 +1494,26 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 resume_result = await _planner_module.resume_plan(pending_response)
                 if resume_result:
                     parsed_emotion, clean_result = llm.parse_emotion_tag(resume_result)
-                    await tts.speak(
-                        clean_result, bridge,
-                        emotion=parsed_emotion or "neutral"
-                    )
+                    if source in _LOCAL_SOURCES:
+                        await tts.speak(
+                            clean_result, bridge,
+                            emotion=parsed_emotion or "neutral"
+                        )
                     memory.save_turn(
                         "[plan resumed]", "planner", clean_result,
                         session_mod.get_current_session_id(),
                     )
 
-            await _finish_turn(bridge)
+            await _finish_turn(bridge, source)
             return
 
         # ── Recording mode guard ────────────────────────────────────────────
         if recording.is_active() and intent_result.intent not in (
             "stop_recording", "get_recording", "summarize_recording"
         ):
+            # CAPABILITY-EXEMPT: declining to act is not an effect
+            # The branch drops the input and returns. There is nothing here a
+            # caller could want that it does not already have by staying quiet.
             logger.info(
                 f"[RECORDING] Ignoring pipeline input during active session: {transcription}"
             )
@@ -1305,6 +1524,14 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         policy = evaluate_policy(intent_result)
 
         if not policy.allowed:
+            # CAPABILITY-EXEMPT: this branch is itself a refusal
+            # Nothing runs on this path, so there is no effect to charge for.
+            # Note what this branch is NOT: a security control the gate may
+            # lean on. `evaluate_policy` judges `intent_result.params["goal"]`,
+            # and the goal-override below overwrites that same field with the
+            # raw transcription for six intents afterwards -- so the string the
+            # policy approved is not always the string that runs. The
+            # capability gate is deliberately independent of it.
             logger.warning(f"Policy DENIED: {policy.reason}")
             await bridge.send_command("set_expression", value="worried")
             if source == "studio":
@@ -1639,7 +1866,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                     logger.debug(f"Fact extraction failed (non-critical): {e}")
 
                 await bridge.send_command("set_expression", value="neutral")
-                await _finish_turn(bridge)
+                await _finish_turn(bridge, source)
             else:
                 # Non-streaming path (tool results, pending states, etc.)
                 parsed_emotion, response_text = llm.parse_emotion_tag(response_text)
@@ -1661,7 +1888,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 await tts.speak(response_text, bridge, emotion=emotion)
                 _tracker.latency_tts_ms = int((_time.monotonic() - _t0_tts) * 1000)
                 await bridge.send_command("set_expression", value="neutral")
-                await _finish_turn(bridge)
+                await _finish_turn(bridge, source)
 
     except Exception as e:
         _tracker.action_outcome = "failure"
@@ -2076,12 +2303,38 @@ async def _follow_up_listen() -> tuple[str, int | None]:
     return text, _stt_ms
 
 
-async def _finish_turn(bridge: UnityBridge) -> None:
+async def _finish_turn(bridge: UnityBridge, source: str) -> None:
     """
     Called after every assistant response. Opens a follow-up listen window so the
     user can reply without saying the wake word again. Then resumes the wake
     word listener (idempotent — safe even if called before the finally block).
+
+    `source` is required and has no default. It is not decoration: opening the
+    follow-up window records from the local microphone and re-queues whatever
+    it hears as `("stt", ...)`, and `_grants_for_item` hands an `stt` item
+    `frozenset(Capability)` -- the full local grant set. So this function is
+    the one place in the tree where a turn can *mint privilege it did not
+    arrive with*, and a caller that does not say which turn it is finishing
+    would be minting it blind. A default here would be the same mistake
+    `ChatDispatch.submit()` refuses to make with its grants parameter.
+
+    The attack it closes: a remote Studio message that merely matched the
+    teach-trigger regex reached a `_finish_turn(bridge)` call, which opened the
+    microphone, waited for the operator to say anything at all in the room, and
+    ran that utterance with every capability there is. The attacker speaks
+    nothing and holds only CHAT_SEND. Remote hot mic and remote-to-local
+    privilege escalation in one move.
     """
+    if source not in _LOCAL_SOURCES:
+        # Not an error and not worth a refusal message -- a remote turn simply
+        # has no follow-up window, because there is no one at the microphone
+        # who asked for it. The wake listener still resumes: the turn's own
+        # `finally` does it too, and doing it here keeps this function's
+        # postcondition ("the listener is running again") true on both paths.
+        logger.debug(f"[TURN] No follow-up listen for non-local source {source!r}")
+        if _wake_listener:
+            _wake_listener.resume()
+        return
     followup, stt_ms = await _follow_up_listen()
     if _wake_listener:
         _wake_listener.resume()
