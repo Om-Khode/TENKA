@@ -1,0 +1,15 @@
+{
+  "_comment": "Synthetic fixture, documented shape (fix round 4 fold-in). The 'leftover' half of the AllowFunnel threat: the Web mapping on tailnet's public port 8443 is already gone, but the AllowFunnel flag for that same key survives. Tailscale keys AllowFunnel on '<hostname>:<public-port>' in its own top-level document, so TENKA's own subsequent 'tailscale serve --https 8443 ...' would inherit the flag and publish the one raisable listener to the open internet. Fix round 3's check lived inside the Web loop and could not see this shape at all. The surviving Web entry here is funnel's own, correctly targeted, so nothing else in the document may fire.",
+  "TCP": {
+    "443": { "HTTPS": true }
+  },
+  "Web": {
+    "example-host.example-tailnet.ts.net:443": {
+      "Handlers": { "/": { "Proxy": "http://127.0.0.1:8789" } }
+    }
+  },
+  "AllowFunnel": {
+    "example-host.example-tailnet.ts.net:8443": true,
+    "example-host.example-tailnet.ts.net:443": true
+  }
+}

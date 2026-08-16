@@ -89,8 +89,47 @@ class TransportAdapter(Protocol):
         returned argv is required to undo a provider whose spawn already
         detached -- `tailscale serve --bg` daemonises and its invoking
         process exits on its own, so killing that process again touches
-        nothing; only running the explicit `... off` argv this returns
-        un-serves it."""
+        nothing.
+
+        **Running this argv is not, by itself, proof the tunnel is down.**
+        The Tailscale adapters' argv (an `... off` form) is Tailscale's own
+        documented way to remove one mapping, but it was verified against
+        Tailscale's documentation, not by execution against a live mapping
+        -- and the same `<target>` grammar `command()` uses accepts a bare
+        file, directory or arbitrary text, so a subtly wrong invocation
+        could be silently reinterpreted as a new thing to serve rather than
+        a request to stop serving: the process would exit 0 while the
+        mapping stayed up. Any adapter whose `stop_command` returns a
+        non-`None` argv for the same reason (its provider daemonises and
+        only an explicit second command undoes it) carries the same
+        obligation. The caller **MUST** treat a returned argv's exit code
+        as provisional: run it, then re-read the provider's own status
+        (e.g. `tailscale {serve,funnel} status --json`) and confirm no
+        `Web` entry is still keyed under this transport's public port,
+        before treating the stop as successful -- not "no mapping still
+        targets" that port, a phrasing that would always be true here
+        since a mapping *targets* a local port and is *keyed under* a
+        public one, and so would let a literal reading conclude every stop
+        succeeded (fix round 3, Must fix 2: this is exactly the wording
+        that leaked the Critical this docstring exists to prevent, the
+        first time it was written). If a `Web` entry is still keyed under
+        that public port, fail loudly rather than report success -- an
+        internet-facing listener that silently stayed up is the worst
+        failure mode this milestone can produce, worse than a stop that
+        visibly failed.
+
+        Note what that obligation costs the caller: **nothing on this
+        Protocol yields the public port it names.** `name`, `command`,
+        `hostname_from`, `preflight` and `stop_command` are the whole
+        surface, and `port` throughout means the *local* port a transport
+        forwards to, never the public one it is published on -- so the
+        manager must recover the public port from the argv this method
+        returns (the value following `--https`), which is the only place
+        an adapter states it. That is deliberate: the port to check is
+        then read off the same command whose effect is being checked, so
+        the two cannot drift apart the way a separately-declared constant
+        could. See `transports/tailscale.py`'s two adapters for the
+        concrete case this obligation exists for."""
         ...
 
 

@@ -90,3 +90,4 @@ transport_registry = TransportRegistry()
 # their module exists. Importing a module that is not yet written would
 # fail the whole package import, so the lines are deferred to those tasks
 # rather than stubbed out in advance.
+from . import tailscale  # noqa: E402, F401

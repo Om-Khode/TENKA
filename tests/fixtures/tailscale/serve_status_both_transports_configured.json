@@ -1,0 +1,18 @@
+{
+  "_comment": "Synthetic fixture, documented shape (KI-17 layer 2, fix round 2 Important-1 regression). Both tailnet (public 8443 -> local 8788) and funnel (public 443 -> local 8789) are legitimately configured at once in the one shared Web document. Neither adapter's preflight may refuse because of the other's own, correctly-targeted mapping -- that mutual refusal was the fix-round-2 bug.",
+  "TCP": {
+    "443": { "HTTPS": true },
+    "8443": { "HTTPS": true }
+  },
+  "Web": {
+    "example-host.example-tailnet.ts.net:8443": {
+      "Handlers": { "/": { "Proxy": "http://127.0.0.1:8788" } }
+    },
+    "example-host.example-tailnet.ts.net:443": {
+      "Handlers": { "/": { "Proxy": "http://127.0.0.1:8789" } }
+    }
+  },
+  "AllowFunnel": {
+    "example-host.example-tailnet.ts.net:443": true
+  }
+}

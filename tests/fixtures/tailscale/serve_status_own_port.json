@@ -1,0 +1,16 @@
+{
+  "_comment": "Synthetic fixture, documented shape (KI-17 layer 2). tailnet's own public port (8443) already maps to tailnet's own local target (8788) -- the clear-to-start case preflight must accept without refusing. The second handler under the same mapping carries no 'Proxy' key (a file/text serve entry) to exercise the skip-with-debug-log path rather than a crash.",
+  "TCP": {
+    "443": { "HTTPS": true },
+    "8443": { "HTTPS": true }
+  },
+  "Web": {
+    "example-host.example-tailnet.ts.net:8443": {
+      "Handlers": {
+        "/": { "Proxy": "http://127.0.0.1:8788" },
+        "/notes": { "Path": "/home/operator/notes.txt" }
+      }
+    }
+  },
+  "AllowFunnel": {}
+}
