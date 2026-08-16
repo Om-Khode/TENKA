@@ -97,6 +97,29 @@ def current_listeners() -> StudioListeners | None:
     return _listeners
 
 
+def _refuse_a_second_primary() -> None:
+    """Raise if a primary listener is already serving in this process.
+
+    The failure mode is the one `serve_socket`'s docstring spends a paragraph
+    on -- two listeners owning the app's lifespan means the `EventHub` is
+    started twice and the first shutdown stops it for both -- so it is made
+    unreachable here rather than merely discouraged. Liveness is asked of the
+    task, never of the handle: `current_listeners()` deliberately outlives the
+    daemon it describes, so a non-`None` handle whose local task is done is a
+    stopped daemon and no obstacle to starting another.
+    """
+    existing = _listeners
+    if existing is None:
+        return
+    local = existing.tasks.get("local")
+    if local is not None and not local.done():
+        raise RuntimeError(
+            "a Studio daemon is already serving in this process; stop it "
+            "before starting another (two primary listeners would each run "
+            "the app's lifespan, and the first to stop would stop the event "
+            "hub for both)")
+
+
 # ─── Binding, separately from serving ────────────────────────────────────
 
 def bind_listener(port: int, host: str = _HOST) -> socket.socket:
@@ -163,7 +186,21 @@ def serve_socket(app: FastAPI, sock: socket.socket, *, name: str,
     Defaults to `False`, so a transport listener added later is non-primary
     unless somebody deliberately says otherwise -- the safe direction, since
     the failure mode of a second primary is a hub that stops while three
-    sockets are still serving.
+    sockets are still serving. A second *live* primary is refused outright
+    (`_refuse_a_second_primary`), not merely discouraged.
+
+    **Stop the transports before the primary, always.** Cancelling the primary
+    runs uvicorn's shutdown, which runs the app's lifespan shutdown, which
+    calls `hub.stop()` -- for every listener at once, because there is one app
+    and one hub. A transport listener still serving after that is serving a
+    stopped hub: its `/v1/events` sockets attach to nothing and its HTTP routes
+    answer against an app that has run its own teardown. The ordering is not
+    enforceable from inside this function (it does not know what else is
+    running); it belongs to whoever holds the `StudioListeners` handle, and it
+    is `TransportManager.stop_all()` before the local task's `cancel()`.
+    Neutralising `capture_signals` above makes that obligation sharper rather
+    than softer: a transport listener will not stop on Ctrl+C on its own, so
+    something has to cancel it.
 
     The uvicorn flags below are pinned identically on **every** listener, and
     two of them are security settings rather than preferences:
@@ -208,6 +245,8 @@ def serve_socket(app: FastAPI, sock: socket.socket, *, name: str,
     lines before this call. Uvicorn's own records still reach root and format
     like the rest.
     """
+    if primary:
+        _refuse_a_second_primary()
     host, port = sock.getsockname()[:2]
     config = uvicorn.Config(app, host=host, port=port, log_level="warning",
                             access_log=False,
@@ -269,7 +308,10 @@ def serve_socket(app: FastAPI, sock: socket.socket, *, name: str,
 
     task.add_done_callback(_release)
 
-    logger.info(f"[API] Studio listener '{name}' serving on http://{host}:{port}")
+    # No log line here, deliberately. `serve()` already announces the daemon,
+    # and `TransportManager` announces a tunnel with the context that actually
+    # matters (which provider, which public name); a second line from in here
+    # would be the same event said twice, once without a name for it.
     return task
 
 
@@ -318,6 +360,22 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     owns them is attached by main.py to the app this function built, through
     `current_listeners()`.
     """
+    global _listeners
+    # Refused before anything is torn down: if a daemon really is still
+    # serving, its handle below is the live one and must survive this call.
+    _refuse_a_second_primary()
+    # Cleared before the first thing that can fail, and that ordering is the
+    # whole point. Every failure path out of this function -- the host check
+    # below, a bind collision, a `serve_socket` that raised -- returns with
+    # `_start_studio_daemon()` logging a warning and handing back `None`, and
+    # a handle left installed from a *previous* daemon would then be a live
+    # answer from `current_listeners()` describing an app whose sockets are
+    # closed. A port collision is the likeliest failure here and takes exactly
+    # that path. `None` has to mean "nothing this function started is
+    # reachable", or the contract in `current_listeners()` is a lie on the
+    # only paths where it matters.
+    _listeners = None
+
     if host != _HOST:
         raise ValueError("the Studio daemon binds loopback only in this milestone")
 
@@ -350,7 +408,6 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
         sock.close()
         raise
 
-    global _listeners
     _listeners = StudioListeners(app=app, tasks={"local": task},
                                  sockets={"local": sock})
 
@@ -383,6 +440,25 @@ def shutdown(task: asyncio.Task | None, vault: TokenVault) -> None:
     bound. `tests/test_api_server_lifecycle.py::
     test_shutdown_revokes_devices_and_eventually_frees_the_port` pins both
     halves against a real socket, in the correct order.
+
+    **This covers the local task and nothing else, deliberately, and that
+    makes it a partial stop from Milestone 6b on.** It takes one task because
+    it is handed one task -- there is no handle here to a transport, and
+    inventing one would put tunnel teardown (a `tailscale serve` mapping to
+    un-serve, a subprocess to reap, a public hostname to unpublish) inside a
+    synchronous function whose whole value is that a signal handler can call
+    it without ceremony. So a transport listener's socket stays bound after
+    this returns, and with uvicorn's signal capture neutralised on those
+    listeners (see `serve_socket`) a Ctrl+C does not reach them either.
+
+    The security half still holds regardless: `vault.reset()` rotates the
+    instance secret, so every device is refused on every listener immediately,
+    including the ones still bound. What does not hold on its own is this
+    module's own standard -- *a kill switch that revokes every token but never
+    releases its own socket has only paused, not stopped* -- so the caller owes
+    the rest, in this order: **`TransportManager.stop_all()` first, then this.**
+    The other way round stops the event hub (the local listener owns the app's
+    lifespan) while the transports are still serving against it.
     """
     if task is not None:
         task.cancel()

@@ -69,6 +69,25 @@ REFUSED = 403
 # classified by whoever adds it.
 WEBSOCKET_ROUTES = frozenset({"/v1/events"})
 
+# The Studio front-end's catch-all (`ui.py`'s `mount_ui`), recorded rather
+# than covered, because it is absent from every app in this file: these apps
+# are built with no `ui_bundle`, so no `/{ui_path:path}` route is registered
+# at all, and `include_in_schema=False` keeps it out of the sweep even when
+# one is.
+#
+# **Intended answer, stated so it is a decision rather than a silence:** the
+# UI is deliberately unauthenticated and reachable on **every** listener,
+# including `funnel` and `quick`. A page is not a capability -- it carries no
+# credential of its own, and the credential a browser then presents is
+# narrowed by that listener's ceiling on every request the page makes, which
+# is what the rest of this table is about. It is not ungated either: it sits
+# *inside* `HostGate`, so DNS rebinding is refused there, and it answers an
+# API-shaped 404 for any unrouted `/v1` path rather than an HTML shell.
+# `tests/test_api_ui_serving.py` is the compensating coverage, and
+# `test_api_auth.py`'s `test_no_route_hides_from_the_schema_sweep` already
+# carries it as a named exemption.
+UNCLASSIFIED_BY_DESIGN = frozenset({"GET|HEAD /{ui_path:path}"})
+
 
 # ─── the table ───────────────────────────────────────────────────────────
 
@@ -332,15 +351,41 @@ def test_no_matrix_row_names_a_route_that_does_not_exist(app_for_introspection):
     assert not stale, f"MATRIX rows for routes this app does not serve: {sorted(stale)}"
 
 
+def _websocket_paths(routes, prefix: str = "") -> set[str]:
+    """Every WebSocket path reachable from `routes`, prefixes applied.
+
+    Recursive, and that is the whole point. A socket registered directly on
+    the app *is* a flat `WebSocketRoute` in `app.routes` -- which is what
+    `/v1/events` happens to be -- but one registered on an included router is
+    reachable only through that router's `_IncludedRouter` wrapper, at
+    `original_router.routes`, with the prefix carried on `include_context`.
+    Verified against this checkout: a websocket added to any of the ten
+    included routers is invisible to a flat sweep, which would leave the guard
+    below as green and as vacuous as the `app.routes` sweep this file already
+    corrects for HTTP routes. The same mistake, one function apart.
+    """
+    from starlette.routing import WebSocketRoute
+
+    found: set[str] = set()
+    for route in routes:
+        if isinstance(route, WebSocketRoute):
+            found.add(f"{prefix}{route.path}")
+            continue
+        included = getattr(route, "original_router", None)
+        if included is None:
+            continue
+        context = getattr(route, "include_context", None)
+        found |= _websocket_paths(getattr(included, "routes", ()),
+                                  prefix + getattr(context, "prefix", ""))
+    return found
+
+
 def test_the_event_socket_is_still_the_only_websocket_route(app_for_introspection):
     """`app.openapi()` cannot see a WebSocket route, so a second one added
     later would slip past `test_every_route_has_a_row_in_the_matrix` entirely.
-    The socket routes are read off `app.routes` -- where they *are* flat -- and
-    pinned by name."""
-    from starlette.routing import WebSocketRoute
-
-    sockets = {route.path for route in app_for_introspection.routes
-               if isinstance(route, WebSocketRoute)}
+    Socket routes are swept off `app.routes` instead -- recursively, through
+    the included routers as well as the app itself -- and pinned by name."""
+    sockets = _websocket_paths(app_for_introspection.routes)
     assert sockets == set(WEBSOCKET_ROUTES), (
         f"the WebSocket routes changed: {sorted(sockets)}. A socket has no "
         "HTTP status to put in MATRIX, so decide what each listener does with "
@@ -349,7 +394,43 @@ def test_the_event_socket_is_still_the_only_websocket_route(app_for_introspectio
     )
 
 
+def test_the_websocket_sweep_would_actually_see_a_route_added_on_a_router(
+    app_for_introspection,
+):
+    """The guard on the guard above. `/v1/events` is registered directly on
+    the app, so a flat sweep of `app.routes` finds it and the test passes --
+    while a socket added the way every *other* route in this app is added
+    (on a router, then `include_router`) would be invisible. Proved by
+    registering exactly that and requiring the sweep to see it, at its
+    prefixed path."""
+    from fastapi import APIRouter
+
+    router = APIRouter()
+
+    @router.websocket("/probe")
+    async def probe(websocket) -> None:  # pragma: no cover - never connected
+        pass
+
+    app_for_introspection.include_router(router, prefix="/v1")
+    assert "/v1/probe" in _websocket_paths(app_for_introspection.routes)
+
+
 # ─── the table must not be vacuous ───────────────────────────────────────
+
+def test_the_port_table_matches_the_one_the_daemon_actually_uses():
+    """The literals above are duplicated from `listeners.py` on purpose -- this
+    file is about what each *socket* answers, so the numbers a request is sent
+    to have to be visible in the test rather than computed out of sight. That
+    is only safe while the duplicate cannot drift, which is what this pins:
+    every offset against `port_for`, and the base against the one setting the
+    whole map is derived from."""
+    import assistant.config as config
+    from assistant.io.api.listeners import LISTENER_OFFSETS, port_for
+
+    base = LISTENER_PORTS["local"]
+    assert base == config.STUDIO_API_PORT
+    assert LISTENER_PORTS == {name: port_for(name, base) for name in LISTENER_OFFSETS}
+
 
 def test_the_matrix_is_not_all_permitted():
     """A guard on the guard. If every cell said "allowed", this file would be
@@ -369,14 +450,25 @@ def test_the_quick_listener_carries_nothing_but_observation():
     terminates TLS). Every row that is not OBSERVE-gated -- or gated on
     nothing at all -- must be refused there."""
     for row in MATRIX:
-        refused = expected_status(row, "quick") == REFUSED
-        if row.capability in (None, Capability.OBSERVE) and not row.admin:
-            assert not refused, (
-                f"{row.method} {row.path} is observation (or gated on nothing) "
-                "and must stay reachable on quick"
-            )
-        else:
-            assert refused, (
+        expected = expected_status(row, "quick")
+        if row.capability not in (None, Capability.OBSERVE) or row.admin:
+            assert expected == REFUSED, (
                 f"{row.method} {row.path} is reachable on the one listener a "
                 "third party reads the plaintext of"
+            )
+        elif row.bearer_only:
+            # Refused here too, but by the route rather than by the ceiling,
+            # and with a different status. Named as its own case so the
+            # reachable branch below can compare against the row's own allowed
+            # status instead of merely "is not 403" -- which this row would
+            # have satisfied while in fact being turned away.
+            assert expected == 401, (
+                f"{row.method} {row.path} is bearer-only and must be refused "
+                f"off loopback, got {expected}"
+            )
+        else:
+            assert expected == row.allowed, (
+                f"{row.method} {row.path} is observation (or gated on "
+                f"nothing) and must answer {row.allowed} on quick, not "
+                f"{expected}"
             )

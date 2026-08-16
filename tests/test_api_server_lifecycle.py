@@ -615,6 +615,102 @@ def test_serve_still_refuses_a_non_loopback_host(tmp_path):
     with pytest.raises(ValueError):
         server.bind_listener(8953, host="0.0.0.0")
 
+    assert server.current_listeners() is None, (
+        "a refused serve() left a handle installed -- `current_listeners()` "
+        "promises None means nothing this function started is reachable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_serve_does_not_leave_the_previous_daemons_handle(tmp_path):
+    """The failure path nobody covered, and the one most likely to be taken.
+
+    `_start_studio_daemon()` catches everything `serve()` raises, logs one
+    warning and returns `None` -- so on a port collision the assistant runs on
+    with no daemon. If the module global still held the *previous* daemon's
+    handle, `current_listeners()` would answer with an app whose sockets are
+    closed, and a `TransportManager` would hang tunnels off it: a public URL
+    forwarded into an app nothing is listening for.
+
+    Driven through a real collision, which is the realistic case (a second
+    TENKA, or a restart racing the first one's socket) rather than a
+    synthesised exception.
+    """
+    import asyncio
+    import socket
+
+    from assistant.io.api import server
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    port, taken = 8957, 8958
+    task = server.serve(build_fake_runtime(), TokenVault(tmp_path), port=port,
+                        origins=[])
+    await asyncio.sleep(0.2)
+    assert server.current_listeners() is not None
+
+    # A first daemon that has since stopped -- exactly what a restart looks
+    # like -- and a port somebody else already holds.
+    await _cancel(task)
+    squatter = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    squatter.bind(("127.0.0.1", taken))
+    squatter.listen(1)
+    try:
+        with pytest.raises(OSError):
+            server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                         port=taken, origins=[])
+        assert server.current_listeners() is None, (
+            "a bind collision left the previous daemon's handle installed -- "
+            "current_listeners() now describes an app with closed sockets"
+        )
+    finally:
+        squatter.close()
+
+
+@pytest.mark.asyncio
+async def test_a_second_live_daemon_is_refused_rather_than_started(tmp_path):
+    """Two primaries would each run the app's lifespan, so the `EventHub`
+    would start twice and the first shutdown would stop it for both. Made
+    unreachable rather than merely documented -- and the refusal must leave
+    the running daemon's handle alone, because that daemon is still serving.
+    """
+    import asyncio
+
+    from assistant.io.api import server
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    first_port, second_port = 8959, 8960
+    task = server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                        port=first_port, origins=[])
+    await asyncio.sleep(0.2)
+    handle = server.current_listeners()
+    try:
+        with pytest.raises(RuntimeError):
+            server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                         port=second_port, origins=[])
+        assert server.current_listeners() is handle, (
+            "the refusal cleared the running daemon's own handle"
+        )
+        assert _port_is_free(second_port), "the refused daemon bound a port anyway"
+        # And a direct `serve_socket(primary=True)` is refused for the same
+        # reason -- the guard is on the property, not on the entry point.
+        sock = server.bind_listener(second_port)
+        try:
+            with pytest.raises(RuntimeError):
+                server.serve_socket(handle.app, sock, name="second",
+                                    primary=True)
+        finally:
+            sock.close()
+    finally:
+        await _cancel(task)
+
+    # Once it has stopped, starting another is fine: liveness is asked of the
+    # task, never of the handle, which deliberately outlives its daemon.
+    again = server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                         port=second_port, origins=[])
+    await _cancel(again)
+
 
 @pytest.mark.asyncio
 async def test_serve_threads_a_raise_store_through_to_the_app(tmp_path):
