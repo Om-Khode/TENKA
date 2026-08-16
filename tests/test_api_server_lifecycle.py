@@ -182,6 +182,462 @@ async def test_shutdown_revokes_devices_and_eventually_frees_the_port(tmp_path):
         probe.close()
 
 
+# ─── Milestone 6b: one app, many sockets, one policy per socket ───────────
+# Spec §2.1/§2.2. `serve()`'s signature and return type are unchanged -- the
+# tests above assert on them directly -- so the multi-listener machinery is
+# added *beside* it: `bind_listener()` takes a port and hands back a bound,
+# listening socket; `serve_socket()` runs the same app on that socket under
+# its own `uvicorn.Server`; and a module-level `StudioListeners` is what
+# main.py (and, later, `TransportManager`) holds to reach the app and the
+# per-listener tasks and sockets.
+#
+# Every listener in this section binds 127.0.0.1. Separation is by port,
+# never by host, because `cloudflared` and `tailscale funnel` both connect to
+# this daemon from loopback and are indistinguishable from a local caller by
+# peer address (policy.py's docstring holds the full argument).
+#
+# These use real sockets and real HTTP, not `TestClient`: the whole subject is
+# which socket a connection was accepted on, and `TestClient` speaks ASGI
+# directly with a scope it was handed.
+
+_SIX_B_TOKEN_COOKIE = "tenka_device"
+
+
+async def _get(port: int, path: str, token: str | None = None):
+    """One real HTTP GET against a real loopback listener.
+
+    The credential goes in a literal `Cookie` header rather than through
+    httpx's cookie jar: a jar entry is matched by domain and path, and a
+    silently unmatched cookie would turn every assertion below into "401,
+    because nothing was sent" while looking like a policy refusal.
+    """
+    import httpx
+
+    headers = {} if token is None else {"Cookie": f"{_SIX_B_TOKEN_COOKIE}={token}"}
+    async with httpx.AsyncClient(timeout=5.0) as http:
+        return await http.get(f"http://127.0.0.1:{port}{path}", headers=headers)
+
+
+async def _cancel(*tasks) -> None:
+    import asyncio
+    import contextlib
+
+    for task in tasks:
+        if task is not None:
+            task.cancel()
+    for task in tasks:
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+    await asyncio.sleep(0.1)
+
+
+def _port_is_free(port: int) -> bool:
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+@pytest.mark.asyncio
+async def test_a_second_listener_serves_the_same_app_under_its_own_policy(tmp_path):
+    """One app, two sockets, two ceilings.
+
+    Four separate apps would fork `AuthState`, the rate limiter, the event hub
+    and the pair store for no benefit, and would give four different answers to
+    `GET /v1/devices` -- so the second listener must be the *same* app object,
+    proven here by the shared audit log holding both requests. What must NOT be
+    shared is the ceiling: `/v1/audit` is behind `require_admin`, which loopback
+    alone satisfies, so the identical credential is answered 200 on the local
+    port and 403 on the tailnet one.
+    """
+    import asyncio
+
+    from assistant.io.api import server
+    from assistant.io.api.vault import Capability, TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    local_port, tailnet_port = 8940, 8941
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+
+    task = server.serve(build_fake_runtime(), vault, port=local_port,
+                        origins=["http://localhost:3000"])
+    handle = server.current_listeners()
+    assert handle is not None, "serve() left no StudioListeners for main.py to hold"
+    assert handle.app.state.listener_policies == {local_port: "local"}
+
+    sock = server.bind_listener(tailnet_port)
+    handle.app.state.listener_policies[tailnet_port] = "tailnet"
+    second = server.serve_socket(handle.app, sock, name="studio-tailnet")
+    handle.tasks["tailnet"] = second
+    handle.sockets["tailnet"] = sock
+    await asyncio.sleep(0.4)
+
+    try:
+        assert (await _get(local_port, "/v1/status", token)).status_code == 200
+        assert (await _get(tailnet_port, "/v1/status", token)).status_code == 200
+
+        assert (await _get(local_port, "/v1/audit", token)).status_code == 200
+        assert (await _get(tailnet_port, "/v1/audit", token)).status_code == 403, (
+            "the tailnet listener answered an admin-only route -- either it is "
+            "serving a different app, or it inherited local's policy (KI-17)"
+        )
+
+        paths = [entry.path for entry in handle.app.state.auth.audit.entries()]
+        assert paths.count("/v1/status") == 2, (
+            "the two listeners do not share one AuthState -- they are not one "
+            f"app: {paths}"
+        )
+    finally:
+        await _cancel(task, second)
+
+
+@pytest.mark.asyncio
+async def test_a_bound_socket_is_released_when_its_listener_task_is_cancelled(tmp_path):
+    """A listener that revokes every token but never releases its socket has
+    only paused, not stopped.
+
+    Two cases, and the second is the one pre-bound sockets introduce.
+    `uvicorn.Server.main_loop()` awaits `asyncio.sleep(0.1)` with no
+    try/finally, so a bare cancel skips the `shutdown()` that closes the
+    listening socket -- that is the case `serve()` already handled. The new
+    one is a task cancelled *before* uvicorn ever started: `bind_listener()`
+    bound the port before the task existed, so nothing inside uvicorn would
+    ever close it and only `serve_socket()`'s own cleanup can.
+    """
+    import asyncio
+
+    from assistant.io.api.app import create_app
+    from assistant.io.api import server
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    port = 8942
+    app = create_app(build_fake_runtime(), TokenVault(tmp_path),
+                     origins=[], listener_policies={port: "tailnet"})
+
+    sock = server.bind_listener(port)
+    assert not _port_is_free(port), "sanity: bind_listener() did not bind"
+    task = server.serve_socket(app, sock, name="studio-tailnet")
+    await asyncio.sleep(0.3)
+    await _cancel(task)
+    assert _port_is_free(port), "the socket survived its cancelled listener task"
+
+    # Cancelled before uvicorn's startup ever completed.
+    sock = server.bind_listener(port)
+    task = server.serve_socket(app, sock, name="studio-tailnet")
+    await _cancel(task)
+    assert _port_is_free(port), (
+        "a listener cancelled before startup left its pre-bound socket open -- "
+        "uvicorn never owned it, so nothing else will ever close it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_registering_a_second_listener_never_touches_the_local_entry(tmp_path):
+    """The registry is one mutable dict shared by the app, `HostGate` and
+    `authenticate()`. A transport starting or stopping edits its own key and
+    nothing else -- a second listener must never be able to lend its policy
+    to, or take one from, the local port.
+    """
+    import asyncio
+
+    from assistant.io.api import server
+    from assistant.io.api.policy import POLICIES, policy_for_port
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    local_port, tailnet_port = 8943, 8944
+    task = server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                        port=local_port, origins=[])
+    try:
+        registry = server.current_listeners().app.state.listener_policies
+        assert registry == {local_port: "local"}
+
+        registry[tailnet_port] = "tailnet"
+        assert registry[local_port] == "local"
+        assert policy_for_port(local_port, registry) is POLICIES["local"]
+        assert policy_for_port(tailnet_port, registry) is POLICIES["tailnet"]
+
+        # And back out again, which is a transport's stop path.
+        del registry[tailnet_port]
+        assert registry == {local_port: "local"}
+        assert policy_for_port(local_port, registry) is POLICIES["local"]
+        assert policy_for_port(tailnet_port, registry) is None
+    finally:
+        await _cancel(task)
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_dropping_a_listener_makes_its_port_answer_401_not_another_policy(tmp_path):
+    """Spec §9, "listener registry mutation under load".
+
+    A transport stops by dropping its registry entry. From that instant its
+    port resolves to *no* policy, and `authenticate()` answers 401 -- never to
+    a different policy, and above all never to `local`'s. A request already in
+    flight keeps the policy it resolved on the way in (that lookup happened
+    before the drop) and must not be widened by the drop either.
+    """
+    import asyncio
+
+    from assistant.io.api import server
+    from assistant.io.api.vault import Capability, TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    local_port, tailnet_port = 8945, 8946
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability))
+
+    task = server.serve(build_fake_runtime(), vault, port=local_port,
+                        origins=[])
+    handle = server.current_listeners()
+    sock = server.bind_listener(tailnet_port)
+    handle.app.state.listener_policies[tailnet_port] = "tailnet"
+    second = server.serve_socket(handle.app, sock, name="studio-tailnet")
+    await asyncio.sleep(0.4)
+
+    try:
+        # In flight: the drop lands between this request's policy lookup and
+        # the assertion. It stays on tailnet's ceiling -- `/v1/audit` is
+        # admin-only and is refused -- rather than picking up local's.
+        registry = handle.app.state.listener_policies
+        in_flight = asyncio.create_task(_get(tailnet_port, "/v1/audit", token))
+        await asyncio.sleep(0)
+        registry.pop(tailnet_port)
+        assert (await in_flight).status_code in (401, 403), (
+            "a request in flight when its transport stopped resolved to some "
+            "other listener's policy"
+        )
+
+        # After the drop, the port carries nothing at all.
+        assert (await _get(tailnet_port, "/v1/status", token)).status_code == 401
+        assert (await _get(tailnet_port, "/v1/audit", token)).status_code == 401, (
+            "a dropped listener's port answered an admin route -- an "
+            "unregistered port must grant nothing, not fall back to a policy"
+        )
+        # The local listener is untouched by any of it.
+        assert (await _get(local_port, "/v1/audit", token)).status_code == 200
+    finally:
+        await _cancel(task, second)
+
+
+@pytest.mark.asyncio
+async def test_only_one_listener_runs_the_apps_lifespan(tmp_path):
+    """`create_app`'s lifespan starts and stops the `EventHub`. Uvicorn runs
+    startup and shutdown per `Server`, so four servers would start the hub
+    four times and the first one to stop would stop it for everybody. The
+    local listener owns the lifespan; every other listener is `lifespan="off"`.
+    """
+    import asyncio
+
+    from assistant.io.api import server
+    from assistant.io.api.events import EventHub
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    starts, stops = [], []
+
+    class CountingHub(EventHub):
+        async def start(self, runtime) -> None:
+            starts.append(1)
+            await super().start(runtime)
+
+        async def stop(self) -> None:
+            stops.append(1)
+            await super().stop()
+
+    local_port = 8947
+    extra_ports = (8948, 8949)
+    hub = CountingHub()
+    task = server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                        port=local_port, origins=[], hub=hub)
+    handle = server.current_listeners()
+    extra = []
+    for port in extra_ports:
+        sock = server.bind_listener(port)
+        handle.app.state.listener_policies[port] = "tailnet"
+        extra.append(server.serve_socket(handle.app, sock, name=f"studio-{port}"))
+    await asyncio.sleep(0.5)
+
+    try:
+        assert len(starts) == 1, (
+            f"the event hub was started {len(starts)} times across three "
+            "listeners -- every listener is running the app's lifespan"
+        )
+        assert stops == [], "the hub was stopped while listeners were still serving"
+    finally:
+        await _cancel(*extra)
+        await asyncio.sleep(0.2)
+        assert stops == [], (
+            "stopping a transport listener stopped the shared event hub -- the "
+            "first shutdown took the socket stream away from every other listener"
+        )
+        await _cancel(task)
+
+
+@pytest.mark.asyncio
+async def test_every_listener_pins_the_same_uvicorn_security_flags(tmp_path, monkeypatch):
+    """`proxy_headers=False` and `forwarded_allow_ips=[]` are a security
+    setting, not a preference, and they have to be identical on every socket.
+
+    Uvicorn's default rewrites `scope["client"]` from `X-Forwarded-For` on any
+    loopback peer -- which is *every* tunnelled connection -- and both the
+    anonymous rate budget and the exponential auth lockout are keyed on it.
+    `log_config=None` is pinned for a different reason with the same shape:
+    uvicorn's default config goes through `dictConfig`, which calls
+    `logging.shutdown()` on every handler in the process, including the
+    assistant's own `debug.log` FileHandler.
+
+    Asserted on the `uvicorn.Config` objects actually built, not on the source
+    text: a fifth listener added later that quietly omits one of these would
+    read fine and would be a live hole.
+    """
+    import asyncio
+
+    import uvicorn
+
+    from assistant.io.api import server
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    built: list = []
+    real_config = uvicorn.Config
+
+    def _spy(*args, **kwargs):
+        config = real_config(*args, **kwargs)
+        built.append(config)
+        return config
+
+    monkeypatch.setattr(server.uvicorn, "Config", _spy)
+
+    local_port, tailnet_port = 8950, 8951
+    task = server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                        port=local_port, origins=[])
+    handle = server.current_listeners()
+    sock = server.bind_listener(tailnet_port)
+    second = server.serve_socket(handle.app, sock, name="studio-tailnet")
+    await asyncio.sleep(0.3)
+
+    try:
+        assert len(built) == 2, f"expected one uvicorn.Config per listener, got {built}"
+        for config in built:
+            assert config.proxy_headers is False
+            assert not config.forwarded_allow_ips
+            assert config.log_config is None
+            assert config.access_log is False
+            assert config.log_level == "warning"
+        lifespans = [config.lifespan for config in built]
+        assert lifespans == ["on", "off"], (
+            f"exactly one listener may own the app's lifespan, got {lifespans}"
+        )
+    finally:
+        await _cancel(task, second)
+
+
+@pytest.mark.asyncio
+async def test_a_transport_listener_does_not_take_the_processs_signal_handlers(tmp_path):
+    """`uvicorn.Server.serve()` wraps itself in `capture_signals()`, which
+    replaces this process's SIGINT and SIGTERM handlers for the duration and
+    restores whatever was there when it started.
+
+    With one server that nests correctly. With four, starting and stopping at
+    arbitrary times, it does not: the second listener saves the *first
+    server's* handler and puts it back when it stops -- so a transport that
+    starts and stops leaves Ctrl+C pointing at whichever `Server` object
+    happened to be installed then, quite possibly one that has already exited
+    and will do nothing with it. The local listener owns the signals for the
+    same reason it owns the lifespan; a transport must leave them alone.
+    """
+    import asyncio
+    import signal
+
+    from assistant.io.api import server
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    local_port, tailnet_port = 8955, 8956
+    task = server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                        port=local_port, origins=[])
+    await asyncio.sleep(0.3)
+    before = {sig: signal.getsignal(sig)
+              for sig in (signal.SIGINT, signal.SIGTERM)}
+
+    handle = server.current_listeners()
+    sock = server.bind_listener(tailnet_port)
+    second = server.serve_socket(handle.app, sock, name="studio-tailnet")
+    await asyncio.sleep(0.3)
+    try:
+        for sig, handler in before.items():
+            assert signal.getsignal(sig) is handler, (
+                f"a transport listener replaced the process's {sig!r} handler"
+            )
+    finally:
+        await _cancel(second, task)
+
+
+@pytest.mark.asyncio
+async def test_a_bind_collision_fails_loudly(tmp_path):
+    """No `SO_REUSEADDR`. A second TENKA silently sharing a port -- answering
+    some of the first one's connections, under its own vault -- is worse than
+    a refusal, and on Windows `SO_REUSEADDR` permits exactly that hijack
+    rather than merely relaxing TIME_WAIT."""
+    from assistant.io.api import server
+
+    port = 8952
+    first = server.bind_listener(port)
+    try:
+        with pytest.raises(OSError):
+            server.bind_listener(port)
+    finally:
+        first.close()
+
+
+def test_serve_still_refuses_a_non_loopback_host(tmp_path):
+    """Carried control. Every listener binds loopback; separation is by port."""
+    from assistant.io.api import server
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    with pytest.raises(ValueError):
+        server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                     host="0.0.0.0", port=8953, origins=[])
+    with pytest.raises(ValueError):
+        server.bind_listener(8953, host="0.0.0.0")
+
+
+@pytest.mark.asyncio
+async def test_serve_threads_a_raise_store_through_to_the_app(tmp_path):
+    """`RaiseStore` follows `hub` and `pair_store` exactly: main.py holds the
+    one store the admin raise route writes and `authenticate()` reads, and
+    hands it in. Left unset -- every caller before 6b -- the app builds a
+    private one, so nothing outside that app could ever reach it."""
+    from assistant.io.api.app import create_app
+    from assistant.io.api import server
+    from assistant.io.api.raises import RaiseStore
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    private = create_app(build_fake_runtime(), TokenVault(tmp_path), origins=[],
+                         listener_policies={8787: "local"})
+    assert isinstance(private.state.raises, RaiseStore)
+
+    raises = RaiseStore()
+    task = server.serve(build_fake_runtime(), TokenVault(tmp_path), port=8954,
+                        origins=[], raises=raises)
+    try:
+        assert server.current_listeners().app.state.raises is raises
+    finally:
+        await _cancel(task)
+
+
 def test_the_exporter_writes_a_schema(tmp_path):
     import json
     import subprocess

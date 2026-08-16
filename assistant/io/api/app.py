@@ -33,6 +33,7 @@ from .events import (
 )
 from .pairing import PairCodeStore
 from .policy import effective
+from .raises import RaiseStore
 from .routes import chat as chat_routes
 from .routes import commands as command_routes
 from .routes import devices as device_routes
@@ -357,7 +358,8 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                origins: list[str], hub: EventHub | None = None,
                listener_policies: dict[int, str] | None = None,
                ui_bundle: UiBundle | None = None,
-               pair_store: PairCodeStore | None = None) -> FastAPI:
+               pair_store: PairCodeStore | None = None,
+               raises: RaiseStore | None = None) -> FastAPI:
     # Eager, once: instance_secret() is uncached on the environment-override
     # path, and a wrong-length TENKA_SECRET raises ValueError. Resolving it
     # here means a misconfigured override fails when the app is built, not
@@ -392,6 +394,20 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # when it needs to hold the same store the routes do -- the pairing tests,
     # which mint without going through the loopback-only route.
     app.state.pair_store = pair_store if pair_store is not None else PairCodeStore()
+    # Live ceiling raises, keyed on (device, policy). Threaded in for the same
+    # reason `hub` and `pair_store` are, and with the same default: a caller
+    # that has to hold the *same* store the routes read -- main.py, so that
+    # `vault.reset()` can clear every raise the moment the kill switch is
+    # thrown, and so `TransportManager` can drop a stopped transport's raises
+    # -- passes one in. Left unset (tests, the OpenAPI exporter) the app builds
+    # a private one scoped to itself, which is the only safe default: a
+    # process-wide store would let a raise minted against one app be spent
+    # against another.
+    #
+    # Never persisted, by construction rather than by convention -- see
+    # `raises.py`'s module docstring for why a raise that survives a restart
+    # would not be a raise.
+    app.state.raises = raises if raises is not None else RaiseStore()
     # Port -> policy name. An empty registry denies everything, which is the
     # correct answer to "nobody said what this socket is": see
     # `policy.py`'s docstring for why the port, and nothing the client sends,

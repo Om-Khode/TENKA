@@ -1,19 +1,40 @@
 # assistant/io/api/server.py
-"""Run the daemon inside the assistant's event loop.
+"""Run the daemon inside the assistant's event loop -- on one socket, or many.
 
-Loopback only. Milestone 6 adds transports; until then the only way in is from
-this machine.
+**One ASGI app, one `uvicorn.Server` per listener, one shared registry.**
+Milestone 6b gives each transport its own socket on its own port, because the
+daemon resolves what a request may do from the local port the connection was
+accepted on -- the one piece of addressing a client cannot forge (`policy.py`
+holds that argument in full). Four separate apps would fork `AuthState`, the
+rate limiter, the event hub and the pair store for no benefit, and would give
+four different answers to `GET /v1/devices`.
+
+Every listener binds `127.0.0.1`, without exception. Separation is by **port**,
+never by host: `cloudflared` and `tailscale funnel` both connect to this daemon
+from loopback, so a tunnel is indistinguishable from a local caller by peer
+address.
+
+`serve()` binds and serves the `local` listener and returns its task, exactly
+as it always has. Transports come later and from elsewhere (`transports/`),
+through `bind_listener()` and `serve_socket()` -- the two halves this module
+splits binding and serving into so that a caller can bind first, decide, and
+serve second.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import socket
+from contextlib import nullcontext, suppress
+from dataclasses import dataclass, field
 
 import uvicorn
+from fastapi import FastAPI
 
 from .app import create_app
 from .events import EventHub
 from .pairing import PairCodeStore
+from .raises import RaiseStore
 from .runtime import StudioRuntime
 from .ui import UiBundle
 from .vault import TokenVault
@@ -22,91 +43,189 @@ logger = logging.getLogger(__name__)
 
 _HOST = "127.0.0.1"
 
+# The listen backlog. Small deliberately: this daemon serves one household's
+# devices, and a deep backlog only buys a longer queue of connections nobody
+# is going to get to any sooner.
+_BACKLOG = 64
 
-def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
-          port: int = 8787, origins: list[str],
-          hub: EventHub | None = None,
-          ui_bundle: UiBundle | None = None,
-          pair_store: PairCodeStore | None = None) -> asyncio.Task:
-    """Start uvicorn as a task on the running loop. Cancel the task to stop.
 
-    `hub` lets a caller (main.py) subscribe status_broadcaster to the exact
-    EventHub instance this app will use, before the socket route ever sees a
-    connection. Left unset -- every existing caller (tests, the exporter) --
-    `create_app` builds its own, private to that one app, exactly as before.
+# ─── The handle main.py holds ────────────────────────────────────────────
 
-    `ui_bundle` is the third of these, and the one that has to be threaded
-    rather than resolved here: deciding *which* bundle means reading
-    `studio_ui_path`, and nothing under `io/api` may import `config` (see the
-    closing comment in ui.py). So main.py resolves it and hands it in, exactly
-    as it already does for `origins`. Left unset -- tests, the exporter -- the
-    app mounts no UI route at all and is otherwise unchanged.
+@dataclass
+class StudioListeners:
+    """Everything a caller needs to reach the running daemon, keyed by policy.
 
-    `pair_store` is the same shape of escape hatch, for the same reason:
-    main.py threads its own module-level `PairCodeStore` through here so
-    that `/studio pair` (a slash command, not a route) can mint into the
-    exact object `POST /v1/pair` consults. Left unset, `create_app` builds a
-    private store nothing outside that one app could ever reach.
+    `serve()`'s return type is pinned by `tests/test_api_server_lifecycle.py`
+    -- it returns the local listener's task and nothing else -- so the app and
+    the per-listener machinery are reachable through this instead, which
+    `serve()` leaves in `current_listeners()`. `TransportManager` (Task 9) is
+    the other holder: starting a tunnel means binding a socket, writing one
+    entry into `app.state.listener_policies`, and parking the task and the
+    socket here so a stop can find them again.
+
+    `tasks` and `sockets` are keyed by **policy name**, not by port. A port is
+    derivable from the name (`listeners.port_for`) and the name is what a
+    transport, a ceiling and a raise are all scoped by, so keying on it means
+    those four things cannot drift apart.
+    """
+
+    app: FastAPI
+    tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    sockets: dict[str, socket.socket] = field(default_factory=dict)
+
+
+_listeners: StudioListeners | None = None
+
+
+def current_listeners() -> StudioListeners | None:
+    """The handle for the daemon `serve()` most recently started, or `None`.
+
+    A function rather than a bare module attribute so that a caller reading it
+    always gets the current value: `from .server import _listeners` would
+    capture whatever was there at import time, which is `None` forever.
+
+    **Lifetime is the caller's, deliberately.** This is set by `serve()` and
+    is *not* cleared when the local task ends -- because a stop is exactly
+    when a caller still needs the handle, to tear down whatever transports are
+    running before the app goes away. So `None` here means "no daemon was ever
+    started in this process", not "no daemon is serving right now": whoever
+    stops the daemon (main.py's `_stop_studio_daemon`) is the one that must
+    clear it afterwards, the same obligation it already carries for
+    `_studio_pair_store`. Do not decide a daemon is live from this being
+    non-`None`; ask the task.
+    """
+    return _listeners
+
+
+# ─── Binding, separately from serving ────────────────────────────────────
+
+def bind_listener(port: int, host: str = _HOST) -> socket.socket:
+    """A bound, listening socket on loopback. Raises `OSError` on a collision.
+
+    Split from serving because a caller has work to do in between. A transport
+    must know its port is genuinely its own *before* it spawns a tunnel at it,
+    and it must be able to give the port back -- closing this socket -- if
+    anything after the bind fails. Binding inside the serve task instead would
+    put both of those on the far side of an `await`, in a task the caller can
+    only cancel and hope.
+
+    **`SO_REUSEADDR` is deliberately not set, and this is a Windows machine.**
+    On Linux the option merely relaxes TIME_WAIT. On Windows it means
+    something else entirely: a second process setting it can bind a port
+    another process is *actively listening on*, and takes the connections --
+    which is why Microsoft's own guidance is to use `SO_EXCLUSIVEADDRUSE`
+    rather than this. A second TENKA answering the first one's requests under
+    its own vault, its own devices and its own audit log is far worse than a
+    refusal to start. So a bind collision fails loudly, and
+    `_start_studio_daemon()` already catches it, logs it and leaves the
+    assistant running without a daemon.
+
+    The host argument exists so the refusal below is expressed once. There is
+    no configuration that reaches it: every caller in this milestone takes the
+    default.
     """
     if host != _HOST:
-        raise ValueError("the Studio daemon binds loopback only in this milestone")
+        raise ValueError("the Studio daemon binds loopback only")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, port))
+        sock.listen(_BACKLOG)
+    except BaseException:
+        # Including the collision this function exists to surface: the socket
+        # object would otherwise be left holding a file descriptor nobody has
+        # a reference to, once the exception has unwound past the caller.
+        sock.close()
+        raise
+    return sock
 
-    # The one listener this milestone binds, declared by the port it binds
-    # on. Everything a request is allowed to do is looked up from this map by
-    # the port the connection was accepted on; a port that is not in it grants
-    # nothing at all. A later transport adds its own entry here rather than
-    # relying on any property of the traffic itself.
-    app = create_app(runtime, vault, origins=origins, hub=hub,
-                     listener_policies={port: "local"}, ui_bundle=ui_bundle,
-                     pair_store=pair_store)
-    # `proxy_headers=False`, explicitly, and it is a security setting rather
-    # than a preference. Uvicorn's default is True with
-    # `forwarded_allow_ips="127.0.0.1"`, which installs
-    # `ProxyHeadersMiddleware` and lets it rewrite `scope["client"]` from the
-    # `X-Forwarded-For` header on any connection whose peer is loopback --
-    # which is *every* tunnelled connection, because `cloudflared` and
-    # `tailscale funnel` both connect to this daemon from 127.0.0.1.
-    #
-    # Two things in this codebase are keyed on `request.client.host`: the
-    # anonymous rate-limit budget and the exponential auth lockout
-    # (`security.py`'s `authenticate()`), and both are documented as safe on
-    # the grounds that a tunnel collapses every remote caller onto one shared
-    # key. With the default in force that reasoning was simply wrong -- ten
-    # wrong-token guesses under one `X-Forwarded-For` value lock that value
-    # out, and the next request under a different value is answered as a
-    # fresh, unmetered caller. The lockout and the window were both rotatable
-    # by a header, and `RateLimiter` grew one permanent entry per distinct
-    # value on the way. (Task 10's review missed this because `TestClient`
-    # speaks ASGI directly and never installs uvicorn's middleware at all;
-    # only a real `server.serve()` shows it.)
-    #
-    # Turning it off is the right direction rather than trusting the header
-    # more carefully: nothing in this daemon wants a client-supplied address.
-    # Policy comes from the accepting port, the `Host` gate is a rejection
-    # list, and the two budgets above are better off metering the one peer
-    # they can actually see. The cost is that a tunnel's traffic all meters
-    # as one caller -- which is exactly what the code already claims, and now
-    # true. `forwarded_allow_ips` is pinned to an empty list as well so that
-    # re-enabling the middleware by accident still trusts nobody.
-    #
-    # `log_config=None` keeps uvicorn out of the host application's logging.
-    # Its default config is applied through `logging.config.dictConfig`, which
-    # calls `logging.shutdown()` on every handler in the process -- including
-    # main.py's `debug.log` FileHandler. `FileHandler.close()` nulls `stream`,
-    # and `emit()` refuses to reopen a closed `mode="w"` handler (that guard
-    # exists so a reopen cannot truncate the file), so every record after this
-    # line was dropped in silence while the handler sat in `root.handlers`
-    # looking healthy. Every debug log since the daemon shipped ended mid-boot,
-    # a few lines before this call. Uvicorn's own records still reach root and
-    # format like the rest.
+
+def serve_socket(app: FastAPI, sock: socket.socket, *, name: str,
+                 primary: bool = False) -> asyncio.Task:
+    """Serve `app` on an already-bound socket. Cancel the task to stop.
+
+    `primary` marks the one listener that owns this process's lifecycle, and it
+    controls two things that must both be true of exactly one socket:
+
+    - **The app's lifespan.** `create_app`'s lifespan starts and stops the
+      `EventHub`. Uvicorn runs startup and shutdown per `Server`, so four
+      servers would start the hub four times -- and the first one to stop would
+      stop it for everybody, taking the event socket's stream away from every
+      other listener. Non-primary listeners run `lifespan="off"`.
+    - **Uvicorn's signal handlers.** `Server.serve()` installs its own SIGINT
+      and SIGTERM handlers for the duration and restores whatever was there
+      when it started. With one server that nests correctly. With four,
+      starting and stopping at arbitrary times, it does not: a transport
+      stopping would restore a handler belonging to a server that has itself
+      already stopped, and Ctrl+C would then reach a dead `Server` object and
+      do nothing at all. So only the primary listener captures signals; the
+      others leave the process's handlers exactly as they found them.
+
+    Defaults to `False`, so a transport listener added later is non-primary
+    unless somebody deliberately says otherwise -- the safe direction, since
+    the failure mode of a second primary is a hub that stops while three
+    sockets are still serving.
+
+    The uvicorn flags below are pinned identically on **every** listener, and
+    two of them are security settings rather than preferences:
+
+    `proxy_headers=False`, explicitly. Uvicorn's default is True with
+    `forwarded_allow_ips="127.0.0.1"`, which installs `ProxyHeadersMiddleware`
+    and lets it rewrite `scope["client"]` from the `X-Forwarded-For` header on
+    any connection whose peer is loopback -- which is *every* tunnelled
+    connection, because `cloudflared` and `tailscale funnel` both connect to
+    this daemon from 127.0.0.1.
+
+    Two things in this codebase are keyed on the client's identity: the
+    anonymous rate-limit budget and the exponential auth lockout
+    (`security.py`'s `authenticate()`), and both are documented as safe on the
+    grounds that a tunnel collapses every remote caller onto one shared key.
+    With the default in force that reasoning was simply wrong -- ten wrong
+    token guesses under one `X-Forwarded-For` value lock that value out, and
+    the next request under a different value is answered as a fresh, unmetered
+    caller. The lockout and the window were both rotatable by a header, and
+    `RateLimiter` grew one permanent entry per distinct value on the way.
+    (Task 10's review missed this because `TestClient` speaks ASGI directly and
+    never installs uvicorn's middleware at all; only a real `server.serve()`
+    shows it.)
+
+    Turning it off is the right direction rather than trusting the header more
+    carefully: nothing in this daemon wants a client-supplied address. Policy
+    comes from the accepting port, the `Host` gate is a rejection list, and the
+    two budgets above are better off metering the one peer they can actually
+    see. The cost is that a tunnel's traffic all meters as one caller -- which
+    is exactly what the code already claims, and now true.
+    `forwarded_allow_ips` is pinned to an empty list as well so that
+    re-enabling the middleware by accident still trusts nobody.
+
+    `log_config=None` keeps uvicorn out of the host application's logging. Its
+    default config is applied through `logging.config.dictConfig`, which calls
+    `logging.shutdown()` on every handler in the process -- including main.py's
+    `debug.log` FileHandler. `FileHandler.close()` nulls `stream`, and `emit()`
+    refuses to reopen a closed `mode="w"` handler (that guard exists so a
+    reopen cannot truncate the file), so every record after this line was
+    dropped in silence while the handler sat in `root.handlers` looking
+    healthy. Every debug log since the daemon shipped ended mid-boot, a few
+    lines before this call. Uvicorn's own records still reach root and format
+    like the rest.
+    """
+    host, port = sock.getsockname()[:2]
     config = uvicorn.Config(app, host=host, port=port, log_level="warning",
-                            access_log=False, lifespan="on", log_config=None,
+                            access_log=False,
+                            lifespan="on" if primary else "off",
+                            log_config=None,
                             proxy_headers=False, forwarded_allow_ips=[])
     server = uvicorn.Server(config)
+    if not primary:
+        # See the docstring: `Server.serve()` wraps itself in
+        # `capture_signals()`, which is correct for one server and actively
+        # harmful for four. Replaced on the instance, which is the whole reach
+        # of this -- the class, and therefore the primary listener, is
+        # untouched.
+        server.capture_signals = nullcontext
 
     async def _run() -> None:
         try:
-            await server.serve()
+            await server.serve(sockets=[sock])
         except asyncio.CancelledError:
             server.should_exit = True
             # uvicorn's own main_loop() awaits asyncio.sleep(0.1) with no
@@ -121,11 +240,112 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
             # close) is what actually frees the port before this coroutine
             # finishes unwinding.
             if server.started:
-                await server.shutdown()
+                await server.shutdown(sockets=[sock])
             raise
 
+    task = asyncio.create_task(_run(), name=name)
+
+    def _release(_task: asyncio.Task) -> None:
+        """Close the socket once this listener's task is over, however it ended.
+
+        A done-callback rather than a `finally` inside `_run()`, and the
+        difference is the whole point. The socket is bound by
+        `bind_listener()` *before* this task exists, so it is not uvicorn's to
+        close on a path where uvicorn never ran -- and there is such a path:
+        `task.cancel()` before the loop has given the coroutine its first turn
+        cancels it without ever entering the body, so no `try`/`finally`
+        written inside `_run()` executes at all. That is not a contrived case;
+        it is exactly what a transport does when a step after the bind fails
+        and it tears the half-built listener down.
+
+        Left alone, the port stays bound for the life of the process with
+        nothing holding a reference to it. A done-callback fires whether the
+        coroutine ran, raised, or was never started. Idempotent, because
+        `socket.close()` on an already-closed socket is a no-op and uvicorn's
+        own shutdown will usually have closed it first.
+        """
+        with suppress(OSError):
+            sock.close()
+
+    task.add_done_callback(_release)
+
+    logger.info(f"[API] Studio listener '{name}' serving on http://{host}:{port}")
+    return task
+
+
+def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
+          port: int = 8787, origins: list[str],
+          hub: EventHub | None = None,
+          ui_bundle: UiBundle | None = None,
+          pair_store: PairCodeStore | None = None,
+          raises: RaiseStore | None = None) -> asyncio.Task:
+    """Start the `local` listener as a task on the running loop.
+
+    Signature and return type are unchanged from Milestone 6a, deliberately:
+    `tests/test_api_server_lifecycle.py` asserts on both directly, and
+    main.py's whole startup sequence is written around "serve() returns the
+    task, or raises". The multi-listener machinery sits *beside* it -- the app
+    and every listener's task and socket are reachable through
+    `current_listeners()`.
+
+    `hub` lets a caller (main.py) subscribe status_broadcaster to the exact
+    EventHub instance this app will use, before the socket route ever sees a
+    connection. Left unset -- every existing caller (tests, the exporter) --
+    `create_app` builds its own, private to that one app, exactly as before.
+
+    `ui_bundle` is the second of these, and the one that has to be threaded
+    rather than resolved here: deciding *which* bundle means reading
+    `studio_ui_path`, and nothing under `io/api` may import `config` (see the
+    closing comment in ui.py). So main.py resolves it and hands it in, exactly
+    as it already does for `origins`. Left unset -- tests, the exporter -- the
+    app mounts no UI route at all and is otherwise unchanged.
+
+    `pair_store` is the same shape of escape hatch, for the same reason:
+    main.py threads its own module-level `PairCodeStore` through here so
+    that `/studio pair` (a slash command, not a route) can mint into the
+    exact object `POST /v1/pair` consults. Left unset, `create_app` builds a
+    private store nothing outside that one app could ever reach.
+
+    `raises` is the fourth, added in 6b and defaulting to `None` so every
+    existing caller stays valid untouched. It is the live record of ceiling
+    raises that `authenticate()` reads and the admin raise route writes; a
+    caller that needs to reach the same store the routes do -- to clear it
+    with the kill switch, or to drop a stopped transport's raises -- hands one
+    in.
+
+    `app.state.transports` is deliberately NOT threaded through here.
+    Transports start and stop long after the daemon does, so the manager that
+    owns them is attached by main.py to the app this function built, through
+    `current_listeners()`.
+    """
+    if host != _HOST:
+        raise ValueError("the Studio daemon binds loopback only in this milestone")
+
+    # The listener this function binds, declared by the port it binds on.
+    # Everything a request is allowed to do is looked up from this map by the
+    # port the connection was accepted on; a port that is not in it grants
+    # nothing at all. A transport adds its own entry to this same dict as it
+    # starts -- `HostGate` and `authenticate()` both hold the dict itself, not
+    # a copy, so an entry added or dropped is live on the very next request --
+    # rather than relying on any property of the traffic itself.
+    app = create_app(runtime, vault, origins=origins, hub=hub,
+                     listener_policies={port: "local"}, ui_bundle=ui_bundle,
+                     pair_store=pair_store, raises=raises)
+
+    # Bound here, synchronously, before any task exists. A port collision is
+    # then raised out of this call -- where `_start_studio_daemon()`'s own
+    # try/except already turns it into one warning and a running assistant --
+    # instead of surfacing later as an exception inside a task somebody has to
+    # remember to retrieve.
+    sock = bind_listener(port, host)
+    task = serve_socket(app, sock, name="studio-api", primary=True)
+
+    global _listeners
+    _listeners = StudioListeners(app=app, tasks={"local": task},
+                                 sockets={"local": sock})
+
     logger.info(f"[API] Studio daemon listening on http://{host}:{port}")
-    return asyncio.create_task(_run(), name="studio-api")
+    return task
 
 
 def shutdown(task: asyncio.Task | None, vault: TokenVault) -> None:
@@ -140,7 +360,7 @@ def shutdown(task: asyncio.Task | None, vault: TokenVault) -> None:
     The other half is not synchronous. `task.cancel()` only *schedules*
     cancellation; it does not run `_run()`'s except-CancelledError cleanup
     (the `await server.shutdown()` that actually closes the listening
-    socket -- see `serve()` above). This function stays `-> None` rather
+    socket -- see `serve_socket()` above). This function stays `-> None` rather
     than `async def` because a synchronous kill switch that a signal handler
     or a non-async call site can fire without ceremony is worth more than a
     guarantee this function alone cannot keep anyway: `shutdown()` never
