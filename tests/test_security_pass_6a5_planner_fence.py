@@ -62,12 +62,22 @@ def test_the_machine_driving_tools_fail_closed_for_now():
 
 
 def test_a_payload_tool_declares_itself_as_one():
-    """`create_note` writes its param to disk and `store_memory` writes it to
-    the DB -- neither is a model instruction, and "save $step_1 as a note" is
-    the feature. They opt in explicitly rather than by omission."""
+    """`create_note` writes its param to disk -- not a model instruction, and
+    "save $step_1 as a note" is the feature. It opts in explicitly rather than
+    by omission.
+
+    AMENDED by the 6a.5 adversarial review, finding H2. This test used to name
+    `store_memory` here too, on the reasoning that it "writes it to the DB".
+    That reasoning was wrong in both halves: the handler interpolates the
+    content into an LLM prompt as the user's own words before anything is
+    written (`memory_search.py`), and what IS written is re-rendered into
+    every later turn's SYSTEM prompt under "KNOWN FACTS ABOUT THE USER". A
+    write to that DB is a write to the next turn's instructions, which is the
+    opposite of an inert payload. `store_memory` left the payload class; see
+    tests/test_6a5_fence_leaks.py for the pins."""
     from assistant.actions.planner.planner import TOOL_MANIFEST
-    for name in ("create_note", "store_memory"):
-        assert TOOL_MANIFEST[name]["inline_refs"] is True, name
+    assert TOOL_MANIFEST["create_note"]["inline_refs"] is True
+    assert TOOL_MANIFEST["store_memory"]["inline_refs"] is False
 
 
 def test_no_instruction_position_tool_inlines_references():
