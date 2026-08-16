@@ -346,3 +346,51 @@ def test_chat_text_cannot_forge_a_line_in_the_debug_log():
     assert sites, "the transcription log lines vanished -- retarget this test"
     for line in sites:
         assert "!r" in line, f"main.py interpolates chat text without !r: {line.strip()}"
+
+
+# ─── The two runners that fire outside a turn ────────────────────────────
+# Not in the plan. They are the call sites A4's fail-closed default breaks:
+# neither has a turn around it, so `current_grants` would be unset and every
+# fired monitor and scheduled task would answer with the refusal string. Each
+# now states its grant, and each statement is pinned here.
+@pytest.mark.asyncio
+async def test_a_fired_monitor_runs_with_the_local_grant_set(monkeypatch):
+    from assistant import actions
+    from assistant.automation.event_bus import EventBus
+    from assistant.core.capabilities import Capability
+
+    seen = {}
+
+    async def _spy(intent, params, llm_response="", bridge=None, _from_planner=False):
+        seen["intent"] = intent
+        seen["grants"] = actions.current_grants.get()
+        return "ok"
+
+    monkeypatch.setattr(actions, "execute", _spy)
+    assert await EventBus()._run_code_executor("do the thing") == "ok"
+    assert seen["intent"] == "code_executor"
+    assert Capability.EXECUTE in seen["grants"]
+    # ...and put back afterwards, so one fired monitor does not leave the
+    # process permanently privileged.
+    assert actions.current_grants.get() is None
+
+
+@pytest.mark.asyncio
+async def test_a_scheduled_task_runs_with_the_local_grant_set(monkeypatch):
+    from assistant import actions, scheduler
+    from assistant.core.capabilities import Capability
+
+    seen = {}
+
+    async def _spy(intent, params, llm_response="", bridge=None, _from_planner=False):
+        seen["intent"] = intent
+        seen["grants"] = actions.current_grants.get()
+        return "ok"
+
+    monkeypatch.setattr(actions, "execute", _spy)
+    result = await scheduler._async_run_handler(
+        {"task_type": "web_search", "task_goal": "tide times", "name": "t"})
+    assert result == "ok"
+    assert seen["intent"] == "web_search"
+    assert Capability.CHAT_SEND in seen["grants"]
+    assert actions.current_grants.get() is None
