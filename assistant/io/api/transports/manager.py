@@ -635,6 +635,17 @@ class TransportManager:
             # Recorded for whoever is owed the news but cannot see the log:
             # `start`'s own caller (below) and a `stop` that cancelled us.
             self._unwind_failures[name] = failures
+            # The teardown is done; only now is a cancellation delivered
+            # while it was in flight safe to honour -- matching the other
+            # two call sites (fix round 4). Without this, a direct cancel
+            # landing here while `exc` is some unrelated failure (a natural
+            # preflight or hostname-timeout refusal, say) would let this
+            # task finish via that failure's exception while still carrying
+            # an unhonoured `cancelling() > 0` -- recorded failures are
+            # unaffected either way, since they are read from
+            # `_unwind_failures`, not from which exception this task exits
+            # through.
+            _reraise_if_still_cancelling()
             if failures and isinstance(exc, TransportError):
                 # The caller gets a 409 whose detail says both things: why the
                 # start failed, and that the provider-side mapping could not
@@ -785,19 +796,22 @@ class TransportManager:
                     name)
                 self._stopped_while_starting.add(name)
                 starting.cancel()
-            # `asyncio.wait`, never `gather`: `gather` cancels its child when
-            # the *awaiter* is cancelled, so a stop that is itself cancelled
-            # here -- a second stop racing this same window, or `stop_all`
-            # racing a shutdown -- would deliver a further cancellation into
-            # `starting` from this line, exactly what the branch above exists
-            # to prevent (fix round 3, Important 1). `asyncio.wait` leaves
-            # `starting` untouched no matter how many times this wait itself
-            # is cancelled; `starting`'s own unwind is what guarantees its
-            # teardown still completes regardless, and a cancellation here
-            # is left to propagate rather than swallowed, so this method
-            # never reports "unwound" before `_unwind_failures` is actually
-            # settled.
-            await asyncio.wait({starting})
+            # `_wait_uncancellably`, never a plain `asyncio.wait` (fix round
+            # 4): `asyncio.wait` never forwards a cancel onto `starting`
+            # itself, however many times *this* wait is cancelled -- that
+            # part was already right -- but it does not loop, so the first
+            # such cancel propagates out of `stop` immediately, before
+            # `starting`'s own (correctly protected) teardown has
+            # necessarily finished. `stop_all`'s per-name handler then
+            # records that teardown as "already completed" when it was not,
+            # and nothing re-awaits the abandoned task afterward -- silent
+            # at runtime, fatal at shutdown, which is `stop_all`'s entire
+            # purpose. Waiting uncancellably here closes that gap the same
+            # way the sibling branch below already closes it.
+            await _wait_uncancellably(starting)
+            # The starting transport's own teardown is done; only now is a
+            # cancellation delivered while it was in flight safe to honour.
+            _reraise_if_still_cancelling()
             failures = self._unwind_failures.get(name, [])
             if failures:
                 raise TransportError("; ".join(failures))
@@ -1214,9 +1228,9 @@ def _serve(app: Any, sock: socket.socket, *, name: str) -> asyncio.Task:
 
 # ─── Small async utilities ───────────────────────────────────────────────────
 
-async def _await_uncancellably(fut: "asyncio.Future") -> Any:
-    """Await *fut* to completion, no matter how many times the caller's own
-    task is cancelled while waiting -- then hand back its result untouched.
+async def _settle_uncancellably(fut: "asyncio.Future") -> None:
+    """Re-shield *fut* until it is actually done, no matter how many times
+    the caller's own task is cancelled while waiting.
 
     A plain `await fut` forwards every cancellation of the *caller* onto
     *fut* (`Task.cancel()` cancels whatever future the task is currently
@@ -1234,23 +1248,54 @@ async def _await_uncancellably(fut: "asyncio.Future") -> Any:
     Re-shielding on *every* iteration, rather than recovering once, removes
     the bound entirely: probe-verified robust at cancellation depths 2, 3, 5
     and 9 (fix round 3). Bounded by *fut* itself, not by anything added
-    here -- every caller of this helper wraps something whose own steps are
-    already bounded (subprocess timeouts, `HOSTNAME_TIMEOUT_SECONDS`), so a
-    fresh timeout here would only duplicate that, not add safety.
+    here -- every caller wraps something whose own steps are already bounded
+    (subprocess timeouts, `HOSTNAME_TIMEOUT_SECONDS`), so a fresh timeout
+    here would only duplicate that, not add safety.
 
-    Deliberately does not re-raise a cancellation itself once *fut* is
-    done -- the caller's own task still carries the outstanding request
-    (`asyncio.current_task().cancelling()`), and callers with bookkeeping to
-    do about *fut*'s result (recording failures, say) are better placed than
-    this generic wait to decide when to also honour it (see
-    `_reraise_if_still_cancelling`).
+    The shared body behind `_await_uncancellably` and `_wait_uncancellably`
+    below -- round 4 found a *third* call site (`stop`'s "still starting"
+    branch) that needed the same protection but not the same return shape,
+    which is what split this out rather than adding a third near-duplicate.
     """
     while not fut.done():
         try:
             await asyncio.shield(fut)
         except asyncio.CancelledError:
             continue
+
+
+async def _await_uncancellably(fut: "asyncio.Future") -> Any:
+    """`_settle_uncancellably`, then hand back *fut*'s own result or
+    exception untouched.
+
+    Deliberately does not re-raise a cancellation of the *caller* itself
+    once *fut* is done -- the caller's own task still carries the
+    outstanding request (`asyncio.current_task().cancelling()`), and callers
+    with bookkeeping to do about *fut*'s result (recording failures, say)
+    are better placed than this generic wait to decide when to also honour
+    it (see `_reraise_if_still_cancelling`).
+    """
+    await _settle_uncancellably(fut)
     return fut.result()
+
+
+async def _wait_uncancellably(fut: "asyncio.Future") -> None:
+    """`_settle_uncancellably`, for callers that only need to know *fut* is
+    done -- never its result or exception.
+
+    `stop`'s "still starting" branch waits on the in-flight start's own
+    task, which it (or a concurrent stop) may itself have cancelled, so
+    *fut* routinely ends up cancelled or raising on its own account; that
+    outcome is not this caller's to propagate -- `_unwind_failures` is the
+    channel that branch reports through instead (matching what plain
+    `asyncio.wait` used to leave alone before round 4 replaced it with
+    this). *fut*'s own exception, if it has one and was not a cancellation,
+    is still retrieved and discarded here, so asyncio does not log an
+    "exception was never retrieved" warning for a future nobody else reads.
+    """
+    await _settle_uncancellably(fut)
+    if not fut.cancelled():
+        fut.exception()
 
 
 def _reraise_if_still_cancelling() -> None:
