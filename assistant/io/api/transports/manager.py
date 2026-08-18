@@ -54,7 +54,20 @@ Three things in here exist because they were got wrong somewhere first:
    stop argv, because nothing on the `TransportAdapter` Protocol exposes it
    (`base.py`'s `stop_command` docstring says so at length) -- which also
    means the port being checked is read off the very command whose effect is
-   being checked, so the two cannot drift apart.
+   being checked, so the two cannot drift apart. The *document* to check is
+   named by the adapter's own `status_command`, never derived from the stop
+   argv's verb -- deriving it assumed every provider's CLI is `<binary> <verb>
+   status --json` and quietly asked a funnel-scoped view a serve-scoped
+   question. A stop this module cannot verify -- no status command, an
+   unreadable document, a shape it cannot sweep -- is reported UNVERIFIED,
+   never as success: this check is the last thing standing, with no layer 3
+   behind it.
+
+   A stop or a shutdown arriving while a start is still in flight **cancels
+   that start** rather than finding nothing and reporting success. The window
+   is `HOSTNAME_TIMEOUT_SECONDS` wide, and what it costs is exactly the
+   outcome above: a tunnel that comes up after the operator asked for
+   everything to be down.
 
 3. **Every synchronous provider call is wrapped in `asyncio.to_thread`.**
    `preflight()` and the status re-read are `subprocess.run` with a 10s
@@ -246,32 +259,18 @@ def _public_port_from_argv(argv: list[str]) -> int | None:
     return None
 
 
-def _status_argv_for(argv: list[str]) -> list[str] | None:
-    """The `<binary> <verb> status --json` reader that matches *argv*.
+class _UnrecognisedStatus(Exception):
+    """A provider status document this module cannot sweep.
 
-    Derived from the stop argv itself -- its binary and its verb -- for the
-    same reason the public port is: the check is then read off the very
-    command whose effect is being checked, and a provider whose stop and
-    status verbs disagreed would have to say so in one place rather than two.
-
-    **Recorded gap, in the same class as the ones `tailscale.py` records for
-    its preflight.** Deriving the verb means `funnel`'s stop is verified
-    against `tailscale funnel status --json` rather than `serve status`.
-    Today those return the same document (verified against this machine's
-    1.102.2 binary, per `tailscale.py`'s module docstring), but that is not
-    guaranteed across versions: a future `funnel status` that filtered to
-    funnel-enabled entries would hide a residual *serve-only* mapping still
-    keyed under 443, and this check would then report a stop it could not
-    see. The adapters solved the same problem for preflight by pinning
-    `serve status` for both verbs -- which this module cannot do without
-    knowing which provider it is talking to, the one thing the Protocol
-    exists to prevent. Stated here rather than papered over; the direction of
-    the failure is a false "verified", which is the bad direction, so it
-    belongs on the adversarial round's list.
+    Raised rather than degraded-to-`False`, and that asymmetry with
+    `tailscale.py`'s preflight -- which logs a warning and carries on -- is
+    the whole point (fix round 1, Important 2). A preflight that degrades is
+    contained by KI-17 layer 3, the per-listener `Host` gate; **this check has
+    nothing behind it.** It is the last thing standing between a stop that
+    silently failed and an internet-facing listener nobody knows is up, so a
+    document it cannot read has to become an UNVERIFIED stop rather than a
+    verified one.
     """
-    if len(argv) < 2:
-        return None
-    return [argv[0], argv[1], "status", "--json"]
 
 
 def _web_documents(payload: object) -> Iterator[dict]:
@@ -281,17 +280,43 @@ def _web_documents(payload: object) -> Iterator[dict]:
     the ones nested under `Foreground`, because a foreground mapping keyed
     under our public port is an internet-facing listener whether or not it is
     ours -- and this function's caller is deciding whether a stop succeeded.
+
+    Raises `_UnrecognisedStatus` when a key that should hold a map does not.
+    An absent key is a different thing from a key of the wrong shape: absent
+    means "no mappings of that kind", which is the ordinary clear case and the
+    literal `{}` this machine prints when nothing is served; the wrong shape
+    means this function is reading a document it does not understand, and it
+    must not answer "nothing there" for one it never looked inside.
     """
     if not isinstance(payload, dict):
-        return
+        raise _UnrecognisedStatus(
+            f"the status document is a {type(payload).__name__}, not an object")
     web = payload.get("Web")
-    if isinstance(web, dict):
+    if web is not None:
+        if not isinstance(web, dict):
+            raise _UnrecognisedStatus(
+                f"its 'Web' value is a {type(web).__name__}, not an object")
         yield web
     foreground = payload.get("Foreground")
-    if isinstance(foreground, dict):
-        for entry in foreground.values():
-            if isinstance(entry, dict) and isinstance(entry.get("Web"), dict):
-                yield entry["Web"]
+    if foreground is None:
+        return
+    if not isinstance(foreground, dict):
+        raise _UnrecognisedStatus(
+            f"its 'Foreground' value is a {type(foreground).__name__}, not an "
+            f"object")
+    for entry in foreground.values():
+        if not isinstance(entry, dict):
+            raise _UnrecognisedStatus(
+                f"one of its 'Foreground' entries is a "
+                f"{type(entry).__name__}, not an object")
+        inner = entry.get("Web")
+        if inner is None:
+            continue
+        if not isinstance(inner, dict):
+            raise _UnrecognisedStatus(
+                f"a 'Foreground' entry's 'Web' value is a "
+                f"{type(inner).__name__}, not an object")
+        yield inner
 
 
 def _key_public_port(key: object) -> int | None:
@@ -314,10 +339,25 @@ def _keyed_under(payload: object, public_port: int) -> bool:
     round would be trivially satisfied by every document and would report
     every stop as successful (`base.py` records that this is exactly the
     wording that leaked a Critical the first time it was written).
+
+    Raises `_UnrecognisedStatus` for a document of an unreadable shape. A key
+    whose trailing half is not a port number is logged and skipped instead of
+    raising: an entry keyed in some shape this module does not know cannot be
+    matched against a port either way, and the provider's own status is
+    documented to key on `"<host>:<port>"`, so raising there would turn one
+    odd entry into a permanent false UNVERIFIED on every stop. Logged, not
+    silent -- that was the other half of the finding.
     """
     for web in _web_documents(payload):
         for key in web:
-            if _key_public_port(key) == public_port:
+            port = _key_public_port(key)
+            if port is None:
+                logger.warning(
+                    "[API] a provider status entry is keyed in a shape this "
+                    "check does not recognise, so it could not be matched "
+                    "against public port %d; skipped", public_port)
+                continue
+            if port == public_port:
                 return True
     return False
 
@@ -354,10 +394,22 @@ class TransportManager:
         self._registry = registry if registry is not None else transport_registry
         self._sessions: dict[str, TransportSession] = {}
         self._watchers: dict[str, asyncio.Task] = {}
-        # Names with a start in flight. Set synchronously before the first
-        # `await` in `start`, so two overlapping starts of one transport
-        # cannot both pass the "already running" check and both bind.
-        self._starting: set[str] = set()
+        # Starts in flight, by name -- the task, not merely the name, because
+        # a stop arriving mid-start has to be able to *cancel* it (fix round
+        # 1, Important 1). Registered synchronously before the first `await`
+        # in `start`, so two overlapping starts of one transport cannot both
+        # pass the "already running" check and both bind.
+        self._starting: dict[str, asyncio.Task] = {}
+        # Names whose in-flight start was cancelled by `stop`, so `start` can
+        # tell that cancellation apart from its own caller being cancelled and
+        # answer with a `TransportError` instead of re-raising `CancelledError`
+        # into a caller that was never cancelled.
+        self._stopped_while_starting: set[str] = set()
+        # What a start's unwind could not undo, by name. Read by whoever is
+        # owed the news: the failing `start` itself, and a `stop` that
+        # cancelled it. Cleared at the top of each start, so a read only ever
+        # describes the most recent attempt on that name.
+        self._unwind_failures: dict[str, list[str]] = {}
 
     # ─── Reading ─────────────────────────────────────────────────────────
 
@@ -414,14 +466,38 @@ class TransportManager:
                 f"transport '{name}' would bind port {port}, the loopback "
                 f"listener's own port (KI-17); refusing to start")
 
-        self._starting.add(name)
+        # Run the start as a task this manager owns, so a `stop` or a
+        # `stop_all` arriving while it is in flight can cancel it. The
+        # alternative -- refusing such a stop -- leaves the caller with a
+        # tunnel that comes up *after* it asked for everything to be down,
+        # and at shutdown that is a mapping still published to the open
+        # internet after TENKA has exited.
+        task = asyncio.create_task(self._start_and_unwind(name, adapter, port),
+                                   name=f"transport-start-{name}")
+        self._starting[name] = task
         try:
-            return await self._start_and_unwind(name, adapter, port)
+            return await task
+        except asyncio.CancelledError:
+            if name not in self._stopped_while_starting:
+                # Our own caller was cancelled, not us. The start task was
+                # cancelled with it and has already unwound; re-raise, because
+                # swallowing a cancellation is how a shutdown hangs.
+                raise
+            self._stopped_while_starting.discard(name)
+            raise TransportError("; ".join([
+                f"transport '{name}' was stopped while it was still starting",
+                *self._unwind_failures.get(name, ()),
+            ])) from None
         finally:
-            self._starting.discard(name)
+            self._starting.pop(name, None)
+            # A marker left set would make the *next* start on this name read
+            # its own caller's cancellation as a stop.
+            self._stopped_while_starting.discard(name)
 
     async def _start_and_unwind(self, name: str, adapter: TransportAdapter,
                             port: int) -> TransportSession:
+        self._unwind_failures.pop(name, None)
+
         # 1. Preflight, off the event loop -- the Tailscale adapters shell out
         # to `tailscale serve status --json` in here (spec §2.3 L2). Before
         # the bind, so a refusal has nothing to unwind.
@@ -436,6 +512,14 @@ class TransportManager:
         owner = _new_owner(name)
         process: asyncio.subprocess.Process | None = None
         serve_task: asyncio.Task | None = None
+        # Whether the provider was asked to do anything at all. The teardown
+        # runs the provider's own `off` argv only when this is true, so a
+        # start refused by the layer-1 argv check -- which happens *before*
+        # the spawn -- cannot destroy a pre-existing operator mapping it never
+        # created (fix round 1, Minor 4; spec §2.3 L2's rule is that a
+        # preflight names a conflict and does not silently repair it, and this
+        # is the same principle on the way back out).
+        spawn_attempted = False
         try:
             # 3. Register the port in the *live* registry, before the spawn:
             # the argv assertion below reads this dict, and a tunnel must
@@ -445,7 +529,20 @@ class TransportManager:
             # 4. Spawn, with the argv checked against the registry first.
             argv = [str(token) for token in adapter.command(port)]
             self._refuse_a_foreign_target(argv, name=name, port=port)
-            process = await _spawn(argv)
+            spawn_attempted = True
+            # Shielded, and then awaited again on cancellation. A cancel that
+            # landed *inside* `create_subprocess_exec` would otherwise leave a
+            # child this manager has no handle to -- an orphan tunnel, which is
+            # the very thing a cancellable start is supposed to prevent. The
+            # shield lets the spawn finish; the re-await recovers the handle so
+            # the teardown below can reap it.
+            spawn = asyncio.ensure_future(_spawn(argv))
+            try:
+                process = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    process = await spawn
+                raise
             logger.info("[API] transport '%s' spawned %s (pid %s) for port %d",
                         name, argv[0], getattr(process, "pid", "?"), port)
 
@@ -467,16 +564,28 @@ class TransportManager:
 
             session = require_serving(TransportSession(
                 policy_name=name, port=port, owner=owner, process=process,
-                sock=sock, serve_task=serve_task, hostname=hostname))
+                sock=sock, serve_task=serve_task, hostname=hostname,
+                adapter=adapter))
             self._sessions[name] = session
             self._listeners.tasks[name] = serve_task
             self._listeners.sockets[name] = sock
-        except BaseException:
-            for failure in await self._teardown(
-                    adapter, policy_name=name, port=port, owner=owner,
-                    process=process, sock=sock, serve_task=serve_task):
+        except BaseException as exc:
+            failures = await self._teardown_completely(
+                adapter, policy_name=name, port=port, owner=owner,
+                process=process, sock=sock, serve_task=serve_task,
+                spawned=spawn_attempted)
+            for failure in failures:
                 logger.error("[API] while unwinding transport '%s': %s",
                              name, failure)
+            # Recorded for whoever is owed the news but cannot see the log:
+            # `start`'s own caller (below) and a `stop` that cancelled us.
+            self._unwind_failures[name] = failures
+            if failures and isinstance(exc, TransportError):
+                # The caller gets a 409 whose detail says both things: why the
+                # start failed, and that the provider-side mapping could not
+                # be proved gone (fix round 1, Minor 5). Losing the second half
+                # to a log line is how an unverified stop becomes invisible.
+                raise TransportError("; ".join([str(exc), *failures])) from exc
             raise
 
         self._supervise_output(name, adapter, session)
@@ -581,20 +690,46 @@ class TransportManager:
         A name that is not running is not an error: a crash handler and an
         orderly shutdown both call this, and both may call it twice.
 
+        A name that is *still starting* is neither. Reading only `_sessions`
+        left a window up to `HOSTNAME_TIMEOUT_SECONDS` wide in which a stop
+        found nothing, reported success, and the tunnel came up afterwards --
+        at shutdown, a mapping published to the open internet after TENKA had
+        exited, with nothing reporting anything (fix round 1, Important 1). So
+        an in-flight start is cancelled and awaited, and its own unwind -- the
+        `except BaseException` path that already handles `CancelledError` --
+        is what tears down whatever it had allocated.
+
         Raises `TransportError` when the provider's own status still shows a
         mapping keyed under this transport's public port after its stop argv
-        ran -- everything else has been torn down by then, so the raise
-        reports a failure rather than abandoning one.
+        ran, or when that status could not be read at all -- everything else
+        has been torn down by then, so the raise reports a failure rather than
+        abandoning one.
         """
+        starting = self._starting.get(name)
+        if starting is not None and not starting.done():
+            logger.warning(
+                "[API] transport '%s' is still starting; cancelling its start "
+                "rather than letting it come up after this stop", name)
+            self._stopped_while_starting.add(name)
+            starting.cancel()
+            with suppress(Exception):
+                await asyncio.gather(starting, return_exceptions=True)
+            failures = self._unwind_failures.get(name, [])
+            if failures:
+                raise TransportError("; ".join(failures))
+            logger.info("[API] transport '%s' start cancelled and unwound",
+                        name)
+            return
+
         session = self._sessions.pop(name, None)
         if session is None:
             logger.debug("[API] transport '%s' is not running; nothing to stop",
                          name)
             return
-        failures = await self._teardown(
-            self._registry.get(name), policy_name=session.policy_name,
+        failures = await self._teardown_completely(
+            session.adapter, policy_name=session.policy_name,
             port=session.port, owner=session.owner, process=session.process,
-            sock=session.sock, serve_task=session.serve_task)
+            sock=session.sock, serve_task=session.serve_task, spawned=True)
         if failures:
             raise TransportError("; ".join(failures))
         logger.info("[API] transport '%s' stopped", name)
@@ -610,7 +745,10 @@ class TransportManager:
         log or surface them; they are never swallowed.
         """
         failures: list[str] = []
-        for name in list(self._sessions):
+        # Starting names included, and that is the half that matters: a
+        # shutdown inside a start's 30-second window would otherwise leave the
+        # tunnel it never saw to come up after the process was gone.
+        for name in [*self._sessions, *self._starting]:
             try:
                 await self.stop(name)
             except TransportError as exc:
@@ -622,15 +760,52 @@ class TransportManager:
                 logger.exception("[API] transport '%s' teardown raised", name)
         return failures
 
+    async def _teardown_completely(self, adapter: TransportAdapter | None,
+                                   **kwargs) -> list[str]:
+        """`_teardown`, run to completion even if *this* task is cancelled
+        while it is in flight.
+
+        Found while testing Important 1's fix, and in the same family as it: a
+        `stop` cancels an in-flight start, and if that start is already
+        unwinding, the cancellation lands *inside* the teardown -- between the
+        socket close and the provider's `off` argv, say. A teardown that stops
+        halfway leaves exactly what the whole method exists to prevent, and
+        the stop that caused it would have reported success.
+
+        A cancellation delivered here is swallowed once the teardown has
+        finished, deliberately: the callers are the unwind (which re-raises
+        the exception it was already handling immediately afterwards, so
+        cancellation semantics survive when that exception *is* the
+        `CancelledError`) and `stop` (whose caller wanted everything down,
+        which is what completing the teardown achieves). A *second*
+        cancellation while waiting is not swallowed -- it is a `BaseException`
+        and passes straight through the `suppress` below.
+        """
+        task = asyncio.ensure_future(self._teardown(adapter, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            with suppress(Exception):
+                return await task
+            raise
+
     async def _teardown(self, adapter: TransportAdapter | None, *,
                         policy_name: str, port: int, owner: str,
                         process: Any | None, sock: socket.socket | None,
-                        serve_task: asyncio.Task | None) -> list[str]:
+                        serve_task: asyncio.Task | None,
+                        spawned: bool) -> list[str]:
         """The one teardown, in spec §4's reverse order. Idempotent.
 
-        Returns the failures that could not be undone -- currently only an
-        unverified provider stop, which is the one thing this method cannot
-        fix by trying harder and must not report as success.
+        *spawned* says whether the provider was ever asked to do anything. It
+        gates the provider-side stop: a start refused before its subprocess
+        existed has no mapping of its own to remove, and running the `off`
+        argv anyway would destroy whatever mapping the operator already had
+        under that public port.
+
+        Returns the failures that could not be undone -- an unverified
+        provider stop, or a raise that could not be dropped. Both are things
+        this method cannot fix by trying harder and must not report as
+        success.
         """
         failures: list[str] = []
 
@@ -654,8 +829,19 @@ class TransportManager:
         # listener under the same name.
         raises = getattr(self._app_state(), "raises", None)
         if raises is not None:
-            with suppress(Exception):
+            try:
                 raises.drop_policy(policy_name)
+            except Exception as exc:
+                # Never swallowed (fix round 1, Minor 6): a raise that
+                # survives its listener is inherited by the next session under
+                # the same policy name, which is the exact inheritance
+                # `drop_policy` exists to prevent.
+                logger.error("[API] transport '%s': its ceiling raises could "
+                             "not be dropped (%s)", policy_name, exc)
+                failures.append(
+                    f"transport '{policy_name}': its ceiling raises could not "
+                    f"be dropped ({exc}) -- a raise scoped to this policy may "
+                    f"be inherited by the next session under the same name")
 
         # 4. The crash watcher, before the things it watches go away.
         await _cancel(self._watchers.pop(policy_name, None))
@@ -673,8 +859,16 @@ class TransportManager:
             with suppress(OSError):
                 sock.close()
 
-        # 6. The provider's own stop, and the verification that it worked.
-        failures.extend(await self._provider_stop(adapter, policy_name, port))
+        # 6. The provider's own stop, and the verification that it worked --
+        # only if the provider was ever asked for anything.
+        if spawned:
+            failures.extend(
+                await self._provider_stop(adapter, policy_name, port))
+        else:
+            logger.debug(
+                "[API] transport '%s' never reached its subprocess, so there "
+                "is no provider-side mapping of its own to remove",
+                policy_name)
 
         # 7. The subprocess. Last, because for a daemonising provider it has
         # already exited and for a foreground one this *is* the stop -- and
@@ -690,12 +884,19 @@ class TransportManager:
         spawned process *is* the tunnel, so reaping it (step 7) is the stop
         and there is nothing to verify. An argv means the provider
         daemonised, and then the exit code is provisional -- only the
-        provider's own status can say whether the mapping is gone.
+        provider's own status, named by the same adapter through
+        `status_command`, can say whether the mapping is gone.
+
+        Every path out of here either verifies the stop or returns a sentence
+        containing UNVERIFIED. There is no third answer, because the third
+        answer is the failure this whole method exists to make impossible: a
+        stop reported as successful when nothing checked.
         """
-        if adapter is None:  # pragma: no cover - registry reset mid-teardown
-            return [f"transport '{policy_name}': no adapter is registered any "
-                    f"more, so its provider-side stop could not be run or "
-                    f"verified -- the mapping may still be UNVERIFIED and up"]
+        if adapter is None:
+            return [f"transport '{policy_name}': the session carries no "
+                    f"adapter, so its provider-side stop could not be run or "
+                    f"verified -- any mapping it left is UNVERIFIED and may "
+                    f"still be up"]
         try:
             argv = adapter.stop_command(port)
         except Exception as exc:  # pragma: no cover - defensive
@@ -716,12 +917,30 @@ class TransportManager:
                 "[API] transport '%s' stop command exited %d; the status "
                 "re-read below is what decides", policy_name, code)
 
+        # The public port comes off the very command whose effect is being
+        # checked (`base.py`'s `stop_command` docstring requires exactly this,
+        # and it is why the two cannot drift apart). The *reader* comes from
+        # the adapter instead of being derived from that argv's verb: an
+        # adapter has already decided which of its provider's documents it
+        # trusts, and guessing a second one behind its back is how a
+        # funnel-scoped view came to be used for a serve-scoped question.
         public_port = _public_port_from_argv(argv)
-        status_argv = _status_argv_for(argv)
-        if public_port is None or status_argv is None:
+        if public_port is None:
             return [f"transport '{policy_name}': its stop command names no "
                     f"public port to check, so the stop is UNVERIFIED -- an "
                     f"internet-facing listener may still be up"]
+        try:
+            status_argv = adapter.status_command(port)
+        except Exception as exc:  # pragma: no cover - defensive
+            status_argv = None
+            logger.warning("[API] transport '%s' could not name a status "
+                           "command (%s)", policy_name, exc)
+        if not status_argv:
+            return [f"transport '{policy_name}': its adapter names a stop "
+                    f"command but no status command, so the stop of public "
+                    f"port {public_port} is UNVERIFIED -- an internet-facing "
+                    f"listener may still be up"]
+        status_argv = [str(token) for token in status_argv]
         try:
             _code, out = await asyncio.to_thread(_run_argv, status_argv)
         except (OSError, subprocess.SubprocessError) as exc:
@@ -731,14 +950,18 @@ class TransportManager:
         try:
             payload = json.loads(out)
         except ValueError as exc:
-            payload = None
-            logger.warning("[API] transport '%s' status was not JSON (%s)",
-                           policy_name, exc)
-        if not isinstance(payload, dict):
+            return [f"transport '{policy_name}': its status was not readable "
+                    f"JSON ({exc}), so the stop of public port {public_port} "
+                    f"is UNVERIFIED -- an internet-facing listener may still "
+                    f"be up"]
+        try:
+            still_there = _keyed_under(payload, public_port)
+        except _UnrecognisedStatus as exc:
             return [f"transport '{policy_name}': its status could not be "
-                    f"parsed, so the stop of public port {public_port} is "
-                    f"UNVERIFIED -- an internet-facing listener may still be up"]
-        if _keyed_under(payload, public_port):
+                    f"swept ({exc}), so the stop of public port "
+                    f"{public_port} is UNVERIFIED -- an internet-facing "
+                    f"listener may still be up"]
+        if still_there:
             return [f"transport '{policy_name}': a mapping is STILL keyed "
                     f"under public port {public_port} after its stop command "
                     f"ran -- an internet-facing listener may still be up; "
@@ -810,6 +1033,14 @@ class TransportManager:
             "[API] transport '%s' exited on its own (code %s); tearing its "
             "listener down so nothing outlives it",
             name, getattr(process, "returncode", None))
+        # Deregister *this* watcher before tearing down. The teardown cancels
+        # the session's watcher, and it now runs in a task of its own
+        # (`_teardown_completely`), so `asyncio.current_task()` inside it is no
+        # longer this task -- meaning it would cancel the very task that is
+        # awaiting it, and the two would wait on each other forever. Dropping
+        # the registration first leaves the teardown nothing to cancel.
+        if self._watchers.get(name) is asyncio.current_task():
+            self._watchers.pop(name, None)
         try:
             await self.stop(name)
         except TransportError as exc:

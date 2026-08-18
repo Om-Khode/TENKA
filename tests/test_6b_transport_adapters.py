@@ -47,6 +47,9 @@ class _FakeAdapter:
     def stop_command(self, port: int) -> list[str] | None:
         return None
 
+    def status_command(self, port: int) -> list[str] | None:
+        return None
+
 
 @pytest.fixture(autouse=True)
 def _snapshot_registry():

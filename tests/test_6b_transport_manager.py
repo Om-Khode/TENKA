@@ -25,6 +25,8 @@ import json
 import re
 import socket
 import sys
+import threading
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -54,6 +56,10 @@ from assistant.io.api.transports.manager import (
 BASE = 18787
 
 _LOOPBACK_TARGET_RE = re.compile(r"http://127\.0\.0\.1:(\d+)")
+
+# A sentinel, so `status_argv=None` can mean 'names no reader' rather than
+# 'take the default'.
+_UNSET: object = object()
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -129,12 +135,18 @@ class _FakeAdapter:
 
     def __init__(self, name: str, *, events: list[str] | None = None,
                  refusal: str | None = None, target_port: int | None = None,
-                 stop_argv: list[str] | None = None) -> None:
+                 stop_argv: list[str] | None = None,
+                 status_argv: list[str] | None = _UNSET) -> None:
         self.name = name
         self._events = events if events is not None else []
         self.refusal = refusal
         self._target_port = target_port
         self._stop_argv = stop_argv
+        # Defaults to the provider's own reader, in the shape the Tailscale
+        # adapters use. `None` is passed explicitly by the test that asserts a
+        # stop it cannot verify.
+        self._status_argv = ([f"fake-{name}", "serve", "status", "--json"]
+                             if status_argv is _UNSET else status_argv)
         self.preflight_calls: list[int] = []
         self.stop_calls: list[int] = []
 
@@ -158,6 +170,9 @@ class _FakeAdapter:
     def stop_command(self, port: int) -> list[str] | None:
         self.stop_calls.append(int(port))
         return list(self._stop_argv) if self._stop_argv else None
+
+    def status_command(self, port: int) -> list[str] | None:
+        return list(self._status_argv) if self._status_argv else None
 
 
 class _RecordingPolicies(dict):
@@ -306,7 +321,11 @@ def h(monkeypatch):
 
     def _run(argv):
         harness.ran.append(list(argv))
-        if "status" in argv and "--json" in argv:
+        # Any argv asking for JSON is a status read -- keyed on `--json`
+        # rather than on the token "status", so a test may give an adapter a
+        # reader that does not spell it that way (the whole point of
+        # `status_command` being the adapter's to name).
+        if "--json" in argv:
             return 0, json.dumps(harness.status_payload)
         return 0, ""
 
@@ -963,3 +982,323 @@ async def test_a_session_with_no_hostname_is_never_treated_as_serving(h):
     h.manager._sessions["quick"] = nameless
     assert h.manager.running() == {}, (
         "a nameless session was reported as a running transport")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Fix round 1
+# ═════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_a_stop_arriving_while_a_transport_is_still_starting_is_not_lost(h):
+    """Fix round 1, Important 1. The window is `HOSTNAME_TIMEOUT_SECONDS`
+    wide: a start between its spawn and its publish is in `_starting` and
+    nowhere else, so a stop that only consults `_sessions` returns having done
+    nothing, the caller is told it succeeded, and the tunnel comes up
+    afterwards. A daemonising provider is used deliberately -- the assertion
+    that its `off` argv ran is the one that says the mapping is gone, not
+    merely that TENKA stopped watching it.
+    """
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(adapter, lines=[])
+    h.stall.add("tailnet")
+
+    starting = asyncio.create_task(h.manager.start("tailnet"))
+    assert await _settle(lambda: bool(h.spawned)), "the start never spawned"
+    assert "tailnet" not in h.manager.running(), (
+        "precondition: the session is not tracked yet -- that is the window")
+
+    await h.manager.stop("tailnet")
+
+    # Bounded, so a manager that cannot see the starting transport fails here
+    # instead of hanging this test forever.
+    with pytest.raises(TransportError, match="still starting"):
+        await asyncio.wait_for(starting, 2.0)
+
+    assert _STOP_ARGV in h.ran, (
+        "the provider's own mapping was never un-served -- this is the "
+        "shutdown case that leaves a tunnel published after TENKA has exited")
+    assert h.manager.running() == {}
+    assert port_for("tailnet", BASE) not in h.policies
+    assert h.published.owners() == frozenset()
+    assert h.sockets[0].fileno() == -1
+    assert h.processes[0].returncode is not None
+    assert "tailnet" not in h.listeners.tasks
+
+
+@pytest.mark.asyncio
+async def test_stop_all_stops_a_transport_that_is_still_starting(h):
+    """The version that matters: an operator quitting TENKA inside that
+    window."""
+    adapter = _FakeAdapter("funnel", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(adapter, lines=[])
+    h.stall.add("funnel")
+
+    starting = asyncio.create_task(h.manager.start("funnel"))
+    assert await _settle(lambda: bool(h.spawned))
+
+    failures = await h.manager.stop_all()
+
+    with pytest.raises(TransportError):
+        await asyncio.wait_for(starting, 2.0)
+    assert failures == [], failures
+    assert _STOP_ARGV in h.ran
+    assert dict(h.policies) == {BASE: "local"}
+    assert h.sockets[0].fileno() == -1
+    assert h.processes[0].returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_start_does_not_orphan_its_subprocess(h, monkeypatch):
+    """A stop landing after the child exists but before its handle comes back
+    must not leave a process nobody holds -- an orphan tunnel is exactly the
+    outcome a cancellable start exists to prevent. So the spawn is shielded
+    and re-awaited on cancellation.
+
+    The window is made deterministic rather than raced for: the spawn creates
+    the real child, announces itself, and only then sleeps. A cancel arriving
+    during that sleep is the case. With the shield removed, the handle is
+    never returned, the teardown reaps nothing, and the assertion on the
+    child's return code fails -- which is what makes this a test of the shield
+    and not of the timing.
+    """
+    created: list = []
+    spawned_child = asyncio.Event()
+    script = "import time; time.sleep(5)"
+
+    async def _slow_spawn(argv):
+        proc = await h.real_spawn(argv)
+        created.append(proc)
+        spawned_child.set()
+        await asyncio.sleep(0.05)
+        return proc
+
+    monkeypatch.setattr(manager_mod, "_spawn", _slow_spawn)
+
+    class _SlowSpawnAdapter(_FakeAdapter):
+        def command(self, port: int) -> list[str]:
+            return [sys.executable, "-c", script,
+                    f"http://127.0.0.1:{int(port)}"]
+
+    h.register(_SlowSpawnAdapter("quick", events=h.events), lines=[])
+
+    starting = asyncio.create_task(h.manager.start("quick"))
+    await asyncio.wait_for(spawned_child.wait(), 5.0)
+
+    await h.manager.stop("quick")
+    with pytest.raises(TransportError):
+        await asyncio.wait_for(starting, 5.0)
+
+    assert created, "precondition: a real child was spawned"
+    assert created[0].returncode is not None, (
+        "the spawned child was orphaned -- the start was cancelled before its "
+        "handle came back, so the teardown had nothing to reap")
+    assert h.manager.running() == {}
+    assert port_for("quick", BASE) not in h.policies
+
+
+@pytest.mark.parametrize("payload", [
+    {"Web": "not an object"},
+    {"Web": {}, "Foreground": 5},
+    {"Foreground": {"session": {"Web": 7}}},
+    {"Foreground": {"session": "not an object"}},
+])
+@pytest.mark.asyncio
+async def test_a_status_document_of_an_unrecognised_shape_is_unverified(h,
+                                                                       payload):
+    """Fix round 1, Important 2. Task 7's preflight may degrade an
+    unrecognised document to a warning because KI-17 layer 3 is behind it.
+    This check has nothing behind it, so a document it cannot sweep is an
+    UNVERIFIED stop, never a verified one."""
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(adapter)
+    session = await h.manager.start("tailnet")
+    h.status_payload = payload
+
+    with pytest.raises(TransportError, match="UNVERIFIED"):
+        await h.manager.stop("tailnet")
+
+    # Loud, not a leak: the rest of the teardown still ran.
+    assert session.port not in h.policies
+    assert session.sock.fileno() == -1
+    assert h.published.owners() == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_an_empty_status_document_is_a_verified_stop(h):
+    """The other side of the test above, and the ordinary case: this machine's
+    real cleared `tailscale serve status --json` prints a bare `{}`. If that
+    were UNVERIFIED, every successful stop would report a failure."""
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(adapter)
+    await h.manager.start("tailnet")
+    h.status_payload = {}
+
+    await h.manager.stop("tailnet")  # must not raise
+
+    assert h.manager.running() == {}
+
+
+@pytest.mark.asyncio
+async def test_the_status_reader_is_the_adapters_own(h):
+    """Fix round 1, Minor 3. The reader is named by the adapter, not derived
+    from the stop argv's verb -- deriving it asked a funnel-scoped view a
+    serve-scoped question, and assumed every provider's CLI has the shape
+    `<binary> <verb> status --json`."""
+    reader = ["fake-tailnet", "whatever-this-provider-calls-it", "--json"]
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV,
+                           status_argv=reader)
+    h.register(adapter)
+    await h.manager.start("tailnet")
+
+    await h.manager.stop("tailnet")
+
+    assert reader in h.ran, h.ran
+    assert ["fake-tailnet", "serve", "status", "--json"] not in h.ran, (
+        "the reader was derived from the stop argv rather than asked for")
+
+
+@pytest.mark.asyncio
+async def test_a_stop_with_no_status_command_is_reported_unverified(h):
+    """An adapter that names a stop but no way to check it cannot have its
+    stop believed -- the pair is what makes a stop verifiable."""
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV,
+                           status_argv=None)
+    h.register(adapter)
+    await h.manager.start("tailnet")
+
+    with pytest.raises(TransportError, match="UNVERIFIED"):
+        await h.manager.stop("tailnet")
+
+
+@pytest.mark.asyncio
+async def test_a_start_refused_before_its_spawn_runs_no_provider_stop(h):
+    """Fix round 1, Minor 4. A layer-1 refusal happens before the subprocess
+    exists, so there is no mapping of TENKA's own to remove -- and running the
+    `off` argv anyway would destroy whatever the operator already had under
+    that public port, which spec §2.3 L2 forbids ('does not silently
+    repair')."""
+    liar = _FakeAdapter("funnel", events=h.events, stop_argv=_STOP_ARGV,
+                        target_port=local_port(BASE))
+    h.register(liar)
+
+    with pytest.raises(TransportError):
+        await h.manager.start("funnel")
+
+    assert h.ran == [], f"a refused start ran {h.ran} against the provider"
+    assert h.spawned == []
+
+    # Vacuity guard: the same shape of adapter, telling the truth, does reach
+    # the provider's stop -- so `h.ran == []` above is the refusal, not the
+    # harness never running anything.
+    honest = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(honest)
+    await h.manager.start("tailnet")
+    await h.manager.stop("tailnet")
+    assert _STOP_ARGV in h.ran
+
+
+@pytest.mark.asyncio
+async def test_an_unwind_that_cannot_prove_the_mapping_gone_says_so(h):
+    """Fix round 1, Minor 5. A 409 reading only 'never announced a hostname'
+    hides the half the operator has to act on: that the provider-side mapping
+    could not be proved gone."""
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(adapter, lines=[b"nothing useful\n"])
+    h.status_payload = {"Web": {"box.ts.net:9443": {}}}
+
+    with pytest.raises(TransportError) as excinfo:
+        await h.manager.start("tailnet")
+
+    message = str(excinfo.value)
+    assert "never announced a hostname" in message
+    assert "STILL keyed" in message and "9443" in message, message
+
+
+@pytest.mark.asyncio
+async def test_a_raise_that_cannot_be_dropped_is_reported(h):
+    """Fix round 1, Minor 6. A swallowed `drop_policy` failure leaves a raise
+    scoped to a policy name the next session reuses -- the exact inheritance
+    `drop_policy` exists to prevent."""
+    class _AngryRaises:
+        def drop_policy(self, policy_name: str) -> None:
+            raise RuntimeError("the raise store is wedged")
+
+    adapter = _FakeAdapter("quick", events=h.events)
+    h.register(adapter)
+    session = await h.manager.start("quick")
+    h.app.state.raises = _AngryRaises()
+
+    with pytest.raises(TransportError, match="raises could not be dropped"):
+        await h.manager.stop("quick")
+
+    assert session.sock.fileno() == -1, "the rest of the teardown was abandoned"
+    assert session.port not in h.policies
+    assert h.manager.running() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_stop_uses_the_adapter_its_start_used(h):
+    """Fix round 1, Minor 8. Re-resolving the adapter by name at stop time
+    means a registry mutated in between runs a different provider's stop argv
+    -- against a mapping that provider never made."""
+    original = _FakeAdapter("quick", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(original)
+    await h.manager.start("quick")
+
+    impostor = _FakeAdapter("quick", events=h.events,
+                            stop_argv=["fake-impostor", "serve", "off"])
+    h.registry.reset()
+    h.registry.register("quick", impostor)
+
+    await h.manager.stop("quick")
+
+    assert _STOP_ARGV in h.ran
+    assert impostor.stop_calls == [], "the impostor's stop command was run"
+
+
+@pytest.mark.asyncio
+async def test_a_stop_landing_inside_a_teardown_does_not_leave_it_half_done(
+        h, monkeypatch):
+    """Found while testing Important 1's fix, and in the same family as it.
+
+    A stop cancels an in-flight start; if that start is already unwinding, the
+    cancellation lands *inside* the teardown -- and a teardown abandoned
+    between the socket close and the provider's `off` argv leaves exactly what
+    it exists to prevent, while the stop that caused it reports success. So
+    the teardown runs in a task of its own and is re-awaited.
+
+    The window is made deterministic: the provider's stop command blocks in a
+    worker thread until this test has fired the cancel.
+    """
+    ran_stop = threading.Event()
+    real_run = manager_mod._run_argv
+
+    def _slow_run(argv):
+        h.ran.append(list(argv))
+        ran_stop.set()
+        time.sleep(0.15)
+        if "--json" in argv:
+            return 0, json.dumps(h.status_payload)
+        return 0, ""
+
+    monkeypatch.setattr(manager_mod, "_run_argv", _slow_run)
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(adapter, lines=[b"nothing useful\n"])
+
+    starting = asyncio.create_task(h.manager.start("tailnet"))
+    assert await _settle(lambda: ran_stop.is_set()), (
+        "precondition: the unwind must already be inside its teardown")
+
+    await h.manager.stop("tailnet")
+
+    with pytest.raises(TransportError, match="never announced a hostname"):
+        await asyncio.wait_for(starting, 5.0)
+
+    assert _STOP_ARGV in h.ran
+    assert ["fake-tailnet", "serve", "status", "--json"] in h.ran, (
+        "the teardown was abandoned before it could verify the stop")
+    assert h.processes[0].returncode is not None, (
+        "the teardown was abandoned before it reaped the subprocess")
+    assert h.sockets[0].fileno() == -1
+    assert port_for("tailnet", BASE) not in h.policies
+    assert h.manager.running() == {}
