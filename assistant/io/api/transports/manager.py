@@ -362,6 +362,29 @@ def _keyed_under(payload: object, public_port: int) -> bool:
     return False
 
 
+def _a_child_may_exist(spawn: asyncio.Future | None) -> bool:
+    """Whether a spawn may have produced a process nobody holds.
+
+    Asked only when the manager has no handle, to decide whether the provider's
+    own stop must still run (fix round 2, Minor 1). The three answers:
+
+    - `None` -- the spawn was never reached (a layer-1 refusal). No child, and
+      no mapping of TENKA's own to remove.
+    - done and it raised -- the OS refused the exec (no binary, no permission).
+      Same conclusion: nothing was started, so nothing must be un-served.
+    - anything else -- still running, cancelled, or succeeded while the handle
+      was lost. A child may exist, so the provider's stop runs. Unknown is
+      answered as "yes" deliberately: the cost of an unnecessary `off` is one
+      mapping this transport owns anyway, and the cost of skipping a necessary
+      one is an internet-facing listener nobody knows about.
+    """
+    if spawn is None:
+        return False
+    if not spawn.done() or spawn.cancelled():
+        return True
+    return spawn.exception() is None
+
+
 def _new_owner(name: str) -> str:
     """A fresh owner id for one *session* of a transport.
 
@@ -472,15 +495,32 @@ class TransportManager:
         # tunnel that comes up *after* it asked for everything to be down,
         # and at shutdown that is a mapping still published to the open
         # internet after TENKA has exited.
+        # Cleared *before* the task exists, not on its first line: a stop
+        # landing in that one-tick window would otherwise cancel a task that
+        # never ran and report the *previous* failed start's failures as its
+        # own (fix round 2, Minor 2). Over-reporting is the safe direction, but
+        # the message would be about a different attempt.
+        self._unwind_failures.pop(name, None)
         task = asyncio.create_task(self._start_and_unwind(name, adapter, port),
                                    name=f"transport-start-{name}")
         self._starting[name] = task
         try:
             return await task
         except asyncio.CancelledError:
+            # Whose cancellation was it? The marker is *not* evidence: a stop
+            # may have set it while this caller's own task was independently
+            # cancelled, and answering that caller with a `TransportError`
+            # instead of a `CancelledError` is the shutdown-hang shape (fix
+            # round 2, Minor 3). `cancelling()` is the only thing that knows:
+            # it counts cancellation requests against *this* task, so it is
+            # non-zero exactly when our caller was cancelled and zero when only
+            # the inner start task was.
+            outer = asyncio.current_task()
+            if outer is not None and outer.cancelling() > 0:
+                raise
             if name not in self._stopped_while_starting:
-                # Our own caller was cancelled, not us. The start task was
-                # cancelled with it and has already unwound; re-raise, because
+                # Nothing cancelled us on purpose; the start task was cancelled
+                # from somewhere else and has already unwound. Re-raise, because
                 # swallowing a cancellation is how a shutdown hangs.
                 raise
             self._stopped_while_starting.discard(name)
@@ -496,8 +536,6 @@ class TransportManager:
 
     async def _start_and_unwind(self, name: str, adapter: TransportAdapter,
                             port: int) -> TransportSession:
-        self._unwind_failures.pop(name, None)
-
         # 1. Preflight, off the event loop -- the Tailscale adapters shell out
         # to `tailscale serve status --json` in here (spec §2.3 L2). Before
         # the bind, so a refusal has nothing to unwind.
@@ -512,14 +550,16 @@ class TransportManager:
         owner = _new_owner(name)
         process: asyncio.subprocess.Process | None = None
         serve_task: asyncio.Task | None = None
-        # Whether the provider was asked to do anything at all. The teardown
-        # runs the provider's own `off` argv only when this is true, so a
-        # start refused by the layer-1 argv check -- which happens *before*
-        # the spawn -- cannot destroy a pre-existing operator mapping it never
-        # created (fix round 1, Minor 4; spec §2.3 L2's rule is that a
-        # preflight names a conflict and does not silently repair it, and this
-        # is the same principle on the way back out).
-        spawn_attempted = False
+        # The spawn task, once there is one. What gates the provider's `off`
+        # argv is whether a **child may exist**, never whether one was
+        # intended: a start refused by the layer-1 argv check, or a spawn the
+        # OS refused outright (no binary, exec denied), created no mapping of
+        # TENKA's own, and running `off` anyway would destroy whatever the
+        # operator already had under that public port -- spec §2.3 L2's rule is
+        # that a conflict is named, never silently repaired, and this is the
+        # same principle on the way back out (fix round 1, Minor 4; narrowed
+        # from "we were about to try" in fix round 2, Minor 1).
+        spawn: asyncio.Future | None = None
         try:
             # 3. Register the port in the *live* registry, before the spawn:
             # the argv assertion below reads this dict, and a tunnel must
@@ -529,7 +569,6 @@ class TransportManager:
             # 4. Spawn, with the argv checked against the registry first.
             argv = [str(token) for token in adapter.command(port)]
             self._refuse_a_foreign_target(argv, name=name, port=port)
-            spawn_attempted = True
             # Shielded, and then awaited again on cancellation. A cancel that
             # landed *inside* `create_subprocess_exec` would otherwise leave a
             # child this manager has no handle to -- an orphan tunnel, which is
@@ -573,7 +612,7 @@ class TransportManager:
             failures = await self._teardown_completely(
                 adapter, policy_name=name, port=port, owner=owner,
                 process=process, sock=sock, serve_task=serve_task,
-                spawned=spawn_attempted)
+                spawned=process is not None or _a_child_may_exist(spawn))
             for failure in failures:
                 logger.error("[API] while unwinding transport '%s': %s",
                              name, failure)
@@ -707,11 +746,29 @@ class TransportManager:
         """
         starting = self._starting.get(name)
         if starting is not None and not starting.done():
-            logger.warning(
-                "[API] transport '%s' is still starting; cancelling its start "
-                "rather than letting it come up after this stop", name)
-            self._stopped_while_starting.add(name)
-            starting.cancel()
+            if name in self._stopped_while_starting:
+                # Somebody already cancelled this start and is waiting for it
+                # to finish unwinding. A **second** cancel would land on the
+                # teardown's own re-await inside `_teardown_completely` --
+                # where `CancelledError` is a `BaseException` and passes
+                # straight through the `suppress(Exception)` -- abandoning the
+                # teardown after its first three steps and before the `off`
+                # argv, its verification and the reap. Both stops would then
+                # read an empty failure list and report success, which is
+                # Important 1's own outcome reached through the mechanism that
+                # fixed it (fix round 2). It also re-opens the orphan window at
+                # the spawn's re-await. So: wait, do not cancel again.
+                logger.info(
+                    "[API] transport '%s' is already being stopped mid-start; "
+                    "waiting for that teardown rather than cancelling it",
+                    name)
+            else:
+                logger.warning(
+                    "[API] transport '%s' is still starting; cancelling its "
+                    "start rather than letting it come up after this stop",
+                    name)
+                self._stopped_while_starting.add(name)
+                starting.cancel()
             with suppress(Exception):
                 await asyncio.gather(starting, return_exceptions=True)
             failures = self._unwind_failures.get(name, [])
@@ -1107,9 +1164,15 @@ async def _cancel(task: asyncio.Task | None) -> None:
     uvicorn's own shutdown and frees the port, so a teardown that cancelled
     without awaiting would return with the socket still bound.
 
-    Never cancels the task it is running inside -- the crash watcher tears
-    down the session it is watching, and cancelling itself mid-teardown would
-    abandon the rest of it.
+    Skips the task it is running inside, which is now a **belt-and-braces
+    check that protects nothing on its own** (fix round 2, Minor 4). It used to
+    be what stopped a crash watcher from cancelling itself mid-teardown, but
+    the teardown runs in its own task (`_teardown_completely`) and
+    `current_task()` inside it is that task, not the watcher. The real
+    protection is `_supervise` **deregistering itself from `_watchers` before
+    calling `stop`** -- do not delete that as redundant on the strength of this
+    guard, or the teardown will cancel the task awaiting it and the two will
+    wait on each other forever.
     """
     if task is None or task is asyncio.current_task():
         return
