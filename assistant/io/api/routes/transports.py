@@ -62,10 +62,13 @@ async def list_transports(
     request: Request,
     _: Device = Depends(require_admin(Capability.SYSTEM_CONTROL)),
 ) -> Envelope[TransportsPayload]:
-    """Every registered transport, running or not, with its `ceiling` and
-    `raisable` set read straight off `POLICIES` -- so Studio can explain why a
-    control is unavailable on a given transport without a second copy of that
-    table."""
+    """Every registered transport, running or not, with the capability set
+    it may ever carry and the capability set it may carry if temporarily
+    raised -- so a caller can explain why a control is unavailable on a given
+    transport."""
+    # `ceiling`/`raisable` are read straight off `POLICIES` in `_row` rather
+    # than hand-copied here, so this listing can never drift from what the
+    # daemon actually enforces.
     manager = _manager(request)
     running = manager.running() if manager is not None else {}
     return Envelope(data=TransportsPayload(
@@ -78,15 +81,15 @@ async def start_transport(
     name: str, request: Request,
     _: Device = Depends(require_admin(Capability.SYSTEM_CONTROL)),
 ) -> Envelope[TransportPayload]:
-    """Start transport *name*. `name` not in `POLICIES` (including
-    `"local"`) is a 404: nothing declares what such a transport would even
-    be.
-
-    A refusal `TransportManager.start` raises -- a preflight conflict, a
-    tunnel that never announced a hostname, one already running or already
-    starting -- becomes a 409 whose detail is the manager's own sentence,
-    written to name a misconfiguration and never a hostname, token or path.
-    """
+    """Start transport *name*. An unrecognised name -- including `"local"`,
+    which is never a startable transport -- is a 404. A conflict that
+    prevents the transport from starting is a 409, with a message describing
+    what went wrong."""
+    # `"local"` is never in the registry (it is the loopback listener itself,
+    # with no adapter behind it -- see `transports/__init__.py`'s KI-17
+    # guard), so checking membership here is what makes it a 404 the same way
+    # an unregistered name is, rather than reaching `TransportManager.start`'s
+    # own refusal of it.
     if name not in transport_registry.names():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     manager = _manager(request)
@@ -96,6 +99,10 @@ async def start_transport(
     try:
         session = await manager.start(name)
     except TransportError as exc:
+        # A preflight conflict, a tunnel that never announced a hostname, one
+        # already running or already starting -- `TransportError`'s message is
+        # already written to name a misconfiguration and never a hostname,
+        # token or path, so it is passed straight through.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail=str(exc)) from exc
     return Envelope(data=_row(name, session))
@@ -107,14 +114,9 @@ async def stop_transport(
     _: Device = Depends(require_admin(Capability.SYSTEM_CONTROL)),
 ) -> Envelope[TransportPayload]:
     """Stop transport *name*. Not currently running -- including an unknown
-    name, and including when no manager is wired at all -- is a 404: the same
-    "nothing happened, and that has to be distinguishable from now it is
-    gone" argument `revoke_device` makes.
-
-    A `TransportError` the manager raises while stopping -- an unverified
-    provider-side stop, most notably -- becomes a 409 with the manager's own
-    sentence, never this route's own words.
-    """
+    name -- is a 404: "nothing happened" has to be distinguishable from "it
+    is gone now". A failure to confirm the stop actually took effect is a
+    409, with a message describing what went wrong."""
     manager = _manager(request)
     running = manager.running() if manager is not None else {}
     if name not in running:
@@ -122,6 +124,10 @@ async def stop_transport(
     try:
         await manager.stop(name)
     except TransportError as exc:
+        # An unverified provider-side stop, most notably: the message is
+        # already written to name a misconfiguration and never a hostname,
+        # token or path, so it is passed straight through rather than
+        # replaced with this route's own words.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail=str(exc)) from exc
     return Envelope(data=_row(name, None))
