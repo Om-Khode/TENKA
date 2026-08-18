@@ -202,6 +202,24 @@ MATRIX: tuple[Row, ...] = (
         Capability.SYSTEM_CONTROL, admin=True),
     Row("POST", "/v1/pair/code", "/v1/pair/code", Capability.SYSTEM_CONTROL,
         admin=True, body={"label": "phone", "grants": ["observe"]}),
+
+    # A raise is this milestone's one privilege-widening route, minted at the
+    # keyboard -- same `admin=True` as the two rows above, for the identical
+    # reason: `policy.admin` is `local` alone, so no other listener even
+    # reaches the check that would answer either 409 or 404. `allowed` here
+    # is this harness's own answer, not production's: `create_app` in
+    # `_client_on` wires no `transports` manager, so `raise_device_ceiling`
+    # always finds nothing running and refuses with 409 before it can mint a
+    # raise; the fresh `RaiseStore` behind `revoke_device_raise` never holds
+    # one for the victim, so that one answers 404. Both are "the admin gate
+    # let the request through", not a claim that a raise ever really lands
+    # in this fixture.
+    Row("POST", "/v1/devices/{device_id}/raise", "/v1/devices/{victim}/raise",
+        Capability.SYSTEM_CONTROL, admin=True, allowed=409,
+        body={"transport": "tailnet", "capabilities": ["execute"],
+              "minutes": 30, "reason": "fixing the build"}),
+    Row("DELETE", "/v1/devices/{device_id}/raise", "/v1/devices/{victim}/raise",
+        Capability.SYSTEM_CONTROL, admin=True, allowed=404),
 )
 
 
