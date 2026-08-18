@@ -356,14 +356,25 @@ def _production_wrapped(app):
 
 
 def test_the_daemon_does_not_run_with_uvicorn_proxy_headers_enabled():
-    """The precondition for the finding below, asserted on the real config."""
+    """The precondition for the finding below, asserted on the real config.
+
+    Reads `serve_socket`, not `serve`: Milestone 6b split binding from serving
+    so one app can be served on four sockets, and `serve_socket` is now the
+    single place any listener's `uvicorn.Config` is built -- so this covers
+    every transport listener as well as the loopback one, where before it
+    covered exactly one socket. `tests/test_api_server_lifecycle.py::
+    test_every_listener_pins_the_same_uvicorn_security_flags` asserts the same
+    property on the `Config` objects actually constructed, which is the check
+    that survives this code being rearranged again.
+    """
     import inspect
 
-    source = inspect.getsource(server.serve)
+    source = inspect.getsource(server.serve_socket)
     assert "proxy_headers=False" in source, (
-        "server.serve() builds uvicorn.Config without proxy_headers=False, so "
-        "uvicorn's default (True, trusting 127.0.0.1) is in force and every "
-        "tunnelled client picks its own scope['client'] via X-Forwarded-For")
+        "server.serve_socket() builds uvicorn.Config without "
+        "proxy_headers=False, so uvicorn's default (True, trusting 127.0.0.1) "
+        "is in force and every tunnelled client picks its own scope['client'] "
+        "via X-Forwarded-For")
 
 
 def test_the_anonymous_lockout_cannot_be_reset_by_a_client_header(tmp_path):
