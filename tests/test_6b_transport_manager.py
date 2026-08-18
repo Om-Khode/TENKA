@@ -1392,10 +1392,15 @@ async def test_two_concurrent_stops_of_a_starting_transport_still_tear_it_down(
 
 @pytest.mark.asyncio
 async def test_a_spawn_the_os_refused_runs_no_provider_stop(h, monkeypatch):
-    """Fix round 2, Minor 1. A spawn that raises created no mapping, so the
-    `off` argv must not run against whatever the operator already had under
-    that public port -- the gate follows whether a child may exist, not whether
-    one was intended."""
+    """Fix round 2, Minor 1; the wrapping is fix round 3's fold-in. A spawn
+    that raises created no mapping, so the `off` argv must not run against
+    whatever the operator already had under that public port -- the gate
+    follows whether a child may exist, not whether one was intended. The OS's
+    own refusal (no such binary, exec denied) must not escape `start()` in
+    its native exception type either: `start()`'s docstring promises
+    `TransportError` on every refusal, and `cloudflared` being absent from
+    this very machine makes a raw `FileNotFoundError` the commonest way that
+    promise could be broken."""
     async def _refused(argv):
         h.spawned.append(list(argv))
         raise FileNotFoundError("the provider binary is not installed")
@@ -1404,8 +1409,11 @@ async def test_a_spawn_the_os_refused_runs_no_provider_stop(h, monkeypatch):
     adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
     h.register(adapter)
 
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(TransportError, match="tailnet") as excinfo:
         await h.manager.start("tailnet")
+    assert isinstance(excinfo.value.__cause__, FileNotFoundError), (
+        "the OS's own refusal should be chained, not discarded, so an "
+        "operator (or a test) can still see what actually failed")
 
     assert h.spawned, "precondition: the spawn really was attempted"
     assert h.ran == [], f"a refused spawn ran {h.ran} against the provider"
@@ -1473,3 +1481,214 @@ async def test_a_cancelled_caller_is_answered_with_its_own_cancellation(h):
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(caller, 5.0)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Fix round 3
+# ═════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth", [2, 3, 5, 9])
+async def test_a_teardown_survives_any_number_of_repeat_cancellations(
+        h, monkeypatch, depth):
+    """Important 2. Round 1 and round 2 both shielded the teardown once and
+    recovered with a single plain re-await -- which survives exactly one
+    repeat cancellation of whatever is waiting on it before a further one
+    reaches the teardown task directly and abandons it mid-flight (between
+    the socket close and the provider's own stop, in this test's window).
+
+    `depth` cancellations are fired at the task running `stop()` once it is
+    already inside the teardown's protected wait, all before the provider's
+    blocked stop command is allowed to return. At `depth == 1` even the
+    single-recovery shape survives (that is what the shield alone already
+    does); this starts at 2, which is where a reverted, single-recovery
+    `_teardown_completely` first abandons the teardown -- confirmed by
+    running this test against that reversion, not merely reasoned about.
+
+    The window is gated on an `asyncio.Event`, not on a sleep: the fake stop
+    command blocks until this test explicitly releases it, so every one of
+    `depth` cancellations is provably delivered before the teardown is
+    allowed to finish, however many there are.
+    """
+    loop = asyncio.get_running_loop()
+    ran_stop = asyncio.Event()
+    release = asyncio.Event()
+
+    def _slow_run(argv):
+        # Runs in `to_thread`'s worker thread, which has no running loop of
+        # its own -- the loop captured above, not `get_running_loop()` here,
+        # is what a thread-safe call back into it needs.
+        h.ran.append(list(argv))
+        if argv == _STOP_ARGV:
+            loop.call_soon_threadsafe(ran_stop.set)
+            # A plain `Event().wait()` (threading's, not asyncio's) belongs
+            # here, but reaching for asyncio's own `Event` from a thread via
+            # `run_coroutine_threadsafe` would dead-lock this same loop, so a
+            # small poll loop stands in for a cross-thread wait instead.
+            # Capped, not unbounded: a failed assertion below must not leave
+            # this worker thread blocked forever (mutation testing routinely
+            # fails the assertion right after this without ever releasing).
+            deadline = time.monotonic() + 5.0
+            while not release.is_set() and time.monotonic() < deadline:
+                time.sleep(0.01)
+        if "--json" in argv:
+            return 0, json.dumps(h.status_payload)
+        return 0, ""
+
+    monkeypatch.setattr(manager_mod, "_run_argv", _slow_run)
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(adapter)
+    await h.manager.start("tailnet")
+
+    stop_task = asyncio.create_task(h.manager.stop("tailnet"))
+    assert await _settle(lambda: ran_stop.is_set()), (
+        "precondition: the teardown must already be running the off argv")
+
+    for _ in range(depth):
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+    assert not stop_task.done(), (
+        f"the teardown was abandoned by the {depth}th cancellation instead "
+        f"of running to completion -- a mapping may still be on the open "
+        f"internet with nothing reporting it")
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(stop_task, 5.0)
+
+    assert _STOP_ARGV in h.ran
+    assert ["fake-tailnet", "serve", "status", "--json"] in h.ran, (
+        "the teardown was abandoned before it could verify the stop")
+    assert h.processes[0].returncode is not None, (
+        "the teardown was abandoned before it reaped the subprocess")
+    assert h.sockets[0].fileno() == -1
+    assert dict(h.policies) == {BASE: "local"}
+    assert h.published.owners() == frozenset()
+    assert h.manager.running() == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth", [2, 3, 5, 9])
+async def test_the_spawn_survives_any_number_of_repeat_cancellations_too(
+        h, monkeypatch, depth):
+    """Important 2, the other call site. The same shield-then-plain-re-await
+    shape guarded `create_subprocess_exec` -- a cancel landing there once the
+    OS has already created the child, but before the handle is assigned,
+    orphans a real process this manager can never again reach. `depth`
+    cancellations land on the task running `_start_and_unwind` while the
+    spawn is still in flight; the process must still be recovered and reaped
+    regardless of how many there are.
+    """
+    spawn_started = asyncio.Event()
+    release_spawn = asyncio.Event()
+
+    async def _slow_spawn(argv):
+        h.spawned.append(list(argv))
+        spawn_started.set()
+        await release_spawn.wait()
+        proc = _FakeProcess(h.lines_for.get("tailnet", []))
+        h.processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(manager_mod, "_spawn", _slow_spawn)
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(adapter)
+
+    outer_task = asyncio.create_task(h.manager.start("tailnet"))
+    assert await _settle(lambda: spawn_started.is_set()), (
+        "precondition: the spawn never started")
+    inner_task = h.manager._starting["tailnet"]
+
+    for _ in range(depth):
+        inner_task.cancel()
+        await asyncio.sleep(0)
+
+    assert not inner_task.done(), (
+        f"the spawn was abandoned by the {depth}th cancellation -- an orphan "
+        f"process this manager can no longer reach may now exist")
+
+    release_spawn.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(outer_task, 5.0)
+
+    assert h.processes, "the process must have been recovered, not orphaned"
+    assert h.processes[0].terminated or h.processes[0].killed, (
+        "the recovered process was not reaped")
+    assert port_for("tailnet", BASE) not in h.policies
+    assert h.sockets[0].fileno() == -1
+    assert h.manager.running() == {}
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_stop_never_forwards_a_further_cancel_into_a_starting_transport(
+        h):
+    """Important 1. `asyncio.gather` cancels its child when the *awaiter* is
+    cancelled, so a stop that is itself cancelled while it waits for an
+    in-flight start to unwind would deliver a second cancellation into that
+    start through the one call the round 2 guard does not cover.
+    `asyncio.wait` never forwards, no matter how many times the wait itself
+    is cancelled here.
+    """
+    adapter = _FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV)
+    h.register(adapter, lines=[])
+    h.stall.add("tailnet")
+
+    starting = asyncio.create_task(h.manager.start("tailnet"))
+    assert await _settle(lambda: bool(h.spawned)), "the start never spawned"
+    start_task = h.manager._starting["tailnet"]
+
+    stop_task = asyncio.create_task(h.manager.stop("tailnet"))
+    assert await _settle(lambda: start_task.cancelling() >= 1)
+    assert start_task.cancelling() == 1
+
+    for _ in range(3):
+        stop_task.cancel()
+        await asyncio.sleep(0)
+
+    assert start_task.cancelling() == 1, (
+        "the stop's own cancellation reached the starting transport -- "
+        "exactly what `asyncio.wait` (not `gather`) exists to stop")
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(stop_task, 5.0)
+
+    # The starting transport's own unwind must still complete regardless of
+    # the cancelled stop above.
+    with pytest.raises(TransportError, match="still starting"):
+        await asyncio.wait_for(starting, 5.0)
+    assert port_for("tailnet", BASE) not in h.policies
+    assert h.sockets[0].fileno() == -1
+    assert h.manager.running() == {}
+
+
+@pytest.mark.asyncio
+async def test_stop_all_keeps_going_past_a_transport_whose_stop_was_cancelled(
+        h, monkeypatch):
+    """Important 1, secondary. `stop`'s own teardown only ever lets a
+    cancellation reach its caller after that teardown has completed (see the
+    depth tests above) -- so a `CancelledError` out of `stop` here means the
+    transport in question is already down, only unreported. Before this
+    round, `stop_all`'s per-name guard did not catch `CancelledError`, so it
+    escaped the loop entirely and every transport after the cancelled one was
+    never even attempted -- exactly the stranding `stop_all`'s own docstring
+    says it must not do.
+    """
+    calls: list[str] = []
+
+    async def _fake_stop(name):
+        calls.append(name)
+        if name == "tailnet":
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(h.manager, "stop", _fake_stop)
+    h.manager._sessions["tailnet"] = None
+    h.manager._sessions["funnel"] = None
+
+    failures = await h.manager.stop_all()
+
+    assert calls == ["tailnet", "funnel"], (
+        "stop_all abandoned the remaining transports after one stop was "
+        f"cancelled -- only reached {calls}")
+    assert any("tailnet" in f and "cancelled" in f for f in failures), (
+        "the cancellation must still be reported, not silently dropped")

@@ -69,6 +69,14 @@ Three things in here exist because they were got wrong somewhere first:
    outcome above: a tunnel that comes up after the operator asked for
    everything to be down.
 
+   The teardown itself, and the spawn it may need to recover a handle from,
+   both survive being cancelled any number of further times while they are in
+   flight (`_await_uncancellably`, fix round 3) -- not just once. anyio
+   re-delivers a cancelled scope's cancellation on every event-loop cycle, so
+   a route handler or a `stop_all` caller reaches a second and third repeat
+   cancel within two loop cycles, and rounds 1 and 2 each survived only the
+   first of those.
+
 3. **Every synchronous provider call is wrapped in `asyncio.to_thread`.**
    `preflight()` and the status re-read are `subprocess.run` with a 10s
    timeout, and this manager runs on the event loop *the assistant herself
@@ -569,19 +577,27 @@ class TransportManager:
             # 4. Spawn, with the argv checked against the registry first.
             argv = [str(token) for token in adapter.command(port)]
             self._refuse_a_foreign_target(argv, name=name, port=port)
-            # Shielded, and then awaited again on cancellation. A cancel that
-            # landed *inside* `create_subprocess_exec` would otherwise leave a
-            # child this manager has no handle to -- an orphan tunnel, which is
-            # the very thing a cancellable start is supposed to prevent. The
-            # shield lets the spawn finish; the re-await recovers the handle so
-            # the teardown below can reap it.
+            # `_await_uncancellably`, not a single shield-then-recover: a
+            # cancel landing *inside* `create_subprocess_exec` would leave a
+            # child this manager has no handle to -- an orphan tunnel, the
+            # very thing a cancellable start is supposed to prevent -- and
+            # round 2's single recovery survived exactly one repeat cancel
+            # before a further one reached the spawn directly (fix round 3,
+            # Important 2). A non-cancellation failure here (no such binary,
+            # exec denied) is the OS refusing the exec, not a refusal this
+            # manager issued, so it is wrapped to match this method's own
+            # docstring -- `start` raises `TransportError` on every refusal.
             spawn = asyncio.ensure_future(_spawn(argv))
             try:
-                process = await asyncio.shield(spawn)
-            except asyncio.CancelledError:
-                with suppress(Exception):
-                    process = await spawn
-                raise
+                process = await _await_uncancellably(spawn)
+            except Exception as exc:
+                raise TransportError(
+                    f"transport '{name}' could not be spawned ({exc})"
+                ) from exc
+            # The spawn is done; only now is a cancellation delivered while
+            # it was in flight safe to honour -- any earlier would race the
+            # very child creation this exists to protect.
+            _reraise_if_still_cancelling()
             logger.info("[API] transport '%s' spawned %s (pid %s) for port %d",
                         name, argv[0], getattr(process, "pid", "?"), port)
 
@@ -748,16 +764,16 @@ class TransportManager:
         if starting is not None and not starting.done():
             if name in self._stopped_while_starting:
                 # Somebody already cancelled this start and is waiting for it
-                # to finish unwinding. A **second** cancel would land on the
-                # teardown's own re-await inside `_teardown_completely` --
-                # where `CancelledError` is a `BaseException` and passes
-                # straight through the `suppress(Exception)` -- abandoning the
-                # teardown after its first three steps and before the `off`
-                # argv, its verification and the reap. Both stops would then
-                # read an empty failure list and report success, which is
-                # Important 1's own outcome reached through the mechanism that
-                # fixed it (fix round 2). It also re-opens the orphan window at
-                # the spawn's re-await. So: wait, do not cancel again.
+                # to finish unwinding. Measured on 3.11.9: a second cancel
+                # lands on `asyncio.shield`'s own outer wrapper, not on the
+                # teardown itself -- that is what a shield is for -- so it
+                # takes a *third* cancel, arriving while round 2's recovery
+                # re-await is unshielded, to reach the teardown directly and
+                # abandon it. Round 3 removed that bound rather than naming
+                # its next multiple: the wait below never cancels `starting`
+                # a second time either way, and whatever teardown it may be
+                # running is now protected for any number of further cancels,
+                # not just one (see `_await_uncancellably`).
                 logger.info(
                     "[API] transport '%s' is already being stopped mid-start; "
                     "waiting for that teardown rather than cancelling it",
@@ -769,8 +785,19 @@ class TransportManager:
                     name)
                 self._stopped_while_starting.add(name)
                 starting.cancel()
-            with suppress(Exception):
-                await asyncio.gather(starting, return_exceptions=True)
+            # `asyncio.wait`, never `gather`: `gather` cancels its child when
+            # the *awaiter* is cancelled, so a stop that is itself cancelled
+            # here -- a second stop racing this same window, or `stop_all`
+            # racing a shutdown -- would deliver a further cancellation into
+            # `starting` from this line, exactly what the branch above exists
+            # to prevent (fix round 3, Important 1). `asyncio.wait` leaves
+            # `starting` untouched no matter how many times this wait itself
+            # is cancelled; `starting`'s own unwind is what guarantees its
+            # teardown still completes regardless, and a cancellation here
+            # is left to propagate rather than swallowed, so this method
+            # never reports "unwound" before `_unwind_failures` is actually
+            # settled.
+            await asyncio.wait({starting})
             failures = self._unwind_failures.get(name, [])
             if failures:
                 raise TransportError("; ".join(failures))
@@ -787,6 +814,16 @@ class TransportManager:
             session.adapter, policy_name=session.policy_name,
             port=session.port, owner=session.owner, process=session.process,
             sock=session.sock, serve_task=session.serve_task, spawned=True)
+        # The teardown is done; only now is a cancellation delivered while it
+        # was in flight safe to honour. Unlike the mid-start branch above,
+        # this call was not entered by catching anything, so there is no
+        # enclosing `raise` to carry a cancellation forward on its own --
+        # it is checked and raised explicitly instead (fix round 3).
+        if failures:
+            logger.error(
+                "[API] transport '%s' could not be fully stopped: %s",
+                name, "; ".join(failures))
+        _reraise_if_still_cancelling()
         if failures:
             raise TransportError("; ".join(failures))
         logger.info("[API] transport '%s' stopped", name)
@@ -812,6 +849,23 @@ class TransportManager:
                 failures.append(str(exc))
                 logger.error("[API] transport '%s' could not be stopped: %s",
                              name, exc)
+            except asyncio.CancelledError:
+                # `stop` only ever lets a cancellation reach here *after*
+                # running its teardown to completion (fix round 3) -- so this
+                # transport is not left half-stopped, only unreported -- and
+                # `stop_all` must still attempt every other name rather than
+                # abandon them to the same cancellation that produced this
+                # one. Never re-raised: raising mid-shutdown would skip
+                # main.py's cancel of the primary listener, which is worse
+                # than a logged failure (round 1, concern 4) -- and that
+                # concern is exactly as true of a cancellation as of any
+                # other failure this loop already swallows.
+                failures.append(
+                    f"transport '{name}': its stop was cancelled after its "
+                    f"teardown had already completed")
+                logger.warning(
+                    "[API] transport '%s' stop was cancelled (its teardown "
+                    "had already completed)", name)
             except Exception as exc:  # pragma: no cover - defensive
                 failures.append(f"transport '{name}' teardown raised: {exc}")
                 logger.exception("[API] transport '%s' teardown raised", name)
@@ -819,8 +873,8 @@ class TransportManager:
 
     async def _teardown_completely(self, adapter: TransportAdapter | None,
                                    **kwargs) -> list[str]:
-        """`_teardown`, run to completion even if *this* task is cancelled
-        while it is in flight.
+        """`_teardown`, run to completion no matter how many times *this*
+        task is cancelled while it is in flight.
 
         Found while testing Important 1's fix, and in the same family as it: a
         `stop` cancels an in-flight start, and if that start is already
@@ -829,22 +883,25 @@ class TransportManager:
         halfway leaves exactly what the whole method exists to prevent, and
         the stop that caused it would have reported success.
 
-        A cancellation delivered here is swallowed once the teardown has
-        finished, deliberately: the callers are the unwind (which re-raises
-        the exception it was already handling immediately afterwards, so
-        cancellation semantics survive when that exception *is* the
-        `CancelledError`) and `stop` (whose caller wanted everything down,
-        which is what completing the teardown achieves). A *second*
-        cancellation while waiting is not swallowed -- it is a `BaseException`
-        and passes straight through the `suppress` below.
+        Round 1 and round 2 both shielded once and recovered with a single
+        plain re-await, which survives exactly one repeat cancellation before
+        a further one lands on the teardown task directly -- and anyio
+        re-delivers a cancelled scope's cancellation on every event-loop
+        cycle, so a route handler or a `stop_all` caller reaches that further
+        cancel within two loop cycles, not some comfortable margin (fix round
+        3). `_await_uncancellably` re-shields on every iteration instead of
+        recovering once, so the teardown always runs to completion regardless
+        of depth (probe-verified at 2, 3, 5 and 9).
+
+        Returns the failures exactly as `_teardown` produced them, whether or
+        not a cancellation arrived while waiting: a cancellation delivered
+        here means the *caller* wants out, not that the failures stopped
+        mattering, and a caller with bookkeeping to do about them (recording,
+        deciding whether to raise) is better placed than this method to also
+        decide when to honour that cancellation.
         """
         task = asyncio.ensure_future(self._teardown(adapter, **kwargs))
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            with suppress(Exception):
-                return await task
-            raise
+        return await _await_uncancellably(task)
 
     async def _teardown(self, adapter: TransportAdapter | None, *,
                         policy_name: str, port: int, owner: str,
@@ -1156,6 +1213,60 @@ def _serve(app: Any, sock: socket.socket, *, name: str) -> asyncio.Task:
 
 
 # ─── Small async utilities ───────────────────────────────────────────────────
+
+async def _await_uncancellably(fut: "asyncio.Future") -> Any:
+    """Await *fut* to completion, no matter how many times the caller's own
+    task is cancelled while waiting -- then hand back its result untouched.
+
+    A plain `await fut` forwards every cancellation of the *caller* onto
+    *fut* (`Task.cancel()` cancels whatever future the task is currently
+    suspended on); one `asyncio.shield` only defers exactly one such cancel,
+    landing it on the shield's own outer wrapper instead of *fut*. Rounds 1
+    and 2 both recovered from that one cancel with a single plain re-await,
+    which is itself unshielded -- so a *further* cancel, arriving while that
+    recovery is in flight, reaches *fut* directly and abandons it. anyio
+    re-delivers a cancelled scope's cancellation on every event-loop cycle
+    (`anyio/_backends/_asyncio.py`, reschedule at line 623), so a route
+    handler or a `stop_all` caller reaches that further cancel within two
+    loop cycles -- not some comfortable margin an enumeration of callers
+    could hope to bound.
+
+    Re-shielding on *every* iteration, rather than recovering once, removes
+    the bound entirely: probe-verified robust at cancellation depths 2, 3, 5
+    and 9 (fix round 3). Bounded by *fut* itself, not by anything added
+    here -- every caller of this helper wraps something whose own steps are
+    already bounded (subprocess timeouts, `HOSTNAME_TIMEOUT_SECONDS`), so a
+    fresh timeout here would only duplicate that, not add safety.
+
+    Deliberately does not re-raise a cancellation itself once *fut* is
+    done -- the caller's own task still carries the outstanding request
+    (`asyncio.current_task().cancelling()`), and callers with bookkeeping to
+    do about *fut*'s result (recording failures, say) are better placed than
+    this generic wait to decide when to also honour it (see
+    `_reraise_if_still_cancelling`).
+    """
+    while not fut.done():
+        try:
+            await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            continue
+    return fut.result()
+
+
+def _reraise_if_still_cancelling() -> None:
+    """Raise a fresh `CancelledError` if the current task still carries an
+    outstanding cancellation request.
+
+    Called only *after* whatever must not be interrupted -- a teardown, a
+    spawn -- has already finished, so a cancellation delivered while that was
+    in flight is honoured now rather than lost, and never a moment earlier:
+    checking before completion would honour it in place of the very
+    completion `_await_uncancellably` exists to guarantee (fix round 3).
+    """
+    current = asyncio.current_task()
+    if current is not None and current.cancelling() > 0:
+        raise asyncio.CancelledError()
+
 
 async def _cancel(task: asyncio.Task | None) -> None:
     """Cancel *task* and wait for it to finish unwinding.
