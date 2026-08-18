@@ -408,7 +408,7 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
         from .actions.studio_runtime import build_studio_runtime
         from .io.api.events import EventHub
         from .io.api.pairing import PairCodeStore
-        from .io.api.server import current_listeners, serve as serve_studio_api
+        from .io.api.server import clear_listeners, current_listeners, serve as serve_studio_api
         from .io.api.transports.manager import TransportManager
         from .io.api.vault import Capability, TokenVault
 
@@ -500,10 +500,43 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
         # transport is ever started at boot (spec §2.1), so there is nothing
         # for an earlier assignment to buy and everything for it to risk if
         # a step after this one somehow still failed.
+        #
+        # In its own try/except, deliberately separate from the one wrapping
+        # this whole function. `_studio_task` is already live at this point --
+        # `serve_studio_api()` returned without raising -- so a raise out of
+        # this trivial constructor must not fall into the outer handler and
+        # be logged as "Studio daemon failed to start": that message is a lie
+        # once a socket is genuinely listening, and the outer handler has no
+        # way to reach `_studio_task` to cancel it (a local, not the global
+        # this function returns). Left alone, a manager failure here would
+        # orphan the very listener this task is about to hand back -- reachable
+        # by nothing, stopped by nothing, the identical class of bug the
+        # `_studio_pair_store` comment above already exists to prevent, one
+        # step later in this same sequence. So a failure here tears the
+        # listener back down itself and reports `None`, the same outcome a
+        # `serve_studio_api()` failure produces, but via its own path and its
+        # own message.
         listeners = current_listeners()
         if listeners is not None:
-            _studio_transports = TransportManager(listeners, config.STUDIO_API_PORT)
-            listeners.app.state.transports = _studio_transports
+            try:
+                _studio_transports = TransportManager(listeners, config.STUDIO_API_PORT)
+                listeners.app.state.transports = _studio_transports
+            except Exception as e:
+                logger.warning(
+                    f"[API] Studio transport manager could not be built; "
+                    f"stopping the listener it would have managed "
+                    f"(non-critical): {redact_secrets(str(e))}"
+                )
+                _studio_pair_store = None
+                _studio_task.cancel()
+                try:
+                    await _studio_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                clear_listeners()
+                return None
         # publish_status(), not publish() directly: it translates the
         # broadcaster's own snake_case event shape into the daemon's
         # camelCase wire frame (assistant/io/api/events.py) before it ever

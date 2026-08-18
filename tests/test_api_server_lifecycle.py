@@ -152,6 +152,7 @@ async def test_shutdown_revokes_devices_and_eventually_frees_the_port(tmp_path):
     import socket
 
     from assistant.io.api import server
+    from assistant.io.api.raises import RaiseStore
     from assistant.io.api.vault import Capability, TokenVault
     from tests.fakes.studio_runtime import build_fake_runtime
 
@@ -162,7 +163,7 @@ async def test_shutdown_revokes_devices_and_eventually_frees_the_port(tmp_path):
                         origins=["http://localhost:3000"])
     await asyncio.sleep(0.2)
 
-    server.shutdown(task, vault)
+    server.shutdown(task, vault, raises=RaiseStore())
 
     # Half one: revocation, synchronous, already true.
     assert vault.devices() == []
@@ -2099,6 +2100,67 @@ async def test_a_studio_boot_failure_leaves_no_transport_running(tmp_path, monke
     assert m._studio_transports is None, (
         "a serve() that raised synchronously left a transport manager behind"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_transport_manager_construction_failure_does_not_orphan_the_listener(
+    tmp_path, monkeypatch,
+):
+    """Fix round 1, Important 2: `TransportManager(...)` sits behind its own
+    try/except, separate from the one wrapping `serve_studio_api()` itself --
+    because by the time it runs, `serve()` has already returned a real, live
+    listener task. A raise here must not be reported as "serve() failed"
+    while a socket keeps answering, and the listener it would have managed
+    must be torn down rather than orphaned: cancelled, its handle cleared
+    from `current_listeners()`, and its port actually released back to the
+    OS -- proved here by rebinding it, the strongest evidence available,
+    rather than merely asserting a Python-level `None`."""
+    import asyncio
+    import socket
+
+    import assistant.config as config
+    import assistant.main as m
+    from assistant.io.api import server
+    from assistant.io.api.transports import manager as manager_mod
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    port = 18995
+    monkeypatch.setattr(config, "STUDIO_API_PORT", port)
+    monkeypatch.setattr(m, "_studio_transports", None)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("the manager blew up")
+
+    monkeypatch.setattr(manager_mod, "TransportManager", _raise)
+
+    result = await m._start_studio_daemon()
+    assert result is None, (
+        "a TransportManager that fails to construct must not hand back a "
+        "task nothing will ever stop"
+    )
+    assert m._studio_transports is None
+    assert m._studio_pair_store is None, (
+        "the pair store must not survive a transport-manager failure either "
+        "-- it would keep minting codes for a daemon nothing is serving"
+    )
+    assert server.current_listeners() is None, (
+        "current_listeners() must be cleared, or a later caller reads a "
+        "live-looking handle for an app whose listener was cancelled"
+    )
+
+    # The strongest proof: the real socket serve() bound is actually free,
+    # not merely unreferenced. An orphaned task holding the port open would
+    # fail this bind even though every Python-level handle above reads None.
+    await asyncio.sleep(0.2)
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        pytest.fail(
+            f"port {port} is still bound after the manager failed to build: {exc}"
+        )
+    finally:
+        probe.close()
 
 
 @pytest.mark.asyncio

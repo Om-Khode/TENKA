@@ -450,8 +450,8 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     return task
 
 
-def shutdown(task: asyncio.Task | None, vault: TokenVault,
-            raises: RaiseStore | None = None) -> None:
+def shutdown(task: asyncio.Task | None, vault: TokenVault, *,
+            raises: RaiseStore) -> None:
     """Invalidate every device immediately; stop serving on the next tick.
 
     Rotating the instance secret is what makes this a kill switch rather than a
@@ -501,9 +501,18 @@ def shutdown(task: asyncio.Task | None, vault: TokenVault,
     device, and a raise surviving it would be absurd. `RaiseStore.clear()` is
     itself synchronous (a lock, then a dict clear), so it costs this function
     nothing to call inline, the same way `vault.reset()` already does.
-    Defaults to `None` so a caller with no raise store to hand in -- there is
-    none in this milestone, but the parameter is additive -- gets the
-    function exactly as it always behaved: no raise touched.
+
+    **Required, not defaulted, and keyword-only.** `hub`, `pair_store` and
+    `ui_bundle` on `serve()` default to `None` because their absence
+    substitutes something harmless -- a private object nothing outside that
+    app can reach. A missing `raises` here is not harmless: it silently skips
+    a security action the kill switch is specifically supposed to take,
+    every call site would still type-check, and the omission would look
+    exactly like "no raises were live" instead of "nobody asked to clear
+    them." A parameter that can be forgotten will be forgotten, so this one
+    cannot be -- a caller with no `RaiseStore` in hand must go get one
+    (`current_listeners().app.state.raises`, if a daemon is running) rather
+    than have this function silently do less than a kill switch promises.
     """
     if task is not None:
         task.cancel()
