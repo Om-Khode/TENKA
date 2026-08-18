@@ -192,9 +192,20 @@ class PairCodeRequest(BaseModel):
     an unknown string must be a 422 built by the route from a name it never
     echoes, not a Pydantic error whose `msg` might one day carry the
     submitted value back. The route parses and bounds it (`routes/pairing.py`).
+
+    `transport` defaults to `"local"`, which reproduces 6a exactly: minting
+    always runs on the loopback listener (`require_admin`), so with no
+    transport named, the QR is built from that listener's own loopback
+    origin. Naming a different transport asks the route to build the QR from
+    THAT transport's published `https://` host instead -- a plain string, for
+    the same reason `RaiseRequest.transport` is: naming an unknown listener
+    must not print the name back in a 422 either. The route refuses a name
+    that is not currently running, or one that has published no hostname
+    yet, rather than silently falling back to loopback.
     """
     label: str = Field(min_length=1, max_length=64)
     grants: list[str] = Field(min_length=1)
+    transport: str = Field(default="local", min_length=1, max_length=32)
 
 
 class RaiseRequest(BaseModel):

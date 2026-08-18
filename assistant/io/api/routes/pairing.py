@@ -20,10 +20,14 @@ what it serves. These properties carry that weight, and each one has a test:
 - **Grants that survive to `issue()` are also capped by the redeeming
   listener.** The code carries what the laptop authorised; `pair_device` below
   narrows that further to `effective(pair_code.grants, policy)` before it ever
-  reaches the vault, so a code redeemed over a distrusted transport
-  (Cloudflare's `quick` tunnel) can never mint a device wider than that
-  transport is trusted to carry. See that route's own docstring for what this
-  means for a phone that pairs over `quick`.
+  reaches the vault, so a code redeemed over `tailnet` or `funnel` can never
+  mint a device wider than that transport is trusted to carry.
+- **Redemption is refused outright on `quick`.** Cloudflare terminates TLS and
+  reads the plaintext of the code and the resulting `Set-Cookie` alike, so
+  narrowing grants there is not enough -- a third party would still see a
+  working, if watch-only, credential in the clear. Refused before the code is
+  even consulted, so a wrong code and the transport's one genuinely live code
+  read identically. See `pair_device`'s own docstring for the full argument.
 - **Grants ride on the code.** They are chosen on the laptop before the QR is
   drawn and stored on the `PairCode`; the redeeming request never supplies
   them. That is what turns the checkbox row into a boundary rather than a
@@ -35,7 +39,10 @@ what it serves. These properties carry that weight, and each one has a test:
 - **No log line ever carries a code.** Not at DEBUG, not in an audit entry.
   The code appears in exactly one place, the response body that the laptop
   renders, and in the QR's URL *fragment* -- which a browser never sends to a
-  server, so it cannot land in an intermediary's access log either.
+  server, so it cannot land in an intermediary's access log either. That
+  fragment is what the laptop's own `_endpoints()`/`transport` handling builds
+  from -- loopback origin on `local`, or a named transport's published
+  `https://` host -- never the path or the query, on either shape.
 
 Layering: io/api -- core + config only.
 """
@@ -50,7 +57,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from ..pairing import PairCodeStore
 from ..payloads import PairCodePayload
-from ..policy import effective
+from ..policy import POLICIES, effective, policy_for_port
 from ..qr import qr_svg
 from ..schemas import Envelope, PairCodeRequest, PairRequest
 from ..security import (
@@ -115,14 +122,24 @@ def _store(request: Request) -> PairCodeStore:
 
 
 def _endpoints(request: Request) -> list[str]:
-    """Every base URL a phone could be told to reach this daemon at.
+    """Every base URL a phone could be told to reach THIS listener at.
 
-    6a: the loopback origin alone, built from the port the connection was
-    accepted on -- the one piece of addressing a client cannot choose. A
-    transport publishes its public hostname onto `app.state.published_hosts`
-    in 6b, and that is where it joins this list; it is deliberately not read
-    here yet, because an endpoint nobody has tested a QR against is a
-    scannable code with no destination.
+    Listener-scoped, from the port this connection was *accepted* on -- the
+    one piece of addressing a client cannot choose. On the loopback listener,
+    the loopback origin, exactly as in 6a. On a transport listener, that
+    listener's published `https://` hosts (`PublishedHosts.hosts_for`) and no
+    loopback candidate at all: a phone off-LAN cannot reach `127.0.0.1`, and
+    offering it is a QR with no destination.
+
+    6a's "deliberately not read here yet" note about `app.state.published_hosts`
+    is resolved -- but not by this function reaching past its own listener.
+    The resolution is `mint_pair_code`'s `transport` handling below, the one
+    deliberate cross-listener read this milestone introduces: minting always
+    happens on `local` (`require_admin`), so this function alone would only
+    ever answer with the loopback origin, and a named transport's own hosts
+    have to be read on purpose, explicitly, rather than by this function
+    guessing which listener the operator meant. Advertising an endpoint is
+    not trusting an origin.
     """
     port = accepting_port(request.scope)
     if port is None:
@@ -130,7 +147,11 @@ def _endpoints(request: Request) -> list[str]:
         # and refuses when it cannot. Guarded anyway rather than formatting
         # `None` into a URL a QR would then encode.
         raise UNAUTHORIZED
-    return [f"http://127.0.0.1:{port}"]
+    policy = policy_for_port(port, request.app.state.listener_policies)
+    if policy is not None and policy.name == "local":
+        return [f"http://127.0.0.1:{port}"]
+    published = request.app.state.published_hosts
+    return [f"https://{host}" for host in sorted(published.hosts_for(port))]
 
 
 # ─── minting: loopback only ──────────────────────────────────────────────
@@ -184,13 +205,54 @@ async def mint_pair_code(
             detail="none of the requested capabilities are held by this device",
         )
 
+    # `transport` is resolved before the code is minted, never after:
+    # `store.mint()` replaces whatever code is already live, and a request
+    # naming a transport that turns out not to be running must not destroy an
+    # operator's still-live code as a side effect of failing.
+    #
+    # `"local"` -- the default, and 6a's only shape -- reads `_endpoints()`
+    # above, which is scoped to the listener this request itself arrived on.
+    # Minting is always accepted on `local` (`require_admin`), so that is
+    # always the loopback origin. Naming a *different* transport is this
+    # milestone's one deliberate cross-listener read: `_endpoints()` would
+    # only ever answer loopback here, which is useless to a phone off-LAN,
+    # so the operator names the transport explicitly and this route reads
+    # THAT transport's own published host instead. Advertising an endpoint is
+    # not trusting an origin.
+    if body.transport == "local":
+        endpoints = _endpoints(request)
+    else:
+        if body.transport not in POLICIES:
+            # Same silence about the submitted string as the capability
+            # check above: an unknown transport name is a client mistake,
+            # never echoed back into a 422 body.
+            raise HTTPException(status_code=422, detail="unknown transport")
+        # `getattr`, the same defensive shape `raise_device_ceiling` in
+        # `routes/devices.py` uses for the identical reason: a sibling task
+        # wires the transport manager, and an app built without one -- or one
+        # wired but with nothing running under this name -- must fail closed
+        # rather than fall back to loopback. `running()` is already filtered
+        # on `is_serving`, so a session that started but never announced a
+        # hostname is absent from it too; "not running" and "no published
+        # host yet" are one refusal here, not two, because a scannable code
+        # with no destination is worse than no code either way.
+        manager = getattr(request.app.state, "transports", None)
+        running = manager.running() if manager is not None else {}
+        session = running.get(body.transport)
+        if session is None or session.url is None:
+            raise HTTPException(
+                status_code=409,
+                detail="that transport is not running, or has not yet "
+                       "published a hostname",
+            )
+        endpoints = [session.url]
+
     store = _store(request)
     pair_code = store.mint(body.label, grants)
 
     state: AuthState = request.app.state.auth
     state.limiter.record_success(_PAIR_BUDGET_KEY)
 
-    endpoints = _endpoints(request)
     # The code goes in the fragment, never the path or the query: a fragment
     # is stripped by the browser before the request leaves it, so no server,
     # proxy or tunnel between the phone and this daemon ever sees it.
@@ -238,16 +300,24 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     set -- the same intersection `authenticate()` applies to every later
     request, just applied once here, at issue time, instead of on every
     request after. The consequence is real and worth spelling out: a code
-    minted with every capability, redeemed over Cloudflare's `quick` tunnel
-    (ceiling: OBSERVE alone, because Cloudflare terminates TLS and reads the
-    plaintext), mints a device that can only ever watch -- **permanently**,
-    even if that same device later connects over `funnel` or `tailnet`,
-    because the vault only remembers what `issue()` was actually asked to
-    store, not what the code could have carried on a better transport. That
-    will surprise someone: pairing over `quick` is the expected path for a
-    phone with no Tailscale, not a mistake, and there is no way to tell
-    afterward that a device "could have" held more. 6b's pairing UI needs to
-    say so before the QR is scanned, not after.
+    minted with every capability, redeemed over `tailnet` or `funnel`
+    (ceiling: everything but EXECUTE and SYSTEM_CONTROL), mints a device
+    that can never reach either -- **permanently**, even if that same device
+    later connects over `local`, because the vault only remembers what
+    `issue()` was actually asked to store, not what the code could have
+    carried on a wider listener. There is no way to tell afterward that a
+    device "could have" held more.
+
+    **`quick` is refused outright, spec §5.5 -- see the check just below the
+    policy lookup.** Cloudflare terminates TLS and reads the plaintext of
+    everything this listener carries, including the code in this body and
+    the `Set-Cookie` this route would otherwise write; narrowing to OBSERVE
+    alone would still hand a third party a working (if watch-only) device
+    credential in the clear, which is a worse trade than refusing to pair
+    over that transport at all. Refused before `store.consume()` runs, so a
+    wrong code and a right one are indistinguishable on `quick` and no
+    attempt -- however it would have turned out -- burns the operator's live
+    code.
 
     Every refusal is the same `UNAUTHORIZED` the rest of the API uses, with
     two exceptions, both load-bearing: 429 when the pairing budget is spent
@@ -261,6 +331,19 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
         # Nobody declared what this socket is. Same answer `authenticate()`
         # gives, for the same reason: a listener added later and forgotten in
         # the registry must not inherit loopback's rights by silence.
+        raise UNAUTHORIZED
+
+    if policy.name == "quick":
+        # Spec §5.5. Before the budget, before `refuse_unknown_origin`, and
+        # before `store.consume()` -- the code is never even looked at, so a
+        # wrong code and this transport's one genuinely live code are
+        # answered identically and neither attempt costs the budget or burns
+        # anything. Cloudflare terminates TLS and reads the plaintext of this
+        # whole exchange, code and the `Set-Cookie` this route would
+        # otherwise write alike; narrowing to `quick`'s ceiling (OBSERVE
+        # alone) still hands a third party a working, if watch-only, device
+        # credential in the clear, which is the trade this refuses outright
+        # rather than take.
         raise UNAUTHORIZED
 
     # Before the budget, and unmetered -- the same ordering and the same
