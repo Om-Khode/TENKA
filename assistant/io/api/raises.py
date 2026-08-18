@@ -29,11 +29,14 @@ Layering: io/api -- core + config only.
 """
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from dataclasses import dataclass
 
 from ...core.capabilities import Capability
+
+logger = logging.getLogger(__name__)
 
 # Spec §3.3: "Duration is caller-set, in minutes, clamped to a 7-day hard
 # cap." A caller asking for longer than this gets the cap, silently -- the
@@ -171,7 +174,12 @@ class RaiseStore:
             expired = [key for key, record in self._records.items() if record.expires_at <= now]
             for key in expired:
                 del self._records[key]
-            return dict(self._records)
+            live = dict(self._records)
+        # Outside the lock, deliberately: a logging handler writes to a file,
+        # and holding this lock across that write would put the admin route and
+        # every authenticated request behind disk I/O.
+        self._announce_expiry(expired)
+        return live
 
     # ─── Internal ───────────────────────────────────────────────────────────
 
@@ -183,5 +191,28 @@ class RaiseStore:
                 return None
             if record.expires_at <= time.monotonic():
                 del self._records[key]
-                return None
-            return record
+                record = None
+        if record is None:
+            # Reached only on the delete-above branch: the `is None` return a
+            # few lines up already left. See `_announce_expiry` for why this is
+            # one line per record rather than one per read.
+            self._announce_expiry([key])
+            return None
+        return record
+
+    def _announce_expiry(self, keys: list[tuple[str, str]]) -> None:
+        """Spec §3.6: a log line on mint, and one on expiry.
+
+        Expiry has no timer to hang a line off -- a record dies on the read
+        that notices it -- so this fires from the delete-on-read paths above.
+        That is still **one line per record, not one per read**: the record is
+        gone from the dict by the time this runs, so no later read can find it
+        to announce a second time.
+
+        Ids and the transport, and nothing else. The reason string and the
+        capabilities are already on the mint line, and repeating free text the
+        operator typed into a log file that outlives the raise buys nothing.
+        """
+        for device_id, policy_name in keys:
+            logger.info(f"[API] ceiling raise expired (device={device_id} "
+                        f"transport={policy_name})")

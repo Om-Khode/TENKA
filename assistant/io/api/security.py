@@ -1147,28 +1147,35 @@ async def authenticate(request: Request) -> Device:
         device = replace(device, grants=grants)
         request.state.device = device
         request.state.issued_grants = issued
-        # Spec §3.6: an audit event on every request that actually consumes a
-        # raised capability -- the difference between knowing a door was
-        # unlocked and knowing it was walked through. A seven-day window is
-        # not something to hold in your head, and the mint line alone says
-        # only that it opened.
+        # Spec §3.6: an audit event on every request a raise put a capability
+        # within reach of -- the difference between knowing a door was unlocked
+        # and knowing somebody was inside while it was. A seven-day window is
+        # not something to hold in your head, and the mint line alone says only
+        # that it opened.
         #
-        # `applied` is what this request holds *because of* the raise and
-        # would not hold without it, so an ordinary request made while a raise
-        # happens to be live -- one asking for nothing the raise added --
-        # records nothing.
+        # **Read what this records, not what it sounds like.** `applied` is a
+        # function of the raise and the policy alone -- it never consults what
+        # the request went on to require -- so *every* authenticated request on
+        # the raised listener writes one of these entries while the raise is
+        # live: a Studio status poll, a `GET /v1/session`, anything. The entry
+        # says which capabilities the raise put in reach on this request, never
+        # which one the handler actually spent; the method and path beside it
+        # are what narrow that down. `test_a_raise_in_reach_records_on_every_
+        # request_not_only_the_one_that_spends_it` pins exactly that, so nobody
+        # has to infer the semantics from this comment.
         #
         # Recorded here rather than inside `require()`, which is where a
-        # per-capability hook would naturally go, because `require()` does not
-        # see the consumption that matters most: `POST /v1/chat` is gated on
-        # CHAT_SEND and then hands `device.grants` straight to the assistant,
-        # where the intent gate spends EXECUTE with no `require()` anywhere in
-        # sight -- and `run_command` checks a grant of its own choosing
-        # inline. Every one of those paths comes through this function, so
-        # this is the site that cannot be walked around. The cost is that the
-        # entry says which capabilities the raise put in reach on this
-        # request, not which one the handler went on to spend; the method and
-        # path beside it are what narrow that down.
+        # per-capability hook -- one that *could* tell spending from reach --
+        # would naturally go. `require()` does not see the consumption that
+        # matters most: `POST /v1/chat` is gated on CHAT_SEND and then hands
+        # `device.grants` straight to the assistant, where the intent gate
+        # spends EXECUTE with no `require()` anywhere in sight, and
+        # `run_command` checks a grant of its own choosing inline. Hooking
+        # `require()` plus each of those by name is the enumerate-every-path-
+        # around-the-boundary problem this milestone has already lost to twice.
+        # Every path comes through this function, so this is the one site that
+        # cannot be walked around, and over-recording is the fail-safe
+        # direction to be wrong in.
         applied = grants - effective(issued, policy)
         if applied:
             state.audit.record(AuditEntry(

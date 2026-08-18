@@ -173,6 +173,52 @@ def test_an_unknown_capability_name_is_422_and_is_never_echoed(tmp_path):
     assert submitted not in response.text
 
 
+def test_an_unknown_transport_name_is_422_and_is_never_echoed(tmp_path):
+    """A transport nobody declared is a validation problem, not a 409.
+
+    409 says "not running just now, try again", which would be a lie about a
+    name that can never run -- and the operator's actual mistake is a typo, not
+    a stopped tunnel. Same silence about the submitted string as the unknown
+    capability above: `POLICIES`' keys are not secret, but a route that echoes
+    one caller-supplied field and not another is how the next one starts
+    echoing too.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    device_id = vault.devices()[0].device_id
+    client = client_on(build(vault), "local", token)
+
+    submitted = "ngrok-please"
+    response = post_raise(client, device_id, transport=submitted)
+    assert response.status_code == 422
+    assert submitted not in response.text
+
+
+def test_an_unknown_device_is_refused_before_an_unknown_capability_is_parsed(tmp_path):
+    """The refusal order, pinned as an order rather than as two separate facts.
+
+    A request carrying *both* an unknown device and an unknown capability must
+    answer 404, not 422. Reversed, the pair becomes an oracle: a caller could
+    submit a deliberately invalid capability and read the status to learn
+    whether a device id exists -- 422 for a real device, 404 for a made-up one.
+    Loopback-admin-only today, so this is defence in depth rather than a live
+    hole; unpinned, it is one refactor away from being neither.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    device_id = vault.devices()[0].device_id
+    client = client_on(build(vault), "local", token)
+
+    both_wrong = post_raise(client, "nope", capabilities=["not-a-capability"],
+                            transport="not-a-transport")
+    assert both_wrong.status_code == 404
+
+    # The same body against a device that *does* exist gets the 422 -- which is
+    # what makes the 404 above an ordering fact rather than a coincidence.
+    assert post_raise(client, device_id,
+                      capabilities=["not-a-capability"]).status_code == 422
+
+
 def test_a_capability_outside_the_transports_raisable_is_refused(tmp_path):
     """`raisable` is the static, vetted, per-transport bound a raise can never
     reach past. `tailnet` is `{execute, system_control}` and nothing else."""
@@ -257,7 +303,12 @@ def test_minutes_are_clamped_to_the_seven_day_cap(tmp_path):
 
     response = post_raise(client, device_id, minutes=60 * 24 * 30)   # thirty days
     assert response.status_code == 200
-    assert response.json()["data"]["expiresInSeconds"] == MAX_RAISE_SECONDS
+    # `>=` with a second of slack rather than exact equality: the payload's
+    # `round()` reads the clock again after `grant()` stamped `expires_at`, so
+    # exact equality quietly depends on under half a second elapsing in
+    # between. Certain in practice, and a flake vector bought for nothing.
+    remaining = response.json()["data"]["expiresInSeconds"]
+    assert MAX_RAISE_SECONDS - 1 <= remaining <= MAX_RAISE_SECONDS
 
 
 # ─── the one test that asserts the feature works ─────────────────────────
@@ -404,16 +455,22 @@ def test_revoking_the_device_drops_its_raises(tmp_path):
     assert store.get(phone_id, "tailnet") is None
 
 
-def test_vault_reset_drops_every_raise(tmp_path):
+def test_vault_reset_makes_every_raise_unusable(tmp_path):
     """The kill switch, observed where it counts.
 
-    `TokenVault.reset()` holds no reference to the raise store (and must not:
-    `raises.py` imports `Capability` and nothing else from this layer), so the
-    property asserted here is the one that is actually load-bearing -- after
+    **Named for what it proves, not for what spec §3.3 asks for.** The spec
+    lists `vault.reset()` among the events that *drop* a raise record; this
+    test does not prove that, and cannot -- the 401 below holds whether the
+    record survived or not. `TokenVault.reset()` holds no reference to the
+    store (and must not: `raises.py` imports `Capability` and nothing else from
+    this layer), and `server.shutdown()`, the one place that calls it, belongs
+    to the task that owns the daemon lifecycle. The store-level `clear()` is
+    formally carried there.
+
+    What this pins is the load-bearing half, and it is the stronger one: after
     the switch is thrown, no request can consume a raise, because no request
-    can authenticate at all. The store-level `clear()` on the same event
-    belongs to whichever task owns `server.shutdown()`; this test fails the
-    moment a raise survives the reset in any way a caller could observe.
+    can authenticate at all. Renamed rather than deleted so the remaining gap
+    stays visible in the test list instead of looking closed.
     """
     vault = TokenVault(tmp_path)
     token = vault.issue("laptop", frozenset(Capability))
@@ -455,11 +512,65 @@ def test_using_a_raised_capability_writes_an_audit_entry(tmp_path):
                         headers={CSRF_HEADER: "1"}).status_code == 200
 
     used = [e for e in app.state.auth.audit.entries() if e.outcome.startswith("raised:")]
+    # One, because exactly one request is made over the raised listener -- NOT
+    # because the entry is filtered by whether the handler spent the raised
+    # capability. It is not; `test_a_raise_in_reach_records_on_every_request_
+    # not_only_the_one_that_spends_it` below is where those semantics live, and
+    # a second request added here would make this 2.
     assert len(used) == 1
     assert used[0].device_id == device_id
     assert used[0].path == "/v1/settings"
     assert used[0].method == "PATCH"
     assert "system_control" in used[0].outcome
+
+
+def test_a_raise_in_reach_records_on_every_request_not_only_the_one_that_spends_it(tmp_path):
+    """The honest semantics of the entry above, pinned so nobody has to infer
+    them from a comment.
+
+    `applied` in `authenticate()` is a function of the raise and the policy
+    alone -- it never consults what the request went on to require -- so an
+    entry means "a raise put this within reach on this request", never "the
+    handler spent it". A `GET /v1/session` that needs no capability at all
+    records one too.
+
+    That is over-recording, and it is deliberate. Telling reach from spending
+    would mean hooking `require()` *plus* every site that checks a grant
+    without it -- `POST /v1/chat` hands `device.grants` to the assistant where
+    the intent gate spends EXECUTE, and `run_command` checks inline -- which is
+    the enumerate-the-paths-around-the-boundary problem this milestone has
+    already lost to twice. One choke point that over-records is the fail-safe
+    direction.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    device_id = vault.devices()[0].device_id
+    app = build(vault)
+
+    assert post_raise(client_on(app, "local", token), device_id,
+                      capabilities=["system_control"]).status_code == 200
+
+    remote = client_on(app, "tailnet", token)
+    # Neither of these spends SYSTEM_CONTROL. `GET /v1/session` is gated on no
+    # capability whatsoever; `GET /v1/status` is gated on OBSERVE, which
+    # tailnet's own ceiling has always carried.
+    assert remote.get("/v1/session").status_code == 200
+    assert remote.get("/v1/status").status_code == 200
+
+    raised = [e for e in app.state.auth.audit.entries() if e.outcome.startswith("raised:")]
+    assert [(e.method, e.path) for e in raised] == [
+        ("GET", "/v1/session"), ("GET", "/v1/status"),
+    ]
+    assert all(e.outcome == "raised:system_control" for e in raised)
+
+    # And the mirror image: a device on the same listener with no raise of its
+    # own records nothing, so the entry is about the raise rather than about
+    # the listener.
+    other = vault.issue("wall display", frozenset(Capability))
+    unraised = client_on(app, "tailnet", other)
+    assert unraised.get("/v1/session").status_code == 200
+    still = [e for e in app.state.auth.audit.entries() if e.outcome.startswith("raised:")]
+    assert len(still) == 2
 
 
 def test_minting_a_raise_writes_a_log_line_that_names_no_secret(tmp_path, caplog):
