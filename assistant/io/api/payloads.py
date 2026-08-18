@@ -421,6 +421,30 @@ class ForgetEnrolledPayload(CamelModel):
     kind: Literal["voice", "face"]
 
 
+# ─── Transports ──────────────────────────────────────────────────────────
+class TransportPayload(CamelModel):
+    """One transport, running or not.
+
+    `ceiling` and `raisable` are read straight off `policy.py`'s `POLICIES`
+    for this transport's name, never hand-copied here -- so Studio can explain
+    *why* a control is unavailable on a given transport without carrying a
+    second copy of the table that could drift from the one the daemon
+    actually enforces. `url` is `None` whenever `running` is `False`: a
+    session with no announced hostname does not serve
+    (`transports/manager.py`'s `is_serving`), so there is nothing to show.
+    """
+
+    name: str
+    running: bool
+    url: str | None
+    ceiling: list[str]
+    raisable: list[str]
+
+
+class TransportsPayload(CamelModel):
+    transports: list[TransportPayload]
+
+
 class AuditEntryPayload(CamelModel):
     at: str
     device_id: str

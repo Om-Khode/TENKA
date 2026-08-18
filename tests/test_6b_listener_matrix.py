@@ -220,6 +220,23 @@ MATRIX: tuple[Row, ...] = (
               "minutes": 30, "reason": "fixing the build"}),
     Row("DELETE", "/v1/devices/{device_id}/raise", "/v1/devices/{victim}/raise",
         Capability.SYSTEM_CONTROL, admin=True, allowed=404),
+
+    # Task 13: which doors exist, opening one, closing one. Same admin gate as
+    # the two device rows above, for the identical reason -- managing
+    # transports is the same class of thing as managing devices, and both
+    # stay at the keyboard. `_client_on` builds every app in this file with no
+    # `transports` manager wired (a sibling task's job), so the `allowed`
+    # values below are this harness's own fail-closed answers, exactly as the
+    # raise route's two rows above are: the listing always has something to
+    # report (empty, with no manager), starting has nothing to start against
+    # (503), and stopping finds nothing running to stop (404) -- none of that
+    # is a claim about what a wired manager would do.
+    Row("GET", "/v1/transports", "/v1/transports",
+        Capability.SYSTEM_CONTROL, admin=True),
+    Row("POST", "/v1/transports/{name}", "/v1/transports/tailnet",
+        Capability.SYSTEM_CONTROL, admin=True, allowed=503),
+    Row("DELETE", "/v1/transports/{name}", "/v1/transports/tailnet",
+        Capability.SYSTEM_CONTROL, admin=True, allowed=404),
 )
 
 

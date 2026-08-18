@@ -44,6 +44,7 @@ from .routes import session as session_routes
 from .routes import settings as settings_routes
 from .routes import status as status_routes
 from .routes import system as system_routes
+from .routes import transports as transport_routes
 from .runtime import StudioRuntime
 from .security import (
     ANONYMOUS_DEVICE_ID,
@@ -625,6 +626,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     app.include_router(system_routes.router, prefix="/v1")
     app.include_router(pairing_routes.router, prefix="/v1")
     app.include_router(device_routes.router, prefix="/v1")
+    app.include_router(transport_routes.router, prefix="/v1")
 
     # ─── the event socket ───────────────────────────────────────────────
     # Not a route module like the ones above: `test_every_registered_route_
