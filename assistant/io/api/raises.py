@@ -138,8 +138,11 @@ class RaiseStore:
     def clear(self) -> None:
         """Drop every raise, for every device and transport.
 
-        Called by `vault.reset()` -- the kill switch already revokes every
-        device, and a raise surviving it would be absurd.
+        Called by `server.shutdown()`, alongside (not by) `vault.reset()` --
+        the kill switch already revokes every device, and a raise surviving
+        it would be absurd. Not called by `vault.reset()` itself: `TokenVault`
+        has no reach into this store, and `shutdown()` is the one place that
+        holds both.
         """
         with self._lock:
             self._records.clear()

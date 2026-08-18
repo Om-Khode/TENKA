@@ -152,6 +152,7 @@ async def test_shutdown_revokes_devices_and_eventually_frees_the_port(tmp_path):
     import socket
 
     from assistant.io.api import server
+    from assistant.io.api.raises import RaiseStore
     from assistant.io.api.vault import Capability, TokenVault
     from tests.fakes.studio_runtime import build_fake_runtime
 
@@ -162,7 +163,7 @@ async def test_shutdown_revokes_devices_and_eventually_frees_the_port(tmp_path):
                         origins=["http://localhost:3000"])
     await asyncio.sleep(0.2)
 
-    server.shutdown(task, vault)
+    server.shutdown(task, vault, raises=RaiseStore())
 
     # Half one: revocation, synchronous, already true.
     assert vault.devices() == []
@@ -2027,3 +2028,326 @@ async def test_local_sources_gain_no_frames_from_the_bracket(
     assert status_frames == [], (
         f"the bracket must not fire for a local source, got: {status_frames}"
     )
+
+
+# ─── Task 15: wiring TransportManager into the daemon's lifecycle ─────────
+# Spec §2.1, §4. `_start_studio_daemon` builds a `TransportManager` from
+# `current_listeners()` only after `serve()` has returned without raising --
+# the manager cannot be threaded through `serve()` itself, because `serve()`
+# builds the app and the manager needs it. `_stop_studio_daemon` stops every
+# transport before cancelling the primary listener, logs what `stop_all()`
+# reports rather than discarding it, and clears `current_listeners()` on the
+# way out. No test here starts a real tunnel -- either the real `local`
+# listener (a plain loopback socket, exercised the same way the rest of this
+# file already does) or a hand-rolled fake standing in for `TransportManager`.
+
+
+@pytest.mark.asyncio
+async def test_the_daemon_boots_with_only_the_local_listener(tmp_path, monkeypatch):
+    """Spec §2.1: only `local` is bound at startup. `app.state.transports` is
+    a real `TransportManager` built from `current_listeners()` -- not `None`,
+    not a stand-in -- and it reports nothing running, because nothing but the
+    local listener was ever asked to start."""
+    import assistant.config as config
+    import assistant.main as m
+    from assistant.io.api import server
+    from assistant.io.api.transports.manager import TransportManager
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    monkeypatch.setattr(config, "STUDIO_API_PORT", 18990)
+
+    task = await m._start_studio_daemon()
+    try:
+        assert task is not None, "sanity: the daemon must have actually started"
+        handle = server.current_listeners()
+        assert handle is not None
+        assert handle.app.state.listener_policies == {18990: "local"}, (
+            "a transport started at boot -- spec §2.1 says only local binds"
+        )
+        transports = getattr(handle.app.state, "transports", None)
+        assert isinstance(transports, TransportManager), (
+            f"app.state.transports must be a real TransportManager, got {transports!r}"
+        )
+        assert transports.running() == {}, (
+            "no transport may be running immediately after boot"
+        )
+        assert m._studio_transports is transports, (
+            "main.py's own handle must be the same manager object the app holds"
+        )
+    finally:
+        await m._stop_studio_daemon(task)
+
+
+@pytest.mark.asyncio
+async def test_a_studio_boot_failure_leaves_no_transport_running(tmp_path, monkeypatch):
+    """The mirror of `_studio_pair_store`'s own failure test: a `serve()` that
+    raises synchronously (a bad `TENKA_SECRET`, say) must not leave a
+    transport manager behind either -- there is no daemon for it to manage,
+    and a stale one would describe an app with closed sockets."""
+    import assistant.config as config
+    import assistant.main as m
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    monkeypatch.setattr(m, "_studio_transports", None)
+
+    def _raise(*args, **kwargs):
+        raise ValueError("bad TENKA_SECRET")
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _raise)
+
+    result = await m._start_studio_daemon()
+    assert result is None, "sanity: the start must actually have failed"
+    assert m._studio_transports is None, (
+        "a serve() that raised synchronously left a transport manager behind"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_transport_manager_construction_failure_does_not_orphan_the_listener(
+    tmp_path, monkeypatch,
+):
+    """Fix round 1, Important 2: `TransportManager(...)` sits behind its own
+    try/except, separate from the one wrapping `serve_studio_api()` itself --
+    because by the time it runs, `serve()` has already returned a real, live
+    listener task. A raise here must not be reported as "serve() failed"
+    while a socket keeps answering, and the listener it would have managed
+    must be torn down rather than orphaned: cancelled, its handle cleared
+    from `current_listeners()`, and its port actually released back to the
+    OS -- proved here by rebinding it, the strongest evidence available,
+    rather than merely asserting a Python-level `None`."""
+    import asyncio
+    import socket
+
+    import assistant.config as config
+    import assistant.main as m
+    from assistant.io.api import server
+    from assistant.io.api.transports import manager as manager_mod
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    port = 18995
+    monkeypatch.setattr(config, "STUDIO_API_PORT", port)
+    monkeypatch.setattr(m, "_studio_transports", None)
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("the manager blew up")
+
+    monkeypatch.setattr(manager_mod, "TransportManager", _raise)
+
+    result = await m._start_studio_daemon()
+    assert result is None, (
+        "a TransportManager that fails to construct must not hand back a "
+        "task nothing will ever stop"
+    )
+    assert m._studio_transports is None
+    assert m._studio_pair_store is None, (
+        "the pair store must not survive a transport-manager failure either "
+        "-- it would keep minting codes for a daemon nothing is serving"
+    )
+    assert server.current_listeners() is None, (
+        "current_listeners() must be cleared, or a later caller reads a "
+        "live-looking handle for an app whose listener was cancelled"
+    )
+
+    # The strongest proof: the real socket serve() bound is actually free,
+    # not merely unreferenced. An orphaned task holding the port open would
+    # fail this bind even though every Python-level handle above reads None.
+    await asyncio.sleep(0.2)
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError as exc:
+        pytest.fail(
+            f"port {port} is still bound after the manager failed to build: {exc}"
+        )
+    finally:
+        probe.close()
+
+
+@pytest.mark.asyncio
+async def test_stopping_the_daemon_stops_every_running_transport_first():
+    """Spec: `serve_socket`'s docstring makes 'transports before the primary,
+    always' the caller's obligation, because cancelling the primary runs the
+    app's lifespan shutdown (stopping the shared `EventHub`) while transport
+    listeners would still be serving. Proved on the real ordering, not on
+    which function was called: the fake's `stop_all()` and the primary task's
+    own cancellation both append to one shared list."""
+    import asyncio
+
+    import assistant.main as m
+
+    order: list[str] = []
+
+    class _FakeTransports:
+        async def stop_all(self) -> list[str]:
+            order.append("stop_all")
+            return []
+
+    async def _run_forever():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            order.append("cancelled")
+            raise
+
+    m._studio_transports = _FakeTransports()
+    task = asyncio.create_task(_run_forever())
+    await asyncio.sleep(0)  # let it actually start awaiting the sleep
+
+    await m._stop_studio_daemon(task)
+
+    assert order == ["stop_all", "cancelled"], (
+        f"transports must be stopped before the primary listener is "
+        f"cancelled, got: {order}"
+    )
+    assert m._studio_transports is None, (
+        "the transport manager handle must not survive its own daemon's stop"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_transport_that_fails_to_stop_does_not_block_the_shutdown(caplog):
+    """`stop_all()` returns a list of failure strings rather than raising,
+    deliberately -- a raise mid-`stop_all` would skip the primary cancel. A
+    discarded list means a tunnel that could not be proved stopped is
+    silently forgotten on the one path where that matters most, so
+    `_stop_studio_daemon` must log what it returns, and the primary listener
+    must still be cancelled regardless."""
+    import asyncio
+    import logging
+
+    import assistant.main as m
+
+    class _FailingTransports:
+        async def stop_all(self) -> list[str]:
+            return ["transport 'tailnet': a mapping is STILL keyed under "
+                    "public port 8443 -- an internet-facing listener may "
+                    "still be up"]
+
+    m._studio_transports = _FailingTransports()
+
+    async def _run_forever():
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(_run_forever())
+    await asyncio.sleep(0)
+
+    with caplog.at_level(logging.WARNING, logger="main"):
+        await m._stop_studio_daemon(task)
+
+    assert task.done() and task.cancelled(), (
+        "a transport that could not be proven stopped must not prevent the "
+        "primary listener from being cancelled"
+    )
+    assert any("STILL keyed under public port 8443" in r.message
+              for r in caplog.records), (
+        "stop_all()'s returned failures must be logged, not discarded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_studio_daemon_clears_current_listeners(tmp_path, monkeypatch):
+    """A stopped daemon's handle must not outlive its own stop, or a later
+    caller reads a live-looking `StudioListeners` describing an app whose
+    sockets are all closed -- the same orphaned-handle class
+    `_studio_pair_store` already taught this codebase."""
+    import assistant.config as config
+    import assistant.main as m
+    from assistant.io.api import server
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+    monkeypatch.setattr(config, "STUDIO_API_PORT", 18991)
+
+    task = await m._start_studio_daemon()
+    assert server.current_listeners() is not None, "sanity: the daemon started"
+
+    await m._stop_studio_daemon(task)
+
+    assert server.current_listeners() is None, (
+        "current_listeners() must be cleared once the daemon that built it "
+        "has been stopped"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_kill_switch_clears_every_raise(tmp_path):
+    """Spec §3.3's fifth drop condition: `vault.reset()` already revokes
+    every device, and a raise surviving it would be absurd. Asserted on the
+    store itself, keyed under a device id that was never issued through
+    `vault` at all -- a revoked device 401s regardless of whether its raise
+    survived, so an observable-only assertion through the vault would prove
+    nothing about `RaiseStore` specifically. This has to fail for
+    `raises.clear()` alone."""
+    from assistant.io.api import server
+    from assistant.io.api.raises import RaiseStore
+    from assistant.io.api.vault import Capability, TokenVault
+
+    vault = TokenVault(tmp_path)
+    raises = RaiseStore()
+    raises.grant("device-never-issued", "tailnet",
+                 frozenset({Capability.EXECUTE}), 60, "operator", "test raise")
+    assert raises.capabilities_for("device-never-issued", "tailnet"), (
+        "sanity: the raise must actually be live before the kill switch fires"
+    )
+
+    server.shutdown(None, vault, raises=raises)
+
+    assert raises.active() == {}, (
+        "the kill switch must drop every raise, not just revoke devices"
+    )
+    assert raises.capabilities_for("device-never-issued", "tailnet") == frozenset()
+
+
+def test_current_listeners_docstring_states_both_meanings_of_none():
+    """The stale wording said `None` means only 'no daemon was ever started
+    in this process'. It now also means 'the most recent serve() attempt
+    failed' -- the module carries two contracts for one global, and the
+    docstring must say so rather than only the first."""
+    from assistant.io.api import server
+
+    doc = server.current_listeners.__doc__ or ""
+    assert "most recent" in doc and "failed" in doc, (
+        "current_listeners()'s docstring still describes only the "
+        "never-started case, not the failed-serve() case"
+    )
+
+
+@pytest.mark.asyncio
+async def test_refuse_a_second_primary_checks_every_listener_not_only_local(tmp_path):
+    """`_refuse_a_second_primary` used to inspect only `tasks['local']`: a
+    restart with the local task stopped but a transport task still live would
+    pass that check and `serve()` would overwrite `current_listeners()` with a
+    brand-new handle, orphaning the still-running transport's task and
+    socket. Proved by leaving a fake transport listener running after the
+    local task is cancelled, then confirming a second `serve()` is still
+    refused."""
+    import asyncio
+    import contextlib
+
+    from assistant.io.api import server
+    from assistant.io.api.vault import TokenVault
+    from tests.fakes.studio_runtime import build_fake_runtime
+
+    local_port, tailnet_port, third_port = 18992, 18993, 18994
+    task = server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                        port=local_port, origins=[])
+    handle = server.current_listeners()
+    sock = server.bind_listener(tailnet_port)
+    handle.app.state.listener_policies[tailnet_port] = "tailnet"
+    extra = server.serve_socket(handle.app, sock, name="studio-tailnet")
+    handle.tasks["tailnet"] = extra
+    handle.sockets["tailnet"] = sock
+    await asyncio.sleep(0.3)
+
+    # The local task stops -- exactly what a restart that never reached
+    # stop_all() would look like -- while the transport task is still live.
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.1)
+
+    try:
+        with pytest.raises(RuntimeError):
+            server.serve(build_fake_runtime(), TokenVault(tmp_path),
+                         port=third_port, origins=[])
+    finally:
+        await _cancel(extra)

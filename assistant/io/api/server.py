@@ -87,32 +87,67 @@ def current_listeners() -> StudioListeners | None:
     **Lifetime is the caller's, deliberately.** This is set by `serve()` and
     is *not* cleared when the local task ends -- because a stop is exactly
     when a caller still needs the handle, to tear down whatever transports are
-    running before the app goes away. So `None` here means "no daemon was ever
-    started in this process", not "no daemon is serving right now": whoever
-    stops the daemon (main.py's `_stop_studio_daemon`) is the one that must
-    clear it afterwards, the same obligation it already carries for
-    `_studio_pair_store`. Do not decide a daemon is live from this being
-    non-`None`; ask the task.
+    running before the app goes away. `None` here carries **two** meanings,
+    not one: "no daemon was ever started in this process", and "the most
+    recent `serve()` attempt failed" (see the inline comment inside `serve()`,
+    which clears `_listeners` before the first thing that can fail so a bind
+    collision cannot leave a previous daemon's handle looking live). Neither
+    of those is "no daemon is serving right now" for a daemon that *did*
+    start successfully and is only now being stopped: whoever stops the
+    daemon (main.py's `_stop_studio_daemon`, via `clear_listeners()` below) is
+    the one that must clear it afterwards, the same obligation it already
+    carries for `_studio_pair_store`. Do not decide a daemon is live from
+    this being non-`None`; ask the task.
     """
     return _listeners
 
 
+def clear_listeners() -> None:
+    """Drop the handle a stopped daemon left behind. Idempotent.
+
+    `serve()` already clears `_listeners` on its own failure paths (see its
+    inline comment); this is the other half, for a daemon that started
+    *successfully* and has since been stopped. `current_listeners()`'s
+    docstring explains why that handle is left in place through the stop
+    itself rather than cleared the instant the local task is cancelled --
+    `TransportManager.stop_all()` still needs it. Nothing inside this module
+    calls this function: tearing the daemon all the way down is main.py's job
+    (`_stop_studio_daemon`), the same caller that already owns clearing
+    `_studio_pair_store`, and for the same reason -- a handle left behind here
+    would describe an app whose sockets are all closed as if it were still
+    live.
+    """
+    global _listeners
+    _listeners = None
+
+
 def _refuse_a_second_primary() -> None:
-    """Raise if a primary listener is already serving in this process.
+    """Raise if a primary listener -- or any transport listener -- is already
+    serving in this process.
 
     The failure mode is the one `serve_socket`'s docstring spends a paragraph
     on -- two listeners owning the app's lifespan means the `EventHub` is
     started twice and the first shutdown stops it for both -- so it is made
     unreachable here rather than merely discouraged. Liveness is asked of the
     task, never of the handle: `current_listeners()` deliberately outlives the
-    daemon it describes, so a non-`None` handle whose local task is done is a
+    daemon it describes, so a non-`None` handle whose tasks are all done is a
     stopped daemon and no obstacle to starting another.
+
+    Checked across **every** entry in `tasks`, not only `"local"`. A restart
+    that stopped the local task but left a transport task running (a
+    `TransportManager.stop_all()` that was skipped, or one whose own teardown
+    is still in flight) would pass a local-only check, and `serve()` would
+    then overwrite `_listeners` with a brand-new `StudioListeners` -- losing
+    the only handle to that transport's task and socket, the same
+    orphaned-handle failure `current_listeners()`'s docstring already warns
+    about. Refusing when *any* task is not done closes it at no cost: a
+    caller that genuinely wants to restart still stops every transport first
+    (`TransportManager.stop_all()`), same as it always had to.
     """
     existing = _listeners
     if existing is None:
         return
-    local = existing.tasks.get("local")
-    if local is not None and not local.done():
+    if any(not task.done() for task in existing.tasks.values()):
         raise RuntimeError(
             "a Studio daemon is already serving in this process; stop it "
             "before starting another (two primary listeners would each run "
@@ -415,7 +450,8 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     return task
 
 
-def shutdown(task: asyncio.Task | None, vault: TokenVault) -> None:
+def shutdown(task: asyncio.Task | None, vault: TokenVault, *,
+            raises: RaiseStore) -> None:
     """Invalidate every device immediately; stop serving on the next tick.
 
     Rotating the instance secret is what makes this a kill switch rather than a
@@ -459,8 +495,28 @@ def shutdown(task: asyncio.Task | None, vault: TokenVault) -> None:
     the rest, in this order: **`TransportManager.stop_all()` first, then this.**
     The other way round stops the event hub (the local listener owns the app's
     lifespan) while the transports are still serving against it.
+
+    `raises` drops every ceiling raise alongside the device revocation --
+    spec §3.3's fifth drop condition: `vault.reset()` already revokes every
+    device, and a raise surviving it would be absurd. `RaiseStore.clear()` is
+    itself synchronous (a lock, then a dict clear), so it costs this function
+    nothing to call inline, the same way `vault.reset()` already does.
+
+    **Required, not defaulted, and keyword-only.** `hub`, `pair_store` and
+    `ui_bundle` on `serve()` default to `None` because their absence
+    substitutes something harmless -- a private object nothing outside that
+    app can reach. A missing `raises` here is not harmless: it silently skips
+    a security action the kill switch is specifically supposed to take,
+    every call site would still type-check, and the omission would look
+    exactly like "no raises were live" instead of "nobody asked to clear
+    them." A parameter that can be forgotten will be forgotten, so this one
+    cannot be -- a caller with no `RaiseStore` in hand must go get one
+    (`current_listeners().app.state.raises`, if a daemon is running) rather
+    than have this function silently do less than a kill switch promises.
     """
     if task is not None:
         task.cancel()
     vault.reset()
+    if raises is not None:
+        raises.clear()
     logger.info("[API] Studio daemon stopped and all devices revoked")

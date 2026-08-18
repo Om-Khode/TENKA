@@ -147,10 +147,11 @@ def test_a_secret_shaped_path_segment_is_redacted_in_the_audit_log(context):
 # ─── kill switch ─────────────────────────────────────────────────────────
 def test_shutdown_revokes_every_device(tmp_path):
     from assistant.io.api import server
+    from assistant.io.api.raises import RaiseStore
     vault = TokenVault(tmp_path)
     vault.issue("studio", frozenset(Capability))
     vault.issue("phone", frozenset({Capability.OBSERVE}))
-    server.shutdown(None, vault)
+    server.shutdown(None, vault, raises=RaiseStore())
     assert vault.devices() == []
 
 

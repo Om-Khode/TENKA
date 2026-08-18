@@ -318,6 +318,21 @@ _studio_pair_store: "PairCodeStore | None" = None
 # ever successfully started (or one that did has since stopped), and the
 # slash command must say so plainly rather than mint anyway.
 
+_studio_transports: "TransportManager | None" = None
+# Same reachability need and the same assignment discipline as
+# `_studio_pair_store` above, for the object Milestone 6b adds:
+# `TransportManager` needs the app `serve_studio_api()` built, so it cannot
+# be threaded through that call the way `hub`, `pair_store` and `raises` are
+# -- it is built *after* `serve_studio_api()` returns without raising, from
+# `current_listeners()`, and only then assigned both here and onto
+# `app.state.transports` (routes/devices.py's raise endpoint reads the
+# latter). `_stop_studio_daemon()` reads this global to stop every transport
+# *before* cancelling the primary listener (`server.serve_socket`'s docstring
+# names that ordering as the caller's obligation -- cancelling the primary
+# runs the app's lifespan shutdown, which stops the shared `EventHub` while
+# transport listeners would still be serving), then clears it back to `None`
+# the same unconditional way `_studio_pair_store` already is.
+
 
 _VENDORED_UI_ZIP = pathlib.Path(__file__).resolve().parent / "io" / "api" / "studio_ui.zip"
 # The bundle `tools/package_studio_ui.py` writes on a release. A module-level
@@ -388,12 +403,13 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
     Split out of async_main() so a test can drive this exact sequence
     (e.g. forcing serve() to fail) without booting the assistant.
     """
-    global _studio_dispatch, _studio_vault, _studio_pair_store
+    global _studio_dispatch, _studio_vault, _studio_pair_store, _studio_transports
     try:
         from .actions.studio_runtime import build_studio_runtime
         from .io.api.events import EventHub
         from .io.api.pairing import PairCodeStore
-        from .io.api.server import serve as serve_studio_api
+        from .io.api.server import clear_listeners, current_listeners, serve as serve_studio_api
+        from .io.api.transports.manager import TransportManager
         from .io.api.vault import Capability, TokenVault
 
         _studio_vault = TokenVault(config.SANDBOX_DIR)
@@ -473,6 +489,54 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
             pair_store=_pair_store,
         )
         _studio_pair_store = _pair_store
+        # `TransportManager` cannot be threaded through `serve_studio_api()`
+        # the way `hub` and `pair_store` are: it needs the app that call
+        # builds, so it can only be constructed once that call has already
+        # returned without raising. Built from `current_listeners()` --
+        # `serve_studio_api()`'s own return value is pinned to `asyncio.Task`
+        # by this function's tests and cannot carry it either -- and
+        # assigned to `app.state.transports` only here, for the identical
+        # reason `_studio_pair_store` above is assigned this late: no
+        # transport is ever started at boot (spec §2.1), so there is nothing
+        # for an earlier assignment to buy and everything for it to risk if
+        # a step after this one somehow still failed.
+        #
+        # In its own try/except, deliberately separate from the one wrapping
+        # this whole function. `_studio_task` is already live at this point --
+        # `serve_studio_api()` returned without raising -- so a raise out of
+        # this trivial constructor must not fall into the outer handler and
+        # be logged as "Studio daemon failed to start": that message is a lie
+        # once a socket is genuinely listening, and the outer handler has no
+        # way to reach `_studio_task` to cancel it (a local, not the global
+        # this function returns). Left alone, a manager failure here would
+        # orphan the very listener this task is about to hand back -- reachable
+        # by nothing, stopped by nothing, the identical class of bug the
+        # `_studio_pair_store` comment above already exists to prevent, one
+        # step later in this same sequence. So a failure here tears the
+        # listener back down itself and reports `None`, the same outcome a
+        # `serve_studio_api()` failure produces, but via its own path and its
+        # own message.
+        listeners = current_listeners()
+        if listeners is not None:
+            try:
+                _studio_transports = TransportManager(listeners, config.STUDIO_API_PORT)
+                listeners.app.state.transports = _studio_transports
+            except Exception as e:
+                logger.warning(
+                    f"[API] Studio transport manager could not be built; "
+                    f"stopping the listener it would have managed "
+                    f"(non-critical): {redact_secrets(str(e))}"
+                )
+                _studio_pair_store = None
+                _studio_task.cancel()
+                try:
+                    await _studio_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                clear_listeners()
+                return None
         # publish_status(), not publish() directly: it translates the
         # broadcaster's own snake_case event shape into the daemon's
         # camelCase wire frame (assistant/io/api/events.py) before it ever
@@ -504,24 +568,57 @@ async def _stop_studio_daemon(task: "asyncio.Task | None") -> None:
     construction. `/studio pair` must see `None` the instant the daemon
     stops serving, not only after some particular shutdown path (no task,
     an already-crashed task, or a task actually cancelled here all count).
+
+    Every running transport is stopped *before* the primary task is
+    cancelled -- `server.serve_socket`'s docstring names this as the
+    caller's obligation, because cancelling the primary runs the app's
+    lifespan shutdown (stopping the shared `EventHub`) while transport
+    listeners would still be serving against it. `TransportManager.stop_all()`
+    returns the transports it could not prove stopped as a list of strings
+    rather than raising -- a raise here would skip the primary cancel below,
+    which matters more than reporting the failure would -- so every one of
+    those strings is logged rather than discarded; a tunnel that could not
+    be proved stopped and forgotten silently is the one failure this
+    milestone can least afford.
+
+    `current_listeners()` is cleared on the way out (`finally`, so every exit
+    path below reaches it: no task, an already-crashed task, or one actually
+    cancelled here) -- the same orphaned-handle lesson `_studio_pair_store`
+    already taught this codebase, applied to the handle a `TransportManager`
+    would otherwise still be reachable through after the app it describes is
+    gone.
     """
-    global _studio_pair_store
+    global _studio_pair_store, _studio_transports
     _studio_pair_store = None
-    if task is None:
-        return
-    if task.done():
-        if not task.cancelled():
-            exc = task.exception()
-            if exc is not None:
-                logger.warning(f"[API] Studio daemon exited early: {redact_secrets(str(exc))}")
-        return
-    task.cancel()
+    transports, _studio_transports = _studio_transports, None
+
+    from .io.api import server as server_mod
+
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.warning(f"[API] Studio daemon did not shut down cleanly: {redact_secrets(str(e))}")
+        if transports is not None:
+            failures = await transports.stop_all()
+            for failure in failures:
+                logger.warning(
+                    f"[API] a transport could not be proven stopped: "
+                    f"{redact_secrets(failure)}")
+
+        if task is None:
+            return
+        if task.done():
+            if not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    logger.warning(f"[API] Studio daemon exited early: {redact_secrets(str(exc))}")
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"[API] Studio daemon did not shut down cleanly: {redact_secrets(str(e))}")
+    finally:
+        server_mod.clear_listeners()
 
 
 async def _drain_and_announce_notifications(bridge: UnityBridge):
