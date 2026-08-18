@@ -253,6 +253,21 @@ def _status_argv_for(argv: list[str]) -> list[str] | None:
     same reason the public port is: the check is then read off the very
     command whose effect is being checked, and a provider whose stop and
     status verbs disagreed would have to say so in one place rather than two.
+
+    **Recorded gap, in the same class as the ones `tailscale.py` records for
+    its preflight.** Deriving the verb means `funnel`'s stop is verified
+    against `tailscale funnel status --json` rather than `serve status`.
+    Today those return the same document (verified against this machine's
+    1.102.2 binary, per `tailscale.py`'s module docstring), but that is not
+    guaranteed across versions: a future `funnel status` that filtered to
+    funnel-enabled entries would hide a residual *serve-only* mapping still
+    keyed under 443, and this check would then report a stop it could not
+    see. The adapters solved the same problem for preflight by pinning
+    `serve status` for both verbs -- which this module cannot do without
+    knowing which provider it is talking to, the one thing the Protocol
+    exists to prevent. Stated here rather than papered over; the direction of
+    the failure is a false "verified", which is the bad direction, so it
+    belongs on the adversarial round's list.
     """
     if len(argv) < 2:
         return None
