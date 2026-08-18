@@ -247,62 +247,81 @@ def test_the_pairing_request_cannot_rename_the_device(tmp_path):
 
 
 # ─── I-2: grants are also capped by the redeeming listener ────────────────
-def test_pairing_over_quick_narrows_grants_to_the_listeners_ceiling(tmp_path):
-    """A code minted with every capability, redeemed over Cloudflare's `quick`
-    tunnel (ceiling: OBSERVE alone), must mint a device that can only ever
-    watch -- exactly `effective(pair_code.grants, policy)`, never the code's
-    own, unnarrowed set.
+#
+# These three used to redeem over Cloudflare's `quick` tunnel, whose ceiling
+# (OBSERVE alone) made it the narrowest available demonstration. Milestone 6b
+# spec §5.5 refuses ALL redemption on `quick`, unconditionally, before the
+# code is even consulted (`tests/test_6b_pairing_transports.py` pins that
+# refusal and checks it is not vacuous) -- so `quick` can no longer show
+# narrowing at all, only refusal, and these three moved to `funnel` (ceiling:
+# everything but EXECUTE and SYSTEM_CONTROL) to keep demonstrating the
+# property they were written for.
+def test_pairing_over_funnel_narrows_grants_to_the_listeners_ceiling(tmp_path):
+    """A code minted with every capability, redeemed over `funnel` (ceiling:
+    everything but EXECUTE and SYSTEM_CONTROL), must mint a device that can
+    never reach either -- exactly `effective(pair_code.grants, policy)`,
+    never the code's own, unnarrowed set.
     """
     vault = TokenVault(tmp_path)
     store = _store()
     code = store.mint("phone", frozenset(Capability)).code
-    client = _client(vault, policies={LOCAL_PORT: "quick"}, store=store)
+    client = _client(vault, policies={LOCAL_PORT: "funnel"}, store=store)
     r = client.post("/v1/pair", json={"code": code})
     assert r.status_code == 204
     paired = [d for d in vault.devices() if d.label == "phone"][0]
-    assert paired.grants == frozenset({Capability.OBSERVE})
+    assert paired.grants == frozenset({
+        Capability.OBSERVE, Capability.RECALL, Capability.CHAT_SEND,
+        Capability.SCREEN, Capability.FILES,
+    })
 
 
-def test_pairing_over_quick_permanently_limits_the_device_even_on_a_wider_listener(tmp_path):
+def test_pairing_over_funnel_permanently_limits_the_device_even_on_a_wider_listener(tmp_path):
     """The narrowing at issue time is not a per-request ceiling that lifts on
     a better connection later -- it changes what the vault actually stored.
-    A device that paired over `quick` and ended up with OBSERVE alone stays
-    OBSERVE-only when it later connects over `funnel`, because
-    `GET /v1/session` reports the issued grants the vault has on file, and
-    `quick` never let anything but OBSERVE reach `issue()` in the first
-    place. This is the surprising consequence the route's docstring calls
-    out explicitly.
+    A device that paired over `funnel` and lost EXECUTE and SYSTEM_CONTROL
+    stays without them when it later connects over `local` (ceiling:
+    everything), because `GET /v1/session` reports the issued grants the
+    vault has on file, and `funnel` never let either of those two reach
+    `issue()` in the first place.
     """
     vault = TokenVault(tmp_path)
     store = _store()
     code = store.mint("phone", frozenset(Capability)).code
-    quick_client = _client(vault, policies={LOCAL_PORT: "quick"}, store=store)
-    r = quick_client.post("/v1/pair", json={"code": code})
+    funnel_client = _client(vault, policies={LOCAL_PORT: "funnel"}, store=store)
+    r = funnel_client.post("/v1/pair", json={"code": code})
     assert r.status_code == 204
-    # `quick`, `tailnet` and `funnel` all set `secure_cookie`, so since
-    # `fix/6a5-api-review` they write the `__Host-` prefixed name -- a browser
-    # will not store that one unless it is host-only, which is what stops a
-    # sibling under `*.trycloudflare.com` planting a `tenka_device` inward.
-    # Only `local` still uses the unprefixed name. Both are read.
+    # `funnel` and `tailnet` set `secure_cookie`, so since `fix/6a5-api-review`
+    # they write the `__Host-` prefixed name -- a browser will not store that
+    # one unless it is host-only, which is what stops a sibling under
+    # `*.trycloudflare.com` planting a `tenka_device` inward. Only `local`
+    # still uses the unprefixed name. Both are read.
     cookie_value = r.cookies[HOST_COOKIE_NAME]
 
-    funnel_client = _client(vault, policies={LOCAL_PORT: "funnel"})
-    funnel_client.cookies.set(HOST_COOKIE_NAME, cookie_value)
-    data = funnel_client.get("/v1/session").json()["data"]
-    assert data["grants"] == ["observe"]
+    local_client = _client(vault, policies={LOCAL_PORT: "local"})
+    local_client.cookies.set(HOST_COOKIE_NAME, cookie_value)
+    data = local_client.get("/v1/session").json()["data"]
+    assert set(data["grants"]) == {"observe", "recall", "chat_send", "screen", "files"}
+    assert "execute" not in data["grants"]
+    assert "system_control" not in data["grants"]
 
 
 def test_pairing_with_nothing_the_listener_can_carry_is_refused(tmp_path):
-    """A code minted without OBSERVE, redeemed over `quick` (ceiling: OBSERVE
-    alone), has nothing left after the intersection. Refused exactly like a
-    wrong code -- the alternative is `TokenVault.issue()` raising on an empty
-    grant set, which must never reach a caller as a raw exception. The code
-    is still burned (single-use): this is not a retryable failure.
+    """A code minted without anything `funnel` carries (ceiling: everything
+    but EXECUTE and SYSTEM_CONTROL), redeemed over `funnel`, has nothing left
+    after the intersection. Refused exactly like a wrong code -- the
+    alternative is `TokenVault.issue()` raising on an empty grant set, which
+    must never reach a caller as a raw exception. The code is still burned
+    (single-use): this is not a retryable failure.
+
+    `quick` used to be this test's listener; it no longer can be, because
+    spec §5.5 now refuses every redemption there regardless of what the code
+    carries, so it could never isolate "nothing survived the intersection"
+    from "this listener refuses everything" -- `funnel` still can.
     """
     vault = TokenVault(tmp_path)
     store = _store()
-    code = store.mint("phone", frozenset({Capability.FILES, Capability.SYSTEM_CONTROL})).code
-    client = _client(vault, policies={LOCAL_PORT: "quick"}, store=store)
+    code = store.mint("phone", frozenset({Capability.EXECUTE, Capability.SYSTEM_CONTROL})).code
+    client = _client(vault, policies={LOCAL_PORT: "funnel"}, store=store)
     r = client.post("/v1/pair", json={"code": code})
     assert r.status_code == 401
     assert vault.devices() == []
