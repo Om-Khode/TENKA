@@ -443,18 +443,22 @@ Prefer gating on **pending-state context** over a pure regex where possible: whe
 
 ---
 
-## KI-13: Pending state has no owner — cross-device confused deputy
+## KI-13: ~~Pending state has no owner — cross-device confused deputy~~ FIXED
 
 **Priority:** Medium (security)
-**Effort:** Medium (a `current_principal` contextvar plus a field on `PendingState`, touching every arming site)
 **Discovered:** 2026-08-16, milestone 6a.5 adversarial review
-**Pinned by:** `tests/test_6a5_predispatch_gate.py`, as a strict `xfail`
+**Fixed:** 2026-08-19, milestone 6b (`fix/6b-pending-state-owner`, squashed to main `942a411`) — `tests/test_6a5_predispatch_gate.py`'s strict `xfail` removed and now passing.
 
-**Symptom:** Pending state is process-global — not per-device, not per-session — so the device that *answers* a confirmation need not be the device that asked. The operator says "delete my downloads folder" at the keyboard, TENKA arms `pending_destructive` and waits for "yes", and a remote device can answer it. Same shape for the backup restore/unlock phrases and the OAuth paste.
+**What shipped:** `core/principal.py`'s `current_principal` contextvar, set alongside `current_grants` at every place a turn's identity is known (voice/console set `LOCAL_PRINCIPAL`; an authenticated device turn sets `f"device:{device_id}"`, a namespace no device can spoof into since the prefix is never built from caller input). `PendingState` records the principal at arm time; both answer sites in `pending_handlers.py` compare it at answer time before honouring a "yes".
 
-**Why 6a.5 did not close it:** the pre-dispatch gate now charges each pending row its own capability, which stops a device that *lacks* the capability. It cannot stop a confused deputy that *holds* it — a tunnel device legitimately holding `FILES` can still answer a locally-armed file confirmation. Forcing a stronger capability would break ordinary local confirmations and buy nothing.
+**Two ways the shipped fix differs from the original recommendation, learned by hitting the failure modes:**
 
-**Recommended fix:** record a principal on `PendingState` at arm time, from a `current_principal` contextvar set alongside `current_grants`, and compare it at answer time. Refuse a mismatch rather than silently ignoring it, so the operator sees that something else tried to answer.
+1. **A mismatch skips the row rather than refusing the whole turn.** The first cut refused the turn outright, which meant a phone arming a pending and then *the operator at their own keyboard* saying anything got refused by it — for up to 300 seconds. Skipping means a non-owner's message falls through as an ordinary capability-gated turn instead of eating the confirmation slot; the confused deputy is still closed, because the skip happens whether or not the non-owner holds the capability the row is guarded by.
+2. **The operator-facing notice lands on the owner's next answer, not on the intruder.** The original "refuse loudly" wording aimed the loudness at the wrong party — there is no useful message to show a device that was silently skipped. `PendingState.note_foreign_attempt()` / `take_foreign_attempts()` record the attempt and surface a short notice the next time the actual owner answers, so the operator learns something else tried, without the row itself ever being disturbed.
+
+One arming site needed moving rather than gating: a code-executor knowledge-approval handler that armed *itself* inside its own confirmation check bypassed the ownership comparison entirely (it never reached the loop-level guard); the fix relocated its arming to proposal-creation time, carrying the creating turn's principal forward, rather than special-casing the loop for one row.
+
+Tests: `tests/test_6a5_predispatch_gate.py` (`xfail` removed), `tests/test_6b_principal.py` (the new suite, including an AST walk over every arming site in `main.py` so a future site cannot silently forget to record a principal).
 
 ---
 
@@ -463,6 +467,7 @@ Prefer gating on **pending-state context** over a pure regex where possible: whe
 **Priority:** Medium (security)
 **Effort:** Medium (a pending state plus a resolver, following the existing pending-handler pattern)
 **Discovered:** 2026-08-16, milestone 6a.5 adversarial review
+**Status:** open. Explicitly out of scope for milestone 6b (spec §1) — not touched, not made worse.
 
 **Symptom:** "Read notes.txt and open the site named in it" is a legitimate request, and 6a.5 keeps it working. But the file picks the destination, and a query string on that URL carries data outward. Reduction (one public http(s) URL, no userinfo, no private hosts) and authorisation (the user's own words must carry a navigation verb) narrow it; neither closes it.
 
@@ -475,6 +480,7 @@ Prefer gating on **pending-state context** over a pure regex where possible: whe
 **Priority:** Medium (security)
 **Effort:** Low (fence the block, as `render_untrusted_block` already does elsewhere)
 **Discovered:** 2026-08-16, milestone 6a.5 adversarial review
+**Status:** open. Explicitly out of scope for milestone 6b (spec §1) — not touched, not made worse.
 
 **Symptom:** `_build_facts_context` concatenates stored facts into `build_personality_prompt()` with no delimiter and no untrusted label — the most trusted position in the tree — on every subsequent turn.
 
@@ -487,6 +493,7 @@ Prefer gating on **pending-state context** over a pure regex where possible: whe
 **Priority:** Medium (correctness / usability, not security)
 **Effort:** Unknown — needs diagnosis before a fix is proposed
 **Discovered:** 2026-08-16, during 6a.5 live testing
+**Status:** open. Explicitly out of scope for milestone 6b (spec §1) — not touched, not made worse.
 
 **Symptom:** "it" is replaced with a noun phrase lifted from the previous turn, frequently the wrong one. Observed in one session:
 
@@ -502,14 +509,92 @@ The third injected the word "shell", which the then-live `DANGEROUS_PATTERNS` de
 
 ---
 
-## KI-17: A 6b tunnel pointed at the existing port inherits the `local` policy
+## KI-17: ~~A 6b tunnel pointed at the existing port inherits the `local` policy~~ FIXED
 
-**Priority:** **High — a landmine for the next milestone, not a live defect**
-**Effort:** Low if done deliberately in 6b; catastrophic if missed
+**Priority:** was **High — a landmine for the next milestone, not a live defect**
 **Discovered:** 2026-08-16, milestone 6a.5 adversarial review
+**Fixed:** 2026-08-19, milestone 6b — three independent layers, the third load-bearing on its own.
 
-**Symptom:** `policy_for_port` keys on the local port a connection was accepted on. If 6b points `tailscale serve`/`funnel`/`cloudflared` at the **existing** Studio port, every tunnelled request resolves to `POLICIES["local"]` — `admin=True`, `allow_bearer=True`, and a ceiling containing `EXECUTE` and `SYSTEM_CONTROL`. Every ceiling 6a.5 built is bypassed, not by a bug but by a deployment choice.
+**What shipped:**
 
-Nothing in the code prevents it, and `serve()`'s hard refusal of a non-loopback host makes reusing the port the *natural* implementation.
+- **L1 — TENKA builds every tunnel's argv.** The target port always comes from the fixed port registry (`io/api/listeners.py`'s `port_for`), never from anything an operator types. A spawn-time assertion checks the real argument vector against the registry: the port is registered, maps to this adapter's own policy name, and is not the port `local` holds.
+- **L2 — preflight reconciliation, on every start.** Before binding, the Tailscale adapters read `tailscale serve status --json` and refuse a pre-existing mapping that conflicts, naming the offending entry rather than silently repairing it. The predicate is two checks: unconditionally refuse any entry proxying into `local`'s port (KI-17 proper, from either adapter), and — only within this adapter's own public-port entry — refuse a stale target pointing somewhere other than this transport's local port. A malformed entry degrades that one entry, never the whole sweep.
+- **L3 — per-listener `Host` scoping. The load-bearing layer.** The `local` listener's `HostGate` accepts **loopback names only** (`127.0.0.1`, `localhost`, `[::1]`). Every tunnel forwards the public authority in `Host` (`*.ts.net`, `*.trycloudflare.com`), so a tunnelled request arriving on the local port is refused **421 before authentication, before policy lookup, before any route runs** — and this holds even against a tunnel TENKA never launched and knows nothing about, which is more than a kernel-assigned port could ever offer.
 
-**Required in 6b:** each transport binds its **own** listener on its **own** port, registered in `listener_policies` with its own policy name. A test must assert that no two entries in `listener_policies` share a port and that no non-`local` transport is ever registered against the port `local` holds.
+**Stated gap, recorded rather than claimed away:** `cloudflared --http-host-header 127.0.0.1:8787` rewrites `Host` to a loopback name and defeats L3. That requires an attacker already executing processes on this machine, at which point the local listener is not the weakest thing available to them. L2 catches the honest-mistake version (a stale hand-set `tailscale serve` mapping); L3 catches everything short of a local shell.
+
+**Two gaps recorded for the adversarial round rather than closed here** (both contained by L3): the preflight sweep is `Web`-only, so a `--tls-terminated-tcp` mapping and Tailscale's `Foreground` map are both invisible to it (see [KI-19](#ki-19)); and a leftover `AllowFunnel` flag can still escape the check under an unrecognised document shape (see [KI-20](#ki-20)).
+
+Tests: `tests/test_6b_ki17.py`, `tests/test_api_hardening.py`'s per-listener host-scoping suite, plus `tests/test_6b_transport_adapters.py` and `tests/test_6b_transport_cloudflare.py` for each adapter's own preflight coverage.
+
+---
+
+## KI-18: The admin gate is not isolated by any test
+
+**Priority:** Medium (security — a config-time footgun, not a live defect)
+**Effort:** Medium (a fixture exercising a listener no `POLICIES` entry currently produces)
+**Discovered:** 2026-08-19, milestone 6b (Task 13's own vacuity audit, generalised by Task 18's review)
+
+**Symptom:** `require_admin(Capability.SYSTEM_CONTROL)` checks two independent things — the caller's capability, and `policy.admin` — but every route gated this way (the raise routes, the transport management routes, `/v1/devices`) refuses on the **capability** first, because `SYSTEM_CONTROL` is outside every non-`local` ceiling today. Inverting `require_admin` to `require` in a live diff did not turn any of these tests red; only stripping all the way to bare `authenticate()` produced a real failure. That means **no test in the tree would fail if `admin=True` were set on a tunnel policy by accident** — the two controls are conflated in every assertion that currently exercises this gate.
+
+**How you would know:** flip `admin=False` on `"local"` or `admin=True` on `"tailnet"` in `io/api/policy.py` and run the full admin-gated route suite (`test_6b_raise_routes.py`, `test_6b_transport_routes.py`, `test_api_hardening.py`'s device-management tests). None of them should be expected to go red from the flip alone — that is the gap.
+
+**What to check first:** whether a fix has landed a listener fixture whose `ceiling` contains `SYSTEM_CONTROL` but whose `admin` is `False`. That is the only shape that isolates the admin flag from the capability check — a policy `POLICIES` does not currently have (every ceiling containing `SYSTEM_CONTROL` today also has `admin=True`), so the probe needs a constructed `ListenerPolicy`, not one of the four shipped ones.
+
+---
+
+## KI-19: The `tailscale serve` preflight sweep only sees `Web` mappings
+
+**Priority:** Low (contained by KI-17's layer 3)
+**Effort:** Medium (two more parsers: a bare `host:port` string for TCP forwards, and a recursive descent into `Foreground`)
+**Discovered:** 2026-08-19, milestone 6b (Task 7's fix rounds)
+
+**Symptom:** KI-17's layer 2 preflight (`transports/tailscale.py`) walks `tailscale serve status --json`'s `Web` map to catch a pre-existing mapping pointed at the local Studio port. Two shapes never reach that walk: a `tailscale serve --tls-terminated-tcp 443 tcp://127.0.0.1:8787` mapping, whose `TCPForward` value is a bare `host:port` string rather than a URL and needs different parsing entirely; and a **foreground** (non-`--bg`) serve, which Tailscale nests under its own `Foreground` map with its own `Web`/`AllowFunnel` pair that neither the sweep nor the `AllowFunnel` check descends into.
+
+**How you would know:** hand-set either shape (`tailscale serve --tls-terminated-tcp 443 tcp://127.0.0.1:8787`, or a foreground `tailscale serve https / http://127.0.0.1:8787` without `--bg`) and start a TENKA transport — preflight will not refuse it, even though the mapping conflicts.
+
+**What to check first:** layer 3 (`HostGate`'s loopback-only local listener) still refuses the resulting tunnelled request with 421 regardless — this is a hole in the honest-mistake catch, not in the load-bearing defence. Confirm layer 3 is still in place before treating this as urgent.
+
+---
+
+## KI-20: A leftover `AllowFunnel` flag can still escape the preflight check
+
+**Priority:** Low (contained by KI-17's layer 3; the one check that exists is correct for its own scope)
+**Effort:** Low (the existing top-level `AllowFunnel` read just needs to run before any shape guard, and to descend into `Foreground`)
+**Discovered:** 2026-08-19, milestone 6b (Task 7 fix rounds 3–4)
+
+**Symptom:** A leftover `AllowFunnel` entry on tailnet's public port 8443 would publish TENKA's only raisable listener to the open internet while she believes it is tailnet-only. The shipped check reads `AllowFunnel` at the top level, independently of the `Web` shape guard, specifically for `tailnet`'s own public port — closing the case the fold-in was written for. It does not sweep `AllowFunnel` in general: a flag sitting inside a non-dict `Web` entry, or inside the `Foreground` map (see [KI-19](#ki-19)), is still invisible to it.
+
+**How you would know:** a leftover `AllowFunnel: true` under `tailnet`'s public port with a malformed or foreground `Web` shape around it passes preflight silently.
+
+**What to check first:** whether the check has been generalised to hoist above every shape guard and to walk `Foreground` the same way `Web` is walked, rather than being re-scoped narrowly again to `tailnet`'s own document shape.
+
+---
+
+## KI-21: A cancellation helper can leak a non-cancellation exception through its own discard contract
+
+**Priority:** Low (dormant — no reachable path today)
+**Effort:** Low (one direct unit test, before the helper gets a second caller)
+**Discovered:** 2026-08-19, milestone 6b (Task 9, self-reported, deferred by design)
+
+**Symptom:** `transports/manager.py`'s `_settle_uncancellably(fut)` re-shields `fut` on every loop-cycle cancellation but only catches `asyncio.CancelledError` from the shield; if `fut` itself completes with a **non-cancellation** exception while a caller is mid-await, that exception propagates straight out of `_settle_uncancellably` rather than being handed to the caller to discard. `_wait_uncancellably`, the one caller whose whole contract is "discard `fut`'s outcome, cancellation or not," would then fail to discard it — contradicting its own docstring.
+
+**Why it is dormant, not live:** `_wait_uncancellably`'s sole caller today only ever waits on a task that `_reraise_if_still_cancelling()` guarantees ends `CANCELLED` — never on a task that can raise something else. The `if not fut.cancelled(): fut.exception()` line in `_wait_uncancellably` is consequently dead code with no test exercising the branch it exists for.
+
+**What to check first, before the helper gets a second caller:** a direct unit test on `_wait_uncancellably` against a bare `asyncio.Future` resolved with a non-cancellation exception (e.g. `fut.set_exception(RuntimeError(...))`, no cancellation involved) — confirm the call returns cleanly rather than propagating. If that test does not exist yet, `_wait_uncancellably` is not safe to reuse for a future call site without it.
+
+---
+
+## KI-22: The raise audit trail records reach, not consumption
+
+**Priority:** Medium (a known, deliberate trade — not a defect, but a real limit on incident forensics)
+**Effort:** N/A — accepted trade-off, not a bug to fix without a broader design change
+**Discovered:** 2026-08-19, milestone 6b (Task 10 review; spec §3.6 amended in place)
+
+**Symptom:** Spec §3.6 asks for "an audit event on every request the raise puts capabilities in reach of." What shipped audits **reach**: `applied = grants - effective(issued, policy)` is a function of the raise and the policy alone, computed once per authenticated request on a raised listener, and never consults what the request actually went on to do. A Studio status poll made while a raise is live gets exactly the same audit line as a request that used the raised `EXECUTE` capability to run code.
+
+**Why it shipped this way:** recording true *consumption* means recording inside `require()` **and** every site that checks a grant without going through it — and enumerating those sites is precisely the class of failure this project has already lost two Criticals to (see `boundaries-need-their-bypasses-enumerated`). Recording once, at the single choke point every raised request passes through regardless, is the defensible trade, and over-recording is the fail-safe direction.
+
+**The cost, stated plainly:** an operator reading the audit trail after a raise's window (up to 7 days) cannot tell "a raised capability was walked through" from "the door was merely open." The method and path in each entry narrow it down after the fact, but do not close the gap.
+
+**What to check first** if this needs to become load-bearing later: whether the sites that check a grant without calling `require()` have since been enumerated and closed — if so, moving the audit point (or adding a second one) inside `require()` becomes a much cheaper change than it was at 6b.

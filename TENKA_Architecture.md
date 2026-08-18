@@ -203,6 +203,7 @@ assistant/
     audio/                 # stt, tts, wake_word, speaker_verify, streaming
     overlay/               # Cursor visibility overlay (status pill)
     esc_monitor.py         # Universal abort key listener
+    api/                   # Studio remote-control API — see §15
 
   automation/              # Three "do a step on screen" stacks + shared layer.
     router.py              # Preference → URL regex → process → keyword routing
@@ -321,9 +322,9 @@ channel_registry.register("telegram", TelegramAdapter())
 core/  →  config  →  storage/, llm/  →  domain  →  automation/  →  actions/  →  main.py
 ```
 
-`io/` is parallel to domain and may import `core/`, `config` only. **`io/` may NEVER import `actions/` or `main.py`.** `config.py` may NEVER read SQLite directly.
+`io/` is parallel to domain and may import `core/`, `config` only. **`io/` may NEVER import `actions/` or `main.py`.** `config.py` may NEVER read SQLite directly. `io/api/` (the Studio remote-control surface, §15) holds to the same rule as its own dedicated contract, for the same reason: a shortcut into `actions/` from the API layer is exactly the shortcut the `io/` boundary as a whole exists to forbid.
 
-These boundaries are enforced by **`import-linter`** via `pyproject.toml` and run on every commit through a pre-commit hook. Violations are CI-blocking. Run `lint-imports` locally before pushing.
+These boundaries are enforced by **`import-linter`** via `pyproject.toml`, currently five contracts, and run on every commit through a pre-commit hook. Violations are CI-blocking. Run `lint-imports` locally before pushing.
 
 ---
 
@@ -421,7 +422,53 @@ These are the things to *not* do:
 
 ---
 
-## 15. References inside the repo
+## 15. Remote access — the Studio API
+
+TENKA can be driven from a companion app ("Studio") over HTTP, not only from the voice
+pipeline on this machine. That surface lives entirely under `assistant/io/api/` and is
+built around one idea: **a device's own permissions and the transport it arrived over are
+two separate questions, and the answer is the narrower of the two, always.**
+
+### One app, four doors
+
+A single ASGI application serves four listening sockets, distinguished only by which
+fixed port a connection was accepted on — never by hostname or peer address, both of
+which a tunnel can make look identical to a truly local caller:
+
+| Listener | Reachable by | What it can see or do |
+| --- | --- | --- |
+| `local` | processes on this machine | everything — device management, every capability |
+| `tailnet` | devices signed into the operator's own Tailscale network | chat, screen, files, recall — never running code or changing settings, unless deliberately raised |
+| `funnel` | anyone with the URL, over the operator's Tailscale identity | same as `tailnet`, minus the ability to be raised |
+| `quick` | anyone with a Cloudflare quick-tunnel URL | status and observation only — Cloudflare terminates the connection's encryption, so nothing sensitive is ever offered here |
+
+A device authenticates once and is issued a set of **capabilities** — coarse permissions
+like "read what she remembers" or "run code on this machine." What it can actually do on
+a given connection is the *intersection* of what it was issued and what that listener
+permits — a capability a device holds is never enough on its own if the door it walked
+through doesn't carry it.
+
+### Raising the ceiling, briefly and on purpose
+
+`tailnet` is the one listener that can be temporarily and deliberately widened — a
+"raise" — because reaching it already required signing into the operator's own Tailscale
+network, a second credential a leaked pairing code cannot forge. A raise is minted only
+from the keyboard, expires on its own after a bounded window, cannot survive a restart,
+and cannot grant a device anything it wasn't already capable of holding. Studio shows a
+persistent banner for as long as one is live, naming what it covers and when it expires.
+
+### Known, and recorded honestly
+
+Opening the door to the internet is exactly the kind of change that deserves a public
+paper trail rather than a quiet one. [`TENKA_Known_Issues.md`](./TENKA_Known_Issues.md)
+records what this milestone closed (a tunnel that could otherwise inherit the loopback
+listener's full trust; a confirmation that any paired device could answer, not only the
+one that asked) and what it deliberately left open or only partially covered — including
+the exact stated limits of each defence, rather than a claim that the surface is airtight.
+
+---
+
+## 16. References inside the repo
 
 - [README.md](./README.md) — what TENKA is, quickstart, headline capabilities.
 - [SETUP.md](./SETUP.md) — install walkthrough + troubleshooting.
