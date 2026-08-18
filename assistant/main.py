@@ -322,11 +322,16 @@ _studio_transports: "TransportManager | None" = None
 # Same reachability need and the same assignment discipline as
 # `_studio_pair_store` above, for the object Milestone 6b adds:
 # `TransportManager` needs the app `serve_studio_api()` built, so it cannot
-# be threaded through that call the way `hub`, `pair_store` and `raises` are
-# -- it is built *after* `serve_studio_api()` returns without raising, from
+# be threaded through that call the way `hub` and `pair_store` are -- it is
+# built *after* `serve_studio_api()` returns without raising, from
 # `current_listeners()`, and only then assigned both here and onto
 # `app.state.transports` (routes/devices.py's raise endpoint reads the
-# latter). `_stop_studio_daemon()` reads this global to stop every transport
+# latter). `raises` is NOT threaded through either, despite `serve()` taking
+# a keyword for it: the call below never passes `raises=`, so `create_app`
+# falls back to its own default and this daemon's `RaiseStore` is private,
+# reachable only via `current_listeners().app.state.raises` -- there is no
+# module-level `_studio_raises` global to read it from, unlike the pair
+# store. `_stop_studio_daemon()` reads this global to stop every transport
 # *before* cancelling the primary listener (`server.serve_socket`'s docstring
 # names that ordering as the caller's obligation -- cancelling the primary
 # runs the app's lifespan shutdown, which stops the shared `EventHub` while

@@ -517,6 +517,5 @@ def shutdown(task: asyncio.Task | None, vault: TokenVault, *,
     if task is not None:
         task.cancel()
     vault.reset()
-    if raises is not None:
-        raises.clear()
+    raises.clear()
     logger.info("[API] Studio daemon stopped and all devices revoked")

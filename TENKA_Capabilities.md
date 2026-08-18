@@ -115,6 +115,35 @@ After classification, the matched intent's handler runs. Some handlers can suspe
 
 ---
 
+## Remote access — what each transport carries
+
+Everything above is the voice/text intent catalogue TENKA dispatches on locally. Since
+milestone 6, she can also be reached over HTTP from a companion app ("Studio"), and that
+surface is governed by a separate, coarser permission model — not by `INTENTS`. No new
+intent was added to reach it; a remote request still ends up calling the same handlers
+above, gated by whichever of the following it is permitted to reach.
+
+A paired device is issued a set of **capabilities** (`OBSERVE`, `RECALL`, `CHAT_SEND`,
+`SCREEN`, `FILES`, `SYSTEM_CONTROL`, `EXECUTE`) describing what it may ask for at all. What
+it can actually do on a given connection is narrowed further by **which transport it
+connected over** — a device holding every capability still can't do more than the
+transport it is using permits:
+
+| Transport | Reachable by | Carries | Can be raised to |
+| --- | --- | --- | --- |
+| `local` | this machine only | everything | — (already holds everything) |
+| `tailnet` (Tailscale) | devices on the operator's own tailnet | observe, recall (transcripts/knowledge), send a chat message, screen, files | temporarily, deliberately: run code / change settings |
+| `funnel` (Tailscale, public) | anyone with the URL | same as `tailnet` | nothing — no raise, ever |
+| `quick` (Cloudflare) | anyone with a quick-tunnel URL | observation only (status, live events, configuration) | nothing — Cloudflare can read this traffic, so nothing sensitive is offered here at all |
+
+A "raise" is a temporary, expiring widening of what `tailnet` alone may carry — minted
+only by the operator at the keyboard, never remotely, and never able to hand a device a
+capability it wasn't already issued. See
+[`TENKA_Known_Issues.md`](./TENKA_Known_Issues.md) for the defences around tunnelled
+traffic and the pending-confirmation ownership fix that came with this.
+
+---
+
 ## Adding capabilities
 
 The right way to extend TENKA almost never involves adding a new intent. In order of preference:
