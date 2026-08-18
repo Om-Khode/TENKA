@@ -4,6 +4,7 @@ lives in. `RaiseStore` supplies the `raised` argument `effective()` (Task 1)
 folds in; this file never touches `policy.py` or `effective()` itself, only
 the store's own grant/read/drop lifecycle.
 """
+import logging
 import time
 
 import pytest
@@ -187,6 +188,74 @@ def test_active_never_lists_an_expired_record(monkeypatch):
 
     clock["now"] += 31
     assert store.active() == {}
+
+
+def test_an_expiring_record_is_logged_once_and_only_once(caplog):
+    """Spec §3.6 asks for a log line on mint **and on expiry**.
+
+    Expiry has no timer to hang one off -- a record dies on the read that
+    notices it -- so the line comes from the delete-on-read paths. The
+    once-only half is the part worth pinning: `capabilities_for` is called on
+    every authenticated request, so a line emitted per *read* rather than per
+    *record* would turn a lapsed raise into a log flood for as long as the
+    device kept talking.
+    """
+    box = {"now": 1_000.0}
+    original = raises_module.time.monotonic
+    raises_module.time.monotonic = lambda: box["now"]
+    try:
+        store = RaiseStore()
+        store.grant(
+            device_id="device-1", policy_name="tailnet",
+            capabilities=frozenset({Capability.EXECUTE}),
+            seconds=30, granted_by="admin-device", reason="fixing the printer",
+        )
+        box["now"] += 31
+
+        with caplog.at_level(logging.INFO, logger=raises_module.__name__):
+            # Five reads over one lapsed record, through both delete-on-read
+            # paths: three `capabilities_for`, one `get`, one `active`.
+            assert store.capabilities_for("device-1", "tailnet") == frozenset()
+            assert store.capabilities_for("device-1", "tailnet") == frozenset()
+            assert store.capabilities_for("device-1", "tailnet") == frozenset()
+            assert store.get("device-1", "tailnet") is None
+            assert store.active() == {}
+
+        lines = [r.getMessage() for r in caplog.records if "expired" in r.getMessage()]
+        assert len(lines) == 1, lines
+        assert "device-1" in lines[0] and "tailnet" in lines[0]
+        # Ids and the transport only -- the reason is on the mint line and has
+        # no business in a log that outlives the raise.
+        assert "fixing the printer" not in lines[0]
+    finally:
+        raises_module.time.monotonic = original
+
+
+def test_the_expiry_line_also_fires_when_active_is_the_first_read(caplog):
+    """The other delete-on-read path, reached first. `GET /v1/devices` sweeps
+    with `active()`, so a raise that lapses while nobody is talking is still
+    announced by the next admin listing rather than vanishing silently."""
+    box = {"now": 1_000.0}
+    original = raises_module.time.monotonic
+    raises_module.time.monotonic = lambda: box["now"]
+    try:
+        store = RaiseStore()
+        store.grant(
+            device_id="device-9", policy_name="tailnet",
+            capabilities=frozenset({Capability.SYSTEM_CONTROL}),
+            seconds=30, granted_by="admin-device", reason="quiet",
+        )
+        box["now"] += 31
+
+        with caplog.at_level(logging.INFO, logger=raises_module.__name__):
+            assert store.active() == {}
+            assert store.capabilities_for("device-9", "tailnet") == frozenset()
+
+        lines = [r.getMessage() for r in caplog.records if "expired" in r.getMessage()]
+        assert len(lines) == 1, lines
+        assert "device-9" in lines[0]
+    finally:
+        raises_module.time.monotonic = original
 
 
 def test_the_store_has_no_serialisation_surface():

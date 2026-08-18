@@ -15,6 +15,7 @@ from typing import Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ...core.capabilities import Capability
 from .context import request_id_var
 from .runtime import SettingValue
 
@@ -194,6 +195,41 @@ class PairCodeRequest(BaseModel):
     """
     label: str = Field(min_length=1, max_length=64)
     grants: list[str] = Field(min_length=1)
+
+
+class RaiseRequest(BaseModel):
+    """What the person at the keyboard asks for when lifting one device's
+    ceiling on one transport, for a while.
+
+    `capabilities` is a list of `Capability` *values* rather than the enum
+    itself, for the same reason `PairCodeRequest.grants` is: an unknown string
+    must become a 422 the route builds from a name it never echoes, not a
+    Pydantic error whose `msg` might one day carry the submitted value back.
+    `transport` is a plain string for the mirror-image reason -- naming an
+    unknown listener must not print the name back either.
+
+    `minutes` is bounded below only, and it is the one field deliberately left
+    open at the top. The upper bound is `MAX_RAISE_SECONDS` and it lives in
+    `RaiseStore.grant()`, where it *clamps* rather than refuses: the cap is the
+    safety property, not a promise the caller kept its word, and a 422 here
+    would hand back a retry instead of a bounded raise. Duplicating it as a
+    `Field(le=...)` would also put the number in two places, which is how a cap
+    drifts.
+
+    Every other field is bounded here. `capabilities` is capped at the size of
+    the `Capability` enum, which is the largest request that could ever mean
+    anything -- a list longer than that is either duplicates or names that do
+    not exist, and both are refused. Derived from the enum rather than written
+    as a literal, because this one is an upper bound on a *list length* and can
+    only ever grow with the enum; it is not a ceiling, where `policy.py`'s
+    argument against `frozenset(Capability)` applies and a literal is
+    mandatory.
+    """
+
+    transport: str = Field(min_length=1, max_length=32)
+    capabilities: list[str] = Field(min_length=1, max_length=len(Capability))
+    minutes: int = Field(gt=0)
+    reason: str = Field(min_length=1, max_length=200)
 
 
 class PairRequest(BaseModel):

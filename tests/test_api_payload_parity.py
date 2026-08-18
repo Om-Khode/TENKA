@@ -116,7 +116,13 @@ PAIRS: list[Pair] = [
     # check. Nothing is declared as dropped on purpose: the fields a device
     # record holds that must never reach a client (`token_hmac`) are not
     # fields on this dataclass at all, they only exist in `devices.json`.
-    Pair("Device -> DevicePayload", Device, payloads.DevicePayload),
+    #
+    # `raises` is declared `extra=`: it is not a fact the vault knows. A live
+    # ceiling raise lives in `RaiseStore`, in memory, keyed on the device id
+    # and a policy name -- the route joins the two, which is exactly what
+    # `extra=` is for.
+    Pair("Device -> DevicePayload", Device, payloads.DevicePayload,
+         extra=frozenset({"raises"})),
 ]
 
 # Payload models that wrap a bare `list[...]`, a scalar, or a route
@@ -145,6 +151,11 @@ WRAPPER_PAYLOADS_WITHOUT_A_DATACLASS: dict[type[payloads.CamelModel], str] = {
     payloads.PairCodePayload: "sourced from the minted PairCode plus the endpoint list "
                               "and the QR the route renders from it; PairCode's own "
                               "`grants`/`label` deliberately never reach the wire",
+    payloads.RaisePayload: "sourced from a RaiseGrant plus its store key -- the device "
+                            "id and the policy name the record is filed under, neither "
+                            "of which is a field on the grant; `granted_by` deliberately "
+                            "never reaches the wire, and `expires_at` is a monotonic "
+                            "reading converted to seconds remaining at request time",
     payloads.SessionPayload: "sourced from the authenticated Device plus the listener "
                               "policy and the pre-ceiling issued grants stashed on "
                               "request.state by authenticate(), not one dataclass",

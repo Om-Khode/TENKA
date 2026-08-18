@@ -554,6 +554,13 @@ _MUTATING_OPERATIONS = frozenset({
     # SYSTEM_CONTROL, and `quick` is not an admin listener.
     ("POST", "/v1/pair/code"),
     ("DELETE", "/v1/devices/{device_id}"),
+    # Minting and dropping a ceiling raise. Same gate, and the refusal here is
+    # doubly structural: `quick` is not an admin listener, and its `raisable`
+    # is empty -- so even reaching the route would find nothing to lift. The
+    # one control that widens what a device may do is minted at the keyboard,
+    # always.
+    ("POST", "/v1/devices/{device_id}/raise"),
+    ("DELETE", "/v1/devices/{device_id}/raise"),
     # Moving a verified credential from the bearer channel onto the cookie.
     # Refused here, like everything else in this set -- but with 401 rather
     # than 403; see `_REFUSED_WITH_UNAUTHORIZED` below for why the difference
