@@ -524,6 +524,24 @@ class _TailscaleAdapterBase:
             return None
         return host
 
+    def status_command(self, port: int) -> list[str] | None:
+        """`tailscale serve status --json` -- for **both** adapters, which is
+        the same pinning `preflight` already does through
+        `_run_serve_status` and for the same reason (module docstring's "cheap
+        fix" note): both verbs describe the one underlying serve
+        configuration on the 1.102.2 binary this was verified against, and
+        `funnel status` filtering to funnel-enabled entries in some future
+        version would blind a `funnel` stop's verification to a serve-only
+        residue. The caller must not derive this argv from the stop argv's
+        verb -- that is exactly the assumption this method exists to remove
+        (fix round 1, Minor 3).
+
+        *port* (the local target) plays no part: the document describes every
+        mapping on this node, and the caller looks up its own **public** port
+        in it.
+        """
+        return ["tailscale", "serve", "status", "--json"]
+
     def preflight(self, port: int) -> str | None:
         """Blocks the calling thread for up to `_PREFLIGHT_TIMEOUT_SECONDS`
         (`subprocess.run`) -- a caller on the event loop must wrap this

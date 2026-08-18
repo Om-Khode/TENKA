@@ -132,6 +132,31 @@ class TransportAdapter(Protocol):
         concrete case this obligation exists for."""
         ...
 
+    def status_command(self, port: int) -> list[str] | None:
+        """The argv that re-reads this provider's own state, so a caller can
+        verify a stop actually stopped -- or `None` when there is nothing to
+        read back.
+
+        Split out from `stop_command` (fix round 1, Minor 3) because the
+        caller must not guess it. The first version of `TransportManager`
+        derived the reader from the stop argv, as `<binary> <verb> status
+        --json`, which assumed every provider's CLI has that shape and --
+        worse -- silently chose `funnel status` over `serve status` for the
+        Funnel adapter. Those two return the same document on the Tailscale
+        binary this was verified against, but that is not a guarantee across
+        versions, and an adapter that has already decided which document its
+        `preflight` trusts is the only place that decision belongs.
+
+        An adapter whose `stop_command` returns an argv **must** return one
+        here too: the pair is what makes a stop verifiable, and a caller that
+        cannot verify must report the stop as unverified rather than as
+        successful. An adapter whose `stop_command` is `None` has nothing to
+        verify (reaping the spawned process *is* its stop) and returns `None`
+        here as well, saying so in its docstring rather than leaving the
+        reader to wonder.
+        """
+        ...
+
 
 # ─── Transport Session ───────────────────────────────────────────────────────
 
@@ -162,6 +187,13 @@ class TransportSession:
     sock: socket.socket
     serve_task: asyncio.Task
     hostname: str | None = None
+    # The adapter this session was started with, carried here so a stop runs
+    # *its* stop and status commands rather than whatever the registry holds
+    # by that name later (fix round 1, Minor 8). Optional only so that
+    # existing constructions of this dataclass stay valid; a session the
+    # manager built always has one, and a stop that finds `None` reports an
+    # unverified stop instead of guessing.
+    adapter: "TransportAdapter | None" = None
 
     @property
     def url(self) -> str | None:

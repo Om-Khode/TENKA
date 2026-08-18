@@ -195,6 +195,19 @@ class QuickAdapter:
         """
         return None
 
+    def status_command(self, port: int) -> list[str] | None:
+        """`None` -- there is nothing to read back.
+
+        An unnamed quick tunnel has no persisted configuration (the same
+        reason `preflight` is `None`), and `stop_command` is `None` too, so
+        there is no second command whose effect would need verifying: the
+        tunnel is up exactly as long as the spawned process is, and reaping
+        that process is both the stop and the proof of it. Stated rather than
+        left blank so a reader can tell it was considered
+        (`base.py`'s `status_command` docstring asks for exactly that).
+        """
+        return None
+
     def stop_command(self, port: int) -> list[str] | None:
         """`None` -- terminating the spawned process *is* the stop.
 
