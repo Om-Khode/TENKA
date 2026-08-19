@@ -65,6 +65,55 @@ class TransportAdapter(Protocol):
         hostname."""
         ...
 
+    def public_port(self) -> int:
+        """The public (`--https`) port this adapter's tunnel is reachable on
+        -- `8443` for `tailnet`, `443` for `funnel` and `quick` (module
+        constants in `tailscale.py` / `cloudflare.py`, the same ones
+        `command()` builds its `--https` flag from).
+
+        The one integer every URL/origin site built from a published
+        hostname needs and none of them owns: `public_url` below folds it
+        into a string for callers inside `transports/`, and
+        `TransportManager._publish` (Task 9) passes this same value into
+        `PublishedHosts.publish(..., public_port=...)` so that
+        `security.py` -- which must not import `transports/` -- can build
+        the identical port-carrying origin from data alone, via
+        `PublishedHosts.origins_for`. Both readers derive from this one
+        method so the two cannot drift apart the way a separately-declared
+        constant in each place could."""
+        ...
+
+    def public_url(self, hostname: str) -> str:
+        """The reachable `https://` URL for *hostname*, this adapter's own
+        public port (`public_port()`) folded in.
+
+        `hostname` (from `hostname_from`, trusted and bare -- see
+        `PublishedHosts`) is never the whole story: Tailscale keys a
+        serve/funnel mapping on a public port (`--https`, module constant
+        per adapter in `tailscale.py`) that is not always the HTTPS default,
+        and nothing about the hostname itself says which port a client must
+        connect to. `tailnet` publishes on `8443`; a URL built as bare
+        `https://{hostname}` is one a browser or a phone resolves to 443,
+        where nothing is listening -- `ERR_CONNECTION_TIMED_OUT`, not a
+        reachable Studio.
+
+        This is the one place port knowledge belongs: each adapter already
+        owns its own public port (`command()` builds the `--https` flag from
+        the same constant), so each adapter builds its own URL from it too,
+        rather than a caller outside `transports/` branching on which
+        provider it is talking to. Only the *hostname* stored in
+        `PublishedHosts` stays bare -- `host_is_allowed` matches on it with
+        the port deliberately stripped (`hostname_of`), because a tunnel
+        forwards the public authority and its port is not the daemon's; this
+        method reads that same bare hostname and adds a port only in the
+        string it returns, never in what gets published or matched against.
+
+        A provider whose public port is always the HTTPS default (`quick`,
+        plain 443; `funnel`, 443 by the port-split in `tailscale.py`) omits
+        `:443` -- a URL with an explicit default port is ugly and some
+        clients normalise it away anyway."""
+        ...
+
     def preflight(self, port: int) -> str | None:
         """Reconcile with the provider's own persisted state before binding,
         if the provider has any to reconcile with (spec §2.3 L2). Returns
@@ -201,7 +250,19 @@ class TransportSession:
         announced. Spec §5.3-§5.4 fix the scheme as `https://` for all three
         tunnels -- Tasks 12 (QR encoding) and 13 (an API payload) both need
         exactly this string, so it is derived once here rather than in two
-        places that could drift apart."""
+        places that could drift apart.
+
+        The public *port* is the adapter's own knowledge (`public_url` on
+        `TransportAdapter`), not this dataclass's -- `tailnet` publishes on
+        `8443`, not the HTTPS default, and a bare `https://{hostname}` is a
+        URL that resolves to a port nothing is listening on. Delegated to
+        `self.adapter` when one is carried (every session `TransportManager`
+        actually starts carries one); a session built without one -- test
+        bookkeeping only, never a real start -- falls back to the bare
+        default-port form, since that was this property's only shape before
+        the public port existed anywhere."""
         if self.hostname is None:
             return None
+        if self.adapter is not None:
+            return self.adapter.public_url(self.hostname)
         return f"https://{self.hostname}"

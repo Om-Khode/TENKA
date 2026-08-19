@@ -653,13 +653,18 @@ class PublishedHosts:
     """
 
     def __init__(self) -> None:
-        # owner -> {(listener port, hostname)}. Keyed by owner because a
-        # session is what a name's lifetime hangs off; the listener travels
-        # with the name because it is what a *read* is scoped by.
-        self._by_owner: dict[str, set[tuple[int, str]]] = {}
+        # owner -> {(listener port, hostname, public port)}. Keyed by owner
+        # because a session is what a name's lifetime hangs off; the
+        # listener travels with the name because it is what a *read* is
+        # scoped by. The public port travels with it too (fix for the 6b
+        # live-test defect below) -- `None` when the publisher did not
+        # supply one (test scaffolding, `add()`), which `origins_for` reads
+        # the same way it reads an explicit `443`: no port suffix.
+        self._by_owner: dict[str, set[tuple[int, str, int | None]]] = {}
 
     # ─── ownership ──────────────────────────────────────────────────────
-    def publish(self, hostname: str, *, owner: str, listener: int) -> None:
+    def publish(self, hostname: str, *, owner: str, listener: int,
+                public_port: int | None = None) -> None:
         """Trust `hostname` on the listener bound to `listener`, for as long
         as `owner` is running.
 
@@ -674,6 +679,16 @@ class PublishedHosts:
         permissions it can reach are scoped by the one piece of addressing a
         client cannot forge.
 
+        `public_port` is the *public* port this listener's tunnel is reached
+        on -- `TransportAdapter.public_port()`, e.g. `8443` for `tailnet` --
+        carried alongside the hostname purely so `origins_for` can build a
+        port-correct `Origin` without this module importing `transports/`
+        (which it must not: `io/api/` layering, and `transports/manager.py`
+        already imports `unpublish_host` from here, so the reverse import
+        would cycle). `None` when the caller has no public port to give
+        (test scaffolding, `add()`) -- `origins_for` then omits the port
+        exactly as it would for an explicit `443`.
+
         Normalised through `hostname_of`, which is what `host_is_allowed`
         compares an incoming `Host` with. Both sides therefore agree by
         construction rather than by two spellings of "lowercase and strip"
@@ -683,11 +698,18 @@ class PublishedHosts:
         failed *closed*, so this removes a way to be surprised rather than a
         live hole -- but a gate whose two halves normalise differently is a
         gate waiting for the day one of them is edited.
+
+        **`public_port` never reaches `hostname_of` or the stored name
+        itself** -- only `hostname` does. `hosts_for` and the `Host` gate
+        keep reading a bare hostname exactly as before; the port is a third,
+        separate element of the stored tuple, read only by `origins_for`.
         """
         name = hostname_of(str(hostname))
         if not name:
             return
-        self._by_owner.setdefault(str(owner), set()).add((int(listener), name))
+        port = None if public_port is None else int(public_port)
+        self._by_owner.setdefault(str(owner), set()).add(
+            (int(listener), name, port))
 
     def unpublish(self, owner: str) -> frozenset[str]:
         """Withdraw everything `owner` published. Returns the hostnames that
@@ -697,7 +719,7 @@ class PublishedHosts:
         withdrawn, is not an error -- a transport's stop path must be safe to
         run twice (a crash handler and an orderly shutdown both call it).
         """
-        return frozenset(name for _listener, name
+        return frozenset(name for _listener, name, _public_port
                          in self._by_owner.pop(str(owner), set()))
 
     def owners(self) -> frozenset[str]:
@@ -726,18 +748,66 @@ class PublishedHosts:
                      listener=listener)
 
     def hosts_for(self, listener: int | None) -> frozenset[str]:
-        """Every hostname currently published *on this listener*.
+        """Every hostname currently published *on this listener*, bare --
+        never a port.
 
-        The only read. `listener` is `None` when the accepting port could not
-        be determined at all, and that answers empty rather than everything:
-        a connection nobody can place is a connection nothing was published
+        The only read `host_is_allowed` (the `Host` gate, KI-17's load-
+        bearing layer) uses, and it must stay exactly this shape: a tunnel
+        forwards the public authority in `Host`, and matching it against a
+        bare, port-stripped name is the whole point (`hostname_of` on both
+        sides -- see `publish`'s docstring). `origins_for` below is the
+        *different* question ("what URL reaches this listener"), answered
+        separately so this one is never tempted to grow a port.
+
+        `listener` is `None` when the accepting port could not be
+        determined at all, and that answers empty rather than everything: a
+        connection nobody can place is a connection nothing was published
         for.
         """
         if listener is None:
             return frozenset()
         port = int(listener)
         return frozenset(name for pairs in self._by_owner.values()
-                         for entry_port, name in pairs if entry_port == port)
+                         for entry_port, name, _public_port in pairs
+                         if entry_port == port)
+
+    def origins_for(self, listener: int | None) -> frozenset[str]:
+        """Every reachable `https://` origin for a hostname published *on
+        this listener*, each carrying that listener's own public port when
+        it is not the HTTPS default.
+
+        The fix for the 6b live-test defect: `tailnet` publishes on `8443`,
+        not 443, so a browser's own `Origin` header for a page served there
+        reads `https://<host>:8443` -- and `endpoint_origins` (which trusts
+        this set as a front door) and `_endpoints()` (which offers a QR
+        built from it) both need the identical string, or the two disagree
+        about what "this listener" is reachable at. `hosts_for` above stays
+        bare on purpose (the `Host` gate's job); this is the separate
+        question of what URL a client actually reaches this listener
+        through, so it lives here as a second method rather than a second
+        meaning for the first one.
+
+        A stored `public_port` of `None` (nothing was supplied at publish
+        time -- test scaffolding, `add()`) is treated exactly like an
+        explicit `443`: no port suffix, the same default-port omission
+        `TransportAdapter.public_url` applies for `funnel` and `quick`. A
+        browser never puts the default port in `Origin` either, so emitting
+        one here would refuse a *legitimate* funnel origin -- the opposite
+        direction of this fix.
+        """
+        if listener is None:
+            return frozenset()
+        port = int(listener)
+        origins: set[str] = set()
+        for pairs in self._by_owner.values():
+            for entry_port, name, public_port in pairs:
+                if entry_port != port:
+                    continue
+                if public_port is None or public_port == 443:
+                    origins.add(f"https://{name}")
+                else:
+                    origins.add(f"https://{name}:{public_port}")
+        return frozenset(origins)
 
     def __len__(self) -> int:
         """How many distinct `(listener, hostname)` pairs are live.
@@ -745,8 +815,12 @@ class PublishedHosts:
         A count, never a membership test: nothing decides trust from this, and
         it exists so an operator-facing summary can say how many names are
         currently published without being handed the unscoped read above.
+        Counted on `(listener, hostname)` alone, ignoring the public port --
+        this stays a count of *names*, the same promise it made before the
+        public port existed on the stored tuple at all.
         """
-        return len({pair for pairs in self._by_owner.values() for pair in pairs})
+        return len({(entry_port, name) for pairs in self._by_owner.values()
+                    for entry_port, name, _public_port in pairs})
 
 
 def unpublish_host(app_state, owner: str) -> frozenset[str]:
@@ -891,10 +965,17 @@ def endpoint_origins(app_state, port: int | None,
         origins.add(f"http://127.0.0.1:{port}")
         origins.add(f"http://localhost:{port}")
         if policy.name != "local" and isinstance(published, PublishedHosts):
-            for host in published.hosts_for(port):
-                # A published transport hostname is always reached over TLS:
-                # both Tailscale and Cloudflare terminate https for it.
-                origins.add(f"https://{host}")
+            # `origins_for`, never `hosts_for` -- a published transport
+            # hostname is always reached over TLS (both Tailscale and
+            # Cloudflare terminate https for it), but `tailnet` is reached
+            # on a non-default port (8443) that a bare `https://{host}`
+            # omits. A browser's own `Origin` header for a page served over
+            # `tailnet` carries that port, so trusting the portless form
+            # here refused every real one (`_CROSS_SITE`, live-tested):
+            # this must build the identical string the browser sends, and
+            # `origins_for` is where that construction is shared with
+            # `_endpoints()` (`routes/pairing.py`) rather than repeated.
+            origins.update(published.origins_for(port))
     if policy.name == "local":
         for origin in getattr(app_state, "cors_origins", ()) or ():
             origins.add(str(origin).strip().lower().rstrip("/"))

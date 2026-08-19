@@ -524,6 +524,26 @@ class _TailscaleAdapterBase:
             return None
         return host
 
+    def public_port(self) -> int:
+        """`_public_port` -- `_TAILNET_PUBLIC_PORT` (8443) or
+        `_FUNNEL_PUBLIC_PORT` (443), per subclass."""
+        return self._public_port
+
+    def public_url(self, hostname: str) -> str:
+        """`https://{hostname}`, with `:{public_port()}` appended unless that
+        port is the HTTPS default -- shared by both adapters since both keep
+        their public port in the same `_public_port` class attribute
+        (`_TAILNET_PUBLIC_PORT` / `_FUNNEL_PUBLIC_PORT`). `tailnet`'s `8443`
+        is never the default, so its URL always carries the port; `funnel`'s
+        `443` is, so its URL never does -- the one live case this omission
+        matters for today, but the check is against the value, not the
+        adapter, so it stays correct if a future adapter's split ever puts
+        `funnel` on a non-443 port too."""
+        port = self.public_port()
+        if port == 443:
+            return f"https://{hostname}"
+        return f"https://{hostname}:{port}"
+
     def status_command(self, port: int) -> list[str] | None:
         """`tailscale serve status --json` -- for **both** adapters, which is
         the same pinning `preflight` already does through

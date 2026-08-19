@@ -127,9 +127,17 @@ def _endpoints(request: Request) -> list[str]:
     Listener-scoped, from the port this connection was *accepted* on -- the
     one piece of addressing a client cannot choose. On the loopback listener,
     the loopback origin, exactly as in 6a. On a transport listener, that
-    listener's published `https://` hosts (`PublishedHosts.hosts_for`) and no
-    loopback candidate at all: a phone off-LAN cannot reach `127.0.0.1`, and
-    offering it is a QR with no destination.
+    listener's published origins (`PublishedHosts.origins_for`), each already
+    carrying that transport's own public port (`8443` on `tailnet` -- the
+    live-test defect this fixes: a phone off-LAN cannot reach `127.0.0.1`,
+    and a bare `https://{host}` with no port is just as unreachable, since
+    it resolves to 443 where nothing is listening). `hosts_for` -- bare
+    hostname, no port -- stays the `Host` gate's own read (KI-17's
+    load-bearing layer); `origins_for` is the separate, port-carrying read
+    this function and `endpoint_origins` (`security.py`) share, so the QR
+    this function feeds and the CORS/CSRF origin set that must accept a
+    request back from it agree on the identical string by construction
+    rather than by two call sites happening to compute the same port.
 
     6a's "deliberately not read here yet" note about `app.state.published_hosts`
     is resolved -- but not by this function reaching past its own listener.
@@ -151,7 +159,7 @@ def _endpoints(request: Request) -> list[str]:
     if policy is not None and policy.name == "local":
         return [f"http://127.0.0.1:{port}"]
     published = request.app.state.published_hosts
-    return [f"https://{host}" for host in sorted(published.hosts_for(port))]
+    return sorted(published.origins_for(port))
 
 
 # ─── minting: loopback only ──────────────────────────────────────────────

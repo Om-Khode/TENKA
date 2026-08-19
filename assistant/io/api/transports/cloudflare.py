@@ -165,6 +165,19 @@ class QuickAdapter:
             return None
         return host
 
+    def public_port(self) -> int:
+        """`443` -- a quick tunnel has no `--https` flag at all (`command()`
+        takes none), and Cloudflare's own edge always terminates it on the
+        HTTPS default."""
+        return 443
+
+    def public_url(self, hostname: str) -> str:
+        """`https://{hostname}`, plain -- a Cloudflare quick tunnel is always
+        published on 443, the HTTPS default, so no port suffix is ever
+        needed (unlike `tailnet`'s `8443`; see `tailscale.py`'s
+        `_TailscaleAdapterBase.public_url`)."""
+        return f"https://{hostname}"
+
     def preflight(self, port: int) -> str | None:
         """Always `None`: there is **no persisted configuration** for an
         unnamed tunnel to have gone stale, so there is nothing to reconcile.
