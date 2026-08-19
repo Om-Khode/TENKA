@@ -258,11 +258,23 @@ def _refuse(required: Capability) -> str:
     3. Issued, but this transport can never carry it, raised or not. Must
        not promise a raise that cannot happen.
 
-    Naming a device's own issued set and its own transport's raisable-ness
-    tells it nothing a paired device could not already read off
-    `GET /v1/session` (`grants`, `effective`, `raised`, `policy`) -- and
-    minting a raise is loopback-admin-only (`require_admin(SYSTEM_CONTROL)`),
-    so there is nothing here for a remote caller to act on regardless.
+    **What each sentence discloses, stated rather than waved away.** A
+    device's own issued set and its own effective set are already readable
+    off `GET /v1/session` (`grants`, `effective`, `raised`, `policy`), so
+    case 1 and the "this device holds it" half of cases 2 and 3 tell a
+    caller nothing new.
+
+    Raisable-ness is different and the difference is worth being honest
+    about: it is **not** on the session payload, and the one route that does
+    publish it (`GET /v1/transports`) is `require_admin(SYSTEM_CONTROL)` --
+    loopback only. So case 2 is the first thing in this API to tell a remote
+    caller that a capability is raisable on its transport. Accepted as a
+    stated trade-off, not an oversight, on two grounds: every `raisable` set
+    is static data checked into a public repository, so it is not secret from
+    anyone who can read TENKA at all; and minting a raise is
+    `require_admin(SYSTEM_CONTROL)` on a loopback listener, so a remote
+    caller learns something it has no route to act on. If either of those
+    ever stops being true, this sentence is the thing to revisit.
     """
     context = current_raise_context.get()
     if context is None or required not in context.issued:
