@@ -62,6 +62,63 @@ def test_i4_raisable_is_an_explicit_literal_not_an_enum_derivation():
         assert policy.raisable < everything, policy.name
 
 
+def test_i4b_ceiling_and_raisable_are_ast_pinned_to_a_pure_frozenset_literal():
+    """Ruling 11 / fix round 5, Minor 6, confirmed by reviewer B: the runtime
+    check above catches the exact full-enum spelling (`frozenset(Capability)`
+    is neither `!=` nor `<` itself) but not a *subtractive* one --
+    `frozenset(Capability) - {SCREEN}` is a proper subset of `everything`, so
+    it passes both assertions above while still being derived from the enum,
+    exactly the shape the standing rule exists to forbid: it would silently
+    widen the moment a new capability joins, the same way the two sites
+    Milestone 6a.5 deleted did.
+
+    By the time such an expression has been evaluated into a frozenset there
+    is nothing left in the *value* to tell it apart from one written out by
+    hand, so this walks `policy.py`'s own source instead: every `ceiling=`
+    and `raisable=` keyword on a `ListenerPolicy(...)` call must be exactly
+    `frozenset({...})` -- a call to `frozenset` with at most one set/dict
+    literal argument, no `Capability` name, no `|`/`-`/other `BinOp` at any
+    depth inside it.
+    """
+    import ast
+    import inspect
+
+    from assistant.io.api import policy as policy_module
+
+    tree = ast.parse(inspect.getsource(policy_module))
+    checked = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "ListenerPolicy"):
+            continue
+        for kw in node.keywords:
+            if kw.arg not in ("ceiling", "raisable"):
+                continue
+            checked += 1
+            value = kw.value
+            assert (isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Name)
+                    and value.func.id == "frozenset"), (
+                f"{kw.arg} must be a bare frozenset({{...}}) literal, "
+                f"got {ast.dump(value)}")
+            assert len(value.args) <= 1, (kw.arg, ast.dump(value))
+            if value.args:
+                assert isinstance(value.args[0], (ast.Set, ast.Dict)), (
+                    f"{kw.arg}'s frozenset(...) argument must be a set "
+                    f"literal, not {ast.dump(value.args[0])} -- "
+                    f"frozenset(Capability) is exactly the derivation this "
+                    f"pins against")
+            for sub in ast.walk(value):
+                assert not isinstance(sub, ast.BinOp), (
+                    f"{kw.arg} is derived via a BinOp ({ast.dump(sub)}), "
+                    f"e.g. a union or subtraction, rather than written out "
+                    f"as an explicit literal")
+    assert checked == 2 * len(POLICY_LIST), (
+        f"expected a ceiling= and a raisable= keyword on each of "
+        f"{len(POLICY_LIST)} policies ({2 * len(POLICY_LIST)} total); found "
+        f"{checked} -- a policy or keyword was not parsed as expected")
+
+
 def test_i5_a_raise_touches_capabilities_only():
     """admin, allow_bearer and secure_cookie are not raisable by anything."""
     import inspect

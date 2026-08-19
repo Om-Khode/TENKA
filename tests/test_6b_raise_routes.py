@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import logging
 
+from dataclasses import replace
+
 from assistant.io.api import raises as raises_module
 from assistant.io.api.app import create_app
 from assistant.io.api.listeners import port_for
-from assistant.io.api.policy import POLICIES
+from assistant.io.api.policy import POLICIES, ListenerPolicy
 from assistant.io.api.raises import MAX_RAISE_SECONDS, RaiseStore
 from assistant.io.api.security import COOKIE_NAME, CSRF_HEADER
 from assistant.io.api.vault import Capability, TokenVault
@@ -121,6 +123,58 @@ def test_a_raise_is_refused_on_every_listener_but_local(tmp_path):
         assert post_raise(client, device_id).status_code == 403, listener
         assert client.delete(f"/v1/devices/{device_id}/raise",
                              headers={CSRF_HEADER: "1"}).status_code == 403, listener
+
+
+def test_ki18_the_admin_gate_holds_even_when_the_ceiling_carries_system_control(
+        tmp_path, monkeypatch):
+    """KI-18. Reviewers B and C both "reproduced" this by setting `admin=True`
+    on a tunnel policy and observing admin access -- that is the definition of
+    the flag, not a defect. In every real `POLICIES` entry, the one ceiling
+    holding SYSTEM_CONTROL (`local`'s) is also the one policy with
+    `admin=True`, so `require(SYSTEM_CONTROL)` always refuses first on
+    `tailnet`, `funnel` and `quick` -- nothing there would fail if `admin`
+    were flipped to `True` on any of them, because the capability check never
+    lets a request reach `require_admin`'s own `if not policy.admin` line.
+
+    This builds the one shape that isolates it: a fixture policy with
+    `admin=False` but SYSTEM_CONTROL in its ceiling anyway, so
+    `require(SYSTEM_CONTROL)` passes clean and the admin check is the only
+    thing left standing between this device and `GET /v1/devices`.
+    """
+    probe = ListenerPolicy(
+        name="probe", admin=False, allow_bearer=False, secure_cookie=False,
+        ceiling=frozenset({Capability.OBSERVE, Capability.SYSTEM_CONTROL}),
+        raisable=frozenset(),
+    )
+    monkeypatch.setitem(POLICIES, "probe", probe)
+    port = max(PORTS.values()) + 1000  # not one of the four real listeners
+    registry = dict(POLICY_REGISTRY)
+    registry[port] = "probe"
+
+    vault = TokenVault(tmp_path)
+    token = vault.issue("probe-device", frozenset(Capability))
+    app = create_app(build_fake_runtime(), vault,
+                     origins=["http://localhost:3000"],
+                     listener_policies=registry)
+    app.state.raises = RaiseStore()
+    app.state.transports = FakeTransports()
+    client = ApiTestClient(app, base_url=f"http://127.0.0.1:{port}")
+    client.cookies.set(COOKIE_NAME, token)
+
+    assert client.get("/v1/devices").status_code == 403, (
+        "admin=False must still refuse GET /v1/devices even though this "
+        "policy's ceiling carries SYSTEM_CONTROL")
+
+    # Vacuity guard: the reviewers' own experiment, run last so it cannot
+    # contaminate the assertion above. Flipping only `admin` on the identical
+    # policy must now let the same request through -- proving the 403 above
+    # really was `require_admin`'s own gate, not an unrelated refusal (a bad
+    # cookie, an Origin check, a stale device) that happened to also answer
+    # 403.
+    monkeypatch.setitem(POLICIES, "probe", replace(probe, admin=True))
+    assert client.get("/v1/devices").status_code == 200, (
+        "the vacuity guard failed: admin=True did not restore access, so the "
+        "403 above was not proven to be the admin gate")
 
 
 def test_a_watching_device_on_loopback_cannot_mint_a_raise(tmp_path):

@@ -289,12 +289,21 @@ def test_the_prefixed_cookie_carries_what_the_prefix_demands():
 def test_a_real_pair_over_a_tunnel_sets_the_prefixed_cookie(tmp_path):
     """End to end, because the helper being right is not the same as the route
     using it -- the two `set_cookie` call sites are in `routes/pairing.py` and
-    `routes/session.py`, not here."""
+    `routes/session.py`, not here.
+
+    `funnel`, not `quick`: spec §5.5 (Milestone 6b) refuses ALL redemption on
+    `quick` unconditionally, before the code is even consulted
+    (`tests/test_6b_pairing_transports.py` pins that refusal), so `quick` can
+    no longer complete a pair at all. `funnel` also sets `secure_cookie=True`
+    -- the same property this test needs to demonstrate the `__Host-` prefix
+    -- so the property survives the move exactly the way Task 12 already
+    moved the equivalent tests in `test_api_pairing_routes.py`.
+    """
     vault = TokenVault(tmp_path)
     store = PairCodeStore()
     code = store.mint("phone", frozenset({Capability.OBSERVE})).code
     client = build_api_client(build_fake_runtime(), vault,
-                              policies={LOCAL_PORT: "quick"}, pair_store=store)
+                              policies={LOCAL_PORT: "funnel"}, pair_store=store)
     r = client.post("/v1/pair", json={"code": code})
     assert r.status_code == 204
     assert HOST_COOKIE_NAME in r.cookies, dict(r.cookies)
@@ -512,6 +521,7 @@ _PATH_PARAMS = {
     "{command_id}": "volume_up",
     "{kind}": "voice",
     "{device_id}": "d1",
+    "{name}": "quick",
 }
 
 # The one mutating operation that is deliberately not gated on a capability
@@ -561,6 +571,11 @@ _MUTATING_OPERATIONS = frozenset({
     # always.
     ("POST", "/v1/devices/{device_id}/raise"),
     ("DELETE", "/v1/devices/{device_id}/raise"),
+    # Starting and stopping a transport. Same gate and the same double
+    # refusal as the two rows above: the ceiling carries no SYSTEM_CONTROL,
+    # and `quick` is not an admin listener either.
+    ("POST", "/v1/transports/{name}"),
+    ("DELETE", "/v1/transports/{name}"),
     # Moving a verified credential from the bearer channel onto the cookie.
     # Refused here, like everything else in this set -- but with 401 rather
     # than 403; see `_REFUSED_WITH_UNAUTHORIZED` below for why the difference
@@ -738,6 +753,9 @@ _OFF_THIS_TRANSPORT_ENTIRELY = frozenset({
     ("GET", "/v1/files"),
     ("GET", "/v1/files/content"),
     ("GET", "/v1/files/roots"),
+    # Same double refusal as `/v1/devices`: `require_admin(SYSTEM_CONTROL)`,
+    # and `quick` is neither an admin listener nor a SYSTEM_CONTROL ceiling.
+    ("GET", "/v1/transports"),
 })
 
 

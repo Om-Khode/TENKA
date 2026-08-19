@@ -452,6 +452,29 @@ async def test_a_failed_preflight_stops_before_anything_is_bound(h):
 
 
 @pytest.mark.asyncio
+async def test_a_bind_collision_is_reported_as_a_transport_error(h, monkeypatch):
+    """Fix round 5, Important 3: `_bind` raises a raw `OSError` on a
+    bind-collision race, and `errors.py` maps a raw `OSError` to 404 while
+    this method's own docstring -- and `routes/transports.py`'s -- both
+    promise `TransportError` (409) for every refusal. A caller must never
+    see the raw `OSError` escape `start()`."""
+    def _refuse(port, host="127.0.0.1"):
+        raise OSError("[WinError 10048] address already in use")
+
+    monkeypatch.setattr(server_mod, "bind_listener", _refuse)
+    adapter = _FakeAdapter("funnel", events=h.events)
+    h.register(adapter)
+
+    with pytest.raises(TransportError) as excinfo:
+        await h.manager.start("funnel")
+
+    assert "18787" in str(excinfo.value) or "bind" in str(excinfo.value).lower()
+    assert h.spawned == []
+    assert port_for("funnel", BASE) not in h.policies
+    assert h.manager.running() == {}
+
+
+@pytest.mark.asyncio
 async def test_a_tunnel_that_never_announces_a_hostname_does_not_serve(h):
     """Spec §4: 'a registered socket with no published host is a door with no
     lock on the far side.'
@@ -933,6 +956,31 @@ async def test_a_foreground_transports_stop_runs_no_second_command(h):
     assert h.ran == [], f"a foreground transport ran {h.ran}"
     assert session.process.returncode is not None
     assert session.process.terminated == 1
+
+
+@pytest.mark.asyncio
+async def test_a_process_that_ignores_kill_makes_stop_report_failure(h, monkeypatch):
+    """Critical 1, fix round 5: for a foreground provider (`stop_command()`
+    returns `None`), reaping the process *is* the whole stop -- so if it
+    ignores both `terminate()` and the escalation to `kill()`, `_reap` must
+    say so rather than returning normally. A prior version returned
+    normally here, so `stop()` reported success while the tunnel process --
+    and, for a real provider, its live edge connection -- kept running.
+    Bounded by `wait_for` so a regression fails rather than hangs."""
+    monkeypatch.setattr(manager_mod, "_REAP_TIMEOUT_SECONDS", 0.05)
+    adapter = _FakeAdapter("quick", events=h.events, stop_argv=None)
+    h.register(adapter)
+    session = await h.manager.start("quick")
+
+    # Make the spawned process immune to both `terminate()` and `kill()`.
+    monkeypatch.setattr(session.process, "terminate", lambda: None)
+    monkeypatch.setattr(session.process, "kill", lambda: None)
+
+    with pytest.raises(TransportError, match="UNVERIFIED"):
+        await asyncio.wait_for(h.manager.stop("quick"), 5.0)
+
+    assert session.process.returncode is None, (
+        "the stuck process was falsely reported as reaped")
 
 
 @pytest.mark.asyncio
@@ -1868,3 +1916,42 @@ async def test_a_cancellation_racing_an_unrelated_failure_still_wins(
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(outer_task, 5.0)
+
+
+@pytest.mark.asyncio
+async def test_wait_uncancellably_discards_a_non_cancellation_exception():
+    """KI-21, confirmed by reviewers C and B. `_wait_uncancellably`'s own
+    docstring promises it never propagates *fut*'s result or exception --
+    only whether it is done -- but that promise had no direct test: every
+    existing caller's future always ends up cancelled, so the
+    `if not fut.cancelled(): fut.exception()` line that discards a
+    *non*-cancellation exception has never been exercised by anything in
+    this suite. A future second caller passing a future that can end in a
+    plain exception would have no test to catch a regression that let it
+    leak.
+
+    A bare future, resolved (before this call, deliberately -- the mid-await
+    race that can make `_settle_uncancellably` leak such an exception
+    straight through `asyncio.shield` is KI-21's separate, still-dormant
+    finding, unreachable through this manager's sole caller today, and not
+    what this test is pinning) with a `ValueError`, is the direct shape:
+    `_wait_uncancellably` must return normally, and must have actually
+    *retrieved* the exception -- not merely avoided raising it, which a
+    future GC could still turn into an "exception was never retrieved"
+    warning. `Future._log_traceback` is asyncio's own bookkeeping for
+    exactly that: `set_exception` turns it on, and `exception()` is the one
+    thing that turns it back off, so reading it before and after is a
+    direct check that the guard line ran, not just that nothing exploded.
+    """
+    fut: asyncio.Future = asyncio.get_running_loop().create_future()
+    fut.set_exception(ValueError("boom"))
+    assert fut._log_traceback is True, (
+        "test setup: a freshly excepted future must start out unretrieved")
+
+    await asyncio.wait_for(manager_mod._wait_uncancellably(fut), 5.0)
+
+    assert fut.cancelled() is False
+    assert fut._log_traceback is False, (
+        "_wait_uncancellably returned without ever retrieving fut's "
+        "exception -- a future GC would log it as 'never retrieved', and "
+        "the guard line meant to prevent that never actually ran")

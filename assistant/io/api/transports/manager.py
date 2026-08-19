@@ -554,7 +554,19 @@ class TransportManager:
             raise TransportError(refusal)
 
         # 2. Bind. From here on every failure runs the shared teardown.
-        sock = _bind(port)
+        # Wrapped, not left to propagate: `_bind` raises a raw `OSError` on a
+        # bind-collision race, and `errors.py` maps that to 404 -- while this
+        # method's own docstring, and `routes/transports.py`'s, both promise
+        # `TransportError` (409) for every refusal. Admin/loopback-only, so
+        # the cost of leaving it raw was never a privilege crossing, only an
+        # operator reading the wrong status code for an incident (fix round
+        # 5, Important 3).
+        try:
+            sock = _bind(port)
+        except OSError as exc:
+            raise TransportError(
+                f"transport '{name}' could not bind port {port} ({exc})"
+            ) from exc
         owner = _new_owner(name)
         process: asyncio.subprocess.Process | None = None
         serve_task: asyncio.Task | None = None
@@ -1001,7 +1013,7 @@ class TransportManager:
         # 7. The subprocess. Last, because for a daemonising provider it has
         # already exited and for a foreground one this *is* the stop -- and
         # in neither case is it what un-serves the provider's mapping.
-        await _reap(process)
+        failures.extend(await _reap(process, policy_name))
         return failures
 
     async def _provider_stop(self, adapter: TransportAdapter | None,
@@ -1337,20 +1349,29 @@ async def _cancel(task: asyncio.Task | None) -> None:
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def _reap(process: Any | None) -> None:
-    """Terminate *process* if it is still alive, then wait for it.
+async def _reap(process: Any | None, policy_name: str) -> list[str]:
+    """Terminate *process* if it is still alive, then wait for it; return the
+    failure, as the same UNVERIFIED-sentence list every other teardown step
+    uses, if its death could not be confirmed.
 
     Not the stop for a daemonising provider (`_provider_stop` is), and the
-    whole stop for a foreground one. Escalates to `kill()` because a provider
-    that ignores a terminate must not keep a tunnel open past this call.
+    whole stop for a foreground one -- so for that provider this call *is*
+    the mapping's teardown, and a process this cannot confirm dead is a
+    mapping this cannot confirm gone. Escalates to `kill()` because a
+    provider that ignores a terminate must not keep a tunnel open past this
+    call; if `kill()` also fails to produce a confirmed exit, that is
+    reported rather than swallowed (fix round 5, Critical 1 -- a prior
+    version returned normally here, so `stop()` claimed success while a
+    foreground provider's process, and its live edge connection, kept
+    running).
     """
     if process is None or getattr(process, "returncode", None) is not None:
-        return
+        return []
     with suppress(OSError, ProcessLookupError):
         process.terminate()
     try:
         await asyncio.wait_for(process.wait(), _REAP_TIMEOUT_SECONDS)
-        return
+        return []
     except Exception:
         # `asyncio.TimeoutError` is the expected one; anything else out of a
         # provider's `wait()` earns the same escalation rather than leaving a
@@ -1359,5 +1380,14 @@ async def _reap(process: Any | None) -> None:
                        "killing it")
     with suppress(OSError, ProcessLookupError):
         process.kill()
-    with suppress(Exception):
+    try:
         await asyncio.wait_for(process.wait(), _REAP_TIMEOUT_SECONDS)
+        return []
+    except Exception as exc:
+        logger.error(
+            "[API] transport '%s' subprocess could not be confirmed dead "
+            "after kill() (%s); its mapping is UNVERIFIED and may still be "
+            "up", policy_name, exc)
+        return [f"transport '{policy_name}': its subprocess could not be "
+                f"confirmed dead after kill() ({exc}) -- the mapping is "
+                f"UNVERIFIED and may still be up"]
