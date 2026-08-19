@@ -287,8 +287,9 @@ class EventBus:
 
     async def _run_code_executor(self, goal: str) -> str:
         from assistant.actions import (
-            LOCAL_GRANTS, LOCAL_PRINCIPAL, current_grants, current_principal,
-            execute, set_grants, set_principal,
+            LOCAL_GRANTS, LOCAL_PRINCIPAL, LOCAL_RAISE_CONTEXT, current_grants,
+            current_principal, current_raise_context, execute, set_grants,
+            set_principal, set_raise_context,
         )
         # A fired monitor is not a request from anyone -- there is no turn
         # around it, so `current_grants` would be unset and `execute()` would
@@ -309,9 +310,16 @@ class EventBus:
         # a bug.
         token = set_grants(LOCAL_GRANTS)
         ptoken = set_principal(LOCAL_PRINCIPAL)
+        # Installed alongside grants/principal for the same reason
+        # scheduler.py's two call sites now do: every set_grants() site
+        # installs the raise context too, so a missing one never reads as
+        # "forgotten" -- LOCAL_GRANTS holds everything, so _refuse is never
+        # actually reached from here.
+        rtoken = set_raise_context(LOCAL_RAISE_CONTEXT)
         try:
             return await execute("code_executor", {"goal": goal}, "")
         finally:
+            current_raise_context.reset(rtoken)
             current_principal.reset(ptoken)
             current_grants.reset(token)
 

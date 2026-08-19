@@ -41,8 +41,16 @@ async def send_chat(body: ChatRequest, request: Request,
     # name itself `"local"` and inherit the operator's own confirmations.
     # `device_id` is the vault's identifier for the pairing, not anything the
     # request supplied. See core/principal.py and KI-13.
+    # `issued` and `raisable` travel alongside the effective grants so a
+    # refusal deep in the pipeline can say whether a raise at the keyboard
+    # would fix it -- `authenticate()` already stashed the first on
+    # `request.state` and the second is the listener's own fixed policy, so
+    # this is two more already-known facts, not a new read. Neither is new
+    # information to the device that owns it: both are visible on its own
+    # `GET /v1/session` response already.
     ref = await request.app.state.runtime.chat.send(
-        body.text, device.grants, f"device:{device.device_id}")
+        body.text, device.grants, f"device:{device.device_id}",
+        issued=request.state.issued_grants, raisable=request.state.policy.raisable)
     if not ref.accepted:
         # Deliberately generic: a caller that cannot authenticate any further
         # than "holds a read token" should not learn *what* she is doing --

@@ -112,6 +112,7 @@ _search_result_queue: _queue.Queue = _queue.Queue()
 # ─── Capability grants for the turn in flight ────────────────────────────
 
 import contextvars as _contextvars
+import dataclasses as _dataclasses
 
 from ..core.capabilities import Capability
 from ..core.intent_capabilities import DEFAULT_REQUIRED, REQUIRED_CAPABILITY
@@ -171,6 +172,70 @@ from ..core.principal import (  # noqa: F401  (re-exported by design)
 )
 
 
+# ─── What a raise could do for the turn in flight ────────────────────────
+# `current_grants` alone cannot write an accurate refusal: it is already
+# `effective(issued, ceiling, raised)`, the narrowed result, so by the time a
+# capability is missing from it the narrowing that dropped it is gone. Two
+# more facts distinguish the three refusals this codebase now needs to tell
+# apart -- what the device was *issued*, and what this transport's `raisable`
+# literal holds -- and neither lives on `current_grants`.
+#
+# Carried as a second contextvar, installed at the same call sites and reset
+# in the same `finally` blocks as `current_grants`/`current_principal`, for
+# the same reason those two are contextvars rather than parameters:
+# `execute()` re-enters itself through `planner/executor.py`, and a turn's
+# call sites are several frames removed from wherever `_refuse` eventually
+# runs. See `core/principal.py` for the fuller version of this argument.
+#
+# It is a plain dataclass of two frozensets, not `io/api/policy.py`'s
+# `ListenerPolicy` -- `io.api` may not be imported past this point in a
+# turn's call graph for the AUTHENTICATE step to have already run, but more to
+# the point, `_refuse` only ever needs two of that dataclass's seven fields.
+# Reaching across the layer for a whole policy object to read two frozensets
+# off it would be a needless coupling; the two frozensets travel instead,
+# computed once where the policy is already in hand (`security.py`'s
+# `authenticate()`, by way of `routes/chat.py`) and carried here as data,
+# exactly as `CLAUDE.md`'s layering rule asks. It also lives beside
+# `current_grants` rather than in `core/`, unlike `current_principal`: nothing
+# in `core/` or `pending.py` needs to read it, so there is no layering reason
+# to move it, and every reader of it already imports `actions/`.
+@_dataclasses.dataclass(frozen=True)
+class RaiseContext:
+    """What this turn's caller was issued, and what this transport can ever
+    carry for it under a raise -- the two facts `_refuse` needs beyond
+    `current_grants` to tell "never issued" apart from "issued, raisable
+    here" and from "issued, but this transport can never carry it"."""
+
+    issued: "frozenset[Capability]"
+    raisable: "frozenset[Capability]"
+
+
+current_raise_context: _contextvars.ContextVar["RaiseContext | None"] = \
+    _contextvars.ContextVar("tenka_current_raise_context", default=None)
+"""The pair `_refuse` reads to write an accurate sentence. `None` is the
+fail-soft default -- a call site that installs `set_grants`/`set_principal`
+but not this (because it predates this milestone, or a source nobody has
+wired it for yet) must degrade to the old, always-correct-if-generic
+sentence, never to a wrong one or a crash. See `_refuse` below.
+"""
+
+LOCAL_RAISE_CONTEXT = RaiseContext(issued=LOCAL_GRANTS, raisable=frozenset())
+"""What a caller physically at this machine was issued and could ever raise:
+everything, and therefore nothing left to raise. `_refuse` never actually
+reaches the raisable/never-raisable branches for a local caller -- holding
+`LOCAL_GRANTS` means `capability_refusal` never calls `_refuse` in the first
+place -- so this exists for the same reason `LOCAL_GRANTS` itself is stated
+explicitly rather than left unset: a caller that installs grants should
+install its raise context the same way, not by omission.
+"""
+
+
+def set_raise_context(context: "RaiseContext | None") -> "_contextvars.Token":
+    """Declare what a raise could reach for the turn about to run. Reset the
+    token when it ends, matching `set_grants`/`set_principal`."""
+    return current_raise_context.set(context)
+
+
 def _refuse(required: Capability) -> str:
     """The refusal a caller sees when its grant set does not cover the intent.
 
@@ -179,9 +244,47 @@ def _refuse(required: Capability) -> str:
     device that cannot reach `shutdown` should not learn that shutdown is a
     thing she can do. Under 120 chars with no paths and no error codes,
     because it may be spoken.
+
+    Three sentences, not one, distinguished by `current_raise_context`
+    (`None` degrades to the first, always-correct-if-generic sentence, the
+    same one this function returned before Milestone 6b's live-test found it
+    wrong for the other two cases):
+
+    1. Never issued to this device, on any transport. The original sentence
+       is exactly right here and stays byte-identical to it.
+    2. Issued, narrowed away by this transport's ceiling, but within this
+       transport's `raisable` -- a raise minted at the keyboard fixes it.
+       Must say so.
+    3. Issued, but this transport can never carry it, raised or not. Must
+       not promise a raise that cannot happen.
+
+    **What each sentence discloses, stated rather than waved away.** A
+    device's own issued set and its own effective set are already readable
+    off `GET /v1/session` (`grants`, `effective`, `raised`, `policy`), so
+    case 1 and the "this device holds it" half of cases 2 and 3 tell a
+    caller nothing new.
+
+    Raisable-ness is different and the difference is worth being honest
+    about: it is **not** on the session payload, and the one route that does
+    publish it (`GET /v1/transports`) is `require_admin(SYSTEM_CONTROL)` --
+    loopback only. So case 2 is the first thing in this API to tell a remote
+    caller that a capability is raisable on its transport. Accepted as a
+    stated trade-off, not an oversight, on two grounds: every `raisable` set
+    is static data checked into a public repository, so it is not secret from
+    anyone who can read TENKA at all; and minting a raise is
+    `require_admin(SYSTEM_CONTROL)` on a loopback listener, so a remote
+    caller learns something it has no route to act on. If either of those
+    ever stops being true, this sentence is the thing to revisit.
     """
-    return (f"That needs the {required.value} permission, "
-            f"which this device doesn't have.")
+    context = current_raise_context.get()
+    if context is None or required not in context.issued:
+        return (f"That needs the {required.value} permission, "
+                f"which this device doesn't have.")
+    if required in context.raisable:
+        return (f"This device holds {required.value}; raise it from the "
+                f"keyboard to use it here.")
+    return (f"This device holds {required.value}, but this connection "
+            f"can never carry it.")
 
 
 def capability_refusal(required: Capability) -> "str | None":

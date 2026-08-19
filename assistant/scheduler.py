@@ -118,8 +118,9 @@ def _run_handler(task: dict) -> str:
 
 async def _async_run_handler(task: dict) -> str:
     from assistant.actions import (
-        LOCAL_GRANTS, LOCAL_PRINCIPAL, current_grants, current_principal,
-        execute, set_grants, set_principal,
+        LOCAL_GRANTS, LOCAL_PRINCIPAL, LOCAL_RAISE_CONTEXT, current_grants,
+        current_principal, current_raise_context, execute, set_grants,
+        set_principal, set_raise_context,
     )
 
     task_type = task["task_type"]
@@ -138,9 +139,15 @@ async def _async_run_handler(task: dict) -> str:
         # answer at her own keyboard. See core/principal.py.
         token = set_grants(LOCAL_GRANTS)
         ptoken = set_principal(LOCAL_PRINCIPAL)
+        # Installed alongside the pair above for the same reason: a scheduled
+        # task never reaches a refusal in practice (LOCAL_GRANTS holds
+        # everything), but every set_grants() call site installs the raise
+        # context too, so an unset one is never mistaken for a forgotten one.
+        rtoken = set_raise_context(LOCAL_RAISE_CONTEXT)
         try:
             return await execute("web_search", {"query": goal})
         finally:
+            current_raise_context.reset(rtoken)
             current_principal.reset(ptoken)
             current_grants.reset(token)
     elif task_type == "http_check":
@@ -161,9 +168,11 @@ async def _async_run_handler(task: dict) -> str:
         # rides along for the reason the web_search branch above gives.
         token = set_grants(LOCAL_GRANTS)
         ptoken = set_principal(LOCAL_PRINCIPAL)
+        rtoken = set_raise_context(LOCAL_RAISE_CONTEXT)
         try:
             return await run_procedure(proc, goal)
         finally:
+            current_raise_context.reset(rtoken)
             current_principal.reset(ptoken)
             current_grants.reset(token)
     else:
