@@ -46,8 +46,18 @@ class ChatDispatch(Protocol):
     # would have to default to something, and both available defaults are
     # wrong -- "local" hands a device of unknown provenance the operator's own
     # questions, and "nobody" is a dead end that reads as a timeout.
+    #
+    # `issued` and `raisable` are the two frozensets `ChatRuntime.send`
+    # (io/api/runtime.py) carries down from the route -- everything a refusal
+    # inside the turn needs beyond the effective `grants` to say whether a
+    # raise at the keyboard could fix it (see `actions/__init__.py`'s
+    # `RaiseContext`). Optional, unlike `grants`/`principal`: a caller that
+    # forgets them gets today's generic refusal sentence, not a crash.
     async def submit(self, text: str, grants: frozenset[Capability],
-                     principal: str) -> tuple[str, str, bool, str]: ...
+                     principal: str,
+                     issued: "frozenset[Capability] | None" = None,
+                     raisable: "frozenset[Capability] | None" = None,
+                     ) -> tuple[str, str, bool, str]: ...
     async def abort(self) -> bool: ...
     # Whether a submitted turn is currently in flight -- read by
     # LiveSystemRuntime for StatusInfo.busy. A plain attribute/property, not
@@ -89,13 +99,25 @@ class LiveChatRuntime:
         self._dispatch = dispatch
 
     async def send(self, text: str, grants: frozenset[Capability],
-                   principal: str) -> TurnRef:
+                   principal: str,
+                   issued: "frozenset[Capability] | None" = None,
+                   raisable: "frozenset[Capability] | None" = None,
+                   ) -> TurnRef:
         # `grants` and `principal` travel with the text rather than being read
         # from anywhere here: the route is the only place that knows *which
         # device* asked, and the turn runs later, on the queue consumer's
-        # task, where the request is long gone.
+        # task, where the request is long gone. `issued`/`raisable` ride the
+        # same way, for the same reason, and only when the caller actually
+        # has them: a `ChatDispatch` that predates this milestone's refusal
+        # fix (a test double, say) does not have to grow the two new keyword
+        # arguments just to keep working, so they are passed on only when at
+        # least one is not `None`.
+        kwargs = {}
+        if issued is not None or raisable is not None:
+            kwargs["issued"] = issued
+            kwargs["raisable"] = raisable
         turn_id, conversation_id, accepted, reason = await self._dispatch.submit(
-            text, grants, principal)
+            text, grants, principal, **kwargs)
         return TurnRef(turn_id, conversation_id, accepted, reason)
 
     async def conversations(self) -> list[ConversationRef]:

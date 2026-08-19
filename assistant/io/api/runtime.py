@@ -295,8 +295,22 @@ class ChatRuntime(Protocol):
     # would produce a device that can chat but can never answer its own
     # confirmations -- a silent dead end rather than a loud failure. See
     # core/principal.py and KI-13.
+    #
+    # `issued` and `raisable` default to `None` -- unlike `grants` and
+    # `principal`, a route that forgets them degrades to a generic refusal
+    # sentence rather than a wrong one, so there is no sharp-failure case to
+    # force here. Plain frozenset[Capability], not `policy.py`'s
+    # `ListenerPolicy`: `io/api` may hand these two fields to `actions/`, but
+    # may never hand the module they come from (see
+    # `assistant/actions/__init__.py`'s `RaiseContext`). `issued` is the
+    # device's pre-ceiling grant set (`request.state.issued_grants`);
+    # `raisable` is this listener's fixed `ListenerPolicy.raisable`. Neither
+    # tells a device anything `GET /v1/session` does not already.
     async def send(self, text: str, grants: frozenset[Capability],
-                   principal: str) -> TurnRef: ...
+                   principal: str,
+                   issued: "frozenset[Capability] | None" = None,
+                   raisable: "frozenset[Capability] | None" = None,
+                   ) -> TurnRef: ...
     async def conversations(self) -> list[ConversationRef]: ...
     async def conversation(self, conversation_id: str) -> ConversationDetail | None: ...
     async def abort(self) -> bool: ...

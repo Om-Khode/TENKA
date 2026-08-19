@@ -251,7 +251,10 @@ class _StudioDispatch:
         return self._busy
 
     async def submit(self, text: str, grants: "frozenset[Capability]",
-                     principal: str) -> tuple[str, str, bool, str]:
+                     principal: str,
+                     issued: "frozenset[Capability] | None" = None,
+                     raisable: "frozenset[Capability] | None" = None,
+                     ) -> tuple[str, str, bool, str]:
         if self._busy:
             return ("", "", False, "busy")
         self._busy = True
@@ -264,7 +267,22 @@ class _StudioDispatch:
         # gone by then. `_grants_for_item` and `_principal_for_item` read them
         # back, and they read by source -- for a local item the third slot is
         # stt_ms and there is no fourth.
-        _input_queue.put(("studio", text, grants, principal))
+        #
+        # A 5th slot, `RaiseContext`, rides along only when the caller
+        # actually supplied both halves of it -- `issued` and `raisable`
+        # arrive as two keyword arguments rather than a `RaiseContext`
+        # already built, because `ChatDispatch.submit` (the protocol this
+        # method satisfies) lives in `actions/` and must not force every
+        # caller across the `io/api` boundary to import that class just to
+        # construct one. Built here instead, the one place both halves and
+        # the type meet. `_raise_context_for_item` reads it back the same
+        # defensive way `_grants_for_item` reads the grant set: absent means
+        # `_refuse` degrades to its original, generic sentence.
+        if issued is not None and raisable is not None:
+            raise_context = _actions_module.RaiseContext(issued=issued, raisable=raisable)
+            _input_queue.put(("studio", text, grants, principal, raise_context))
+        else:
+            _input_queue.put(("studio", text, grants, principal))
         return (turn_id, session_mod.get_current_session_id(), True, "")
 
     def mark_done(self) -> None:
@@ -1122,7 +1140,8 @@ def _publish_turn_status(source: str, phase: StatusPhase) -> None:
 async def process_text_from_queue(source: str, transcription: str, bridge: UnityBridge,
                                   stt_ms: int | None = None,
                                   grants: "frozenset[Capability] | None" = None,
-                                  principal: "str | None" = None):
+                                  principal: "str | None" = None,
+                                  raise_context: "_actions_module.RaiseContext | None" = None):
     """
     Run Intent → Policy → Action/LLM → TTS → Unity animations
 
@@ -1138,6 +1157,13 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     item. The pair is what closes KI-13 -- grants say what a caller may do,
     the principal says whose question it may answer, and 6a.5 could only ask
     the first.
+
+    `raise_context` is what a refusal needs to say whether a raise at the
+    keyboard would fix it: what the caller was issued, and what this
+    transport's `raisable` literal holds. Unlike `grants`/`principal`, `None`
+    degrades rather than refuses -- `_refuse` falls back to its original,
+    generic sentence when no context was ever installed. `_raise_context_for_item`
+    decides for a queued item.
     """
     global _turn_counter
     from . import session as session_mod
@@ -1165,6 +1191,16 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     # in `set_grants` would strand an identity, and an identity with no grants
     # can do nothing, whereas the reverse would strand privilege.
     _principal_token = _actions_module.set_principal(principal)
+
+    # Installed between the principal token above and the grants token below
+    # -- after principal for the same reason principal comes before grants
+    # (a raise here would strand an identity, never the reverse), and before
+    # grants so the comment on the grants line stays literally true: nothing
+    # may sit between that line and the `try`. A raise context has no
+    # fail-closed property of its own to protect -- `None` only ever makes
+    # `_refuse` fall back to its generic sentence, never grants or refuses
+    # anything -- so it is not the one the ordering exists to guard.
+    _raise_ctx_token = _actions_module.set_raise_context(raise_context)
 
     # Set LAST, immediately before the `try` whose `finally` resets it, and
     # after `_wake_listener.pause()` rather than before. An adversarial
@@ -2209,6 +2245,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         _tracker.save()
         _telemetry.reset_current_tracker(_tracker_token)
         _actions_module.current_grants.reset(_grants_token)
+        _actions_module.current_raise_context.reset(_raise_ctx_token)
         _actions_module.current_principal.reset(_principal_token)
         # The turn this "studio" item started is only now actually over --
         # success, failure or an early return above all reach this
@@ -2285,6 +2322,34 @@ def _principal_for_item(item: tuple) -> "str | None":
     return None
 
 
+def _raise_context_for_item(item: tuple) -> "_actions_module.RaiseContext | None":
+    """Read a queued item's `RaiseContext` out of its fifth slot.
+
+    The third member of the `_grants_for_item`/`_principal_for_item` pair, and
+    it decides the same way, with one deliberate difference in what "missing"
+    means:
+
+    - Local sources ("stt", "chat") get `LOCAL_RAISE_CONTEXT` -- issued
+      everything, nothing left to raise -- stated explicitly, the same way
+      they get `LOCAL_PRINCIPAL` and the full grant set.
+    - Studio enqueues `("studio", text, grants, principal, raise_context)`
+      only when `_StudioDispatch.submit` was given both `issued` and
+      `raisable`; a caller of `submit` that predates this milestone's fix, or
+      a test double standing in for one, still enqueues the 4-tuple, and
+      that is not a lost fact the way a missing grant set or principal would
+      be. Unlike those two, `_refuse` has a safe, always-correct-if-generic
+      answer for "nobody said": its original sentence. So a "studio" item
+      without a fifth slot gets `None` here, and `None` degrades rather than
+      refuses.
+    """
+    if item[0] in _LOCAL_SOURCES:
+        return _actions_module.LOCAL_RAISE_CONTEXT
+    if item[0] == "studio":
+        carried = item[4] if len(item) > 4 else None
+        return carried if isinstance(carried, _actions_module.RaiseContext) else None
+    return None
+
+
 async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
     """Handle exactly one item already pulled off `_input_queue`.
 
@@ -2314,6 +2379,7 @@ async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
     source, text = item[0], item[1]
     grants, stt_ms = _grants_for_item(item)
     principal = _principal_for_item(item)
+    raise_context = _raise_context_for_item(item)
     # The status bracket is mirrored here for the same reason mark_done() is,
     # and it has to be *both* halves: a raise before the inner try: leaves the
     # bus at whatever the previous turn ended on, and a lone closing IDLE
@@ -2324,7 +2390,8 @@ async def _process_one_queued_item(item: tuple, bridge: UnityBridge) -> None:
     _publish_turn_status(source, StatusPhase.THINKING)
     try:
         await process_text_from_queue(source, text, bridge, stt_ms=stt_ms,
-                                      grants=grants, principal=principal)
+                                      grants=grants, principal=principal,
+                                      raise_context=raise_context)
     finally:
         _publish_turn_status(source, StatusPhase.IDLE)
         if source == "studio" and _studio_dispatch is not None:

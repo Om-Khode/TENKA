@@ -27,6 +27,12 @@ class FakeChatRuntime:
         # and can never answer its own confirmation, which no other assertion
         # here would notice.
         self.sent_principals: list[str] = []
+        # What the route handed over as the raise-context halves -- routes/
+        # chat.py always passes both now (real requests always have an
+        # issued set and a listener policy), so this fake has to accept them
+        # even though most tests never inspect them.
+        self.sent_issued: list[frozenset] = []
+        self.sent_raisable: list[frozenset] = []
         self.aborted = 0
         self._messages = [
             ChatMessage("m1", "user", "what did I ask you yesterday", "2026-08-07T09:00:00Z"),
@@ -34,13 +40,16 @@ class FakeChatRuntime:
                         "2026-08-07T09:00:04Z", intent="memory_query"),
         ]
 
-    async def send(self, text: str, grants: frozenset,
-                   principal: str) -> TurnRef:
+    async def send(self, text: str, grants: frozenset, principal: str,
+                   issued: frozenset | None = None,
+                   raisable: frozenset | None = None) -> TurnRef:
         if self.busy:
             return TurnRef("", "c1", accepted=False, reason="busy")
         self.sent.append(text)
         self.sent_grants.append(grants)
         self.sent_principals.append(principal)
+        self.sent_issued.append(issued)
+        self.sent_raisable.append(raisable)
         return TurnRef(f"t{len(self.sent)}", "c1", accepted=True)
 
     async def conversations(self) -> list[ConversationRef]:
