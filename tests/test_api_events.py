@@ -82,6 +82,49 @@ def test_an_unknown_client_frame_is_ignored_not_fatal(context):
         assert socket.receive_json()["type"] in ("error", "ack")
 
 
+def test_a_live_raise_is_visible_over_the_socket(context, monkeypatch):
+    """Fix round 5, Important 2: `authenticate()` folds a live raise into
+    `effective()` as its third argument; the socket's two call sites
+    (connect-time, and `_reverify` on every delivered frame) did not, so a
+    raise widened the HTTP path but was invisible over this socket for the
+    same device and policy. Both are pinned here by spying on `effective()`
+    itself and asserting the `raised` argument it receives reflects the
+    live `RaiseStore`, rather than the empty default a call site that never
+    threads it through would always produce."""
+    client, app, _, token = context
+    from assistant.io.api import app as app_mod
+    from assistant.io.api.raises import RaiseStore
+
+    device = app.state.auth.vault.verify(token)
+    store = RaiseStore()
+    store.grant(device.device_id, "local", frozenset({Capability.SYSTEM_CONTROL}),
+                60.0, granted_by="test", reason="probe")
+    app.state.raises = store
+
+    calls: list[frozenset] = []
+    real_effective = app_mod.effective
+
+    def _spy(grants, policy, raised=frozenset()):
+        calls.append(raised)
+        return real_effective(grants, policy, raised)
+
+    monkeypatch.setattr(app_mod, "effective", _spy)
+
+    with _as(client, token).websocket_connect("/v1/events") as socket:
+        socket.receive_json()  # hello
+        assert calls, "effective() was never called at connect time"
+        assert calls[-1] == frozenset({Capability.SYSTEM_CONTROL}), (
+            "the connect-time capability check never saw the live raise")
+
+        calls.clear()
+        app.state.hub.publish({"type": "task_step", "taskId": "t1", "index": 0,
+                               "label": "reading", "state": "running"})
+        socket.receive_json()
+        assert calls, "effective() was never called on frame delivery (_reverify)"
+        assert calls[-1] == frozenset({Capability.SYSTEM_CONTROL}), (
+            "the per-frame reverify check never saw the live raise")
+
+
 def test_a_malformed_frame_is_ignored_not_fatal(context):
     """Text that is not JSON at all -- not just well-formed JSON of an
     unknown shape -- must not kill the connection either."""

@@ -714,7 +714,16 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             # Same intersection `authenticate()` applies, for the same
             # reason: the two capability checks below must read the grants
             # this *listener* carries, not the ones the device was issued.
-            grants = effective(device.grants, policy)
+            # `raised` folded in the same way, or a live raise is invisible
+            # over this socket while the identical raise widens the HTTP
+            # path for the same device and policy (fix round 5, Important 2).
+            raise_store = getattr(app.state, "raises", None)
+            raised: frozenset[Capability] = frozenset()
+            if raise_store is not None:
+                raised = await asyncio.to_thread(
+                    raise_store.capabilities_for, device.device_id,
+                    policy.name)
+            grants = effective(device.grants, policy, raised)
             if not grants:
                 _audit("1008")
                 await websocket.close(code=1008)
@@ -853,7 +862,16 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             if fresh is None or fresh.device_id != device.device_id:
                 answer = None
             else:
-                grants = effective(fresh.grants, policy)
+                # Same fold as the connect-time check above, and for the
+                # same reason (fix round 5, Important 2): called directly,
+                # not through `asyncio.to_thread`, matching `verify()` just
+                # above it -- both are synchronous lookups this handler
+                # already runs inline, per frame.
+                raise_store = getattr(app.state, "raises", None)
+                raised: frozenset[Capability] = (
+                    raise_store.capabilities_for(fresh.device_id, policy.name)
+                    if raise_store is not None else frozenset())
+                grants = effective(fresh.grants, policy, raised)
                 if not grants or Capability.OBSERVE not in grants:
                     answer = None
                 else:
