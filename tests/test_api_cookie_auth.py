@@ -39,8 +39,8 @@ def _client(vault: TokenVault, *, policies: dict[int, str]) -> ApiTestClient:
     """A client whose requests really do arrive on `LOCAL_PORT`.
 
     `policies` names what that one port is, so a single test can move the same
-    token between a loopback listener and a Cloudflare quick tunnel without
-    anything about the request itself changing.
+    token between a loopback listener and a remote tunnel without anything
+    about the request itself changing.
     """
     app = create_app(build_fake_runtime(), vault,
                      origins=["http://localhost:3000"],
@@ -48,14 +48,38 @@ def _client(vault: TokenVault, *, policies: dict[int, str]) -> ApiTestClient:
     return ApiTestClient(app, base_url=BASE_URL)
 
 
+def _register_observe_only_policy(monkeypatch) -> None:
+    """A synthetic policy, ceiling OBSERVE alone, registered under the name
+    `"observe_only"`.
+
+    Milestone 6b's `quick` transport used to be this narrow -- the one real
+    listener whose ceiling excluded FILES and CHAT_SEND as well as
+    SYSTEM_CONTROL and EXECUTE -- and it was removed outright (no device
+    could ever authenticate over it). `local`, `tailnet` and `funnel` all
+    carry FILES and CHAT_SEND, so none of the three remaining transports can
+    demonstrate "a full token narrowed down to observation only" on its own;
+    this synthetic policy exists so that property still has a test rather
+    than silently losing coverage when its one real example was deleted.
+    """
+    from assistant.io.api.policy import POLICIES, ListenerPolicy
+
+    monkeypatch.setitem(POLICIES, "observe_only", ListenerPolicy(
+        name="observe_only", admin=False, allow_bearer=False,
+        secure_cookie=True, ceiling=frozenset({Capability.OBSERVE}),
+        raisable=frozenset(), pairable=True,
+    ))
+
+
 @pytest.fixture()
-def quick_client(tmp_path):
-    """A device issued every capability, arriving on the Cloudflare quick
-    tunnel. The token is deliberately maximal: whatever this client cannot
-    reach, the *ceiling* refused, not the grant."""
+def observe_only_client(tmp_path, monkeypatch):
+    """A device issued every capability, arriving on the synthetic
+    OBSERVE-only listener (`_register_observe_only_policy`). The token is
+    deliberately maximal: whatever this client cannot reach, the *ceiling*
+    refused, not the grant."""
+    _register_observe_only_policy(monkeypatch)
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    client = _client(vault, policies={LOCAL_PORT: "quick"})
+    client = _client(vault, policies={LOCAL_PORT: "observe_only"})
     client.cookies.set(COOKIE_NAME, token)
     return client
 
@@ -85,17 +109,22 @@ def test_a_request_on_an_unregistered_port_is_refused(tmp_path):
     assert client.get("/v1/status").status_code == 401
 
 
-def test_the_ceiling_narrows_a_full_token(tmp_path):
-    """Same token, same route, different listener: the quick policy has no
-    FILES in its ceiling, so the file route is refused even though the device
-    holds the grant."""
+def test_the_ceiling_narrows_a_full_token(tmp_path, monkeypatch):
+    """Same token, same route, different listener: the synthetic
+    OBSERVE-only policy has no FILES in its ceiling, so the file route is
+    refused even though the device holds the grant. (Milestone 6b's `quick`
+    transport used to be the real listener this narrow; it was removed, and
+    `tailnet`/`funnel` both carry FILES, so a synthetic policy is what still
+    proves this narrowing happens -- see `_register_observe_only_policy`.)
+    """
+    _register_observe_only_policy(monkeypatch)
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    quick = _client(vault, policies={LOCAL_PORT: "quick"})
-    quick.cookies.set(COOKIE_NAME, token)
-    assert quick.get("/v1/files/roots").status_code == 403
-    assert quick.post("/v1/chat", json={"text": "hi"}).status_code == 403
-    assert quick.get("/v1/status").status_code == 200      # OBSERVE survives
+    client = _client(vault, policies={LOCAL_PORT: "observe_only"})
+    client.cookies.set(COOKIE_NAME, token)
+    assert client.get("/v1/files/roots").status_code == 403
+    assert client.post("/v1/chat", json={"text": "hi"}).status_code == 403
+    assert client.get("/v1/status").status_code == 200      # OBSERVE survives
 
 
 # ─── OBSERVE is watching her; RECALL is reading what she stored ──────────
@@ -121,10 +150,11 @@ def test_the_socket_streams_for_an_observe_only_device(tmp_path):
         assert ws.receive_json()["type"] == "status"
 
 
-def test_a_forged_host_header_cannot_change_policy(tmp_path):
+def test_a_forged_host_header_cannot_change_policy(tmp_path, monkeypatch):
+    _register_observe_only_policy(monkeypatch)
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    client = _client(vault, policies={LOCAL_PORT: "quick"})
+    client = _client(vault, policies={LOCAL_PORT: "observe_only"})
     client.cookies.set(COOKIE_NAME, token)
     r = client.get("/v1/files/roots", headers={"Host": "127.0.0.1",
                                               "X-Forwarded-For": "127.0.0.1"})
@@ -258,7 +288,7 @@ def test_a_secure_listener_writes_the_host_prefixed_cookie(tmp_path):
     so a sibling under `*.ts.net` or `*.trycloudflare.com` cannot plant this
     name at all. That is what closes both halves, and it is available on every
     listener that can set `Secure`."""
-    for name in ("tailnet", "funnel", "quick"):
+    for name in ("tailnet", "funnel"):
         assert POLICIES[name].secure_cookie is True, name
         assert cookie_name_for(POLICIES[name]) == HOST_COOKIE_NAME, name
 
@@ -291,10 +321,10 @@ def test_a_real_pair_over_a_tunnel_sets_the_prefixed_cookie(tmp_path):
     using it -- the two `set_cookie` call sites are in `routes/pairing.py` and
     `routes/session.py`, not here.
 
-    `funnel`, not `quick`: spec §5.5 (Milestone 6b) refuses ALL redemption on
-    `quick` unconditionally, before the code is even consulted
-    (`tests/test_6b_pairing_transports.py` pins that refusal), so `quick` can
-    no longer complete a pair at all. `funnel` also sets `secure_cookie=True`
+    `funnel`: the removed `quick` transport (Milestone 6b) refused ALL
+    redemption unconditionally, before the code was even consulted, so it
+    could never complete a pair at all -- and it no longer exists to pick.
+    `funnel` sets `secure_cookie=True`
     -- the same property this test needs to demonstrate the `__Host-` prefix
     -- so the property survives the move exactly the way Task 12 already
     moved the equivalent tests in `test_api_pairing_routes.py`.
@@ -419,15 +449,15 @@ def test_a_published_transport_hostname_is_accepted(tmp_path):
     """A tunnel's public hostname is not knowable at build time, so a running
     transport publishes it onto the live collection the gate reads.
 
-    On a `quick` listener since Milestone 6b, and that is the point rather
-    than an incidental: a published name is accepted on the listener that
-    published it and nowhere else, and `local` accepts none at all. See
+    On the `funnel` listener since Milestone 6b, and that is the point
+    rather than an incidental: a published name is accepted on the listener
+    that published it and nowhere else, and `local` accepts none at all. See
     `host_is_allowed` -- that clause is KI-17's layer 3, and
     `tests/test_6b_host_scoping.py` pins both halves.
     """
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    client = _client(vault, policies={LOCAL_PORT: "quick"})
+    client = _client(vault, policies={LOCAL_PORT: "funnel"})
     client.cookies.set(COOKIE_NAME, token)
     assert client.get("/v1/status",
                       headers={"Host": "abc-def.trycloudflare.com"}).status_code == 421
@@ -507,9 +537,9 @@ def test_the_ceiling_narrows_a_route_that_checks_grants_itself(tmp_path):
     the device's full issued grants on a listener that carries none of them."""
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    quick = _client(vault, policies={LOCAL_PORT: "quick"})
-    quick.cookies.set(COOKIE_NAME, token)
-    r = quick.post("/v1/commands/lock_workstation/run", headers={CSRF_HEADER: "1"})
+    client = _client(vault, policies={LOCAL_PORT: "funnel"})
+    client.cookies.set(COOKIE_NAME, token)
+    r = client.post("/v1/commands/lock_workstation/run", headers={CSRF_HEADER: "1"})
     assert r.status_code == 403
 
 
@@ -521,7 +551,7 @@ _PATH_PARAMS = {
     "{command_id}": "volume_up",
     "{kind}": "voice",
     "{device_id}": "d1",
-    "{name}": "quick",
+    "{name}": "tailnet",
 }
 
 # The one mutating operation that is deliberately not gated on a capability
@@ -561,11 +591,12 @@ _MUTATING_OPERATIONS = frozenset({
     ("POST", "/v1/personality/reset"),
     # Enrollment and revocation. Both are `require_admin(SYSTEM_CONTROL)`, so
     # they are refused here twice over -- the ceiling carries no
-    # SYSTEM_CONTROL, and `quick` is not an admin listener.
+    # SYSTEM_CONTROL, and this listener is not an admin listener.
     ("POST", "/v1/pair/code"),
     ("DELETE", "/v1/devices/{device_id}"),
     # Minting and dropping a ceiling raise. Same gate, and the refusal here is
-    # doubly structural: `quick` is not an admin listener, and its `raisable`
+    # doubly structural: this listener is not an admin listener, and its
+    # `raisable`
     # is empty -- so even reaching the route would find nothing to lift. The
     # one control that widens what a device may do is minted at the keyboard,
     # always.
@@ -573,7 +604,7 @@ _MUTATING_OPERATIONS = frozenset({
     ("DELETE", "/v1/devices/{device_id}/raise"),
     # Starting and stopping a transport. Same gate and the same double
     # refusal as the two rows above: the ceiling carries no SYSTEM_CONTROL,
-    # and `quick` is not an admin listener either.
+    # and this listener is not an admin listener either.
     ("POST", "/v1/transports/{name}"),
     ("DELETE", "/v1/transports/{name}"),
     # Moving a verified credential from the bearer channel onto the cookie.
@@ -587,7 +618,7 @@ _MUTATING_OPERATIONS = frozenset({
 # 403. One entry, and it is not an inconsistency to be tidied away.
 #
 # Every other mutation here is refused by a *capability* gate: the device
-# holds the grant, the `quick` ceiling does not carry it, and 403 "capability
+# holds the grant, this listener's ceiling does not carry it, and 403 "capability
 # not granted" is the true sentence. `POST /v1/session/cookie` is gated on no
 # capability at all -- it is gated on `policy.allow_bearer`, a property of the
 # listener, because a cookie/bearer exchange is only meaningful where a bearer
@@ -661,12 +692,15 @@ def _sweep_mutations_are_refused(client) -> set[tuple[str, str]]:
     return swept
 
 
-def test_no_mutation_is_reachable_on_a_read_only_ceiling(tmp_path):
-    """The `quick` ceiling claims to be read-only *on the write side*. This is
-    that half of the claim, executed.
+def test_no_mutation_is_reachable_on_a_read_only_ceiling(tmp_path, monkeypatch):
+    """An OBSERVE-only ceiling claims to be read-only *on the write side*.
+    This is that half of the claim, executed, against the synthetic
+    `observe_only` policy -- Milestone 6b's `quick` transport was the one
+    real listener this narrow, and it was removed (`_register_observe_only_
+    policy`'s docstring has the argument).
 
-    `policy.py` says a device on a Cloudflare quick tunnel is "limited to
-    reading history and status through this transport, never to acting". The
+    `policy.py` says a device on such a listener is "limited to reading
+    history and status through this transport, never to acting". The
     "never to acting" half lives entirely in which capability each route
     happens to demand -- data spread across five route modules, readable from
     no single place -- and four routes were quietly violating it: a real cloud
@@ -674,10 +708,12 @@ def test_no_mutation_is_reachable_on_a_read_only_ceiling(tmp_path):
 
     **What this does not check.** It sweeps the 14 mutating operations of 30,
     and says nothing about what the surviving `{OBSERVE}` ceiling lets a
-    caller *read*. The ceiling's other stated purpose is limiting disclosure
-    over the one listener a third party can observe -- `SCREEN` is excluded
-    from `quick` for what Cloudflare could see, not for what an attacker could
-    do -- and a read route that discloses too much would pass this sweep
+    caller *read*. The removed `quick` transport's ceiling had a second stated
+    purpose beyond this one -- limiting disclosure over the one listener a
+    third party could observe, which is why it excluded SCREEN as well as
+    RECALL -- but that reasoning does not apply to this synthetic policy's
+    stand-in role here, only to the historical `quick` ceiling shape it
+    borrows. A read route that discloses too much would pass this sweep
     untouched. Method-based sweeping cannot express that;
     `test_no_stored_data_route_is_reachable_on_a_read_only_ceiling` below is
     that separate thing, added once the `CHAT` split proved the gap was real.
@@ -686,20 +722,22 @@ def test_no_mutation_is_reachable_on_a_read_only_ceiling(tmp_path):
     existence, arriving on a listener whose ceiling is `{OBSERVE}`, must not
     be able to change anything.
     """
+    _register_observe_only_policy(monkeypatch)
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    client = _client(vault, policies={LOCAL_PORT: "quick"})
+    client = _client(vault, policies={LOCAL_PORT: "observe_only"})
     client.cookies.set(COOKIE_NAME, token)
     assert _sweep_mutations_are_refused(client) == _MUTATING_OPERATIONS
 
 
-def test_the_read_only_sweep_catches_a_mutation_gated_on_a_read(tmp_path):
+def test_the_read_only_sweep_catches_a_mutation_gated_on_a_read(tmp_path, monkeypatch):
     """Guard for the sweep itself, not for the app: a new route gated on a
     read capability -- the exact mistake the four real ones made -- must be
     caught."""
+    _register_observe_only_policy(monkeypatch)
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    client = _client(vault, policies={LOCAL_PORT: "quick"})
+    client = _client(vault, policies={LOCAL_PORT: "observe_only"})
     client.cookies.set(COOKIE_NAME, token)
 
     leaky = APIRouter()
@@ -733,7 +771,8 @@ _OBSERVATION_OPERATIONS = frozenset({
     # all (it is what a caller consults *before* it has one), so it answers
     # 200 here regardless of the ceiling. Not stored data and not gated off
     # this transport; it is the least-observational thing on this list, and
-    # it is still on this list because "answers 200 on quick" is exactly the
+    # it is still on this list because "answers 200 regardless of the
+    # ceiling" is exactly the
     # property to pin, not to leave unclassified.
     ("GET", "/v1/listener"),
 })
@@ -747,21 +786,22 @@ _STORED_DATA_OPERATIONS = frozenset({
     ("GET", "/v1/memory/procedures"),
 })
 
-# Refused on `quick` for a reason that predates this split: its ceiling
-# carries neither FILES nor SYSTEM_CONTROL. Listed so the completeness
+# Refused on an OBSERVE-only ceiling for a reason that predates this split:
+# it carries neither FILES nor SYSTEM_CONTROL. Listed so the completeness
 # assertion below can be an equality rather than a subset.
 _OFF_THIS_TRANSPORT_ENTIRELY = frozenset({
     ("GET", "/v1/audit"),
     # Who holds a credential to this machine: the security configuration, the
     # same class of fact as the audit log, and refused here for the same two
-    # reasons -- SYSTEM_CONTROL is not in this ceiling, and `quick` is not an
-    # admin listener.
+    # reasons -- SYSTEM_CONTROL is not in this ceiling, and this listener is
+    # not an admin listener.
     ("GET", "/v1/devices"),
     ("GET", "/v1/files"),
     ("GET", "/v1/files/content"),
     ("GET", "/v1/files/roots"),
     # Same double refusal as `/v1/devices`: `require_admin(SYSTEM_CONTROL)`,
-    # and `quick` is neither an admin listener nor a SYSTEM_CONTROL ceiling.
+    # and this listener is neither an admin listener nor a SYSTEM_CONTROL
+    # ceiling.
     ("GET", "/v1/transports"),
 })
 
@@ -795,21 +835,21 @@ def _sweep_reads(client) -> dict[tuple[str, str], int]:
     return statuses
 
 
-def test_no_stored_data_route_is_reachable_on_a_read_only_ceiling(quick_client):
+def test_no_stored_data_route_is_reachable_on_a_read_only_ceiling(observe_only_client):
     """The companion to Task 5's mutation sweep, for the disclosure side that
     sweep explicitly does not cover. Enumerate the GET operations and assert
-    the transcript and knowledge routes refuse on `quick`."""
+    the transcript and knowledge routes refuse on the OBSERVE-only listener."""
     for path in ("/v1/chat/conversations", "/v1/memory/knowledge"):
-        assert quick_client.get(path).status_code == 403
+        assert observe_only_client.get(path).status_code == 403
 
-    statuses = _sweep_reads(quick_client)
+    statuses = _sweep_reads(observe_only_client)
     assert set(statuses) == (_OBSERVATION_OPERATIONS | _STORED_DATA_OPERATIONS
                              | _OFF_THIS_TRANSPORT_ENTIRELY), (
         "a GET operation appeared or vanished; classify it before this passes"
     )
     stored_leaks = {op: code for op, code in statuses.items()
                     if op in _STORED_DATA_OPERATIONS and code != 403}
-    assert not stored_leaks, f"stored data readable on quick: {stored_leaks}"
+    assert not stored_leaks, f"stored data readable on an OBSERVE-only listener: {stored_leaks}"
     assert {op for op, code in statuses.items() if code == 200} == _OBSERVATION_OPERATIONS
 
 

@@ -1,14 +1,17 @@
 # assistant/io/api/transports/__init__.py
 """Transport registry -- one provider per module, self-registering.
 
-Milestone 6b exposes the Studio daemon over three transports (`tailnet`,
-`funnel`, `quick`), each its own listener with its own capability ceiling
-(`..policy.POLICIES`). Adding a fourth is a new module under this package and
-nothing else -- there is no transport-specific branching anywhere outside it.
-This is the same self-registration shape `llm/providers/` uses for
-`provider_registry` and `actions/` uses for `tool_registry`: a registry that
-exists once, and modules that call `transport_registry.register(...)` on
-import rather than being wired in by name from the outside.
+Milestone 6b exposes the Studio daemon over two transports (`tailnet`,
+`funnel`), each its own listener with its own capability ceiling
+(`..policy.POLICIES`). A third, `quick` (a Cloudflare tunnel), shipped in the
+same milestone and was removed from it -- no device could ever authenticate
+over it (`..policy`'s module docstring has the full argument). Adding a new
+one is a new module under this package and nothing else -- there is no
+transport-specific branching anywhere outside it. This is the same
+self-registration shape `llm/providers/` uses for `provider_registry` and
+`actions/` uses for `tool_registry`: a registry that exists once, and modules
+that call `transport_registry.register(...)` on import rather than being
+wired in by name from the outside.
 
 Layering: `io/api/` may import `core/` and `config` only. Importing
 `..policy` from here is legal and expected -- `POLICIES` is what `register()`
@@ -84,10 +87,11 @@ transport_registry = TransportRegistry()
 # the same shape `llm/providers/__init__.py` uses for `gemini`, `groq`,
 # `cerebras`, `ollama`.
 #
-# Both providers now exist: `tailscale.py` registers `tailnet` and `funnel`
-# (Task 7), `cloudflare.py` registers `quick` (Task 8). A fourth provider adds
-# its own `from . import <module>  # noqa: E402, F401` line here and nothing
-# else -- importing a module that is not yet written would fail the whole
-# package import, so a line is only ever added once its module lands.
+# `tailscale.py` registers `tailnet` and `funnel` (Task 7). A `cloudflare.py`
+# registering `quick` (Task 8) existed through Milestone 6b and was deleted
+# in the same milestone -- no device could ever authenticate over that
+# transport (`..policy`'s module docstring). A new provider adds its own
+# `from . import <module>  # noqa: E402, F401` line here and nothing else --
+# importing a module that is not yet written would fail the whole package
+# import, so a line is only ever added once its module lands.
 from . import tailscale  # noqa: E402, F401
-from . import cloudflare  # noqa: E402, F401

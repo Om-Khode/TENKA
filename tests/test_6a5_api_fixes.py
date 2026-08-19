@@ -133,16 +133,25 @@ def test_control_browse_url_neutralises_a_non_http_scheme():
     assert 'url = "https://" + url' in src
 
 
-def test_control_the_cloudflare_quick_ceiling_excludes_chat_send():
+def test_control_an_observe_only_ceiling_excludes_chat_send(monkeypatch):
     """The Part 1b findings all need CHAT_SEND. The widest-exposure listener
-    -- the Cloudflare quick tunnel, where a third party reads the plaintext
-    -- is OBSERVE only, so none of them reach it. They DO reach `tailnet`
-    and `funnel`, and `tailscale funnel` is reachable from the open internet
-    by anyone holding the URL."""
-    from assistant.io.api.policy import POLICIES
+    shape -- Milestone 6b's now-removed `quick` transport (a Cloudflare
+    tunnel, where a third party reads the plaintext) was the one real
+    listener this narrow -- is OBSERVE only, so none of them reach it.
+    `tailnet` and `funnel` both carry CHAT_SEND, so a synthetic policy is
+    what still proves the property (`policy.py`'s module docstring has the
+    argument for `quick`'s removal). They DO reach `tailnet` and `funnel`,
+    and `tailscale funnel` is reachable from the open internet by anyone
+    holding the URL."""
+    from assistant.io.api.policy import POLICIES, ListenerPolicy
     from assistant.core.capabilities import Capability
 
-    assert Capability.CHAT_SEND not in POLICIES["quick"].ceiling
+    monkeypatch.setitem(POLICIES, "observe_only", ListenerPolicy(
+        name="observe_only", admin=False, allow_bearer=False,
+        secure_cookie=True, ceiling=frozenset({Capability.OBSERVE}),
+        raisable=frozenset(), pairable=True,
+    ))
+    assert Capability.CHAT_SEND not in POLICIES["observe_only"].ceiling
     assert Capability.CHAT_SEND in POLICIES["tailnet"].ceiling
     assert Capability.CHAT_SEND in POLICIES["funnel"].ceiling
     assert Capability.EXECUTE not in POLICIES["funnel"].ceiling

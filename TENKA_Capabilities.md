@@ -134,13 +134,18 @@ transport it is using permits:
 | `local` | this machine only | everything | — (already holds everything) |
 | `tailnet` (Tailscale) | devices on the operator's own tailnet | observe, recall (transcripts/knowledge), send a chat message, screen, files | temporarily, deliberately: run code / change settings |
 | `funnel` (Tailscale, public) | anyone with the URL | same as `tailnet` | nothing — no raise, ever |
-| `quick` (Cloudflare) | anyone with a quick-tunnel URL | observation only (status, live events, configuration) | nothing — Cloudflare can read this traffic, so nothing sensitive is offered here at all |
 
 A "raise" is a temporary, expiring widening of what `tailnet` alone may carry — minted
 only by the operator at the keyboard, never remotely, and never able to hand a device a
 capability it wasn't already issued. See
 [`TENKA_Known_Issues.md`](./TENKA_Known_Issues.md) for the defences around tunnelled
 traffic and the pending-confirmation ownership fix that came with this.
+
+A fourth transport, `quick` (a Cloudflare tunnel), was removed after shipping in the same
+milestone: Cloudflare terminates the connection's encryption, so pairing was refused on
+it outright, and with no bearer header accepted either, no device could ever obtain or
+present a credential over it at all. `funnel` is the transport for "a public URL, nothing
+installed on the phone."
 
 ---
 

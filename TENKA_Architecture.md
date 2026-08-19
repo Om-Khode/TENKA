@@ -429,9 +429,9 @@ pipeline on this machine. That surface lives entirely under `assistant/io/api/` 
 built around one idea: **a device's own permissions and the transport it arrived over are
 two separate questions, and the answer is the narrower of the two, always.**
 
-### One app, four doors
+### One app, three doors
 
-A single ASGI application serves four listening sockets, distinguished only by which
+A single ASGI application serves three listening sockets, distinguished only by which
 fixed port a connection was accepted on — never by hostname or peer address, both of
 which a tunnel can make look identical to a truly local caller:
 
@@ -440,13 +440,20 @@ which a tunnel can make look identical to a truly local caller:
 | `local` | processes on this machine | everything — device management, every capability |
 | `tailnet` | devices signed into the operator's own Tailscale network | chat, screen, files, recall — never running code or changing settings, unless deliberately raised |
 | `funnel` | anyone with the URL, over the operator's Tailscale identity | same as `tailnet`, minus the ability to be raised |
-| `quick` | anyone with a Cloudflare quick-tunnel URL | status and observation only — Cloudflare terminates the connection's encryption, so nothing sensitive is ever offered here |
 
 A device authenticates once and is issued a set of **capabilities** — coarse permissions
 like "read what she remembers" or "run code on this machine." What it can actually do on
 a given connection is the *intersection* of what it was issued and what that listener
 permits — a capability a device holds is never enough on its own if the door it walked
 through doesn't carry it.
+
+A fourth door, `quick` (a Cloudflare tunnel, status-and-observation only), shipped in the
+same milestone this table describes and was removed before the milestone closed: pairing
+was refused on it outright, since Cloudflare terminates the connection's encryption and
+would read both the pairing code and the credential it redeems for — and with no bearer
+header accepted either, no device could ever mint or present a credential over it at all.
+Its only reachable surface was a static landing page, which the project's public demo
+already serves. `funnel` covers the audience it existed for.
 
 ### Raising the ceiling, briefly and on purpose
 

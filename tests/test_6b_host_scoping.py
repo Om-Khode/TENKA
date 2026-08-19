@@ -3,10 +3,10 @@
 Spec `.superpowers/sdd/2026-08-16-milestone6b-transports/spec.md` §2.3 L3,
 §5.1, §5.2.
 
-6b binds four listeners on four ports serving one ASGI app. Two of KI-17's
-three defences are procedural: TENKA builds every tunnel's argv (L1), and a
-preflight refuses a stale `tailscale serve` mapping (L2). Both assume the
-tunnel is one TENKA launched, or at least one it can see.
+6b binds three listeners on three ports serving one ASGI app. Two of
+KI-17's three defences are procedural: TENKA builds every tunnel's argv
+(L1), and a preflight refuses a stale `tailscale serve` mapping (L2). Both
+assume the tunnel is one TENKA launched, or at least one it can see.
 
 This file pins the layer that assumes nothing. `tailscale serve` and
 `cloudflared` both forward the *public* authority in `Host`, so if the `local`
@@ -31,19 +31,17 @@ from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.api_client import ApiTestClient
 from tests.fakes.studio_runtime import build_fake_runtime
 
-# The four fixed ports of spec §2.2, spelled out rather than derived from
+# The three fixed ports of spec §2.2, spelled out rather than derived from
 # `listeners.port_for`: this suite is about what each *socket* is willing to
 # be called, so the numbers it sends to have to be visible in the test.
 LOCAL_PORT = 8787
 TAILNET_PORT = 8788
 FUNNEL_PORT = 8789
-QUICK_PORT = 8790
 
 ALL_LISTENERS: dict[int, str] = {
     LOCAL_PORT: "local",
     TAILNET_PORT: "tailnet",
     FUNNEL_PORT: "funnel",
-    QUICK_PORT: "quick",
 }
 
 DEV_ORIGINS = ["http://localhost:3000"]
@@ -52,19 +50,27 @@ DEV_ORIGINS = ["http://localhost:3000"]
 # refusal and a test that asserts an acceptance cannot drift onto different
 # spellings of "the tunnel's public name".
 #
-# There is deliberately no separate `FUNNEL_NAME`, and the absence is a fact
-# about the deployment rather than an omission: `tailscale serve` and
-# `tailscale funnel` publish the **same** MagicDNS name. So between those two
-# listeners the cross-listener `Host` refusal below is vacuous in production --
-# the same string is legitimately published on both -- and what separates them
-# is the port alone, which is the field a client cannot forge and the reason
-# policy was keyed on it in the first place. Do not "fix" this by inventing a
-# distinct funnel hostname: it would make the tests assert a separation the
-# real deployment does not have. `quick` is the listener used below wherever a
-# genuinely distinct public name is needed, because Cloudflare really does
-# hand out its own.
+# There is deliberately no separate `FUNNEL_NAME` for the tailnet/funnel
+# *sameness* tests below, and the absence is a fact about the deployment
+# rather than an omission: `tailscale serve` and `tailscale funnel` publish
+# the **same** MagicDNS name, so those tests deliberately publish
+# `TAILNET_NAME` on `FUNNEL_PORT` too, rather than inventing a distinct
+# funnel hostname that would assert a separation the real deployment does
+# not have.
+#
+# `SECOND_NAME`, below, is a different thing: the generic cross-listener
+# scoping tests (`PublishedHosts` keying on `(listener, hostname)`) need
+# only *some* second hostname that differs from `TAILNET_NAME`, published on
+# a different port -- `PublishedHosts` never parses domain shape, so nothing
+# about *which* real transport would publish it matters to those tests.
+# Milestone 6b's `quick` transport (a Cloudflare tunnel) used to supply that
+# second name for free, because Cloudflare genuinely hands out its own
+# `*.trycloudflare.com` domain; it was removed outright (no device could
+# ever authenticate over it), so `SECOND_NAME` is published on `FUNNEL_PORT`
+# instead, purely as test data, and the tailnet/funnel sameness tests below
+# are unaffected since they use `TAILNET_NAME` on both ports, never this one.
 TAILNET_NAME = "laptop.tail1234.ts.net"
-QUICK_NAME = "abc-def.trycloudflare.com"
+SECOND_NAME = "second-tunnel.example.net"
 
 
 def _app(tmp_path, *, policies: dict[int, str] | None = None):
@@ -97,11 +103,11 @@ def _client_on(app, token: str, port: int) -> ApiTestClient:
     `tests/fakes/api_client.py` rewrites a leading `/` to the hard-coded
     `ws://127.0.0.1:8787` -- the *local* port -- regardless of the client's
     own `base_url`. A socket test written against `_client_on(app, token,
-    QUICK_PORT)` would therefore arrive on the local listener and assert
-    nothing about the quick one, silently and while passing. Pass an absolute
-    `ws://127.0.0.1:<port>/v1/events`, which `urljoin` leaves untouched, or
-    fix the fake to honour `base_url`. Every test in this file uses HTTP, so
-    none of them is currently exposed to it.
+    FUNNEL_PORT)` would therefore arrive on the local listener and assert
+    nothing about the funnel one, silently and while passing. Pass an
+    absolute `ws://127.0.0.1:<port>/v1/events`, which `urljoin` leaves
+    untouched, or fix the fake to honour `base_url`. Every test in this file
+    uses HTTP, so none of them is currently exposed to it.
     """
     client = ApiTestClient(app, base_url=f"http://127.0.0.1:{port}")
     client.cookies.set(COOKIE_NAME, token)
@@ -203,25 +209,28 @@ def test_a_transport_listener_accepts_the_names_its_own_session_published(tmp_pa
 
 
 def test_a_name_published_by_one_listener_is_refused_on_another(tmp_path):
-    """Spec §5.1. Owner scoping alone made a name published by the quick
-    tunnel a trusted `Host` -- and a trusted `Origin` -- on the funnel port,
-    which is a different transport with a different ceiling and a different
-    threat model."""
+    """Spec §5.1. Owner scoping alone made a name published by one
+    transport a trusted `Host` -- and a trusted `Origin` -- on a different
+    listener's port, one with a different ceiling and a different threat
+    model. `SECOND_NAME` published on `FUNNEL_PORT` is the module-level
+    stand-in for "some transport's own distinct public name" -- see the
+    module docstring for why the real `funnel`/`tailnet` pair cannot supply
+    one honestly."""
     app, token = _app(tmp_path)
-    app.state.published_hosts.publish(QUICK_NAME, owner="cf-1",
-                                      listener=QUICK_PORT)
+    app.state.published_hosts.publish(SECOND_NAME, owner="cf-1",
+                                      listener=FUNNEL_PORT)
 
-    quick = _client_on(app, token, QUICK_PORT)
-    assert quick.get("/v1/status",
-                     headers={"Host": QUICK_NAME}).status_code == 200
+    funnel = _client_on(app, token, FUNNEL_PORT)
+    assert funnel.get("/v1/status",
+                      headers={"Host": SECOND_NAME}).status_code == 200
 
-    for port in (FUNNEL_PORT, TAILNET_PORT, LOCAL_PORT):
+    for port in (TAILNET_PORT, LOCAL_PORT):
         other = _client_on(app, token, port)
         assert other.get("/v1/status",
-                         headers={"Host": QUICK_NAME}).status_code == 421, port
+                         headers={"Host": SECOND_NAME}).status_code == 421, port
 
-    assert app.state.published_hosts.hosts_for(QUICK_PORT) == frozenset({QUICK_NAME})
-    assert app.state.published_hosts.hosts_for(FUNNEL_PORT) == frozenset()
+    assert app.state.published_hosts.hosts_for(FUNNEL_PORT) == frozenset({SECOND_NAME})
+    assert app.state.published_hosts.hosts_for(TAILNET_PORT) == frozenset()
 
 
 def test_unpublishing_a_session_stops_its_names_immediately(tmp_path):
@@ -229,18 +238,18 @@ def test_unpublishing_a_session_stops_its_names_immediately(tmp_path):
     built, so a transport's stop path takes its name back on the very next
     request."""
     app, token = _app(tmp_path)
-    quick = _client_on(app, token, QUICK_PORT)
+    funnel = _client_on(app, token, FUNNEL_PORT)
 
-    app.state.published_hosts.publish(QUICK_NAME, owner="cf-1",
-                                      listener=QUICK_PORT)
-    assert quick.get("/v1/status",
-                     headers={"Host": QUICK_NAME}).status_code == 200
+    app.state.published_hosts.publish(SECOND_NAME, owner="cf-1",
+                                      listener=FUNNEL_PORT)
+    assert funnel.get("/v1/status",
+                      headers={"Host": SECOND_NAME}).status_code == 200
 
     withdrawn = app.state.published_hosts.unpublish("cf-1")
-    assert QUICK_NAME in withdrawn
-    assert quick.get("/v1/status",
-                     headers={"Host": QUICK_NAME}).status_code == 421
-    assert app.state.published_hosts.hosts_for(QUICK_PORT) == frozenset()
+    assert SECOND_NAME in withdrawn
+    assert funnel.get("/v1/status",
+                      headers={"Host": SECOND_NAME}).status_code == 421
+    assert app.state.published_hosts.hosts_for(FUNNEL_PORT) == frozenset()
 
 
 def test_dropping_a_listener_from_the_registry_stops_its_names_immediately(tmp_path):
@@ -260,24 +269,24 @@ def test_dropping_a_listener_from_the_registry_stops_its_names_immediately(tmp_p
     entry left to look wrong.
     """
     app, token = _app(tmp_path)
-    quick = _client_on(app, token, QUICK_PORT)
-    app.state.published_hosts.publish(QUICK_NAME, owner="cf-1",
-                                      listener=QUICK_PORT)
-    assert quick.get("/v1/status",
-                     headers={"Host": QUICK_NAME}).status_code == 200
+    funnel = _client_on(app, token, FUNNEL_PORT)
+    app.state.published_hosts.publish(SECOND_NAME, owner="cf-1",
+                                      listener=FUNNEL_PORT)
+    assert funnel.get("/v1/status",
+                      headers={"Host": SECOND_NAME}).status_code == 200
 
     # The name is still published; only the listener stopped being declared.
-    app.state.listener_policies.pop(QUICK_PORT)
-    assert quick.get("/v1/status",
-                     headers={"Host": QUICK_NAME}).status_code == 421
-    assert app.state.published_hosts.hosts_for(QUICK_PORT) == frozenset({QUICK_NAME})
+    app.state.listener_policies.pop(FUNNEL_PORT)
+    assert funnel.get("/v1/status",
+                      headers={"Host": SECOND_NAME}).status_code == 421
+    assert app.state.published_hosts.hosts_for(FUNNEL_PORT) == frozenset({SECOND_NAME})
 
     # The ratified half of "an unknown port refuses", pinned here beside it: a
     # loopback name still passes this gate on a port nobody declares, and is
     # answered 401 by `authenticate()` rather than 421 by the gate. Spec §2.4
     # item 4 and `test_api_cookie_auth.py::test_a_request_on_an_unregistered_
     # port_is_refused` both depend on that being the shape of the refusal.
-    assert quick.get("/v1/status").status_code == 401
+    assert funnel.get("/v1/status").status_code == 401
 
 
 def test_a_restarted_tunnel_does_not_leave_its_previous_name_trusted(tmp_path):
@@ -297,12 +306,12 @@ def test_a_restarted_tunnel_does_not_leave_its_previous_name_trusted(tmp_path):
     first = "old-tunnel.trycloudflare.com"
     second = "new-tunnel.trycloudflare.com"
 
-    published.publish(first, owner="cf-session-1", listener=QUICK_PORT)
+    published.publish(first, owner="cf-session-1", listener=FUNNEL_PORT)
     published.unpublish("cf-session-1")
-    published.publish(second, owner="cf-session-2", listener=QUICK_PORT)
+    published.publish(second, owner="cf-session-2", listener=FUNNEL_PORT)
 
-    assert published.hosts_for(QUICK_PORT) == frozenset({second})
-    origins = endpoint_origins(app.state, QUICK_PORT, POLICIES["quick"])
+    assert published.hosts_for(FUNNEL_PORT) == frozenset({second})
+    origins = endpoint_origins(app.state, FUNNEL_PORT, POLICIES["funnel"])
     assert f"https://{second}" in origins
     assert f"https://{first}" not in origins
 
@@ -321,21 +330,21 @@ def test_endpoint_origins_only_lists_hosts_published_by_the_accepting_port(tmp_p
     state.published_hosts = PublishedHosts()
     state.cors_origins = list(DEV_ORIGINS)
     state.listener_policies = dict(ALL_LISTENERS)
-    state.published_hosts.publish(QUICK_NAME, owner="cf-1", listener=QUICK_PORT)
+    state.published_hosts.publish(SECOND_NAME, owner="cf-1", listener=FUNNEL_PORT)
     state.published_hosts.publish(TAILNET_NAME, owner="ts-1",
                                   listener=TAILNET_PORT)
 
-    quick_origins = endpoint_origins(state, QUICK_PORT, POLICIES["quick"])
-    assert f"https://{QUICK_NAME}" in quick_origins
-    assert f"https://{TAILNET_NAME}" not in quick_origins
+    funnel_origins = endpoint_origins(state, FUNNEL_PORT, POLICIES["funnel"])
+    assert f"https://{SECOND_NAME}" in funnel_origins
+    assert f"https://{TAILNET_NAME}" not in funnel_origins
 
     tailnet_origins = endpoint_origins(state, TAILNET_PORT, POLICIES["tailnet"])
     assert f"https://{TAILNET_NAME}" in tailnet_origins
-    assert f"https://{QUICK_NAME}" not in tailnet_origins
+    assert f"https://{SECOND_NAME}" not in tailnet_origins
 
     # No port means no listener, so there is nothing to scope a published name
     # to and none is offered.
-    unknown = endpoint_origins(state, None, POLICIES["quick"])
+    unknown = endpoint_origins(state, None, POLICIES["funnel"])
     assert not any(origin.startswith("https://") for origin in unknown), unknown
 
 
@@ -371,7 +380,7 @@ def test_endpoint_origins_withholds_published_hosts_from_the_local_listener(tmp_
     # Same collection, same port, a transport policy: still trusted there.
     # The listener is what changed, which is the whole claim.
     assert f"https://{TAILNET_NAME}" in endpoint_origins(
-        state, LOCAL_PORT, POLICIES["quick"])
+        state, LOCAL_PORT, POLICIES["funnel"])
 
 
 def test_endpoint_origins_still_withholds_dev_origins_from_a_tunnel(tmp_path):
@@ -386,8 +395,7 @@ def test_endpoint_origins_still_withholds_dev_origins_from_a_tunnel(tmp_path):
     local_origins = endpoint_origins(state, LOCAL_PORT, POLICIES["local"])
     assert DEV_ORIGINS[0] in local_origins
 
-    for name, port in (("tailnet", TAILNET_PORT), ("funnel", FUNNEL_PORT),
-                       ("quick", QUICK_PORT)):
+    for name, port in (("tailnet", TAILNET_PORT), ("funnel", FUNNEL_PORT)):
         origins = endpoint_origins(state, port, POLICIES[name])
         assert DEV_ORIGINS[0] not in origins, name
 

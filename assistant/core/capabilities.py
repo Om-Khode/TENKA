@@ -28,8 +28,8 @@ class Capability(str, enum.Enum):
     # preferences, taught procedures, the names of the people she recognises.
     #
     # Split out of the old `CHAT`, which meant both of these at once. That
-    # ambiguity let the `quick` ceiling -- the Cloudflare tunnel, where a
-    # third party terminates TLS and reads the plaintext -- look like
+    # ambiguity let the `quick` ceiling -- a since-removed Cloudflare tunnel
+    # where a third party terminated TLS and read the plaintext -- look like
     # "observation only" while actually admitting the entire knowledge graph
     # and every transcript. `read_screen` and `camera_look` are intents, so
     # her narration of what was on screen lands in a transcript: excluding

@@ -637,10 +637,10 @@ class PublishedHosts:
     *where*, and Milestone 6b is where the second question starts having more
     than one answer.** Until 6b there was a single socket, so "which listener
     published this?" had one answer and storing it would have been ceremony.
-    With four sockets serving one app it is the difference between two
-    transports and one: a name published by the Cloudflare quick tunnel was
-    otherwise a trusted `Host` -- and, through `endpoint_origins()`, a trusted
-    `Origin` -- on the funnel port, which is a different transport with a
+    With three sockets serving one app it is the difference between two
+    transports and one: a name published by one tunnel was otherwise a
+    trusted `Host` -- and, through `endpoint_origins()`, a trusted `Origin` --
+    on another listener's port, which is a different transport with a
     different ceiling and a different adversary. So an entry is a
     `(listener, hostname)` pair, and every read is scoped to one listener.
 
@@ -790,10 +790,10 @@ class PublishedHosts:
         A stored `public_port` of `None` (nothing was supplied at publish
         time -- test scaffolding, `add()`) is treated exactly like an
         explicit `443`: no port suffix, the same default-port omission
-        `TransportAdapter.public_url` applies for `funnel` and `quick`. A
-        browser never puts the default port in `Origin` either, so emitting
-        one here would refuse a *legitimate* funnel origin -- the opposite
-        direction of this fix.
+        `TransportAdapter.public_url` applies for `funnel`. A browser never
+        puts the default port in `Origin` either, so emitting one here would
+        refuse a *legitimate* funnel origin -- the opposite direction of this
+        fix.
         """
         if listener is None:
             return frozenset()
@@ -939,8 +939,8 @@ def endpoint_origins(app_state, port: int | None,
 
     The published half used to read the whole collection, which meant the
     `port` argument only scoped the loopback pair while the tunnel names it
-    sat next to were shared by every listener -- the funnel port trusting a
-    quick tunnel's origin was the exact thing `port` was added to prevent.
+    sat next to were shared by every listener -- one listener's port trusting
+    another tunnel's origin was the exact thing `port` was added to prevent.
     `hosts_for(port)` is now the only read, and a `None` port contributes no
     published name at all: a connection whose accepting port could not be
     determined belongs to no listener, so no listener's names are its own.

@@ -193,12 +193,11 @@ _CLOSE_TIMEOUT_SECONDS = 1.0
 # knowledge graph and every transcript", and that excluding SCREEN while
 # admitting stored data "withheld the photograph and shipped the description
 # of it". The first forty characters of what she was asked to do is that
-# description, arriving live. A device paired to watch -- and the Cloudflare
-# `quick` tunnel, whose {OBSERVE} ceiling exists precisely to keep the user's
-# content away from an intermediary that reads the plaintext -- keeps
-# everything that is about *her*: `phase`, `step`, `tier`, `cursorFollows`,
-# `ts`. Nothing approved as observable is lost, including which model is
-# active: that rides `telemetry_body()` (the `"telemetry"` frame and
+# description, arriving live. A device paired to watch -- OBSERVE alone,
+# without RECALL -- keeps everything that is about *her*: `phase`, `step`,
+# `tier`, `cursorFollows`, `ts`. Nothing approved as observable is lost,
+# including which model is active: that rides `telemetry_body()` (the
+# `"telemetry"` frame and
 # `GET /v1/telemetry`) and `GET /v1/status`, all of them OBSERVE-gated
 # already, so it reaches a watching device by the routes that were always
 # meant to carry it.

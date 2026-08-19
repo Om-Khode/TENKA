@@ -92,7 +92,7 @@ def test_a_raise_is_scoped_to_one_device_and_one_policy():
     # Another device, the same policy.
     assert store.capabilities_for("device-2", "tailnet") == frozenset()
     # A wholly unrelated pair.
-    assert store.capabilities_for("device-9", "quick") == frozenset()
+    assert store.capabilities_for("device-9", "local") == frozenset()
 
 
 def test_revoke_removes_exactly_one_record():
