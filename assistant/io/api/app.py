@@ -429,8 +429,9 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # credential handed to a stranger rather than merely a stale entry.
     #
     # Every entry is scoped to the listener that published it (6b), so a name
-    # the quick tunnel announced is not a trusted `Host` on the funnel port --
-    # and `local` accepts no published name at all, which is KI-17's layer 3.
+    # one transport announced is not a trusted `Host` on another listener's
+    # port -- and `local` accepts no published name at all, which is KI-17's
+    # layer 3.
     published_hosts = PublishedHosts()
     app.state.published_hosts = published_hosts
     app.state.cors_origins = list(origins)

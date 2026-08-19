@@ -42,7 +42,6 @@ from assistant.io.api.transports import TransportRegistry
 from assistant.io.api.transports import manager as manager_mod
 from assistant.io.api.transports import tailscale as tailscale_mod
 from assistant.io.api.transports.base import TransportSession
-from assistant.io.api.transports.cloudflare import QuickAdapter
 from assistant.io.api.transports.manager import (
     TransportError,
     TransportManager,
@@ -377,13 +376,10 @@ def _use_real_adapters(h, monkeypatch) -> None:
     monkeypatch.setattr(tailscale_mod, "_run_serve_status", lambda: {})
     h.registry.register("tailnet", tailscale_mod.TailnetAdapter())
     h.registry.register("funnel", tailscale_mod.FunnelAdapter())
-    h.registry.register("quick", QuickAdapter())
     h.lines_for["tailnet"] = [b"Available within your tailnet:\n",
                               b"https://box.tail1234.ts.net/\n"]
     h.lines_for["funnel"] = [b"Funnel on:\n",
                              b"https://box.tail1234.ts.net/\n"]
-    h.lines_for["quick"] = [b"+---------+\n",
-                            b"|  https://ab-cd-ef.trycloudflare.com  |\n"]
 
 
 async def _settle(predicate, *, tries: int = 200) -> bool:
@@ -425,25 +421,25 @@ async def test_start_binds_registers_spawns_and_publishes_in_that_order(h):
     the registration is a tunnel pointed at a port nothing has claimed, and a
     publish before the hostname is a name nobody announced.
     """
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter)
 
-    session = await h.manager.start("quick")
+    session = await h.manager.start("funnel")
 
     assert h.events == ["preflight", "bind", "register", "spawn", "publish",
                         "serve"], h.events
-    assert session.policy_name == "quick"
-    assert session.port == port_for("quick", BASE)
-    assert session.hostname == "quick.example.com"
-    assert session.url == "https://quick.example.com"
-    assert adapter.preflight_calls == [port_for("quick", BASE)]
-    assert h.policies[session.port] == "quick"
+    assert session.policy_name == "funnel"
+    assert session.port == port_for("funnel", BASE)
+    assert session.hostname == "funnel.example.com"
+    assert session.url == "https://funnel.example.com"
+    assert adapter.preflight_calls == [port_for("funnel", BASE)]
+    assert h.policies[session.port] == "funnel"
     assert h.published.hosts_for(session.port) == frozenset(
-        {"quick.example.com"})
-    assert h.served == ["studio-quick"]
-    assert sorted(h.manager.running()) == ["quick"]
-    assert h.listeners.tasks["quick"] is session.serve_task
-    assert h.listeners.sockets["quick"] is session.sock
+        {"funnel.example.com"})
+    assert h.served == ["studio-funnel"]
+    assert sorted(h.manager.running()) == ["funnel"]
+    assert h.listeners.tasks["funnel"] is session.serve_task
+    assert h.listeners.sockets["funnel"] is session.sock
 
 
 @pytest.mark.asyncio
@@ -531,23 +527,23 @@ async def test_a_tunnel_that_never_announces_a_hostname_does_not_serve(h):
     the manager rather than in the type (controller Ruling 13a) -- which is
     why it gets its own test asserting the whole teardown.
     """
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter, lines=[b"starting up\n", b"still starting\n"])
 
     with pytest.raises(TransportError) as excinfo:
-        await h.manager.start("quick")
+        await h.manager.start("funnel")
 
     assert "hostname" in str(excinfo.value)
     assert h.spawned, "precondition: the tunnel really was spawned"
     assert "publish" not in h.events, "a nameless session reached publish()"
     assert h.served == [], "a nameless session was served"
-    assert port_for("quick", BASE) not in h.policies
+    assert port_for("funnel", BASE) not in h.policies
     assert h.published.owners() == frozenset()
     assert h.sockets[0].fileno() == -1, "the socket was not closed"
     assert h.processes[0].returncode is not None, "the subprocess was not reaped"
     assert h.manager.running() == {}
-    assert "quick" not in h.listeners.tasks
-    assert "quick" not in h.listeners.sockets
+    assert "funnel" not in h.listeners.tasks
+    assert "funnel" not in h.listeners.sockets
 
 
 @pytest.mark.asyncio
@@ -558,15 +554,15 @@ async def test_a_tunnel_that_stalls_past_the_timeout_does_not_serve(h,
     shortened here so the test costs milliseconds instead of thirty seconds.
     """
     monkeypatch.setattr(manager_mod, "HOSTNAME_TIMEOUT_SECONDS", 0.05)
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter, lines=[])
-    h.stall.add("quick")
+    h.stall.add("funnel")
 
     with pytest.raises(TransportError):
-        await h.manager.start("quick")
+        await h.manager.start("funnel")
 
     assert h.served == []
-    assert port_for("quick", BASE) not in h.policies
+    assert port_for("funnel", BASE) not in h.policies
     assert h.sockets[0].fileno() == -1
     assert h.processes[0].returncode is not None
 
@@ -580,11 +576,11 @@ async def test_a_chatty_process_that_never_announces_is_bounded(h, monkeypatch):
     holding the whole stream.
     """
     monkeypatch.setattr(manager_mod, "_MAX_SCAN_BYTES", 200)
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter, lines=[b"x" * 50 + b"\n" for _ in range(100)])
 
     with pytest.raises(TransportError):
-        await h.manager.start("quick")
+        await h.manager.start("funnel")
 
     proc = h.processes[0]
     assert proc.stdout.reads < 100, (
@@ -596,20 +592,20 @@ async def test_starting_a_transport_twice_is_refused(h):
     """And the refusal must not touch the session already running -- an
     'already running' path that ran the teardown would take the live tunnel
     down for the sake of the second caller's error message."""
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter)
 
-    session = await h.manager.start("quick")
+    session = await h.manager.start("funnel")
 
     with pytest.raises(TransportError, match="already running"):
-        await h.manager.start("quick")
+        await h.manager.start("funnel")
 
     assert len(h.spawned) == 1
-    assert sorted(h.manager.running()) == ["quick"]
-    assert h.manager.running()["quick"].owner == session.owner
+    assert sorted(h.manager.running()) == ["funnel"]
+    assert h.manager.running()["funnel"].owner == session.owner
     assert session.sock.fileno() != -1, "the refusal closed the live socket"
     assert h.published.hosts_for(session.port) == frozenset(
-        {"quick.example.com"})
+        {"funnel.example.com"})
 
 
 @pytest.mark.asyncio
@@ -624,7 +620,7 @@ async def test_starting_an_unknown_transport_is_refused(h):
 # KI-17 layer 1 -- against the real argument vector
 # ═════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("name", ["tailnet", "funnel", "quick"])
+@pytest.mark.parametrize("name", ["tailnet", "funnel"])
 @pytest.mark.asyncio
 async def test_the_spawned_argv_targets_a_registered_port_of_this_adapters_policy(
         h, monkeypatch, name):
@@ -666,9 +662,9 @@ async def test_the_spawned_argv_never_targets_the_local_port(h):
     registry entry removed, the sibling check has nothing to say, so only
     KI-17's dedicated check can still refuse.
     """
-    honest = _FakeAdapter("quick", events=h.events)
+    honest = _FakeAdapter("tailnet", events=h.events)
     h.register(honest)
-    await h.manager.start("quick")
+    await h.manager.start("tailnet")
     assert len(h.spawned) == 1
 
     liar = _FakeAdapter("funnel", events=h.events,
@@ -742,16 +738,16 @@ async def test_a_hostname_announced_only_on_stderr_is_read(h, monkeypatch):
         def command(self, port: int) -> list[str]:
             return [sys.executable, "-c", script, f"http://127.0.0.1:{int(port)}"]
 
-    adapter = _StderrAdapter("quick", events=h.events)
+    adapter = _StderrAdapter("funnel", events=h.events)
     h.register(adapter)
 
-    session = await h.manager.start("quick")
+    session = await h.manager.start("funnel")
     try:
         assert session.hostname == "stderr.example.com"
         assert h.published.hosts_for(session.port) == frozenset(
             {"stderr.example.com"})
     finally:
-        await h.manager.stop("quick")
+        await h.manager.stop("funnel")
 
     assert session.process.returncode is not None, (
         "the real subprocess was not reaped by the teardown")
@@ -763,49 +759,49 @@ async def test_a_hostname_announced_only_on_stderr_is_read(h, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_stop_unpublishes_deregisters_drops_raises_and_closes_the_socket(h):
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter)
-    session = await h.manager.start("quick")
-    h.raises.grant("dev-1", "quick", frozenset({Capability.OBSERVE}), 60,
+    session = await h.manager.start("funnel")
+    h.raises.grant("dev-1", "funnel", frozenset({Capability.OBSERVE}), 60,
                    "test", "why")
 
     # Preconditions, so the assertions below cannot pass against a manager
     # whose start never did anything in the first place.
     assert h.published.hosts_for(session.port) == frozenset(
-        {"quick.example.com"})
-    assert h.policies[session.port] == "quick"
-    assert h.raises.capabilities_for("dev-1", "quick") == frozenset(
+        {"funnel.example.com"})
+    assert h.policies[session.port] == "funnel"
+    assert h.raises.capabilities_for("dev-1", "funnel") == frozenset(
         {Capability.OBSERVE})
     assert session.sock.fileno() != -1
     assert not session.serve_task.done()
 
-    await h.manager.stop("quick")
+    await h.manager.stop("funnel")
 
     assert h.published.hosts_for(session.port) == frozenset()
     assert h.published.owners() == frozenset()
     assert session.port not in h.policies
-    assert h.raises.capabilities_for("dev-1", "quick") == frozenset()
+    assert h.raises.capabilities_for("dev-1", "funnel") == frozenset()
     assert session.serve_task.done()
     assert session.sock.fileno() == -1
     assert session.process.returncode is not None
     assert h.manager.running() == {}
-    assert "quick" not in h.listeners.tasks
-    assert "quick" not in h.listeners.sockets
+    assert "funnel" not in h.listeners.tasks
+    assert "funnel" not in h.listeners.sockets
 
 
 @pytest.mark.asyncio
 async def test_stop_is_safe_to_run_twice(h):
     """A crash handler and an orderly shutdown both call the teardown, and
     both may call it twice."""
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter)
-    session = await h.manager.start("quick")
+    session = await h.manager.start("funnel")
 
-    await h.manager.stop("quick")
+    await h.manager.stop("funnel")
     assert session.sock.fileno() == -1, (
         "precondition: the first stop must actually have torn down")
 
-    await h.manager.stop("quick")
+    await h.manager.stop("funnel")
 
     assert h.manager.running() == {}
     assert session.port not in h.policies
@@ -814,7 +810,7 @@ async def test_stop_is_safe_to_run_twice(h):
 
 @pytest.mark.asyncio
 async def test_stopping_a_transport_that_never_started_is_not_an_error(h):
-    await h.manager.stop("quick")
+    await h.manager.stop("funnel")
     assert h.manager.running() == {}
 
 
@@ -825,13 +821,13 @@ async def test_a_crashed_tunnel_runs_the_same_teardown_as_an_orderly_stop(h):
     teardown' is a comparison rather than two lists of assertions that could
     drift apart.
     """
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter)
 
-    crashed = await h.manager.start("quick")
-    h.raises.grant("dev-1", "quick", frozenset({Capability.OBSERVE}), 60,
+    crashed = await h.manager.start("funnel")
+    h.raises.grant("dev-1", "funnel", frozenset({Capability.OBSERVE}), 60,
                    "test", "why")
-    assert h.raises.capabilities_for("dev-1", "quick")  # precondition
+    assert h.raises.capabilities_for("dev-1", "funnel")  # precondition
     crashed.process.exit(1)
     # The session stops being reported as running the instant the teardown
     # takes it, so the wait is for the *last* observable step -- otherwise
@@ -839,15 +835,15 @@ async def test_a_crashed_tunnel_runs_the_same_teardown_as_an_orderly_stop(h):
     assert await _settle(lambda: not h.manager.running()
                          and crashed.sock.fileno() == -1), (
         "the crashed tunnel's listener was left running")
-    after_crash = _effects(h, "quick", crashed.port, crashed.sock,
+    after_crash = _effects(h, "funnel", crashed.port, crashed.sock,
                            crashed.process, crashed.serve_task, "dev-1")
 
-    h.lines_for["quick"] = [b"https://second.example.com\n"]
-    orderly = await h.manager.start("quick")
-    h.raises.grant("dev-1", "quick", frozenset({Capability.OBSERVE}), 60,
+    h.lines_for["funnel"] = [b"https://second.example.com\n"]
+    orderly = await h.manager.start("funnel")
+    h.raises.grant("dev-1", "funnel", frozenset({Capability.OBSERVE}), 60,
                    "test", "why")
-    await h.manager.stop("quick")
-    after_stop = _effects(h, "quick", orderly.port, orderly.sock,
+    await h.manager.stop("funnel")
+    after_stop = _effects(h, "funnel", orderly.port, orderly.sock,
                           orderly.process, orderly.serve_task, "dev-1")
 
     assert after_crash == after_stop
@@ -892,32 +888,32 @@ async def test_two_sessions_of_one_transport_get_different_owners(h):
     of one tunnel get different names from the provider, so the second must
     not inherit the first's ownership -- or stopping the second leaves the
     first's name trusted forever."""
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter)
 
-    first = await h.manager.start("quick")
-    await h.manager.stop("quick")
+    first = await h.manager.start("funnel")
+    await h.manager.stop("funnel")
 
-    h.lines_for["quick"] = [b"https://second.example.com\n"]
-    second = await h.manager.start("quick")
+    h.lines_for["funnel"] = [b"https://second.example.com\n"]
+    second = await h.manager.start("funnel")
 
     assert first.owner != second.owner
-    assert first.owner != "quick" and second.owner != "quick"
+    assert first.owner != "funnel" and second.owner != "funnel"
     assert h.published.hosts_for(second.port) == frozenset(
         {"second.example.com"}), "the first run's hostname is still trusted"
 
-    await h.manager.stop("quick")
+    await h.manager.stop("funnel")
     assert h.published.hosts_for(second.port) == frozenset()
 
 
 @pytest.mark.asyncio
 async def test_stop_all_leaves_only_the_local_listener(h):
-    for name in ("tailnet", "funnel", "quick"):
+    for name in ("tailnet", "funnel"):
         h.register(_FakeAdapter(name, events=h.events))
         await h.manager.start(name)
 
-    assert sorted(h.manager.running()) == ["funnel", "quick", "tailnet"]
-    assert len(h.policies) == 4
+    assert sorted(h.manager.running()) == ["funnel", "tailnet"]
+    assert len(h.policies) == 3
 
     failures = await h.manager.stop_all()
 
@@ -995,11 +991,11 @@ async def test_a_foreground_transports_stop_runs_no_second_command(h):
     """`stop_command()` returning `None` is a real case, not an oversight:
     `cloudflared tunnel --url` runs in the foreground, so reaping the process
     *is* the stop."""
-    adapter = _FakeAdapter("quick", events=h.events, stop_argv=None)
+    adapter = _FakeAdapter("funnel", events=h.events, stop_argv=None)
     h.register(adapter)
-    session = await h.manager.start("quick")
+    session = await h.manager.start("funnel")
 
-    await h.manager.stop("quick")
+    await h.manager.stop("funnel")
 
     assert h.ran == [], f"a foreground transport ran {h.ran}"
     assert session.process.returncode is not None
@@ -1016,16 +1012,16 @@ async def test_a_process_that_ignores_kill_makes_stop_report_failure(h, monkeypa
     and, for a real provider, its live edge connection -- kept running.
     Bounded by `wait_for` so a regression fails rather than hangs."""
     monkeypatch.setattr(manager_mod, "_REAP_TIMEOUT_SECONDS", 0.05)
-    adapter = _FakeAdapter("quick", events=h.events, stop_argv=None)
+    adapter = _FakeAdapter("funnel", events=h.events, stop_argv=None)
     h.register(adapter)
-    session = await h.manager.start("quick")
+    session = await h.manager.start("funnel")
 
     # Make the spawned process immune to both `terminate()` and `kill()`.
     monkeypatch.setattr(session.process, "terminate", lambda: None)
     monkeypatch.setattr(session.process, "kill", lambda: None)
 
     with pytest.raises(TransportError, match="UNVERIFIED"):
-        await asyncio.wait_for(h.manager.stop("quick"), 5.0)
+        await asyncio.wait_for(h.manager.stop("funnel"), 5.0)
 
     assert session.process.returncode is None, (
         "the stuck process was falsely reported as reaped")
@@ -1036,16 +1032,16 @@ async def test_stop_all_reports_a_failed_verification_without_stranding_others(h
     """A shutdown must not be blocked by one transport that will not stop --
     but the failure must still be reported, not swallowed."""
     h.register(_FakeAdapter("tailnet", events=h.events, stop_argv=_STOP_ARGV))
-    h.register(_FakeAdapter("quick", events=h.events))
+    h.register(_FakeAdapter("funnel", events=h.events))
     tailnet = await h.manager.start("tailnet")
-    quick = await h.manager.start("quick")
+    funnel = await h.manager.start("funnel")
     h.status_payload = {"Web": {"box.ts.net:9443": {}}}
 
     failures = await h.manager.stop_all()
 
     assert len(failures) == 1 and "9443" in failures[0]
     assert h.manager.running() == {}
-    assert quick.sock.fileno() == -1, "the healthy transport was stranded"
+    assert funnel.sock.fileno() == -1, "the healthy transport was stranded"
     assert tailnet.sock.fileno() == -1
     assert dict(h.policies) == {BASE: "local"}
 
@@ -1061,15 +1057,15 @@ async def test_a_session_with_no_hostname_is_never_treated_as_serving(h):
     announces a hostname does not serve' is enforced procedurally rather than
     by the type. An invariant that moved out of the type system needs its own
     test."""
-    port = port_for("quick", BASE)
+    port = port_for("funnel", BASE)
     sock = server_mod.bind_listener(port)
     h.sockets.append(sock)
-    task = _sleeping_task("quick")
+    task = _sleeping_task("funnel")
     h.serve_tasks.append(task)
-    nameless = TransportSession(policy_name="quick", port=port, owner="o",
+    nameless = TransportSession(policy_name="funnel", port=port, owner="o",
                                 process=_FakeProcess([]), sock=sock,
                                 serve_task=task, hostname=None)
-    named = replace(nameless, hostname="quick.example.com")
+    named = replace(nameless, hostname="funnel.example.com")
 
     assert is_serving(nameless) is False
     assert is_serving(named) is True, (
@@ -1080,7 +1076,7 @@ async def test_a_session_with_no_hostname_is_never_treated_as_serving(h):
         require_serving(nameless)
     assert require_serving(named) is named
 
-    h.manager._sessions["quick"] = nameless
+    h.manager._sessions["funnel"] = nameless
     assert h.manager.running() == {}, (
         "a nameless session was reported as a running transport")
 
@@ -1180,12 +1176,12 @@ async def test_a_cancelled_start_does_not_orphan_its_subprocess(h, monkeypatch):
             return [sys.executable, "-c", script,
                     f"http://127.0.0.1:{int(port)}"]
 
-    h.register(_SlowSpawnAdapter("quick", events=h.events), lines=[])
+    h.register(_SlowSpawnAdapter("funnel", events=h.events), lines=[])
 
-    starting = asyncio.create_task(h.manager.start("quick"))
+    starting = asyncio.create_task(h.manager.start("funnel"))
     await asyncio.wait_for(spawned_child.wait(), 5.0)
 
-    await h.manager.stop("quick")
+    await h.manager.stop("funnel")
     with pytest.raises(TransportError):
         await asyncio.wait_for(starting, 5.0)
 
@@ -1194,7 +1190,7 @@ async def test_a_cancelled_start_does_not_orphan_its_subprocess(h, monkeypatch):
         "the spawned child was orphaned -- the start was cancelled before its "
         "handle came back, so the teardown had nothing to reap")
     assert h.manager.running() == {}
-    assert port_for("quick", BASE) not in h.policies
+    assert port_for("funnel", BASE) not in h.policies
 
 
 @pytest.mark.parametrize("payload", [
@@ -1324,13 +1320,13 @@ async def test_a_raise_that_cannot_be_dropped_is_reported(h):
         def drop_policy(self, policy_name: str) -> None:
             raise RuntimeError("the raise store is wedged")
 
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter)
-    session = await h.manager.start("quick")
+    session = await h.manager.start("funnel")
     h.app.state.raises = _AngryRaises()
 
     with pytest.raises(TransportError, match="raises could not be dropped"):
-        await h.manager.stop("quick")
+        await h.manager.stop("funnel")
 
     assert session.sock.fileno() == -1, "the rest of the teardown was abandoned"
     assert session.port not in h.policies
@@ -1342,16 +1338,16 @@ async def test_a_stop_uses_the_adapter_its_start_used(h):
     """Fix round 1, Minor 8. Re-resolving the adapter by name at stop time
     means a registry mutated in between runs a different provider's stop argv
     -- against a mapping that provider never made."""
-    original = _FakeAdapter("quick", events=h.events, stop_argv=_STOP_ARGV)
+    original = _FakeAdapter("funnel", events=h.events, stop_argv=_STOP_ARGV)
     h.register(original)
-    await h.manager.start("quick")
+    await h.manager.start("funnel")
 
-    impostor = _FakeAdapter("quick", events=h.events,
+    impostor = _FakeAdapter("funnel", events=h.events,
                             stop_argv=["fake-impostor", "serve", "off"])
     h.registry.reset()
-    h.registry.register("quick", impostor)
+    h.registry.register("funnel", impostor)
 
-    await h.manager.stop("quick")
+    await h.manager.stop("funnel")
 
     assert _STOP_ARGV in h.ran
     assert impostor.stop_calls == [], "the impostor's stop command was run"
@@ -1577,13 +1573,13 @@ async def test_a_cancelled_caller_is_answered_with_its_own_cancellation(h):
     tick earlier -- the point of the finding is that its presence proves
     nothing about the cancellation this frame is handling.
     """
-    adapter = _FakeAdapter("quick", events=h.events)
+    adapter = _FakeAdapter("funnel", events=h.events)
     h.register(adapter, lines=[])
-    h.stall.add("quick")
+    h.stall.add("funnel")
 
-    caller = asyncio.create_task(h.manager.start("quick"))
+    caller = asyncio.create_task(h.manager.start("funnel"))
     assert await _settle(lambda: bool(h.spawned))
-    h.manager._stopped_while_starting.add("quick")
+    h.manager._stopped_while_starting.add("funnel")
 
     caller.cancel()
     with pytest.raises(asyncio.CancelledError):

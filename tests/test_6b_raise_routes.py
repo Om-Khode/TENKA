@@ -34,10 +34,10 @@ from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.api_client import LOCAL_PORT, ApiTestClient
 from tests.fakes.studio_runtime import build_fake_runtime
 
-# The four listeners at their real offsets from the loopback port, so a test
+# The three listeners at their real offsets from the loopback port, so a test
 # that says "tailnet" reaches the port a tailnet listener would actually hold.
 PORTS: dict[str, int] = {name: port_for(name, LOCAL_PORT)
-                         for name in ("local", "tailnet", "funnel", "quick")}
+                         for name in ("local", "tailnet", "funnel")}
 POLICY_REGISTRY: dict[int, str] = {port: name for name, port in PORTS.items()}
 
 
@@ -115,9 +115,9 @@ def test_a_raise_is_refused_on_every_listener_but_local(tmp_path):
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
     device_id = vault.devices()[0].device_id
-    app = build(vault, running=frozenset({"tailnet", "funnel", "quick"}))
+    app = build(vault, running=frozenset({"tailnet", "funnel"}))
 
-    for listener in ("tailnet", "funnel", "quick"):
+    for listener in ("tailnet", "funnel"):
         client = client_on(app, listener, token)
         assert client.get("/v1/session").status_code == 200, listener
         assert post_raise(client, device_id).status_code == 403, listener
@@ -132,8 +132,8 @@ def test_ki18_the_admin_gate_holds_even_when_the_ceiling_carries_system_control(
     the flag, not a defect. In every real `POLICIES` entry, the one ceiling
     holding SYSTEM_CONTROL (`local`'s) is also the one policy with
     `admin=True`, so `require(SYSTEM_CONTROL)` always refuses first on
-    `tailnet`, `funnel` and `quick` -- nothing there would fail if `admin`
-    were flipped to `True` on any of them, because the capability check never
+    `tailnet` and `funnel` -- nothing there would fail if `admin` were
+    flipped to `True` on either of them, because the capability check never
     lets a request reach `require_admin`'s own `if not policy.admin` line.
 
     This builds the one shape that isolates it: a fixture policy with
@@ -144,10 +144,10 @@ def test_ki18_the_admin_gate_holds_even_when_the_ceiling_carries_system_control(
     probe = ListenerPolicy(
         name="probe", admin=False, allow_bearer=False, secure_cookie=False,
         ceiling=frozenset({Capability.OBSERVE, Capability.SYSTEM_CONTROL}),
-        raisable=frozenset(),
+        raisable=frozenset(), pairable=True,
     )
     monkeypatch.setitem(POLICIES, "probe", probe)
-    port = max(PORTS.values()) + 1000  # not one of the four real listeners
+    port = max(PORTS.values()) + 1000  # not one of the three real listeners
     registry = dict(POLICY_REGISTRY)
     registry[port] = "probe"
 
@@ -287,17 +287,17 @@ def test_a_capability_outside_the_transports_raisable_is_refused(tmp_path):
 
 
 def test_a_raise_on_a_transport_with_no_raisable_set_is_refused(tmp_path):
-    """`funnel` and `quick` have `raisable=frozenset()`, so they are unraisable
+    """`funnel` and `local` have `raisable=frozenset()`, so they are unraisable
     by construction rather than by a check somebody could forget. Asserted
     through the route as well, because "by construction" is only true of the
     code path that actually consults the set."""
     vault = TokenVault(tmp_path)
     token = vault.issue("laptop", frozenset(Capability))
     device_id = vault.devices()[0].device_id
-    app = build(vault, running=frozenset({"tailnet", "funnel", "quick"}))
+    app = build(vault, running=frozenset({"tailnet", "funnel"}))
     client = client_on(app, "local", token)
 
-    for transport in ("funnel", "quick", "local"):
+    for transport in ("funnel", "local"):
         response = post_raise(client, device_id, transport=transport)
         assert response.status_code == 403, transport
 

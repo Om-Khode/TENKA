@@ -1,10 +1,14 @@
 """The listener port map -- one fixed port per policy, and KI-17.
 
 Milestone 6 binds one `uvicorn.Server` per listener (`local`, `tailnet`,
-`funnel`, `quick`), all serving the same ASGI app, separated by the port each
+`funnel`), all serving the same ASGI app, separated by the port each
 socket was bound to (`policy.py` argues why port, not host or peer address, is
 the only thing a client cannot forge). This module is the one place that
 port map is declared.
+
+A fourth listener, `quick` (a Cloudflare tunnel), held offset 3 here through
+Milestone 6b and was removed in the same milestone -- no device could ever
+authenticate over it (`policy.py`'s module docstring has the full argument).
 
 KI-17: `policy_for_port` keys on the accepting port, which is correct and
 unforgeable -- but if a tunnel is pointed at the *existing* Studio port,
@@ -54,7 +58,6 @@ LISTENER_OFFSETS: dict[str, int] = {
     "local": 0,
     "tailnet": 1,
     "funnel": 2,
-    "quick": 3,
 }
 
 

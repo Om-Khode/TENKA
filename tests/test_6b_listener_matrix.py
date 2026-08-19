@@ -2,7 +2,7 @@
 
 Spec `.superpowers/sdd/2026-08-16-milestone6b-transports/spec.md` §2.1, §2.2.
 
-Milestone 6b serves **one** ASGI app on four sockets and resolves what a
+Milestone 6b serves **one** ASGI app on three sockets and resolves what a
 request may do from the local port it was accepted on. That makes "which
 routes does each listener actually answer?" a table -- and a table nobody
 wrote down is a table nobody can audit. This file is that table, and it is
@@ -36,17 +36,16 @@ from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.api_client import ApiTestClient
 from tests.fakes.studio_runtime import build_fake_runtime
 
-# The four fixed ports of spec §2.2, spelled out rather than derived from
+# The three fixed ports of spec §2.2, spelled out rather than derived from
 # `listeners.port_for`: this file is about what each *socket* answers, so the
 # number a request is sent to has to be visible in the test.
 LISTENER_PORTS: dict[str, int] = {
     "local": 8787,
     "tailnet": 8788,
     "funnel": 8789,
-    "quick": 8790,
 }
 
-# The registry every app in this file is built with -- all four listeners
+# The registry every app in this file is built with -- all three listeners
 # declared, exactly as a fully-started 6b daemon has them. Only the port a
 # given client talks to changes.
 ALL_LISTENERS: dict[int, str] = {port: name for name, port in LISTENER_PORTS.items()}
@@ -77,7 +76,7 @@ WEBSOCKET_ROUTES = frozenset({"/v1/events"})
 #
 # **Intended answer, stated so it is a decision rather than a silence:** the
 # UI is deliberately unauthenticated and reachable on **every** listener,
-# including `funnel` and `quick`. A page is not a capability -- it carries no
+# including `funnel`. A page is not a capability -- it carries no
 # credential of its own, and the credential a browser then presents is
 # narrowed by that listener's ceiling on every request the page makes, which
 # is what the rest of this table is about. It is not ungated either: it sits
@@ -130,13 +129,13 @@ MATRIX: tuple[Row, ...] = (
     # The one unauthenticated write in the API. 401 is the *reachable*
     # answer -- there is no live pair code, and `pair_device` refuses a
     # wrong, expired, used or malformed one identically. What matters here
-    # is that it answers the same on all four listeners: pairing over a
+    # is that it answers the same on all three listeners: pairing over a
     # tunnel is the expected path for a phone with no Tailscale.
     Row("POST", "/v1/pair", "/v1/pair", None, allowed=401,
         body={"code": "AAAA-BBBB"}),
     # `GET /v1/listener` needs no credential at all -- it is what a caller
     # consults *before* it has one -- so no ceiling can withhold it either;
-    # it answers 200 on all four listeners, `quick` included.
+    # it answers 200 on all three listeners.
     Row("GET", "/v1/listener", "/v1/listener", None),
 
     # ── OBSERVE: watching her work ──────────────────────────────────────
@@ -376,7 +375,7 @@ def test_every_route_has_a_row_in_the_matrix(app_for_introspection):
         f"{sorted(missing)}. Add one per route, naming the capability it is "
         "gated on, whether it is admin-only, and the status it answers when "
         "the listener carries it -- then check what that makes it answer on "
-        "`funnel` and `quick`, which anyone holding the URL can reach."
+        "`funnel`, which anyone holding the URL can reach."
     )
 
 
@@ -483,17 +482,30 @@ def test_the_matrix_is_not_all_permitted():
         assert refused, f"the {policy_name} listener refuses nothing in MATRIX"
 
 
-def test_the_quick_listener_carries_nothing_but_observation():
+def test_an_observe_only_listener_carries_nothing_but_observation(monkeypatch):
     """Spelled out separately from the ceiling itself, because this is the
-    listener whose plaintext a third party reads (`policy.py`: Cloudflare
-    terminates TLS). Every row that is not OBSERVE-gated -- or gated on
-    nothing at all -- must be refused there."""
+    shape of listener whose plaintext a third party could read -- Milestone
+    6b's `quick` transport (a Cloudflare tunnel, where Cloudflare terminates
+    TLS) was the one real listener this narrow, and it was removed outright
+    (no device could ever authenticate over it -- `policy.py`'s module
+    docstring has the full argument). `tailnet` and `funnel` both carry more
+    than OBSERVE, so neither can demonstrate "every row that is not
+    OBSERVE-gated, or gated on nothing at all, is refused" on its own; this
+    synthetic policy is what still proves the property against the real
+    MATRIX rows.
+    """
+    from assistant.io.api.policy import ListenerPolicy
+    monkeypatch.setitem(POLICIES, "observe_only", ListenerPolicy(
+        name="observe_only", admin=False, allow_bearer=False,
+        secure_cookie=True, ceiling=frozenset({Capability.OBSERVE}),
+        raisable=frozenset(), pairable=True,
+    ))
     for row in MATRIX:
-        expected = expected_status(row, "quick")
+        expected = expected_status(row, "observe_only")
         if row.capability not in (None, Capability.OBSERVE) or row.admin:
             assert expected == REFUSED, (
-                f"{row.method} {row.path} is reachable on the one listener a "
-                "third party reads the plaintext of"
+                f"{row.method} {row.path} is reachable on an OBSERVE-only "
+                "listener, the shape a third party could read the plaintext of"
             )
         elif row.bearer_only:
             # Refused here too, but by the route rather than by the ceiling,
@@ -508,6 +520,6 @@ def test_the_quick_listener_carries_nothing_but_observation():
         else:
             assert expected == row.allowed, (
                 f"{row.method} {row.path} is observation (or gated on "
-                f"nothing) and must answer {row.allowed} on quick, not "
-                f"{expected}"
+                f"nothing) and must answer {row.allowed} on an OBSERVE-only "
+                f"listener, not {expected}"
             )

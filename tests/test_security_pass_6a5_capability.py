@@ -41,7 +41,7 @@ def test_execute_exists():
     assert Capability.EXECUTE.value == "execute"
 
 
-@pytest.mark.parametrize("name", ["tailnet", "funnel", "quick"])
+@pytest.mark.parametrize("name", ["tailnet", "funnel"])
 def test_no_transport_carries_execute(name):
     """funnel is the open internet and CHAT_SEND reaches every intent. The
     ceiling is what stops a pair code becoming code execution on this machine."""
@@ -50,7 +50,7 @@ def test_no_transport_carries_execute(name):
     assert Capability.EXECUTE not in POLICIES[name].ceiling
 
 
-@pytest.mark.parametrize("name", ["tailnet", "funnel", "quick"])
+@pytest.mark.parametrize("name", ["tailnet", "funnel"])
 def test_no_transport_carries_system_control(name):
     """PATCH /v1/settings turns the camera on and speaker verification off."""
     from assistant.core.capabilities import Capability
@@ -88,7 +88,8 @@ def test_effective_can_only_narrow():
 # ─── A3: the intent -> capability table ──────────────────────────────────
 def test_default_is_the_strongest_capability():
     """An intent nobody classified must be refused over a transport, not
-    admitted. Fail closed, same reasoning as `quick`'s literal ceiling."""
+    admitted. Fail closed, same reasoning as every ceiling's literal
+    spelling."""
     from assistant.core.capabilities import Capability
     from assistant.core.intent_capabilities import DEFAULT_REQUIRED
     assert DEFAULT_REQUIRED is Capability.EXECUTE
@@ -335,7 +336,7 @@ def test_a_code_carrying_execute_is_narrowed_when_redeemed_over_a_tunnel():
     from assistant.core.capabilities import Capability
     from assistant.io.api.policy import POLICIES, effective
     minted = frozenset(Capability)
-    for name in ("tailnet", "funnel", "quick"):
+    for name in ("tailnet", "funnel"):
         got = effective(minted, POLICIES[name])
         assert Capability.EXECUTE not in got
         assert Capability.SYSTEM_CONTROL not in got

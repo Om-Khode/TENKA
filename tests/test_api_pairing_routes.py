@@ -250,12 +250,14 @@ def test_the_pairing_request_cannot_rename_the_device(tmp_path):
 #
 # These three used to redeem over Cloudflare's `quick` tunnel, whose ceiling
 # (OBSERVE alone) made it the narrowest available demonstration. Milestone 6b
-# spec §5.5 refuses ALL redemption on `quick`, unconditionally, before the
-# code is even consulted (`tests/test_6b_pairing_transports.py` pins that
-# refusal and checks it is not vacuous) -- so `quick` can no longer show
-# narrowing at all, only refusal, and these three moved to `funnel` (ceiling:
-# everything but EXECUTE and SYSTEM_CONTROL) to keep demonstrating the
-# property they were written for.
+# spec §5.5 refused ALL redemption on `quick`, unconditionally, before the
+# code was even consulted, so it could never show narrowing at all, only
+# refusal -- these three moved to `funnel` (ceiling: everything but EXECUTE
+# and SYSTEM_CONTROL) to keep demonstrating the property they were written
+# for. `quick` was removed outright in the same milestone (no device could
+# ever authenticate over it -- `policy.py`'s module docstring has the full
+# chain), so `funnel` is not a workaround for a transport that still exists
+# elsewhere; it is simply the narrowest listener left.
 def test_pairing_over_funnel_narrows_grants_to_the_listeners_ceiling(tmp_path):
     """A code minted with every capability, redeemed over `funnel` (ceiling:
     everything but EXECUTE and SYSTEM_CONTROL), must mint a device that can
@@ -313,10 +315,12 @@ def test_pairing_with_nothing_the_listener_can_carry_is_refused(tmp_path):
     must never reach a caller as a raw exception. The code is still burned
     (single-use): this is not a retryable failure.
 
-    `quick` used to be this test's listener; it no longer can be, because
-    spec §5.5 now refuses every redemption there regardless of what the code
-    carries, so it could never isolate "nothing survived the intersection"
-    from "this listener refuses everything" -- `funnel` still can.
+    `quick` used to be this test's listener; it could not stay, because spec
+    §5.5 refused every redemption there regardless of what the code carried,
+    so it could never isolate "nothing survived the intersection" from "this
+    listener refuses everything" -- and Milestone 6b removed it outright in
+    the same pass, for the unrelated reason that no device could ever
+    authenticate over it at all. `funnel` still isolates the property.
     """
     vault = TokenVault(tmp_path)
     store = _store()

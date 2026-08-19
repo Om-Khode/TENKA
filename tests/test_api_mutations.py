@@ -83,9 +83,9 @@ def test_forget_all_demands_system_control_not_just_a_sending_device(tmp_path):
 def test_a_read_only_device_cannot_forget_even_one_item(tmp_path):
     """The regression this closes: one read grant alone used to carry a memory
     delete, so a device deliberately issued read-only could erase what she
-    knows one item at a time -- and on the `quick` listener, whose entire
-    ceiling was that one grant, it was the only grant any device could hold at
-    all."""
+    knows one item at a time -- and on the removed `quick` listener (Milestone
+    6b), whose entire ceiling used to be that one grant, it was the only grant
+    any device could hold at all."""
     vault = TokenVault(tmp_path)
     reader = vault.issue("reader", frozenset({Capability.RECALL}))
     client = build_api_client(build_fake_runtime(), vault)

@@ -171,11 +171,11 @@ async def test_collection_fanout_requires_both_the_capability_and_the_admin_list
     """
     admin_policy = ListenerPolicy(
         name="local", admin=True, allow_bearer=True, secure_cookie=False,
-        ceiling=frozenset(Capability), raisable=frozenset())
+        ceiling=frozenset(Capability), raisable=frozenset(), pairable=True)
     non_admin_with_capability = ListenerPolicy(
         name="probe", admin=False, allow_bearer=False, secure_cookie=False,
         ceiling=frozenset({Capability.OBSERVE, Capability.SYSTEM_CONTROL}),
-        raisable=frozenset())
+        raisable=frozenset(), pairable=True)
 
     hub = EventHub()
 

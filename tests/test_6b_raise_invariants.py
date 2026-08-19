@@ -130,11 +130,11 @@ def test_i5_a_raise_touches_capabilities_only():
 def test_i6_only_tailnet_is_raisable():
     assert POLICIES["tailnet"].raisable == frozenset(
         {Capability.EXECUTE, Capability.SYSTEM_CONTROL})
-    for name in ("local", "funnel", "quick"):
+    for name in ("local", "funnel"):
         assert POLICIES[name].raisable == frozenset(), name
 
 
-@pytest.mark.parametrize("name", ["local", "funnel", "quick"])
+@pytest.mark.parametrize("name", ["local", "funnel"])
 def test_an_unraisable_transport_ignores_every_raise(name):
     policy = POLICIES[name]
     grants = frozenset(Capability)

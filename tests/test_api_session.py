@@ -39,6 +39,24 @@ def _client(vault: TokenVault, *, policies: dict[int, str]) -> ApiTestClient:
     return ApiTestClient(app, base_url=BASE_URL)
 
 
+def _register_observe_only_policy(monkeypatch) -> None:
+    """A synthetic policy, ceiling OBSERVE alone, registered as `"observe_only"`.
+
+    Milestone 6b's `quick` transport used to be this narrow and was removed
+    outright (no device could ever authenticate over it) -- `tailnet` and
+    `funnel` both carry more than OBSERVE, so neither can demonstrate "the
+    ceiling narrows `effective` down to one grant" on its own. This synthetic
+    policy is what still proves that property has a test.
+    """
+    from assistant.io.api.policy import POLICIES, ListenerPolicy
+
+    monkeypatch.setitem(POLICIES, "observe_only", ListenerPolicy(
+        name="observe_only", admin=False, allow_bearer=False,
+        secure_cookie=True, ceiling=frozenset({Capability.OBSERVE}),
+        raisable=frozenset(), pairable=True,
+    ))
+
+
 def test_session_reports_the_calling_device(tmp_path):
     vault = TokenVault(tmp_path)
     token = vault.issue("Pixel 8", frozenset({Capability.CHAT_SEND, Capability.FILES}))
@@ -50,12 +68,20 @@ def test_session_reports_the_calling_device(tmp_path):
     assert data["policy"] == "local"
 
 
-def test_session_shows_the_ceiling_separately_from_the_grants(tmp_path):
+def test_session_shows_the_ceiling_separately_from_the_grants(tmp_path, monkeypatch):
     """Studio needs both to explain a disabled control: 'your device may, this
-    connection may not'."""
+    connection may not'.
+
+    Registered against a synthetic OBSERVE-only policy -- Milestone 6b's
+    `quick` transport used to be the real listener this narrow, and it was
+    removed outright; `tailnet` and `funnel` both carry more than OBSERVE, so
+    neither can demonstrate this narrowing on its own (see
+    `_register_observe_only_policy`).
+    """
+    _register_observe_only_policy(monkeypatch)
     vault = TokenVault(tmp_path)
     token = vault.issue("Pixel 8", frozenset(Capability))
-    client = _client(vault, policies={8787: "quick"})
+    client = _client(vault, policies={8787: "observe_only"})
     client.cookies.set(COOKIE_NAME, token)
     data = client.get("/v1/session").json()["data"]
     assert set(data["effective"]) == {"observe"}
@@ -160,12 +186,12 @@ def test_session_still_separates_issued_from_effective(tmp_path, monkeypatch):
 
 def test_the_raise_fields_are_absent_for_an_unraisable_transport(tmp_path):
     """'Absent' means present-and-empty, not a shape that varies by
-    transport: three of the four listener policies have no `raisable` set at
+    transport: two of the three listener policies have no `raisable` set at
     all, so this is the common case a client has to handle, not the edge
     case -- the keys must still be there, just empty."""
     vault = TokenVault(tmp_path)
     token = vault.issue("Pixel 8", frozenset(Capability))
-    client = _client(vault, policies={8787: "quick"})
+    client = _client(vault, policies={8787: "funnel"})
     client.cookies.set(COOKIE_NAME, token)
     data = client.get("/v1/session").json()["data"]
     assert "raised" in data and data["raised"] == []
@@ -228,7 +254,7 @@ def test_the_exchange_is_refused_on_a_remote_listener(tmp_path):
     """
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    for name in ("tailnet", "funnel", "quick"):
+    for name in ("tailnet", "funnel"):
         client = _client(vault, policies={8787: name})
         client.cookies.set(COOKIE_NAME, token)
         assert client.get("/v1/session").status_code == 200, name

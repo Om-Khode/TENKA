@@ -67,9 +67,9 @@ class TransportAdapter(Protocol):
 
     def public_port(self) -> int:
         """The public (`--https`) port this adapter's tunnel is reachable on
-        -- `8443` for `tailnet`, `443` for `funnel` and `quick` (module
-        constants in `tailscale.py` / `cloudflare.py`, the same ones
-        `command()` builds its `--https` flag from).
+        -- `8443` for `tailnet`, `443` for `funnel` (module constants in
+        `tailscale.py`, the same ones `command()` builds its `--https` flag
+        from).
 
         The one integer every URL/origin site built from a published
         hostname needs and none of them owns: `public_url` below folds it
@@ -108,10 +108,10 @@ class TransportAdapter(Protocol):
         method reads that same bare hostname and adds a port only in the
         string it returns, never in what gets published or matched against.
 
-        A provider whose public port is always the HTTPS default (`quick`,
-        plain 443; `funnel`, 443 by the port-split in `tailscale.py`) omits
-        `:443` -- a URL with an explicit default port is ugly and some
-        clients normalise it away anyway."""
+        A provider whose public port is always the HTTPS default (`funnel`,
+        443 by the port-split in `tailscale.py`) omits `:443` -- a URL with
+        an explicit default port is ugly and some clients normalise it away
+        anyway."""
         ...
 
     def preflight(self, port: int) -> str | None:
@@ -119,9 +119,10 @@ class TransportAdapter(Protocol):
         if the provider has any to reconcile with (spec §2.3 L2). Returns
         `None` when clear to start, or a refusal sentence naming the
         offending pre-existing mapping when not. A provider with nothing to
-        reconcile (a quick tunnel has no persisted configuration) always
-        returns `None` and says so in its docstring, rather than leaving the
-        reader to wonder whether the check was forgotten."""
+        reconcile (an unnamed tunnel with no persisted configuration, as the
+        removed `quick` provider had none) always returns `None` and says so
+        in its docstring, rather than leaving the reader to wonder whether
+        the check was forgotten."""
         ...
 
     def stop_command(self, port: int) -> list[str] | None:

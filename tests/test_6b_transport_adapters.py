@@ -104,10 +104,12 @@ def test_an_unknown_name_resolves_to_nothing():
 
 
 def test_names_are_stable_and_sorted():
-    transport_registry.register("quick", _FakeAdapter("quick"))
-    transport_registry.register("funnel", _FakeAdapter("funnel"))
+    # Registered out of alphabetical order on purpose -- `tailnet` before
+    # `funnel` -- so a passing `names() == ["funnel", "tailnet"]` proves the
+    # sort, not merely the registration order.
     transport_registry.register("tailnet", _FakeAdapter("tailnet"))
-    assert transport_registry.names() == ["funnel", "quick", "tailnet"]
+    transport_registry.register("funnel", _FakeAdapter("funnel"))
+    assert transport_registry.names() == ["funnel", "tailnet"]
     # Stable: calling again in a different registration order still sorts.
     assert transport_registry.names() == sorted(transport_registry.names())
 

@@ -27,7 +27,7 @@ from tests.fakes.api_client import LOCAL_PORT, ApiTestClient
 from tests.fakes.studio_runtime import build_fake_runtime
 
 PORTS: dict[str, int] = {name: port_for(name, LOCAL_PORT)
-                         for name in ("local", "tailnet", "funnel", "quick")}
+                         for name in ("local", "tailnet", "funnel")}
 POLICY_REGISTRY: dict[int, str] = {port: name for name, port in PORTS.items()}
 
 # A real, registered transport name -- picked off the live registry rather
@@ -106,7 +106,7 @@ def test_listing_transports_is_refused_off_the_local_listener(tmp_path):
     token = vault.issue("phone", frozenset(Capability))
     app = build(vault, manager=FakeTransportManager())
 
-    for listener in ("tailnet", "funnel", "quick"):
+    for listener in ("tailnet", "funnel"):
         client = client_on(app, listener, token)
         assert client.get("/v1/session").status_code == 200, listener
         assert client.get("/v1/transports").status_code == 403, listener
@@ -117,7 +117,7 @@ def test_starting_a_transport_is_refused_off_the_local_listener(tmp_path):
     token = vault.issue("phone", frozenset(Capability))
     app = build(vault, manager=FakeTransportManager())
 
-    for listener in ("tailnet", "funnel", "quick"):
+    for listener in ("tailnet", "funnel"):
         client = client_on(app, listener, token)
         assert client.get("/v1/session").status_code == 200, listener
         response = client.post(f"/v1/transports/{A_REAL_TRANSPORT}",

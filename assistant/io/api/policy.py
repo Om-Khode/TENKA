@@ -1,8 +1,20 @@
 """Listener policy: what a transport permits, independent of what a device holds.
 
-Milestone 6 exposes this daemon beyond loopback -- over a Tailscale tunnel, and
-over a Cloudflare quick tunnel where Cloudflare terminates TLS and can read the
-plaintext. `POST /v1/chat` reaches every intent, `code_executor` included, so
+Milestone 6 exposes this daemon beyond loopback -- over two Tailscale tunnels
+(`tailnet`, `funnel`). A third, a Cloudflare quick tunnel (`quick`), shipped in
+6b and was removed in the same milestone: pairing was refused on it outright
+(Cloudflare terminates TLS and would read both the pair code and the
+`Set-Cookie` it redeems for), and with `allow_bearer=False` a cookie is the
+*only* other way to authenticate -- but cookies are host-scoped, `quick`'s host
+is `*.trycloudflare.com`, and no device's cookie (minted on loopback or over
+the tailnet) is ever scoped to that host. So no device could ever authenticate
+over it at all; every route it served demanded a capability nothing could
+carry, and its actual, permanently reachable surface was the static landing
+page -- which this project's public demo already serves better. See
+`.superpowers/sdd/2026-08-16-milestone6b-transports/spec.md` §5.5 for the full
+chain, recorded there so the wall is not rediscovered by re-adding it.
+
+`POST /v1/chat` reaches every intent, `code_executor` included, so
 the API can run arbitrary code on this machine. A device's grants (`vault.py`)
 say what it was issued; a `ListenerPolicy` says what the *transport it arrived
 on* is trusted to carry at all. The two are combined with `effective()`, an
@@ -46,14 +58,13 @@ from .vault import Capability
 # a capability added to the enum flowed into the public listener for free.
 # `EXECUTE` was exactly that capability: adding it would have handed a
 # publicly reachable URL the right to run code on this machine without anyone
-# deciding to. `quick` already spelled its ceiling out for this reason (the
-# comment on it argues the point); Milestone 6a.5 extends that discipline to
-# all four, so the *next* capability is also granted nowhere by default and
-# must be added by name after someone vets it for each transport.
+# deciding to. Milestone 6a.5 extended that discipline to all three, so the
+# *next* capability is also granted nowhere by default and must be added by
+# name after someone vets it for each transport.
 #
 # `local` is spelled out too, even though it does hold everything today: a
 # derived ceiling there would keep re-introducing the same inheritance, and a
-# reader comparing the four should be able to read them the same way.
+# reader comparing the three should be able to read them the same way.
 
 
 @dataclass(frozen=True)
@@ -61,12 +72,24 @@ class ListenerPolicy:
     """What one kind of listening socket is trusted to carry, regardless of
     which device's grants show up on it."""
 
-    name: str                        # "local" | "tailnet" | "funnel" | "quick"
+    name: str                        # "local" | "tailnet" | "funnel"
     admin: bool                      # may reach device/transport management
     allow_bearer: bool               # may authenticate with an Authorization header
     secure_cookie: bool              # sets the Secure flag
     ceiling: frozenset[Capability]
     raisable: frozenset[Capability]  # what this transport may EVER carry under a raise
+    # May a device credential ever be minted over this transport at all --
+    # `pairing_denied_by_transport()` in `routes/pairing.py` is `not pairable`.
+    # An explicit literal on every policy, like `ceiling` and `raisable`, and
+    # for the identical reason: the removed `quick` policy used to be singled
+    # out by `policy.name == "quick"`, a hardcoded name check that is exactly
+    # what this project's standing rule forbids (behaviour is data). With
+    # `quick` gone the check would have degenerated into dead code that always
+    # answered `False` -- so `pairable` earns its place as a field precisely
+    # because a *future* transport must declare, explicitly, whether a
+    # credential may be minted over it, rather than silently inheriting "yes"
+    # by omission.
+    pairable: bool
 
 
 POLICIES: dict[str, ListenerPolicy] = {
@@ -90,6 +113,7 @@ POLICIES: dict[str, ListenerPolicy] = {
         }),
         # Already holds everything; there is nothing left for a raise to add.
         raisable=frozenset(),
+        pairable=True,
     ),
     # Tailscale tunnel: WireGuard end-to-end, the operator's own tailnet.
     # Trusted with every capability a device might hold, but never with admin
@@ -120,6 +144,7 @@ POLICIES: dict[str, ListenerPolicy] = {
         # a vetted machine on the operator's own tailnet, not a hole opened
         # in a listener anyone with a URL can reach.
         raisable=frozenset({Capability.EXECUTE, Capability.SYSTEM_CONTROL}),
+        pairable=True,
     ),
     # `tailscale funnel` -- a top-level command, not a `serve` flag; there is
     # no `tailscale serve --funnel`. Publicly reachable from the open
@@ -149,44 +174,22 @@ POLICIES: dict[str, ListenerPolicy] = {
         # other end to decide to trust further -- only "whoever has the
         # link" -- so there is nothing here a raise could safely lift.
         raisable=frozenset(),
+        pairable=True,
     ),
-    # Cloudflare quick tunnel: Cloudflare terminates TLS and can read the
-    # plaintext. The ceiling is OBSERVE alone -- watching her work. Even a
-    # device issued every capability is limited to her status, her telemetry,
-    # the live event stream and how she is configured; never to acting
-    # (CHAT_SEND, FILES, SYSTEM_CONTROL), and never to what she has stored.
-    #
-    # SCREEN and RECALL are excluded for the same reason as each other, and a
-    # different one from the acting grants: this isn't about what an attacker
-    # could *do*, it's about what Cloudflare could *see*. Screen capture is
-    # the highest-bandwidth disclosure in the API -- but RECALL is the widest.
-    # It carries the entire knowledge graph and every transcript, and since
-    # `read_screen` and `camera_look` are intents, her narration of what was
-    # on screen is *in* those transcripts. Excluding SCREEN while admitting
-    # stored data withheld the photograph and shipped the description of it.
-    # Reading stored data over this transport joins acting behind a
-    # deliberate, expiring, audited raise.
-    "quick": ListenerPolicy(
-        name="quick",
-        admin=False,
-        allow_bearer=False,
-        secure_cookie=True,
-        # Deliberately an explicit literal, not "everything minus {...}".
-        # Spelling out what IS allowed, rather than what is excluded, means a
-        # future capability added to the enum is granted nowhere by default
-        # and must be added here by name after someone vets it for the one
-        # transport a third party can read. Rewriting this as a subtraction
-        # would look like a tidy-up but inverts the safety property: the
-        # next new capability would then be granted automatically over
-        # exactly the listener that must never get one for free.
-        ceiling=frozenset({Capability.OBSERVE}),
-        # Never raisable: Cloudflare terminates TLS and reads the plaintext
-        # of everything this listener carries. A raise widens what a raised
-        # device may do, not who else can read it -- and on this transport a
-        # third party reads it regardless, so there is no capability whose
-        # exposure a raise could make acceptable.
-        raisable=frozenset(),
-    ),
+    # The Cloudflare quick tunnel that used to stand here (`quick`) was
+    # removed in Milestone 6b, not narrowed: no device could ever
+    # authenticate over it. Pairing was refused on it outright (spec §5.5--
+    # Cloudflare terminates TLS and would read both the pair code and the
+    # `Set-Cookie` it redeems for), and `allow_bearer=False` meant the cookie
+    # was the only other door -- but cookies are host-scoped, `quick`'s host
+    # was `*.trycloudflare.com`, and no device paired on loopback or over the
+    # tailnet ever holds a cookie scoped to that host. So its `OBSERVE`
+    # ceiling was decoration: every route it served demanded a capability
+    # nothing could ever present, and its one permanently reachable surface
+    # was the static landing page, which this project's public demo already
+    # serves better. `funnel` covers the audience it existed for -- a public
+    # HTTPS URL needing nothing installed on the phone. See
+    # `.superpowers/sdd/2026-08-16-milestone6b-transports/spec.md` §5.5.
 }
 
 

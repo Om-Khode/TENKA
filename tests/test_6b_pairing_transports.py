@@ -13,11 +13,18 @@ Three properties, each with its own failure mode if lost:
   URL -- useless to a phone off-LAN. Naming a transport that is not running,
   or one that has not yet announced a hostname, is refused rather than
   silently falling back to loopback.
-- **Redemption is refused on `quick`, before the code is consulted.**
-  Cloudflare terminates TLS and reads the plaintext of the code and the
-  resulting `Set-Cookie` alike, so a wrong code and a right one must be
-  indistinguishable on that listener -- and, unlike a wrong code, a right one
-  must not be burned by an attempt that could never have succeeded.
+- **Redemption is refused outright on a listener declared `pairable=False`,
+  before the code is consulted.** `not policy.pairable` -- an explicit
+  literal field on every `ListenerPolicy`, the same discipline `ceiling` and
+  `raisable` already follow. Milestone 6b's `quick` transport (a Cloudflare
+  tunnel) was the one policy this ever refused -- Cloudflare terminated TLS
+  and read the plaintext of the code and the resulting `Set-Cookie` alike, so
+  a wrong code and a right one had to be indistinguishable on that listener,
+  and, unlike a wrong code, a right one had to not be burned by an attempt
+  that could never have succeeded. `quick` was removed outright in the same
+  milestone (no device could ever authenticate over it at all), so no policy
+  standing today is `pairable=False`; the test below proves the mechanism
+  against a synthetic one instead.
 """
 from __future__ import annotations
 
@@ -34,12 +41,17 @@ from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.api_client import LOCAL_PORT, ApiTestClient
 from tests.fakes.studio_runtime import build_fake_runtime
 
-# The four listeners at their real offsets, exactly as a fully-started 6b
+# The three listeners at their real offsets, exactly as a fully-started 6b
 # daemon has them -- the same shape `test_6b_raise_routes.py` and
 # `test_6b_listener_matrix.py` already use.
 PORTS: dict[str, int] = {name: port_for(name, LOCAL_PORT)
-                         for name in ("local", "tailnet", "funnel", "quick")}
+                         for name in ("local", "tailnet", "funnel")}
 POLICY_REGISTRY: dict[int, str] = {port: name for name, port in PORTS.items()}
+
+# A port outside the real three, used only by
+# `test_redemption_is_refused_on_an_unpairable_listener` for its synthetic
+# `pairable=False` policy.
+_UNPAIRABLE_PORT = 55787
 
 
 class FakeTransports:
@@ -264,12 +276,13 @@ def test_a_tunnel_listener_never_offers_a_loopback_endpoint():
     assert not any(e.startswith("http://127.0.0.1") for e in endpoints)
 
 
-# ─── §5.5: redemption refused on `quick`, before the code is consulted ────
+# ─── §5.5: redemption refused on a `pairable=False` listener, before the
+# code is consulted ────────────────────────────────────────────────────────
 
 def test_redemption_succeeds_on_tailnet_and_funnel(tmp_path):
-    """Sanity companion to the `quick` refusal below: pairing over the other
-    two remote transports is the ordinary, expected path and must keep
-    working."""
+    """Sanity companion to the unpairable-listener refusal below: pairing over
+    the two remote transports that stand today is the ordinary, expected
+    path and must keep working."""
     vault = TokenVault(tmp_path)
     store = PairCodeStore()
     app = build(vault, store=store)
@@ -285,25 +298,51 @@ def test_redemption_succeeds_on_tailnet_and_funnel(tmp_path):
     assert {d.label for d in vault.devices()} == {"phone-a", "phone-b"}
 
 
-def test_redemption_is_refused_on_quick(tmp_path):
-    """Cloudflare would observe the pair code AND the resulting `Set-Cookie`
-    device token in plaintext -- so this must refuse a CORRECT, live code,
-    not merely fail to redeem a wrong one (that would pass even with no
-    quick-specific guard at all, since `consume()` already refuses wrong
-    codes on every listener). The refusal also must not burn the code: the
-    same one succeeds afterward on `tailnet`, proving the attempt on `quick`
-    never reached `store.consume()`.
+def _register_unpairable_policy(monkeypatch) -> None:
+    """A synthetic `pairable=False` policy, registered as `"unpairable"`.
+
+    Milestone 6b's `quick` transport (a Cloudflare tunnel) was the one real
+    listener `pairable=False` ever described -- Cloudflare terminated TLS and
+    would have read both the pair code and the resulting `Set-Cookie` device
+    token in the clear. It was removed outright (no device could ever
+    authenticate over it at all), so no policy standing today is
+    `pairable=False`. This synthetic policy is what still proves
+    `pairing_denied_by_transport` -- `not policy.pairable` -- is honoured by
+    the real route, not merely by the predicate in isolation.
     """
+    from assistant.io.api.policy import ListenerPolicy
+    monkeypatch.setitem(POLICIES, "unpairable", ListenerPolicy(
+        name="unpairable", admin=False, allow_bearer=False, secure_cookie=True,
+        ceiling=frozenset({Capability.OBSERVE}), raisable=frozenset(),
+        pairable=False,
+    ))
+
+
+def test_redemption_is_refused_on_an_unpairable_listener(tmp_path, monkeypatch):
+    """A `pairable=False` listener must refuse a CORRECT, live code, not
+    merely fail to redeem a wrong one (that would pass even with no
+    pairable-specific guard at all, since `consume()` already refuses wrong
+    codes on every listener). The refusal also must not burn the code: the
+    same one succeeds afterward on `tailnet`, proving the attempt on the
+    unpairable listener never reached `store.consume()`.
+    """
+    _register_unpairable_policy(monkeypatch)
     vault = TokenVault(tmp_path)
     store = PairCodeStore()
-    app = build(vault, store=store)
+    registry = dict(POLICY_REGISTRY)
+    registry[_UNPAIRABLE_PORT] = "unpairable"
+    app = create_app(build_fake_runtime(), vault,
+                     origins=["http://localhost:3000"],
+                     listener_policies=registry, pair_store=store)
+    app.state.transports = FakeTransports()
     code = store.mint("phone", frozenset(Capability)).code
 
-    r = client_on(app, "quick").post("/v1/pair", json={"code": code})
+    r = ApiTestClient(app, base_url=f"http://127.0.0.1:{_UNPAIRABLE_PORT}").post(
+        "/v1/pair", json={"code": code})
     assert r.status_code != 204
     assert vault.devices() == []
 
-    # Still live: the attempt on `quick` did not consume it.
+    # Still live: the attempt on the unpairable listener did not consume it.
     r2 = client_on(app, "tailnet").post("/v1/pair", json={"code": code})
     assert r2.status_code == 204
     assert {d.label for d in vault.devices()} == {"phone"}

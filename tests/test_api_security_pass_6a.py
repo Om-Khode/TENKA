@@ -66,6 +66,25 @@ def _client(vault, *, policies, runtime=None, pair_store=None):
     return ApiTestClient(app, base_url=BASE_URL)
 
 
+def _register_observe_only_policy(monkeypatch) -> None:
+    """A synthetic policy, ceiling OBSERVE alone, registered as `"observe_only"`.
+
+    Milestone 6b's `quick` transport (a Cloudflare tunnel) used to be the
+    real listener this narrow, and it was removed outright -- no device
+    could ever authenticate over it. `tailnet` and `funnel` both carry more
+    than OBSERVE, so neither can demonstrate "an OBSERVE-only ceiling keeps
+    RECALL-classified content off the event socket" on its own; this
+    synthetic policy is what still proves that property has a test.
+    """
+    from assistant.io.api.policy import ListenerPolicy
+
+    monkeypatch.setitem(POLICIES, "observe_only", ListenerPolicy(
+        name="observe_only", admin=False, allow_bearer=False,
+        secure_cookie=True, ceiling=frozenset({Capability.OBSERVE}),
+        raisable=frozenset(), pairable=True,
+    ))
+
+
 # ─── Finding 1: an accepted socket does not survive revocation ───────────
 # Copied from sec/lens-authsession's findings probe. Each was
 # `xfail(strict=True)` there; the reason strings are kept as docstrings.
@@ -201,29 +220,38 @@ def test_an_observe_only_socket_never_receives_what_the_user_asked_for(tmp_path)
         f"status socket: {frame!r}")
 
 
-def test_the_quick_ceiling_keeps_user_content_off_the_cloudflare_tunnel(tmp_path):
+def test_an_observe_only_ceiling_keeps_user_content_off_the_event_socket(
+        tmp_path, monkeypatch):
     """The transport half of the same hole.
 
-    `policy.py` sets `quick`'s ceiling to `{OBSERVE}` and argues at length
-    that RECALL is excluded because "it carries the entire knowledge graph
+    `policy.py` argues at length that RECALL is excluded from an
+    observation-only ceiling because "it carries the entire knowledge graph
     and every transcript ... Excluding SCREEN while admitting stored data
-    withheld the photograph and shipped the description of it."
+    withheld the photograph and shipped the description of it." Milestone
+    6b's `quick` transport (a Cloudflare tunnel, where a third party
+    terminates TLS and reads the plaintext) used to be the real listener
+    whose ceiling was exactly `{OBSERVE}`; it was removed outright, and
+    `tailnet`/`funnel` both carry RECALL, so a synthetic policy
+    (`_register_observe_only_policy`) is what still proves the property: an
+    OBSERVE-only device's handshake must not receive RECALL-classified
+    content over the socket.
 
-    The event socket is reachable on `quick` -- its handshake asks for
-    OBSERVE and OBSERVE is the whole ceiling -- so the description shipped
-    anyway, to the one transport whose threat model names the intermediary
-    as the adversary.
+    The event socket is reachable on any OBSERVE-only listener -- its
+    handshake asks for OBSERVE and OBSERVE is the whole ceiling -- so the
+    description would ship anyway if the classifier were wrong, regardless
+    of which transport carried it.
     """
     from assistant.io.api.events import EventHub
     from assistant.io.status_broadcaster import StatusBroadcaster, StatusPhase
 
+    _register_observe_only_policy(monkeypatch)
     query = "divorce lawyer near me"
 
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
     hub = EventHub()
     app = create_app(build_fake_runtime(), vault, origins=[],
-                     hub=hub, listener_policies={LOCAL_PORT: "quick"})
+                     hub=hub, listener_policies={LOCAL_PORT: "observe_only"})
     client = ApiTestClient(app, base_url=BASE_URL)
     client.cookies.set(COOKIE_NAME, token)
 
@@ -243,8 +271,7 @@ def test_the_quick_ceiling_keeps_user_content_off_the_cloudflare_tunnel(tmp_path
         frame = socket.receive_json()
 
     assert query[:40] not in frame.get("detail", ""), (
-        "the user's search query crossed the Cloudflare quick tunnel on an "
-        f"OBSERVE-only ceiling: {frame!r}")
+        f"the user's search query crossed an OBSERVE-only ceiling: {frame!r}")
 
 
 def test_a_recall_holding_device_still_sees_the_detail_it_is_entitled_to(tmp_path):
@@ -301,8 +328,8 @@ def test_a_withheld_detail_is_blanked_not_dropped(tmp_path):
 
     assert set(connect_frame.keys()) == set(frame.keys())
     assert frame["detail"] == ""
-    # Everything that is about *her* survives -- this is the observation the
-    # `quick` ceiling was approved for.
+    # Everything that is about *her* survives -- this is the observation an
+    # OBSERVE-only ceiling was approved for.
     assert frame["phase"] == "THINKING"
     assert frame["step"] == [1, 3]
     assert frame["tier"] == "vision"
@@ -855,12 +882,12 @@ def test_the_security_property_6b_needs_holds(tmp_path):
 
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    # A `quick` listener, not `local`, since Milestone 6b: a published name is
-    # only ever accepted on a *transport* listener (`host_is_allowed` argues
-    # why -- it is KI-17's layer 3). The property under test is unchanged; the
-    # listener is simply the one on which a Cloudflare hostname is a name this
-    # daemon could have published in the first place.
-    client = _client(vault, policies={LOCAL_PORT: "quick"})
+    # A `funnel` listener, not `local`, since Milestone 6b: a published name
+    # is only ever accepted on a *transport* listener (`host_is_allowed`
+    # argues why -- it is KI-17's layer 3). The property under test is
+    # unchanged; the listener is simply the one on which a tunnel's hostname
+    # is a name this daemon could have published in the first place.
+    client = _client(vault, policies={LOCAL_PORT: "funnel"})
     client.cookies.set(COOKIE_NAME, token)
 
     stale_host = "abc-def.trycloudflare.com"
@@ -881,10 +908,10 @@ def test_a_withdrawn_host_is_no_longer_a_trusted_origin(tmp_path):
     read/CSRF checks too, which is the set `_refuse_cross_site()` consults
     before any credential is read.
 
-    On a `quick` listener since Milestone 6b, for the same reason two other
+    On a `funnel` listener since Milestone 6b, for the same reason two other
     tests in this file moved: `endpoint_origins()` now withholds published
     names from `local`, matching the `Host` gate, so `local` is no longer a
-    listener on which a Cloudflare hostname is a trusted origin to withdraw.
+    listener on which a tunnel's hostname is a trusted origin to withdraw.
     The proposition is untouched -- withdrawing a host withdraws its origin --
     and both assertions below are the originals; only the listener the
     question is asked of moved to one where a published name means anything.
@@ -897,15 +924,15 @@ def test_a_withdrawn_host_is_no_longer_a_trusted_origin(tmp_path):
     state = _State()
     state.published_hosts = PublishedHosts()
     state.cors_origins = []
-    state.listener_policies = {LOCAL_PORT: "quick"}
+    state.listener_policies = {LOCAL_PORT: "funnel"}
     state.published_hosts.publish("abc-def.trycloudflare.com", owner="tunnel-1",
                                   listener=LOCAL_PORT)
 
     assert origin_is_known("https://abc-def.trycloudflare.com", state,
-                           LOCAL_PORT, POLICIES["quick"])
+                           LOCAL_PORT, POLICIES["funnel"])
     unpublish_host(state, "tunnel-1")
     assert not origin_is_known("https://abc-def.trycloudflare.com", state,
-                               LOCAL_PORT, POLICIES["quick"])
+                               LOCAL_PORT, POLICIES["funnel"])
 
 
 def test_a_withdrawn_host_no_longer_grants_the_event_socket(tmp_path):
@@ -914,9 +941,9 @@ def test_a_withdrawn_host_no_longer_grants_the_event_socket(tmp_path):
     CORS applies to a WS handshake at all."""
     vault = TokenVault(tmp_path)
     token = vault.issue("phone", frozenset(Capability))
-    # `quick`, for the same reason as the test above: since 6b a published
+    # `funnel`, for the same reason as the test above: since 6b a published
     # name is accepted on a transport listener only.
-    client = _client(vault, policies={LOCAL_PORT: "quick"})
+    client = _client(vault, policies={LOCAL_PORT: "funnel"})
     client.cookies.set(COOKIE_NAME, token)
 
     stale_host = "xyz-tunnel.trycloudflare.com"

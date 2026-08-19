@@ -29,12 +29,22 @@ what it serves. These properties carry that weight, and each one has a test:
   invariant), so issue-time narrowing has nothing further to protect by
   cutting `raisable` capabilities off before a raise ever gets a chance to
   reach them.
-- **Redemption is refused outright on `quick`.** Cloudflare terminates TLS and
-  reads the plaintext of the code and the resulting `Set-Cookie` alike, so
-  narrowing grants there is not enough -- a third party would still see a
-  working, if watch-only, credential in the clear. Refused before the code is
-  even consulted, so a wrong code and the transport's one genuinely live code
-  read identically. See `pair_device`'s own docstring for the full argument.
+- **`pairing_denied_by_transport(policy)` is `not policy.pairable`.** `pairable`
+  is an explicit literal on every `ListenerPolicy`, the same discipline
+  `ceiling` and `raisable` already follow: a transport declares, by name,
+  whether a device credential may ever be minted over it, rather than
+  inheriting "yes" by omission. The removed `quick` transport (a Cloudflare
+  tunnel, Milestone 6b) was the one policy this predicate ever refused --
+  Cloudflare terminates TLS and reads the plaintext of the code and the
+  resulting `Set-Cookie` alike, so narrowing grants there was not enough, and
+  redemption was refused before the code was even consulted. It was removed
+  outright rather than merely narrowed further: no device could authenticate
+  over it at all (`policy.py`'s module docstring has the full chain), so its
+  `pairable=False` was one symptom of a transport with no live credential
+  path, not the load-bearing one. All three remaining policies are
+  `pairable=True` today -- see `pair_device`'s own docstring for the
+  argument this predicate still guards against a future transport that
+  cannot safely mint one.
 - **Grants ride on the code.** They are chosen on the laptop before the QR is
   drawn and stored on the `PairCode`; the redeeming request never supplies
   them. That is what turns the checkbox row into a boundary rather than a
@@ -174,15 +184,23 @@ def pairing_denied_by_transport(policy: ListenerPolicy) -> bool:
     """Whether `pair_device` refuses redemption outright on this listener,
     before the code is even consulted -- spec §5.5.
 
-    `quick` alone, today: Cloudflare terminates TLS and would read both the
-    code and the resulting `Set-Cookie` device token in the clear, so
-    narrowing grants there is not enough. The one place this fact lives, so
-    `GET /v1/listener`'s `can_pair` field can answer "would `pair_device`
-    refuse me?" by calling this function rather than re-spelling
-    `policy.name == "quick"` a second time somewhere else -- a route reading
-    a copy of the condition is exactly how the two drift apart.
+    `not policy.pairable` -- a field, not a name comparison. `pairable` is an
+    explicit literal on every `ListenerPolicy`, declared for the identical
+    reason `ceiling` and `raisable` already are: a transport must say, by
+    name, whether a device credential may ever be minted over it, rather than
+    inheriting "yes" by omission. The removed `quick` transport (a Cloudflare
+    tunnel: it would have read both the code and the resulting `Set-Cookie`
+    device token in the clear, so narrowing grants there was never enough)
+    used to be the one policy singled out here by `policy.name == "quick"` --
+    a hardcoded name check that could not survive its own subject's removal
+    without either rotting into dead code or becoming exactly the kind of
+    special case this project's data-over-code rule forbids. The field is the
+    one place this fact lives now, so `GET /v1/listener`'s `can_pair` field
+    can answer "would `pair_device` refuse me?" by calling this function
+    rather than re-spelling the condition a second time somewhere else -- a
+    route reading a copy of the condition is exactly how the two drift apart.
     """
-    return policy.name == "quick"
+    return not policy.pairable
 
 
 # ─── minting: loopback only ──────────────────────────────────────────────
@@ -358,26 +376,28 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     EXECUTE on every ordinary request. The only thing this change does is
     make the capability *reachable at all* by a live raise later; it does
     not hand it out for free. That is the property the whole milestone rests
-    on, and it is what `funnel` and `quick` prove by their absence: both have
-    an empty `raisable`, so `ceiling | raisable` there is just `ceiling` --
-    identical to the old behaviour, and neither transport's redemption
-    changes shape at all. `funnel` was deliberately left without
-    SYSTEM_CONTROL in its own `raisable` for a different reason (a public URL
-    with no second credential gating it), which this narrowing respects
-    rather than overrides: `funnel`'s ceiling still excludes EXECUTE and
-    SYSTEM_CONTROL from what any device paired there ever holds.
+    on, and it is what `funnel` proves by its absence: it has an empty
+    `raisable`, so `ceiling | raisable` there is just `ceiling` -- identical
+    to the old behaviour, and its redemption does not change shape at all.
+    `funnel` was deliberately left without SYSTEM_CONTROL in its own
+    `raisable` for a different reason (a public URL with no second
+    credential gating it), which this narrowing respects rather than
+    overrides: `funnel`'s ceiling still excludes EXECUTE and SYSTEM_CONTROL
+    from what any device paired there ever holds.
 
-    **`quick` is refused outright, spec §5.5, before the code is even
-    consulted -- `pairing_denied_by_transport()` just below the policy
-    lookup.** Cloudflare terminates TLS and reads the plaintext of
-    everything this listener carries, including the code in this body and
-    the `Set-Cookie` this route would otherwise write; narrowing to OBSERVE
-    alone would still hand a third party a working (if watch-only) device
-    credential in the clear, which is a worse trade than refusing to pair
-    over that transport at all. Refused before `store.consume()` runs, so a
-    wrong code and a right one are indistinguishable on `quick` and no
-    attempt -- however it would have turned out -- burns the operator's live
-    code.
+    **A transport declared `pairable=False` is refused outright, spec §5.5,
+    before the code is even consulted -- `pairing_denied_by_transport()` just
+    below the policy lookup.** All three transports today are `pairable=True`;
+    the clause exists for the transport that isn't. The removed `quick`
+    transport (a Cloudflare tunnel, Milestone 6b) was that case: Cloudflare
+    terminated TLS and read the plaintext of everything the listener
+    carried, including the code in this body and the `Set-Cookie` this route
+    would otherwise write, so narrowing to OBSERVE alone would still have
+    handed a third party a working (if watch-only) device credential in the
+    clear -- a worse trade than refusing to pair over that transport at all.
+    Refused before `store.consume()` runs, so a wrong code and a right one
+    are indistinguishable on an unpairable listener and no attempt --
+    however it would have turned out -- burns the operator's live code.
 
     Every refusal is the same `UNAUTHORIZED` the rest of the API uses, with
     two exceptions, both load-bearing: 429 when the pairing budget is spent
@@ -398,12 +418,13 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
         # before `store.consume()` -- the code is never even looked at, so a
         # wrong code and this transport's one genuinely live code are
         # answered identically and neither attempt costs the budget or burns
-        # anything. Cloudflare terminates TLS and reads the plaintext of this
+        # anything. The removed `quick` transport was the reason this clause
+        # exists: Cloudflare terminated TLS and read the plaintext of the
         # whole exchange, code and the `Set-Cookie` this route would
-        # otherwise write alike; narrowing to `quick`'s ceiling (OBSERVE
-        # alone) still hands a third party a working, if watch-only, device
-        # credential in the clear, which is the trade this refuses outright
-        # rather than take.
+        # otherwise write alike, so narrowing to its ceiling (OBSERVE alone)
+        # would still have handed a third party a working, if watch-only,
+        # device credential in the clear -- the trade a `pairable=False`
+        # transport refuses outright rather than take.
         raise UNAUTHORIZED
 
     # Before the budget, and unmetered -- the same ordering and the same
