@@ -17,11 +17,18 @@ what it serves. These properties carry that weight, and each one has a test:
   one it was issued, through the one route that exists specifically to prevent
   that escalation. Requested grants are intersected with the minting device's
   own before the code is minted, never unioned with them.
-- **Grants that survive to `issue()` are also capped by the redeeming
-  listener.** The code carries what the laptop authorised; `pair_device` below
-  narrows that further to `effective(pair_code.grants, policy)` before it ever
-  reaches the vault, so a code redeemed over `tailnet` or `funnel` can never
-  mint a device wider than that transport is trusted to carry.
+- **Grants that survive to `issue()` are also capped by what the redeeming
+  listener could EVER carry.** The code carries what the laptop authorised;
+  `pair_device` below narrows that further to `effective(pair_code.grants,
+  policy, raised=policy.raisable)` before it ever reaches the vault, so a
+  code redeemed over `tailnet` or `funnel` can never mint a device wider than
+  `ceiling | raisable` for that transport -- narrowing to the bare `ceiling`
+  instead used to discard a raisable capability from the device's own issued
+  set permanently, which is a defect, not the boundary: a raise can already
+  never manufacture a capability the device side lacks (`policy.py`'s
+  invariant), so issue-time narrowing has nothing further to protect by
+  cutting `raisable` capabilities off before a raise ever gets a chance to
+  reach them.
 - **Redemption is refused outright on `quick`.** Cloudflare terminates TLS and
   reads the plaintext of the code and the resulting `Set-Cookie` alike, so
   narrowing grants there is not enough -- a third party would still see a
@@ -57,7 +64,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from ..pairing import PairCodeStore
 from ..payloads import PairCodePayload
-from ..policy import POLICIES, effective, policy_for_port
+from ..policy import POLICIES, ListenerPolicy, effective, policy_for_port
 from ..qr import qr_svg
 from ..schemas import Envelope, PairCodeRequest, PairRequest
 from ..security import (
@@ -160,6 +167,21 @@ def _endpoints(request: Request) -> list[str]:
         return [f"http://127.0.0.1:{port}"]
     published = request.app.state.published_hosts
     return sorted(published.origins_for(port))
+
+
+def pairing_denied_by_transport(policy: ListenerPolicy) -> bool:
+    """Whether `pair_device` refuses redemption outright on this listener,
+    before the code is even consulted -- spec §5.5.
+
+    `quick` alone, today: Cloudflare terminates TLS and would read both the
+    code and the resulting `Set-Cookie` device token in the clear, so
+    narrowing grants there is not enough. The one place this fact lives, so
+    `GET /v1/listener`'s `can_pair` field can answer "would `pair_device`
+    refuse me?" by calling this function rather than re-spelling
+    `policy.name == "quick"` a second time somewhere else -- a route reading
+    a copy of the condition is exactly how the two drift apart.
+    """
+    return policy.name == "quick"
 
 
 # ─── minting: loopback only ──────────────────────────────────────────────
@@ -303,21 +325,50 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     nothing else a caller needs back -- it learns what it may do by calling
     `GET /v1/session` with the credential it now holds.
 
-    **Grants are narrowed to this listener before they ever reach the vault.**
-    `effective(pair_code.grants, policy)`, never the code's own unnarrowed
-    set -- the same intersection `authenticate()` applies to every later
-    request, just applied once here, at issue time, instead of on every
-    request after. The consequence is real and worth spelling out: a code
-    minted with every capability, redeemed over `tailnet` or `funnel`
-    (ceiling: everything but EXECUTE and SYSTEM_CONTROL), mints a device
-    that can never reach either -- **permanently**, even if that same device
-    later connects over `local`, because the vault only remembers what
-    `issue()` was actually asked to store, not what the code could have
-    carried on a wider listener. There is no way to tell afterward that a
-    device "could have" held more.
+    **Grants are narrowed at issue time to what this listener could EVER
+    carry -- `ceiling | raisable`, not `ceiling` alone.**
+    `effective(pair_code.grants, policy, raised=policy.raisable)`, never the
+    code's own unnarrowed set and, as importantly, never `effective(grants,
+    policy)`'s everyday two-argument form either. The difference is the fix
+    for a live-test defect: narrowing to the bare ceiling at issue time
+    discarded a raisable capability from the *device's own issued set*,
+    permanently, the moment a code was redeemed on that transport -- and a
+    raise can only ever widen the *transport* side of `effective()`'s
+    intersection (`policy.py`'s own invariant), never manufacture a
+    capability the device side does not already hold. So a code minted with
+    EXECUTE and SYSTEM_CONTROL, redeemed over `tailnet` (`raisable =
+    {EXECUTE, SYSTEM_CONTROL}`), used to mint a device that could never
+    reach either capability again on that transport, by any raise, ever --
+    confirmed live: ticking both boxes and pairing over tailnet stored
+    neither. `tailnet`'s whole `raisable` set was unreachable configuration.
 
-    **`quick` is refused outright, spec §5.5 -- see the check just below the
-    policy lookup.** Cloudflare terminates TLS and reads the plaintext of
+    Reusing `effective()` with `raised=policy.raisable` rather than adding a
+    new function is deliberate -- the arithmetic
+    `grants & (ceiling | (raisable & raisable))` collapses to
+    `grants & (ceiling | raisable)` by construction, so this is the *same*
+    intersection every other call site already trusts, evaluated at the one
+    raised value that means "everything this transport could ever carry,"
+    not a second narrowing rule to keep in sync with the first.
+
+    **This does not touch per-request narrowing.** `authenticate()` still
+    calls `effective()` with whatever the *live* raise store holds for this
+    device and listener, not `policy.raisable` -- so a device that paired
+    over `tailnet` and now has EXECUTE sitting in the vault is still refused
+    EXECUTE on every ordinary request. The only thing this change does is
+    make the capability *reachable at all* by a live raise later; it does
+    not hand it out for free. That is the property the whole milestone rests
+    on, and it is what `funnel` and `quick` prove by their absence: both have
+    an empty `raisable`, so `ceiling | raisable` there is just `ceiling` --
+    identical to the old behaviour, and neither transport's redemption
+    changes shape at all. `funnel` was deliberately left without
+    SYSTEM_CONTROL in its own `raisable` for a different reason (a public URL
+    with no second credential gating it), which this narrowing respects
+    rather than overrides: `funnel`'s ceiling still excludes EXECUTE and
+    SYSTEM_CONTROL from what any device paired there ever holds.
+
+    **`quick` is refused outright, spec §5.5, before the code is even
+    consulted -- `pairing_denied_by_transport()` just below the policy
+    lookup.** Cloudflare terminates TLS and reads the plaintext of
     everything this listener carries, including the code in this body and
     the `Set-Cookie` this route would otherwise write; narrowing to OBSERVE
     alone would still hand a third party a working (if watch-only) device
@@ -341,7 +392,7 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
         # the registry must not inherit loopback's rights by silence.
         raise UNAUTHORIZED
 
-    if policy.name == "quick":
+    if pairing_denied_by_transport(policy):
         # Spec §5.5. Before the budget, before `refuse_unknown_origin`, and
         # before `store.consume()` -- the code is never even looked at, so a
         # wrong code and this transport's one genuinely live code are
@@ -392,9 +443,12 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
         logger.info("[API] a pair attempt was refused")
         raise UNAUTHORIZED
 
-    # Narrowed to what THIS listener may carry -- see the docstring above.
-    # Never the code's own, unnarrowed `pair_code.grants`.
-    grants = effective(pair_code.grants, policy)
+    # Narrowed to what THIS listener could EVER carry -- ceiling union
+    # raisable -- see the docstring above. Never the code's own, unnarrowed
+    # `pair_code.grants`, and never the bare-ceiling `effective(grants,
+    # policy)` either: that form is what made a raisable capability
+    # permanently unreachable the moment a code was redeemed.
+    grants = effective(pair_code.grants, policy, raised=policy.raisable)
     if not grants:
         # The code was genuinely correct -- `consume()` above already proved
         # that and burned it as single-use -- but this listener cannot carry
