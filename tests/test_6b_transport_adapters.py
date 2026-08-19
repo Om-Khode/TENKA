@@ -41,6 +41,12 @@ class _FakeAdapter:
     def hostname_from(self, line: str) -> str | None:
         return None
 
+    def public_port(self) -> int:
+        return 443
+
+    def public_url(self, hostname: str) -> str:
+        return f"https://{hostname}"
+
     def preflight(self, port: int) -> str | None:
         return None
 
@@ -198,6 +204,43 @@ def test_a_stop_names_the_same_public_port_its_start_claimed():
     assert _https_port(TailnetAdapter().stop_command(8788)) != _https_port(
         FunnelAdapter().stop_command(8789)
     )
+
+
+def test_the_tailnet_url_carries_its_non_default_public_port():
+    """The live-test defect this pins: `tailnet` publishes on 8443, not the
+    HTTPS default, and `PublishedHosts` stores the hostname bare (no port --
+    `host_is_allowed` matches on it that way, KI-17's `Host` gate). A URL
+    with no port resolves to 443, where nothing is listening --
+    `ERR_CONNECTION_TIMED_OUT`, which is exactly what a phone hit before this
+    fix. Goes through both the adapter directly and a real
+    `TransportSession.url`, since the session property is what a caller
+    (`_row`, `_endpoints`, the pairing QR) actually reads."""
+    adapter = TailnetAdapter()
+    assert adapter.public_url("laptop.tail1234.ts.net") == (
+        "https://laptop.tail1234.ts.net:8443")
+
+    session = TransportSession(
+        policy_name="tailnet", port=8788, owner="o", process=None, sock=None,
+        serve_task=None, hostname="laptop.tail1234.ts.net", adapter=adapter)
+    assert session.url == "https://laptop.tail1234.ts.net:8443"
+
+
+def test_the_funnel_url_omits_its_default_public_port():
+    """`funnel` publishes on 443, the HTTPS default -- its URL must NOT carry
+    an explicit `:443` (an explicit default port is ugly and some clients
+    normalise it away anyway). The companion property to the test above: one
+    asserts the port an operator's phone actually needs, the other asserts
+    the port that must NOT be there."""
+    adapter = FunnelAdapter()
+    assert adapter.public_url("laptop.tail1234.ts.net") == (
+        "https://laptop.tail1234.ts.net")
+    assert ":443" not in adapter.public_url("laptop.tail1234.ts.net")
+
+    session = TransportSession(
+        policy_name="funnel", port=8789, owner="o", process=None, sock=None,
+        serve_task=None, hostname="laptop.tail1234.ts.net", adapter=adapter)
+    assert session.url == "https://laptop.tail1234.ts.net"
+    assert ":443" not in session.url
 
 
 def test_a_non_numeric_string_is_rejected_before_it_can_reach_the_command_line():

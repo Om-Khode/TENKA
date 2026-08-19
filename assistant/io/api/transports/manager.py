@@ -622,8 +622,13 @@ class TransportManager:
                     f"transport '{name}' never announced a hostname within "
                     f"{HOSTNAME_TIMEOUT_SECONDS:.0f}s, so it does not serve")
 
-            # 6. Trust the name, scoped to this listener and this session.
-            self._publish(hostname, owner=owner, listener=port)
+            # 6. Trust the name, scoped to this listener and this session --
+            # and to this adapter's own public port, so `security.py`'s
+            # `endpoint_origins`/`origins_for` can build the same
+            # port-carrying URL a browser or a phone actually reaches this
+            # transport at, without importing anything from `transports/`.
+            self._publish(hostname, owner=owner, listener=port,
+                          public_port=adapter.public_port())
 
             # 7. Serve, last: nothing answers on this socket until the name
             # it answers under is both known and published.
@@ -1202,13 +1207,15 @@ class TransportManager:
         nothing from that moment on."""
         return self._app_state().listener_policies
 
-    def _publish(self, hostname: str, *, owner: str, listener: int) -> None:
+    def _publish(self, hostname: str, *, owner: str, listener: int,
+                public_port: int) -> None:
         published = getattr(self._app_state(), "published_hosts", None)
         if published is None:  # pragma: no cover - create_app always sets one
             raise TransportError(
                 "this app has no published-hosts collection, so a tunnel's "
                 "hostname could not be trusted; refusing to serve it")
-        published.publish(hostname, owner=owner, listener=listener)
+        published.publish(hostname, owner=owner, listener=listener,
+                          public_port=public_port)
 
 
 # ─── Deferred `server` reach (see the module docstring) ───────────────────────

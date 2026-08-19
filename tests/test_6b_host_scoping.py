@@ -25,6 +25,7 @@ from assistant.io.api.security import (
     COOKIE_NAME,
     PublishedHosts,
     endpoint_origins,
+    origin_is_known,
 )
 from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.api_client import ApiTestClient
@@ -389,6 +390,123 @@ def test_endpoint_origins_still_withholds_dev_origins_from_a_tunnel(tmp_path):
                        ("quick", QUICK_PORT)):
         origins = endpoint_origins(state, port, POLICIES[name])
         assert DEV_ORIGINS[0] not in origins, name
+
+
+# ─── the live-test defect: a tunnel's public port belongs in the Origin too ──
+#
+# `tailnet` publishes on 8443, not the HTTPS default -- a browser's own
+# `Origin` header for a page served there is `https://<host>:8443`, never
+# bare. `endpoint_origins` trusting only the bare form (the pre-fix shape)
+# refused every genuine one with 403 before a route ever ran, which broke
+# pairing and the event socket alike over a real tailnet tunnel.
+
+def test_a_tailnet_origin_must_carry_its_public_port(tmp_path):
+    """Exactly one of the two spellings is a front door that exists. Trusting
+    the bare form only is the live-test defect; trusting both would accept
+    an origin nothing actually serves."""
+    state = _State()
+    state.published_hosts = PublishedHosts()
+    state.cors_origins = []
+    state.listener_policies = dict(ALL_LISTENERS)
+    state.published_hosts.publish(TAILNET_NAME, owner="ts-1",
+                                  listener=TAILNET_PORT, public_port=8443)
+
+    assert origin_is_known(f"https://{TAILNET_NAME}:8443", state,
+                           TAILNET_PORT, POLICIES["tailnet"])
+    assert not origin_is_known(f"https://{TAILNET_NAME}", state,
+                               TAILNET_PORT, POLICIES["tailnet"])
+
+
+def test_a_funnel_origin_must_not_carry_the_default_port(tmp_path):
+    """The companion property, inverted: `funnel` publishes on 443, the
+    HTTPS default, which a browser's `Origin` header never states
+    explicitly. Trusting an explicit `:443` form would accept an origin no
+    real browser sends -- get the port-omission rule backwards and this is
+    the test that catches it."""
+    state = _State()
+    state.published_hosts = PublishedHosts()
+    state.cors_origins = []
+    state.listener_policies = dict(ALL_LISTENERS)
+    # Tailscale publishes the same MagicDNS name on `serve` and `funnel`
+    # alike (module docstring's note on `TAILNET_NAME`/`FUNNEL_NAME`) -- only
+    # the port and the listener differ, which is exactly what this test is
+    # about.
+    state.published_hosts.publish(TAILNET_NAME, owner="fn-1",
+                                  listener=FUNNEL_PORT, public_port=443)
+
+    assert origin_is_known(f"https://{TAILNET_NAME}", state,
+                           FUNNEL_PORT, POLICIES["funnel"])
+    assert not origin_is_known(f"https://{TAILNET_NAME}:443", state,
+                               FUNNEL_PORT, POLICIES["funnel"])
+
+
+def test_hosts_for_stays_bare_even_when_a_public_port_is_published(tmp_path):
+    """`origins_for` is the new, port-carrying read; `hosts_for` -- and the
+    `Host` gate it feeds -- must be completely unaffected by a published
+    `public_port`. The property most likely to be broken by that change, so
+    it is pinned directly rather than assumed from the origin tests above.
+    """
+    app, token = _app(tmp_path)
+    tailnet = _client_on(app, token, TAILNET_PORT)
+    app.state.published_hosts.publish(TAILNET_NAME, owner="ts-1",
+                                      listener=TAILNET_PORT, public_port=8443)
+
+    assert app.state.published_hosts.hosts_for(TAILNET_PORT) == frozenset(
+        {TAILNET_NAME})
+    assert tailnet.get("/v1/status",
+                       headers={"Host": TAILNET_NAME}).status_code == 200
+    # The port-carrying form must never appear as a trusted `Host` -- that
+    # would be layer 3 accepting something a tunnel never actually forwards.
+    assert f"{TAILNET_NAME}:8443" not in app.state.published_hosts.hosts_for(
+        TAILNET_PORT)
+
+
+def test_event_socket_over_tailnet_is_not_refused_as_cross_site(tmp_path):
+    """`app.py`'s event-socket handshake reads the identical `origin_is_known`
+    that `refuse_unknown_origin` does, so it inherits this fix automatically
+    -- pinned directly rather than merely assumed, since a WebSocket
+    handshake has no CORS preflight to catch a regression before it reaches
+    the socket. Absolute `ws://` URL, per this file's own module note on
+    `websocket_connect`: a relative one silently lands on `local` instead.
+    """
+    app, token = _app(tmp_path)
+    app.state.published_hosts.publish(TAILNET_NAME, owner="ts-1",
+                                      listener=TAILNET_PORT, public_port=8443)
+    client = _client_on(app, token, TAILNET_PORT)
+
+    with client.websocket_connect(
+        f"ws://127.0.0.1:{TAILNET_PORT}/v1/events",
+        headers={"Host": TAILNET_NAME,
+                 "Origin": f"https://{TAILNET_NAME}:8443"},
+    ) as ws:
+        assert ws is not None
+
+
+def test_pairing_over_tailnet_is_not_refused_as_cross_site(tmp_path):
+    """The fully-broken flow the operator's live tunnel actually hit:
+    `POST /v1/pair` over `tailnet`, from a phone whose browser sends
+    `Origin: https://<host>:8443` -- the real `Origin` a page served over
+    that listener carries. Before this fix, `refuse_unknown_origin` compared
+    it against a bare, portless trusted set and refused every attempt with
+    403 regardless of whether the code was right, which made pairing over
+    `tailnet` impossible.
+    """
+    vault = TokenVault(tmp_path)
+    app = create_app(
+        build_fake_runtime(), vault,
+        origins=list(DEV_ORIGINS),
+        listener_policies=dict(ALL_LISTENERS),
+    )
+    app.state.published_hosts.publish(TAILNET_NAME, owner="ts-1",
+                                      listener=TAILNET_PORT, public_port=8443)
+
+    store = app.state.pair_store
+    code = store.mint("phone", frozenset({Capability.OBSERVE})).code
+
+    client = ApiTestClient(app, base_url=f"http://127.0.0.1:{TAILNET_PORT}")
+    r = client.post("/v1/pair", json={"code": code},
+                    headers={"Origin": f"https://{TAILNET_NAME}:8443"})
+    assert r.status_code == 204, r.text
 
 
 # ─── the unscoped read is gone, not merely unused ────────────────────────

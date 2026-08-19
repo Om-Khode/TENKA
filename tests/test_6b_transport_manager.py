@@ -136,12 +136,14 @@ class _FakeAdapter:
     def __init__(self, name: str, *, events: list[str] | None = None,
                  refusal: str | None = None, target_port: int | None = None,
                  stop_argv: list[str] | None = None,
-                 status_argv: list[str] | None = _UNSET) -> None:
+                 status_argv: list[str] | None = _UNSET,
+                 public_port: int = 443) -> None:
         self.name = name
         self._events = events if events is not None else []
         self.refusal = refusal
         self._target_port = target_port
         self._stop_argv = stop_argv
+        self._public_port = public_port
         # Defaults to the provider's own reader, in the shape the Tailscale
         # adapters use. `None` is passed explicitly by the test that asserts a
         # stop it cannot verify.
@@ -161,6 +163,27 @@ class _FakeAdapter:
             return None
         host = text[len("https://"):].split("/")[0]
         return host if host.endswith(".example.com") else None
+
+    def public_port(self) -> int:
+        """Defaults to 443 -- distinct from `command()`'s literal fake
+        `9443` on purpose, so every existing test in this file (none of
+        which asserts a ported URL) stays on the plain, no-port branch of
+        `public_url` below. Overridable per instance
+        (`test_start_publishes_the_adapters_own_public_port` is the one test
+        that does) so this harness can prove `TransportManager._publish`
+        actually forwards *this* value into `PublishedHosts`, rather than a
+        hardcoded one, without duplicating the real adapters' own
+        port-in-URL behaviour -- that stays pinned in
+        `test_6b_transport_adapters.py`."""
+        return self._public_port
+
+    def public_url(self, hostname: str) -> str:
+        """Bare `https://{hostname}` -- this harness's own fake public port
+        (`command()`'s literal `9443`) plays no part in what `session.url`
+        is asserted to be anywhere in this file; the real adapters' own
+        port-in-URL behaviour is pinned in `test_6b_transport_adapters.py`
+        instead."""
+        return f"https://{hostname}"
 
     def preflight(self, port: int) -> str | None:
         self._events.append("preflight")
@@ -202,9 +225,11 @@ class _RecordingHosts(PublishedHosts):
         super().__init__()
         self._events = events
 
-    def publish(self, hostname: str, *, owner: str, listener: int) -> None:
+    def publish(self, hostname: str, *, owner: str, listener: int,
+                public_port: int | None = None) -> None:
         self._events.append("publish")
-        super().publish(hostname, owner=owner, listener=listener)
+        super().publish(hostname, owner=owner, listener=listener,
+                        public_port=public_port)
 
     def unpublish(self, owner: str):
         self._events.append("unpublish")
@@ -419,6 +444,29 @@ async def test_start_binds_registers_spawns_and_publishes_in_that_order(h):
     assert sorted(h.manager.running()) == ["quick"]
     assert h.listeners.tasks["quick"] is session.serve_task
     assert h.listeners.sockets["quick"] is session.sock
+
+
+@pytest.mark.asyncio
+async def test_start_publishes_the_adapters_own_public_port(h):
+    """`_publish` must forward *this adapter's* `public_port()`, not a
+    hardcoded value -- the live-test defect's actual wiring, one layer below
+    `TransportSession.url` (which reads the adapter directly and so cannot
+    catch a broken `_publish` call on its own): `security.py`'s
+    `endpoint_origins`/`origins_for` and `routes/pairing.py`'s `_endpoints()`
+    both read the port back out of `PublishedHosts`, never the adapter, so
+    if `start()` published the wrong port -- or none at all -- those two
+    would silently build an unreachable origin/URL even though
+    `session.url` itself was correct.
+    """
+    adapter = _FakeAdapter("tailnet", events=h.events, public_port=8443)
+    h.register(adapter)
+
+    session = await h.manager.start("tailnet")
+
+    assert h.published.hosts_for(session.port) == frozenset(
+        {"tailnet.example.com"})
+    assert h.published.origins_for(session.port) == frozenset(
+        {"https://tailnet.example.com:8443"})
 
 
 @pytest.mark.asyncio

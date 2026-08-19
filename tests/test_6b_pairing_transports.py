@@ -27,6 +27,7 @@ from assistant.io.api.pairing import PairCodeStore
 from assistant.io.api.routes import pairing as pairing_module
 from assistant.io.api.policy import POLICIES, effective
 from assistant.io.api.security import COOKIE_NAME, CSRF_HEADER, PublishedHosts
+from assistant.io.api.transports import transport_registry
 from assistant.io.api.transports.base import TransportSession
 from assistant.io.api.transports.manager import is_serving
 from assistant.io.api.vault import Capability, TokenVault
@@ -64,10 +65,18 @@ def _session(name: str, *, hostname: str | None) -> TransportSession:
     """A `TransportSession` with the bookkeeping fields this route never
     reads (`process`, `sock`, `serve_task`) left as `None` -- `is_serving` and
     `mint_pair_code` only ever look at `hostname`, `port` and `policy_name`.
+
+    `adapter` is looked up from the real, module-level `transport_registry`
+    by *name* -- the same source `TransportManager.start` reads it from --
+    rather than left `None`, so `.url` here carries the same public port a
+    real session would (fix for the live-test defect: a bare `None` adapter
+    silently fell back to a portless URL, which is exactly the bug on
+    `tailnet`).
     """
     return TransportSession(
         policy_name=name, port=PORTS[name], owner=f"owner-{name}",
         process=None, sock=None, serve_task=None, hostname=hostname,
+        adapter=transport_registry.get(name),
     )
 
 
@@ -111,9 +120,32 @@ def test_minting_defaults_to_the_local_loopback_endpoint(tmp_path):
     assert r.json()["data"]["endpoints"] == [f"http://127.0.0.1:{PORTS['local']}"]
 
 
-def test_minting_for_a_running_transport_encodes_its_https_url(tmp_path):
+def test_minting_for_a_running_transport_encodes_its_https_url(tmp_path, monkeypatch):
     """`transport="tailnet"`, with tailnet actually running and announced,
-    builds the QR from that transport's published host -- never loopback."""
+    builds the QR from that transport's published host -- never loopback.
+
+    Carries `:8443`, tailnet's own public port -- the live-test defect this
+    guards: a phone scanning this QR must be pointed at the port
+    `tailscale serve` actually publishes on, not the HTTPS default it fell
+    back to before the fix (`ERR_CONNECTION_TIMED_OUT`, since nothing
+    listens on 443 for a tailnet mapping). Asserted on the JSON `endpoints`
+    field AND on the literal payload handed to `qr_svg` -- a QR encodes its
+    input as a scannable bitmap, not as recoverable text (`qr.py`'s own
+    docstring: that opacity is deliberate, so the code cannot be read back
+    off a screenshot), so proving the *QR itself* carries the port means
+    spying on the string `qr_svg` was called with, the same shape
+    `test_the_pair_code_still_travels_in_the_url_fragment` already uses for
+    the fragment half of this same payload.
+    """
+    captured: list[str] = []
+    original = pairing_module.qr_svg
+
+    def spy(payload: str) -> str:
+        captured.append(payload)
+        return original(payload)
+
+    monkeypatch.setattr(pairing_module, "qr_svg", spy)
+
     vault = TokenVault(tmp_path)
     admin = vault.issue("laptop", frozenset(Capability))
     session = _session("tailnet", hostname="laptop.tailxyz.ts.net")
@@ -122,8 +154,11 @@ def test_minting_for_a_running_transport_encodes_its_https_url(tmp_path):
     r = mint(client, transport="tailnet")
     assert r.status_code == 200, r.text
     endpoints = r.json()["data"]["endpoints"]
-    assert endpoints == ["https://laptop.tailxyz.ts.net"]
+    assert endpoints == ["https://laptop.tailxyz.ts.net:8443"]
     assert not any(e.startswith("http://127.0.0.1") for e in endpoints)
+
+    assert len(captured) == 1
+    assert captured[0].startswith("https://laptop.tailxyz.ts.net:8443/pair#")
 
 
 def test_minting_for_a_transport_that_is_not_running_is_refused(tmp_path):
@@ -205,10 +240,13 @@ def test_a_tunnel_listener_never_offers_a_loopback_endpoint():
     caller (`require_admin`) means it always runs on `local` today, so this is
     the one place the transport branch is exercised at all. Accepted on a
     transport listener's own port, it must answer that listener's published
-    `https://` hosts and offer no loopback candidate whatsoever.
+    `https://` hosts, each carrying that transport's own public port
+    (`:8443` on tailnet -- the live-test defect this pins), and offer no
+    loopback candidate whatsoever.
     """
     published = PublishedHosts()
-    published.publish("laptop.tailxyz.ts.net", owner="o1", listener=PORTS["tailnet"])
+    published.publish("laptop.tailxyz.ts.net", owner="o1",
+                      listener=PORTS["tailnet"], public_port=8443)
 
     class _State:
         listener_policies = POLICY_REGISTRY
@@ -222,7 +260,7 @@ def test_a_tunnel_listener_never_offers_a_loopback_endpoint():
         scope = {"server": ("127.0.0.1", PORTS["tailnet"])}
 
     endpoints = pairing_module._endpoints(_Request())
-    assert endpoints == ["https://laptop.tailxyz.ts.net"]
+    assert endpoints == ["https://laptop.tailxyz.ts.net:8443"]
     assert not any(e.startswith("http://127.0.0.1") for e in endpoints)
 
 

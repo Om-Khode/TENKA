@@ -180,6 +180,16 @@ def test_quick_stops_by_terminating_its_own_process():
     assert adapter.stop_command(_LOCAL_PORT) is None
 
 
+def test_the_quick_url_omits_its_port():
+    """A quick tunnel is always published on 443, the HTTPS default -- unlike
+    `tailnet`'s 8443 (see `test_6b_transport_adapters.py`'s companion
+    tests), so its URL never carries a port suffix."""
+    adapter = QuickAdapter()
+    url = adapter.public_url("random-name.trycloudflare.com")
+    assert url == "https://random-name.trycloudflare.com"
+    assert ":443" not in url
+
+
 # ─── Task 8: registration ────────────────────────────────────────────────────
 
 def test_quick_registers_itself_under_its_own_policy_name():
