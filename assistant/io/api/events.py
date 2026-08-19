@@ -63,7 +63,9 @@ import threading
 import time
 from typing import Any, Callable
 
+from .policy import ListenerPolicy
 from .routes.system import telemetry_body
+from .security import admin_capability_satisfied
 from .vault import Capability
 
 logger = logging.getLogger(__name__)
@@ -218,6 +220,55 @@ _USER_CONTENT_FIELDS: dict[str, tuple[str, ...]] = {
 _USER_CONTENT_CAPABILITY = Capability.RECALL
 
 
+# ─── invalidate fanout ──────────────────────────────────────────────────────
+# `"invalidate"` names a resource that changed and carries nothing else --
+# `{"type": "invalidate", "resource": "devices"}` -- so the client refetches
+# it through its normal authenticated route, which already enforces every
+# capability that route requires. No id, label, grant, hostname, count or
+# diff ever rides on this frame: that is the property that makes fanout safe
+# to reason about at all, so a resource is never added here paired with a
+# payload field -- it is added here and nowhere else grows a shape.
+#
+# Two fanout shapes, decided here, server-side, never by a field the client
+# supplies:
+#
+# `_DEVICE_SCOPED_RESOURCES` -- a raise minted or revoked for device X changes
+# only what `GET /v1/session` answers *for X*. Delivered to X's own sockets by
+# `device_id` match alone (`_pump`, via `only_device_id`); no capability check
+# rides alongside, because that route is `authenticate()`-gated only -- any
+# device may read its own session. `publish_invalidate` refuses to broadcast
+# one of these (drops it, logs, does not raise) if a call site ever asks for
+# one with no `device_id`: the alternative would tell every *other* connected
+# device that "some device's state changed", which is exactly the disclosure
+# the resource-carries-no-data design exists to prevent.
+#
+# `_ADMIN_COLLECTION_RESOURCES` -- the devices list and the transports list,
+# each read through a route gated by `require_admin(capability)`
+# (`security.py`). The capability recorded here is that route's own argument,
+# so `_pump` asks `admin_capability_satisfied` -- the same predicate
+# `require_admin` itself calls -- rather than a hand-derived copy of "is this
+# socket's device an admin" that could quietly drift from the route it is
+# supposed to mirror.
+#
+# A resource that is in neither table is refused by `publish_invalidate`
+# (dropped, logged) rather than broadcast: adding a resource means adding a
+# row to one of these two tables, never inventing a new frame type, and never
+# defaulting a forgotten row to "tell everyone".
+_DEVICE_SCOPED_RESOURCES = frozenset({"session"})
+_ADMIN_COLLECTION_RESOURCES: dict[str, Capability] = {
+    "devices": Capability.SYSTEM_CONTROL,
+    "transports": Capability.SYSTEM_CONTROL,
+}
+
+# A key `publish()` adds to the *queued* copy of a device-scoped event, never
+# to the frame actually sent -- `_pump` reads it to decide which socket(s) get
+# the event, then strips it before `send_json`. Leading underscore, and a
+# name no real frame field could collide with by accident, because this must
+# never once reach a client: it is delivery routing, not part of the wire
+# shape `test_no_frame_the_socket_can_emit_has_a_snake_case_key` sweeps.
+_ONLY_DEVICE_ID_KEY = "_only_device_id"
+
+
 def visible_frame(frame: dict, grants: frozenset[Capability] | None) -> dict:
     """`frame` as a device holding `grants` may see it.
 
@@ -304,6 +355,14 @@ def telemetry_frame(snapshot) -> dict:
     return {"type": "telemetry", **telemetry_body(snapshot).model_dump(by_alias=True)}
 
 
+def build_invalidate_frame(resource: str) -> dict:
+    """The one `"invalidate"` wire shape: names a resource that changed and
+    carries nothing else. See the module-level note above for the fanout
+    rules this frame's data (never its shape) is gated by.
+    """
+    return {"type": "invalidate", "resource": resource}
+
+
 def build_error_frame(detail: str) -> dict:
     """The `"error"` reply app.py sends for a malformed or unrecognised
     client frame. Routed through a builder -- not a literal dict at the
@@ -384,6 +443,15 @@ class EventHub:
         # any call site not yet passing it): such a socket is not attributable
         # to a device, so only the global cap can apply to it.
         self._device_of: dict[Any, str | None] = {}
+        # socket -> the `ListenerPolicy` it was accepted on, for the
+        # collection-scoped invalidate gate. Fixed for the life of a
+        # connection (a socket never migrates listeners), unlike `grants`,
+        # which the viewer callable re-derives live -- so this is captured
+        # once at `attach()` rather than re-asked, the same way `device_id`
+        # is. `None` for a caller that attached without one (test scaffolding);
+        # such a socket receives no collection-scoped invalidate frame, the
+        # same fail-closed answer `_pump` gives any socket it cannot classify.
+        self._policy_of: dict[Any, ListenerPolicy | None] = {}
         # socket -> `time.monotonic()` of the last traffic in either
         # direction. Wall time would let a clock change reap every socket at
         # once.
@@ -415,7 +483,8 @@ class EventHub:
 
     async def attach(self, socket,
                      viewer: Callable[[], frozenset[Capability] | None] | None = None,
-                     *, device_id: str | None = None) -> bool:
+                     *, device_id: str | None = None,
+                     policy: ListenerPolicy | None = None) -> bool:
         """Start delivering to `socket`. `False` if the hub refused it.
 
         `viewer` is re-consulted, not cached: it must answer "what may this
@@ -429,6 +498,10 @@ class EventHub:
         A caller that does not pass one gets the global cap only: a socket
         nobody attributed cannot be counted against a device without guessing
         which, and guessing wrong locks out a device that did nothing.
+
+        `policy` names the listener this socket was accepted on, for the
+        collection-scoped invalidate gate (`_ADMIN_COLLECTION_RESOURCES`).
+        Captured once, unlike `viewer` -- see `_policy_of`'s docstring.
         """
         # Captured here too, not just in start(): a test harness (or a
         # deployment that never calls start() before the first connection)
@@ -460,6 +533,7 @@ class EventHub:
             return False
         self._sockets[socket] = viewer
         self._device_of[socket] = device_id
+        self._policy_of[socket] = policy
         self._last_active[socket] = time.monotonic()
         if self._pump_task is None:
             self._pump_task = asyncio.create_task(self._pump())
@@ -494,6 +568,7 @@ class EventHub:
         the socket it counted locks a device out after eight page reloads."""
         self._sockets.pop(socket, None)
         self._device_of.pop(socket, None)
+        self._policy_of.pop(socket, None)
         self._last_active.pop(socket, None)
 
     async def detach(self, socket) -> None:
@@ -540,7 +615,7 @@ class EventHub:
                 logger.warning(f"[API] {name} ended with an error: {exc!r}")
 
     # ─── fan-out ────────────────────────────────────────────────────────
-    def publish(self, event: dict) -> None:
+    def publish(self, event: dict, *, only_device_id: str | None = None) -> None:
         """Non-blocking. Safe from sync code on any thread (status_broadcaster).
 
         Sends `event` verbatim -- no translation happens here. Anything that
@@ -550,13 +625,22 @@ class EventHub:
 
         Buffers rather than enqueues while no loop is known yet -- see the
         module docstring for why a direct enqueue here is never safe.
+
+        `only_device_id`, when given, restricts delivery to that device's own
+        sockets (`_pump` reads it off a reserved key it strips before the
+        frame ever reaches `send_json`, so it never rides the wire). Every
+        existing caller omits it, so every existing frame is enqueued
+        byte-for-byte as before -- the key is added to the queued dict only
+        on the path a caller opts into.
         """
+        queued = event if only_device_id is None else {
+            **event, _ONLY_DEVICE_ID_KEY: only_device_id}
         with self._state_lock:
             loop = self._loop
             if loop is None:
-                self._pending.append(event)
+                self._pending.append(queued)
                 return
-        loop.call_soon_threadsafe(self._enqueue, event)
+        loop.call_soon_threadsafe(self._enqueue, queued)
 
     def publish_status(self, event: dict) -> None:
         """The bridge point for `status_broadcaster`: main.py subscribes this
@@ -566,6 +650,32 @@ class EventHub:
         anything reaches a browser. Safe from any thread, same as `publish()`.
         """
         self.publish(status_frame_from_broadcaster_event(event))
+
+    def publish_invalidate(self, resource: str, *, device_id: str | None = None) -> None:
+        """Queue `{"type": "invalidate", "resource": resource}` for delivery.
+
+        This is a mutating route's one call, made after its mutation is
+        durable (never before, never optimistically) -- see the route
+        modules for the call sites. It never raises: a resource this hub
+        cannot classify, or a device-scoped one asked for with no
+        `device_id`, is dropped and logged rather than broadcast, because
+        broadcasting either would tell every connected socket something it
+        has no route and no business reading. A caller wrapping this in a
+        route must still catch anything unexpected from the socket layer
+        below it -- see `notify_invalidate` below for that wrapper.
+        """
+        if resource in _DEVICE_SCOPED_RESOURCES:
+            if device_id is None:
+                logger.error(
+                    f"[API] refusing to broadcast the device-scoped "
+                    f"invalidate resource {resource!r} with no device_id")
+                return
+        elif resource not in _ADMIN_COLLECTION_RESOURCES:
+            logger.error(
+                f"[API] refusing to publish an invalidate frame for the "
+                f"unclassified resource {resource!r}")
+            return
+        self.publish(build_invalidate_frame(resource), only_device_id=device_id)
 
     def _set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Capture the loop once, then flush anything published before it existed."""
@@ -610,8 +720,32 @@ class EventHub:
 
     async def _pump(self) -> None:
         while True:
-            event = await self._queue.get()
+            queued = await self._queue.get()
+            # The routing key never rides the wire -- see `publish()` and
+            # `_ONLY_DEVICE_ID_KEY`'s docstrings. Absent on every frame that
+            # isn't device-scoped, so `event is queued` (no copy) on the
+            # ordinary broadcast path this hub has always taken.
+            only_device_id = queued.get(_ONLY_DEVICE_ID_KEY)
+            if only_device_id is None:
+                event = queued
+            else:
+                event = {k: v for k, v in queued.items()
+                          if k != _ONLY_DEVICE_ID_KEY}
+            # Collection-scoped gating applies only on the broadcast path --
+            # a device-scoped event is already narrowed to one device below,
+            # and no resource is ever in both tables.
+            required_capability = (
+                _ADMIN_COLLECTION_RESOURCES.get(event.get("resource"))
+                if only_device_id is None and event.get("type") == "invalidate"
+                else None)
             for socket, viewer in list(self._sockets.items()):
+                # Device-scoped delivery: only the named device's own sockets
+                # even reach the authorisation/send logic below. Silence for
+                # everyone else, not a filtered frame -- there is nothing to
+                # filter, since the frame carries no data to begin with.
+                if (only_device_id is not None
+                        and self._device_of.get(socket) != only_device_id):
+                    continue
                 # Authorisation, re-asked per frame. The handshake's answer is
                 # never reused: a device revoked a moment ago must not receive
                 # this frame, and `TokenVault.verify()` re-reading disk on
@@ -631,6 +765,19 @@ class EventHub:
                                     "device is no longer authorised")
                         await self._drop(socket, close=True)
                         continue
+                    # Collection-scoped gate: would this device's own GET to
+                    # the admin route this resource lives behind succeed
+                    # right now? Asked of `admin_capability_satisfied` --
+                    # the same predicate `require_admin` calls -- rather than
+                    # re-derived here, so the two cannot drift apart. A
+                    # socket with no recorded policy (test scaffolding that
+                    # attached without one) fails this closed: it is not
+                    # classified as an admin, so it is not treated like one.
+                    if required_capability is not None:
+                        policy = self._policy_of.get(socket)
+                        if policy is None or not admin_capability_satisfied(
+                                required_capability, grants, policy):
+                            continue
                 try:
                     # Bounded. This one `await` is the whole fan-out's
                     # critical section: delivery is sequential, so a send
@@ -764,4 +911,28 @@ class EventHub:
         self._pump_task = None
         self._sockets.clear()
         self._device_of.clear()
+        self._policy_of.clear()
         self._last_active.clear()
+
+
+def notify_invalidate(hub: "EventHub | None", resource: str, *,
+                       device_id: str | None = None) -> None:
+    """The one call a mutating route makes, after its mutation is durable.
+
+    Never raises. `hub` is read defensively (`getattr(request.app.state,
+    "hub", None)` at the call site) the same way `routes/devices.py` already
+    reads `app.state.raises` and `app.state.transports` -- an app built or
+    tested without one gets a silent no-op. `EventHub.publish_invalidate`
+    itself cannot raise (a resource it cannot classify is logged and
+    dropped, and `publish()`'s only failure mode, a full queue, is already
+    caught and logged inside `_enqueue`) -- the `try` here is the outermost
+    net, so a socket that has gone away, a queue that is full, or anything
+    else this call touches can never turn a successful mutation into a 500.
+    """
+    if hub is None:
+        return
+    try:
+        hub.publish_invalidate(resource, device_id=device_id)
+    except Exception:
+        logger.warning(f"[API] failed to publish an invalidate frame for "
+                       f"{resource!r}", exc_info=True)

@@ -1418,6 +1418,25 @@ def require(capability: Capability):
     return _dependency
 
 
+def admin_capability_satisfied(capability: Capability,
+                                grants: frozenset[Capability],
+                                policy: ListenerPolicy) -> bool:
+    """The exact condition `require_admin(capability)` enforces over HTTP --
+    `capability` held AND a listener trusted to manage this daemon's own
+    credentials (`policy.admin`) -- exposed as a plain predicate rather than
+    only as a FastAPI dependency.
+
+    `events.py`'s collection-scoped invalidate fanout is the reason this is
+    a standalone function: a socket is not a route, so it cannot go through
+    `Depends(require_admin(...))`, but "would this device's next GET to the
+    admin route this resource lives behind succeed right now?" has to be the
+    *same* question, answered from the *same* place -- never a second,
+    hand-derived copy of `policy.admin and capability in grants` that could
+    drift from this one as either side changes.
+    """
+    return capability in grants and policy.admin
+
+
 def require_admin(capability: Capability):
     """Dependency factory: `require(capability)`, then insist on a listener
     that is trusted to manage this daemon's own credentials.
@@ -1441,7 +1460,11 @@ def require_admin(capability: Capability):
                           device: Device = Depends(require(capability))) -> Device:
         # `request.state.policy` is set by `authenticate()`, which
         # `require(capability)` above depends on, so it is always present here.
-        if not request.state.policy.admin:
+        # Routed through `admin_capability_satisfied` so this dependency and
+        # the event hub's fanout gate are provably the same rule -- see that
+        # function's docstring.
+        if not admin_capability_satisfied(capability, device.grants,
+                                          request.state.policy):
             raise _NOT_ADMIN
         return device
 

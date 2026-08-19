@@ -62,6 +62,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
+from ..events import notify_invalidate
 from ..pairing import PairCodeStore
 from ..payloads import PairCodePayload
 from ..policy import POLICIES, ListenerPolicy, effective, policy_for_port
@@ -508,6 +509,11 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
                             detail="try again")
     state.limiter.record_success(_PAIR_BUDGET_KEY)
     logger.info(f"[API] paired a new device: {pair_code.label!r}")
+    # After the vault write above has actually landed, never before: the
+    # devices list an admin viewer holds open just went stale, and this is
+    # the one call that tells it so. See `notify_invalidate` for why this
+    # can never turn the pairing that already succeeded into a 500.
+    notify_invalidate(getattr(request.app.state, "hub", None), "devices")
 
     response = Response(status_code=status.HTTP_204_NO_CONTENT)
     # Prefixed on any listener that can set `Secure` -- see the same call in

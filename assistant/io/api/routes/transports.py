@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from ..events import notify_invalidate
 from ..payloads import TransportPayload, TransportsPayload
 from ..policy import POLICIES
 from ..schemas import Envelope
@@ -105,6 +106,10 @@ async def start_transport(
         # token or path, so it is passed straight through.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail=str(exc)) from exc
+    # After `manager.start()` above has actually succeeded: the transports
+    # list any admin viewer holds open (the pair dialog among them) just
+    # went stale.
+    notify_invalidate(getattr(request.app.state, "hub", None), "transports")
     return Envelope(data=_row(name, session))
 
 
@@ -130,4 +135,7 @@ async def stop_transport(
         # replaced with this route's own words.
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail=str(exc)) from exc
+    # After `manager.stop()` above has actually succeeded, same reasoning as
+    # `start_transport`.
+    notify_invalidate(getattr(request.app.state, "hub", None), "transports")
     return Envelope(data=_row(name, None))

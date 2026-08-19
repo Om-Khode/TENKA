@@ -33,6 +33,7 @@ import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from ..events import notify_invalidate
 from ..payloads import DevicePayload, DevicesPayload, RaisePayload, RevokedPayload
 from ..policy import POLICIES
 from ..raises import RaiseGrant, RaiseStore
@@ -173,6 +174,12 @@ async def revoke_device(
     # The device id, never a label and never a token. An id is what the caller
     # already sent; it is the one field here that reveals nothing new.
     logger.info(f"[API] device revoked (device={device_id})")
+    # After both writes above have landed: the devices list an admin viewer
+    # holds open just lost a row (and, via `drop_device`, possibly a raise
+    # too). The revoked device's own socket needs no frame here -- its
+    # `viewer()` already answers `None` on its very next check and the hub
+    # closes it through the ordinary revocation path, not this one.
+    notify_invalidate(getattr(request.app.state, "hub", None), "devices")
     return Envelope(data=RevokedPayload(revoked=device_id))
 
 
@@ -299,6 +306,14 @@ async def raise_device_ceiling(
         f"[API] ceiling raised (device={device_id} transport={body.transport} "
         f"capabilities={'+'.join(payload.capabilities)} "
         f"seconds={payload.expires_in_seconds} by={granter.device_id})")
+    # After `store.grant()` above has landed. Two viewers just went stale:
+    # the raised device's own `GET /v1/session` (device-scoped -- only its
+    # sockets may learn its own ceiling moved) and the admin devices list,
+    # which nests every device's live raises (collection-scoped -- any
+    # socket that could `GET /v1/devices` right now).
+    hub = getattr(request.app.state, "hub", None)
+    notify_invalidate(hub, "session", device_id=device_id)
+    notify_invalidate(hub, "devices")
     return Envelope(data=payload)
 
 
@@ -332,4 +347,10 @@ async def revoke_device_raise(
     store.drop_device(device_id)
     logger.info(f"[API] ceiling raise revoked (device={device_id} "
                 f"transports={'+'.join(sorted(key[1] for key in held))})")
+    # Same two viewers as `raise_device_ceiling` above, for the same reason:
+    # the device's own session narrowed back down, and the admin devices
+    # list's nested raise rows for it just disappeared.
+    hub = getattr(request.app.state, "hub", None)
+    notify_invalidate(hub, "session", device_id=device_id)
+    notify_invalidate(hub, "devices")
     return Envelope(data=RevokedPayload(revoked=device_id))

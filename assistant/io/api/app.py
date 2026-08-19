@@ -937,7 +937,8 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         # rather than proceeding, because an unattached socket would sit in
         # the receive loop forever receiving nothing and looking healthy.
         if not await app.state.hub.attach(websocket, _viewer,
-                                          device_id=device.device_id):
+                                          device_id=device.device_id,
+                                          policy=policy):
             logger.info(f"[API] refused /v1/events, socket cap reached "
                         f"(device={device.device_id})")
             # Audited as a refusal: `_audit("accepted")` used to run above
