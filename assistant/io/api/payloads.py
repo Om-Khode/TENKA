@@ -287,6 +287,30 @@ class SessionPayload(CamelModel):
     policy: str
 
 
+# ─── Listener discovery ──────────────────────────────────────────────────
+class ListenerPayload(CamelModel):
+    """The three facts a caller needs before it holds any credential at all.
+
+    Served by `GET /v1/listener`, the one unauthenticated read in this API
+    (`POST /v1/pair` is the one unauthenticated *write*) -- Studio's
+    `/connect` screen has no other way to learn which listener served it, and
+    that has to be known before it can decide whether to offer the
+    bearer-token exchange at all. Deliberately nothing beyond these three:
+    no device data, no hostname, no ceiling, no capability list. The caller
+    already knows which port it reached -- it chose it -- so none of this is
+    a secret; it is Studio being told what it could otherwise only guess by
+    trying the bearer exchange and reading the failure.
+
+    `can_pair` is `pairing_denied_by_transport()`'s own answer negated, read
+    from `routes/pairing.py` rather than re-derived here, so this field and
+    `pair_device`'s actual refusal cannot drift apart.
+    """
+
+    policy: str
+    allow_bearer: bool
+    can_pair: bool
+
+
 # ─── Pairing and devices ─────────────────────────────────────────────────
 class PairCodePayload(CamelModel):
     """What the laptop puts on screen. The code is in here exactly once, and

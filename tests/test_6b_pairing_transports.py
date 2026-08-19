@@ -309,11 +309,18 @@ def test_redemption_is_refused_on_quick(tmp_path):
     assert {d.label for d in vault.devices()} == {"phone"}
 
 
-def test_redeemed_grants_are_still_narrowed_by_the_listener_ceiling(tmp_path):
-    """`effective(pair_code.grants, policy)` must still run on a transport
-    listener: a code minted with every capability, redeemed over `tailnet`
-    (ceiling excludes EXECUTE and SYSTEM_CONTROL), must not mint a device
-    carrying either.
+def test_redeemed_grants_are_narrowed_to_ceiling_plus_raisable_not_ceiling_alone(tmp_path):
+    """Issue-time narrowing (`pair_device`) uses `effective(pair_code.grants,
+    policy, raised=policy.raisable)`, never the bare-ceiling two-argument
+    form. `tailnet`'s `raisable` is `{EXECUTE, SYSTEM_CONTROL}`, so a code
+    minted with every capability, redeemed over `tailnet`, DOES mint a device
+    carrying both -- narrowing to the everyday ceiling alone used to discard
+    them from the device's own issued set permanently, making `tailnet`'s
+    whole `raisable` configuration unreachable (the live-test defect this
+    fixes). This is not a widening of what the device may do on an ordinary
+    request: `test_a_tailnet_device_holding_execute_is_still_refused_it_
+    without_a_live_raise` below pins that `authenticate()`'s own per-request
+    narrowing is untouched.
     """
     vault = TokenVault(tmp_path)
     store = PairCodeStore()
@@ -324,8 +331,131 @@ def test_redeemed_grants_are_still_narrowed_by_the_listener_ceiling(tmp_path):
     assert r.status_code == 204
 
     paired = [d for d in vault.devices() if d.label == "phone"][0]
-    assert paired.grants == effective(frozenset(Capability), POLICIES["tailnet"])
-    # Not vacuous: the full set must actually have been narrowed down.
-    assert paired.grants != frozenset(Capability)
+    assert paired.grants == effective(frozenset(Capability), POLICIES["tailnet"],
+                                      raised=POLICIES["tailnet"].raisable)
+    # Not vacuous: the stored set must actually carry what the bare ceiling
+    # alone would have discarded.
+    assert Capability.EXECUTE in paired.grants
+    assert Capability.SYSTEM_CONTROL in paired.grants
+    assert paired.grants == frozenset(Capability)  # tailnet's ceiling | raisable is everything
+
+
+def test_redeemed_grants_over_funnel_still_exclude_execute_and_system_control(tmp_path):
+    """`funnel`'s `raisable` is empty, so `ceiling | raisable` there is just
+    `ceiling` -- identical to the pre-fix behaviour, and the property the
+    operator confirmed is deliberately unaffected: a public URL with no
+    second credential gating it must never mint a device carrying EXECUTE or
+    SYSTEM_CONTROL, raise or no raise.
+    """
+    vault = TokenVault(tmp_path)
+    store = PairCodeStore()
+    app = build(vault, store=store)
+    code = store.mint("phone", frozenset(Capability)).code
+
+    r = client_on(app, "funnel").post("/v1/pair", json={"code": code})
+    assert r.status_code == 204
+
+    paired = [d for d in vault.devices() if d.label == "phone"][0]
     assert Capability.EXECUTE not in paired.grants
     assert Capability.SYSTEM_CONTROL not in paired.grants
+    assert paired.grants == frozenset({
+        Capability.OBSERVE, Capability.RECALL, Capability.CHAT_SEND,
+        Capability.SCREEN, Capability.FILES,
+    })
+
+
+def test_a_tailnet_device_holding_execute_is_still_refused_it_without_a_live_raise(tmp_path):
+    """The property the whole fix rests on: storing EXECUTE in the vault is
+    not the same as being allowed to use it. `authenticate()`'s per-request
+    narrowing (`effective(issued, policy, raised)` with whatever the *live*
+    raise store holds -- empty here) is untouched by the issue-time change
+    above, so a device that paired over `tailnet` and now has EXECUTE on file
+    is still refused it on an ordinary request with no raise live.
+
+    Redeems and re-authenticates through the *same* client on purpose: the
+    pairing response's `Set-Cookie` is copied into this client's own jar (the
+    `Secure` attribute `tailnet` sets, per `HOST_COOKIE_NAME`'s docstring,
+    means the test client's own cookie jar will not re-attach it
+    automatically over the plain-`http` test transport -- the same reason
+    `test_pairing_over_funnel_permanently_limits_the_device_even_on_a_wider_
+    listener` above copies it by hand rather than relying on the jar), so the
+    follow-up requests below carry the exact credential `pair_device` just
+    issued, with no need to read the token back out of the vault (which is
+    not exposed after issuance by design).
+    """
+    from assistant.io.api.raises import RaiseStore
+    from assistant.io.api.security import CSRF_HEADER, HOST_COOKIE_NAME
+
+    vault = TokenVault(tmp_path)
+    store = PairCodeStore()
+    app = build(vault, store=store)
+    app.state.raises = RaiseStore()
+    code = store.mint("phone", frozenset(Capability)).code
+
+    remote = client_on(app, "tailnet")
+    paired = remote.post("/v1/pair", json={"code": code})
+    assert paired.status_code == 204
+    remote.cookies.set(HOST_COOKIE_NAME, paired.cookies[HOST_COOKIE_NAME])
+
+    # The vault DOES hold EXECUTE now (the fix), which `GET /v1/session`'s
+    # `grants` field reports -- but `effective` (what this connection may
+    # actually carry right now) must not.
+    session = remote.get("/v1/session").json()["data"]
+    assert "execute" in session["grants"]
+    assert "system_control" in session["grants"]
+    assert "execute" not in session["effective"]
+    assert "system_control" not in session["effective"]
+
+    # And on a real capability-gated route, not just the session summary:
+    # PATCH /v1/settings needs SYSTEM_CONTROL, and the ceiling alone (no
+    # raise live) must still refuse it.
+    patch = {"changes": {"tts_speed": 1.25}}
+    refused = remote.patch("/v1/settings", json=patch, headers={CSRF_HEADER: "1"})
+    assert refused.status_code == 403
+
+
+def test_a_raise_lets_a_tailnet_paired_device_actually_reach_execute(tmp_path):
+    """The end-to-end property the whole milestone rests on, run through the
+    *real* pairing route rather than `vault.issue()` directly (which is what
+    `test_6b_raise_routes.py`'s own version of this test does, and is not
+    enough on its own to prove the pairing fix and the raise mechanism
+    actually compose): a device paired over tailnet holds SYSTEM_CONTROL in
+    the vault only because of the issue-time fix above; refused without a
+    live raise; and the identical request succeeds once one is minted.
+    """
+    from assistant.io.api.raises import RaiseStore
+    from assistant.io.api.security import CSRF_HEADER, HOST_COOKIE_NAME
+
+    vault = TokenVault(tmp_path)
+    store = PairCodeStore()
+    session = _session("tailnet", hostname="laptop.tailxyz.ts.net")
+    app = build(vault, store=store, transports={"tailnet": session})
+    app.state.raises = RaiseStore()
+    code = store.mint("phone", frozenset(Capability)).code
+
+    remote = client_on(app, "tailnet")
+    paired = remote.post("/v1/pair", json={"code": code})
+    assert paired.status_code == 204
+    # `tailnet` sets `secure_cookie=True`, so `HOST_COOKIE_NAME`'s `Secure`
+    # attribute means the test client's own jar will not re-attach it over
+    # the plain-`http` test transport -- copied by hand, the same shape the
+    # pre-existing funnel-permanence test above already uses.
+    remote.cookies.set(HOST_COOKIE_NAME, paired.cookies[HOST_COOKIE_NAME])
+    device_id = [d for d in vault.devices() if d.label == "phone"][0].device_id
+
+    patch = {"changes": {"tts_speed": 1.25}}
+    before = remote.patch("/v1/settings", json=patch, headers={CSRF_HEADER: "1"})
+    assert before.status_code == 403, "no raise yet: must be refused"
+
+    admin = vault.issue("laptop", frozenset(Capability))
+    local = client_on(app, "local", admin)
+    minted = local.post(
+        f"/v1/devices/{device_id}/raise",
+        json={"transport": "tailnet", "capabilities": ["system_control"],
+              "minutes": 30, "reason": "live-test follow-up"},
+        headers={CSRF_HEADER: "1"})
+    assert minted.status_code == 200, minted.text
+
+    after = remote.patch("/v1/settings", json=patch, headers={CSRF_HEADER: "1"})
+    assert after.status_code == 200, "the raise must actually let this through"
+    assert "tts_speed" in after.json()["data"]["saved"]

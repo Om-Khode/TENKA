@@ -729,6 +729,13 @@ _OBSERVATION_OPERATIONS = frozenset({
     ("GET", "/v1/status"),
     ("GET", "/v1/telemetry"),
     ("GET", "/v1/session"),       # who the caller is, not anything she stored
+    # Which listener answered, and two booleans -- needs no credential at
+    # all (it is what a caller consults *before* it has one), so it answers
+    # 200 here regardless of the ceiling. Not stored data and not gated off
+    # this transport; it is the least-observational thing on this list, and
+    # it is still on this list because "answers 200 on quick" is exactly the
+    # property to pin, not to leave unclassified.
+    ("GET", "/v1/listener"),
 })
 
 _STORED_DATA_OPERATIONS = frozenset({

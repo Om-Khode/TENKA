@@ -134,6 +134,10 @@ MATRIX: tuple[Row, ...] = (
     # tunnel is the expected path for a phone with no Tailscale.
     Row("POST", "/v1/pair", "/v1/pair", None, allowed=401,
         body={"code": "AAAA-BBBB"}),
+    # `GET /v1/listener` needs no credential at all -- it is what a caller
+    # consults *before* it has one -- so no ceiling can withhold it either;
+    # it answers 200 on all four listeners, `quick` included.
+    Row("GET", "/v1/listener", "/v1/listener", None),
 
     # ── OBSERVE: watching her work ──────────────────────────────────────
     Row("GET", "/v1/status", "/v1/status", Capability.OBSERVE),

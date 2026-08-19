@@ -103,8 +103,17 @@ def test_a_token_in_the_query_string_does_not_work(client, token):
 # plus the global attempt budget that burns the outstanding code when it is
 # spent. Anything added here needs the same: a named test file, not silent
 # trust.
+#
+# ("GET", "/v1/listener") -- the one unauthenticated *read*, and it has to be:
+# Studio's `/connect` screen consults it before any credential exists, to
+# learn whether this listener can even accept the bearer-token exchange it is
+# about to offer. It answers three non-secret facts derived from the
+# accepting port alone -- the same thing the caller already knows, having
+# chosen which port to connect to -- never a device, a hostname, a ceiling or
+# a capability list. Compensating coverage is tests/test_api_listener_route.py.
 _ANONYMOUS_OPERATIONS = frozenset({
     ("POST", "/v1/pair"),
+    ("GET", "/v1/listener"),
 })
 
 
@@ -185,19 +194,26 @@ def test_the_one_anonymous_route_really_is_reachable_without_a_credential(client
     assert client.post("/v1/pair", json={}).status_code == 422
 
 
+def test_the_anonymous_read_route_really_is_reachable_without_a_credential(client):
+    """Same shape as the check above, for the read exemption: a 200 with no
+    token proves `GET /v1/listener` was reached rather than turned away by an
+    auth dependency this list would then be lying about."""
+    assert client.get("/v1/listener").status_code == 200
+
+
 def test_the_anonymous_exemption_count_is_pinned():
     """`checked > 0` above only proves *something* was swept -- it says
     nothing about how many routes are exempt from the sweep in the first
-    place. A future task could add a second entry to `_ANONYMOUS_OPERATIONS`
+    place. A future task could add a third entry to `_ANONYMOUS_OPERATIONS`
     for a route that should never have been exempt, and every existing guard
     here would still pass: the new route is real (satisfies "names only real
     operations" above) and the sweep still finds plenty of other routes to
     check (satisfies `checked > 0`). Pinning the exact count means growing
     this set is a deliberate, reviewable one-line diff -- justified with the
     same rigor (a named test file, not silent trust) as
-    `("POST", "/v1/pair")` was.
+    `("POST", "/v1/pair")` and `("GET", "/v1/listener")` were.
     """
-    assert len(_ANONYMOUS_OPERATIONS) == 1
+    assert len(_ANONYMOUS_OPERATIONS) == 2
 
 
 def test_the_sweep_catches_a_route_registered_without_auth(vault):

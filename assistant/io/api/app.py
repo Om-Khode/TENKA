@@ -38,6 +38,7 @@ from .routes import chat as chat_routes
 from .routes import commands as command_routes
 from .routes import devices as device_routes
 from .routes import files as file_routes
+from .routes import listener as listener_routes
 from .routes import memory as memory_routes
 from .routes import pairing as pairing_routes
 from .routes import session as session_routes
@@ -625,6 +626,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     app.include_router(chat_routes.router, prefix="/v1")
     app.include_router(system_routes.router, prefix="/v1")
     app.include_router(pairing_routes.router, prefix="/v1")
+    app.include_router(listener_routes.router, prefix="/v1")
     app.include_router(device_routes.router, prefix="/v1")
     app.include_router(transport_routes.router, prefix="/v1")
 
