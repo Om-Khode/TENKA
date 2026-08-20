@@ -939,8 +939,13 @@ async def test_a_normal_turn_through_the_consumer_seam_still_clears_busy(monkeyp
     dispatch = m._StudioDispatch()
     monkeypatch.setattr(m, "_studio_dispatch", dispatch)
 
+    # `raise_context` is spelled out rather than swallowed by `**kwargs`
+    # deliberately: this fake stands in for the real consumer seam, and a fake
+    # that accepts anything would keep passing after the seam's signature
+    # changed under it -- which is exactly how this test went red in the first
+    # place, and the failure was worth having.
     async def _fake_process(source, text, bridge, stt_ms=None, grants=None,
-                            principal=None):
+                            principal=None, raise_context=None):
         return None
 
     monkeypatch.setattr(m, "process_text_from_queue", _fake_process)
@@ -968,8 +973,10 @@ async def test_the_seam_does_not_clear_busy_before_the_turn_actually_finishes(mo
 
     release = asyncio.Event()
 
+    # Same reason as the fake above: the seam's real signature is mirrored
+    # explicitly, so a future argument breaks this loudly instead of silently.
     async def _slow_process(source, text, bridge, stt_ms=None, grants=None,
-                            principal=None):
+                            principal=None, raise_context=None):
         await release.wait()
 
     monkeypatch.setattr(m, "process_text_from_queue", _slow_process)
