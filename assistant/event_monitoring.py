@@ -179,7 +179,8 @@ def _fuzzy_match(monitors: list[dict], goal: str) -> list[dict]:
 
 def _set_disambig(action: str, matches: list[dict]) -> str:
     import assistant.actions as _act
-    _act.pending_monitor_disambig.set({
+    from .pending import try_arm
+    try_arm(_act.pending_monitor_disambig, {
         "action": action,
         "matches": matches,
     })

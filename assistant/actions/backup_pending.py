@@ -61,8 +61,9 @@ async def handle_pending_backup_confirm_phrase(text: str, bridge=None) -> str | 
     _act.pending_backup_confirm_phrase.clear()
 
     from ..io.backup.google_drive import AUTH_URL, TOKEN_URL, SCOPES, REDIRECT_URI
+    from ..pending import try_arm
 
-    _act.pending_backup_oauth.set({
+    try_arm(_act.pending_backup_oauth, {
         "step": "has_app",
         "auth_url": AUTH_URL,
         "token_url": TOKEN_URL,

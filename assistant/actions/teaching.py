@@ -283,7 +283,8 @@ _TEACH_NO = (
 
 def start_teaching_session(name_seed: str) -> str:
     import assistant.actions as _act
-    _act.teaching_session.set({
+    from ..pending import try_arm
+    try_arm(_act.teaching_session, {
         "state":     "collecting",
         "name_seed": name_seed.strip(),
         "steps":     [],
@@ -514,6 +515,7 @@ _BATCH_LINE_RE = re.compile(
 
 def start_batch_teaching(name_seed: str, body: str) -> str:
     import assistant.actions as _act
+    from ..pending import try_arm
 
     lines = [
         m.group(1).strip()
@@ -539,7 +541,7 @@ def start_batch_teaching(name_seed: str, body: str) -> str:
     if not steps:
         return "None of those lines looked like steps I can run. Try 'open X', 'press Y', 'type Z', etc."
 
-    _act.teaching_session.set({
+    try_arm(_act.teaching_session, {
         "state":     "collecting",
         "name_seed": name_seed.strip(),
         "steps":     steps,

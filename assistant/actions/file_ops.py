@@ -12,7 +12,8 @@ logger = logging.getLogger("actions")
 
 def _set_pending_destructive(op: str, path: Path, extra: dict):
     import assistant.actions as _act
-    _act.pending_destructive.set({"op": op, "path": path, **extra})
+    from ..pending import try_arm
+    try_arm(_act.pending_destructive, {"op": op, "path": path, **extra})
 
 
 # ─── Grounding untrusted prior-step data ───────────────────────────────────
@@ -281,6 +282,7 @@ async def handle_file_task(params: dict, llm_response: str, bridge=None) -> str:
     import assistant.actions as _act
     from ..llm.contracts import ask_for_intent, ask_for_synthesis
     from .. import file_manager
+    from ..pending import try_arm
     import json
     import re
 
@@ -439,7 +441,7 @@ async def handle_file_task(params: dict, llm_response: str, bridge=None) -> str:
         matches = file_manager.find_files(name, tier=1)
 
         if not matches:
-            _act.pending_file_search.set({"name": name, "tier": 1})
+            try_arm(_act.pending_file_search, {"name": name, "tier": 1})
             return (
                 f"I couldn't find '{name}' in your common folders. "
                 f"I can do a fast search (a few seconds, 3 levels deep) "
@@ -712,6 +714,7 @@ async def handle_pending_file_search(text: str) -> str | None:
     Returns response string if handled, None if not applicable.
     """
     import assistant.actions as _act
+    from ..pending import try_arm
 
     if _act.pending_file_search.payload is None:
         return None
@@ -769,7 +772,7 @@ async def handle_pending_file_search(text: str) -> str | None:
 
         if not results:
             if tier == 2:
-                _act.pending_file_search.set({"name": name, "tier": 2})
+                try_arm(_act.pending_file_search, {"name": name, "tier": 2})
                 msg = (
                     f"I did a fast search and couldn't find '{name}' "
                     f"in {elapsed}s. Want me to try a deep full-computer search? "

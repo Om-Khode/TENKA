@@ -162,7 +162,8 @@ async def _enable(goal: str = "", bridge=None) -> str:
     # otherwise leave the session unlocked with a phrase nobody wrote
     # down, and the next backup would upload under that orphan key.
     # handle_pending_backup_confirm_phrase caches it on confirmation.
-    _act.pending_backup_confirm_phrase.set({"phrase": phrase})
+    from ..pending import try_arm
+    try_arm(_act.pending_backup_confirm_phrase, {"phrase": phrase})
     await _show_phrase_privately(phrase, bridge)
 
     return (
@@ -181,11 +182,12 @@ def _unlock() -> str:
     """
     import assistant.actions as _act
     from ..io.backup import orchestrator
+    from ..pending import try_arm
 
     if orchestrator.is_unlocked():
         return "Backup is already unlocked for this session."
 
-    _act.pending_backup_unlock_phrase.set({})
+    try_arm(_act.pending_backup_unlock_phrase, {})
     return (
         "Paste or say your 12-word recovery phrase and I'll unlock backup "
         "for this session. Say 'cancel' to stop."
@@ -203,7 +205,8 @@ def _restore() -> str:
     if not provider.is_connected():
         return "Google Drive isn't connected — say 'enable backup' to set it up first."
 
-    _act.pending_backup_restore_phrase.set({})
+    from ..pending import try_arm
+    try_arm(_act.pending_backup_restore_phrase, {})
     return (
         "Restoring overwrites what's on this machine with the latest backup, "
         "and I'll close myself when it's done — start me again after. "

@@ -387,6 +387,7 @@ async def handle_code_executor(params: dict, llm_response: str, bridge=None,
         from .. import code_executor
         from .. import llm as llm_module
         from ..llm.contracts import ask_for_synthesis
+        from ..pending import try_arm
         from ..io.audio import tts
         from ..code_executor import GUI_HANDOFF_SIGNAL
 
@@ -419,7 +420,7 @@ async def handle_code_executor(params: dict, llm_response: str, bridge=None,
         if result.startswith("__NEEDS_OAUTH__|"):
             parts = result.split("|")
             if len(parts) == 6:
-                _act.pending_oauth_setup.set({
+                try_arm(_act.pending_oauth_setup, {
                     "service":       parts[1],
                     "auth_url":      parts[2],
                     "token_url":     parts[3],
@@ -441,7 +442,7 @@ async def handle_code_executor(params: dict, llm_response: str, bridge=None,
                 from ..io import messaging_bridge
                 messaging_bridge.connect_for_pairing(service_name)
 
-                _act.pending_device_auth.set({
+                try_arm(_act.pending_device_auth, {
                     "service": service_name,
                     "session_path": session_path,
                     "original_goal": goal,
@@ -469,7 +470,7 @@ async def handle_code_executor(params: dict, llm_response: str, bridge=None,
             try:
                 payload_str = result[len("__CONFIRM_SEND__|"):]
                 confirm_data = _json.loads(payload_str)
-                _act.pending_messaging_send.set(confirm_data)
+                try_arm(_act.pending_messaging_send, confirm_data)
 
                 resolved_name = confirm_data.get("resolved_name", confirm_data.get("phone", "someone"))
                 text_preview = confirm_data.get("text", "")
@@ -491,7 +492,7 @@ async def handle_code_executor(params: dict, llm_response: str, bridge=None,
                 error_msg = err_data.get("error", "Unknown error")
 
                 if err_data.get("is_disambiguation"):
-                    _act.pending_messaging_disambig.set({
+                    try_arm(_act.pending_messaging_disambig, {
                         "service": err_data.get("service", ""),
                         "text": err_data.get("text", ""),
                     })
