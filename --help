@@ -1,0 +1,3507 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "TENKA Studio daemon",
+    "version": "1"
+  },
+  "paths": {
+    "/v1/status": {
+      "get": {
+        "summary": "Get Status",
+        "operationId": "get_status_v1_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_StatusPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/session": {
+      "get": {
+        "summary": "Get Session",
+        "operationId": "get_session_v1_session_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_SessionPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/session/cookie": {
+      "post": {
+        "summary": "Adopt Session Cookie",
+        "description": "Put the credential that authenticated *this* request into the cookie.\n\n**It moves a credential between channels. It does not mint one.** The\nvalue written to `Set-Cookie` is the exact string `credential_from()` just\nread off this request and `TokenVault.verify()` just accepted -- not a\nreissue, not a re-grant, not a second `Device` record. The vault is never\nwritten; `devices.json` has the same number of rows afterwards as before,\nthe device id is the same id, and the grants are the same grants. There is\nno argument to widen with, because there is no argument at all: the body\nis empty and the route's entire input is the credential it already\nverified. A caller that could reach this route could already do everything\nthe resulting cookie can do -- over HTTP, this same second.\n\n**A POST, never a GET.** It sets a cookie, which is session state, and a\nGET that changes state is reachable by a plain navigation, an `<img>`, a\nlink prefetch and a browser's own speculative fetch -- none of which the\npage asked for. It would also sit outside `_AMBIENT_METHODS`, the set that\ndecides when the CSRF header is demanded, so the one gate that covers a\nrequest no script built would not apply to it. There is no body and no\npayload: the reply is a 204, exactly like `POST /v1/pair`, and for the\nsame reason -- returning the token in JSON as well would put a working\ncredential into a response body a client could log or cache, which is the\nthing this whole migration exists to stop.\n\n**Only where `policy.allow_bearer`.** That is loopback today, and the\ncoupling is not incidental: `allow_bearer` is precisely \"this listener may\naccept a credential on a channel other than the cookie\", which is the only\nsituation in which the two channels can disagree and therefore the only\nsituation this route has anything to fix. A remote listener reads the\ncookie and nothing else (`credential_from`), so a caller there already\nholds the cookie and the exchange is meaningless -- and offering it anyway\nwould mean a route that writes `Set-Cookie` reachable from a tunnel, which\nis a strictly larger surface for no gain. Refused with the same\n`UNAUTHORIZED` every other auth failure in this API raises: constant\nshape, and it must not be `_NOT_ADMIN`'s \"capability not granted\", which\nwould be a lie -- this route is gated on no capability whatsoever.\n\n**CSRF applies exactly as it does everywhere else, and nothing special is\nneeded here.** `authenticate()` runs `_refuse_cross_site()` first, which\ndemands the CSRF header on a write *when the credential was the cookie*.\nThe interesting case is the other one: a bearer-authenticated call carries\nno cookie, so the header is not demanded -- and that is correct rather\nthan a gap. CSRF exists because a browser attaches an *ambient* credential\nto whatever request any page makes; an `Authorization` header is never\nambient, so a cross-site page cannot produce one at all and there is no\nforgeable request to defend against. Bearer is loopback-only besides. The\ncookie-authenticated case is the one that could be forged, and it is\ncovered by the ordinary gate -- where all it could achieve is re-setting\nthe cookie the victim's browser already had, byte for byte, which is why\nthat case is left as a harmless idempotent no-op rather than refused.\n\n**No capability requirement**, for the same reason `GET /session` has\nnone. A device issued a single narrow grant still has to be able to reach\nits own event socket; gating this on, say, SYSTEM_CONTROL would mean a\nCHAT_SEND-only session could authenticate over HTTP forever and never\nopen the socket its replies arrive on.",
+        "operationId": "adopt_session_cookie_v1_session_cookie_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        }
+      }
+    },
+    "/v1/memory/knowledge": {
+      "get": {
+        "summary": "Get Knowledge",
+        "operationId": "get_knowledge_v1_memory_knowledge_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_KnowledgeGraphPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/memory/preferences": {
+      "get": {
+        "summary": "Get Preferences",
+        "operationId": "get_preferences_v1_memory_preferences_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PreferencesPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/memory/procedures": {
+      "get": {
+        "summary": "Get Procedures",
+        "operationId": "get_procedures_v1_memory_procedures_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ProceduresPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/memory/{scope}/{item_id}": {
+      "delete": {
+        "summary": "Forget Item",
+        "operationId": "forget_item_v1_memory__scope___item_id__delete",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "knowledge",
+                "preferences",
+                "procedures"
+              ],
+              "type": "string",
+              "title": "Scope"
+            }
+          },
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Item Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ForgottenPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/memory": {
+      "delete": {
+        "summary": "Forget Everything",
+        "operationId": "forget_everything_v1_memory_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_RemovedPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/settings": {
+      "get": {
+        "summary": "List Settings",
+        "operationId": "list_settings_v1_settings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_SettingsPayload_"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Save Settings",
+        "operationId": "save_settings_v1_settings_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingsPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_SaveOutcomePayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/personality": {
+      "get": {
+        "summary": "Get Personality",
+        "operationId": "get_personality_v1_personality_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PersonalityPayload_"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Set Personality",
+        "operationId": "set_personality_v1_personality_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PersonalityPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PersonalityPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/personality/reset": {
+      "post": {
+        "summary": "Reset Personality",
+        "operationId": "reset_personality_v1_personality_reset_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PersonalityPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/files/roots": {
+      "get": {
+        "summary": "List Roots",
+        "operationId": "list_roots_v1_files_roots_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_RootsPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/files": {
+      "get": {
+        "summary": "List Files",
+        "operationId": "list_files_v1_files_get",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FilesListingPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Delete File",
+        "operationId": "delete_file_v1_files_delete",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_DeletedPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/files/content": {
+      "get": {
+        "summary": "Read File",
+        "operationId": "read_file_v1_files_content_get",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "title": "Path"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FileContentPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/files/rename": {
+      "post": {
+        "summary": "Rename File",
+        "operationId": "rename_file_v1_files_rename_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_FileEntryPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/commands": {
+      "get": {
+        "summary": "List Commands",
+        "operationId": "list_commands_v1_commands_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_CommandsPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/commands/{command_id}/run": {
+      "post": {
+        "summary": "Run Command",
+        "operationId": "run_command_v1_commands__command_id__run_post",
+        "parameters": [
+          {
+            "name": "command_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Command Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_CommandRunPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat": {
+      "post": {
+        "summary": "Send Chat",
+        "operationId": "send_chat_v1_chat_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ChatSendPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/conversations": {
+      "get": {
+        "summary": "List Conversations",
+        "operationId": "list_conversations_v1_chat_conversations_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ConversationsPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/chat/conversations/{conversation_id}": {
+      "get": {
+        "summary": "Get Conversation",
+        "operationId": "get_conversation_v1_chat_conversations__conversation_id__get",
+        "parameters": [
+          {
+            "name": "conversation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Conversation Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ConversationDetailPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/abort": {
+      "post": {
+        "summary": "Abort",
+        "operationId": "abort_v1_abort_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_AbortPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/telemetry": {
+      "get": {
+        "summary": "Telemetry",
+        "operationId": "telemetry_v1_telemetry_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_TelemetryPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/backup": {
+      "get": {
+        "summary": "Backup State",
+        "operationId": "backup_state_v1_backup_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BackupStatePayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/backup/run": {
+      "post": {
+        "summary": "Run Backup",
+        "operationId": "run_backup_v1_backup_run_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_BackupStatePayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/backup/restore": {
+      "post": {
+        "summary": "Restore Backup",
+        "operationId": "restore_backup_v1_backup_restore_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_RestorePayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/backup/unlock": {
+      "post": {
+        "summary": "Unlock Backup",
+        "description": "Arm this process's backup encryption key from the recovery phrase.\n\nSYSTEM_CONTROL, not a read grant: the phrase this accepts is the same\nsecret that can overwrite every memory she has through /backup/restore, so\nit must not be reachable by a device paired only to watch or to read.\n\nThrottled harder than the other write routes. Deriving a key from a\nsubmitted phrase is the one place an attacker with a foothold could grind\ncandidate phrases, and unlike restore there is no destructive side effect\nto make attempts self-limiting -- a wrong-but-well-formed phrase simply\narms a useless key and can be retried. The rate limit is the only thing\nbounding that.",
+        "operationId": "unlock_backup_v1_backup_unlock_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnlockRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_UnlockPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/enrollment": {
+      "get": {
+        "summary": "Enrollment",
+        "operationId": "enrollment_v1_enrollment_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_EnrollmentPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/enrollment/{kind}/{item_id}": {
+      "delete": {
+        "summary": "Forget Enrolled",
+        "operationId": "forget_enrolled_v1_enrollment__kind___item_id__delete",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "voice",
+                "face"
+              ],
+              "type": "string",
+              "title": "Kind"
+            }
+          },
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Item Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ForgetEnrolledPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/audit": {
+      "get": {
+        "summary": "Audit",
+        "operationId": "audit_v1_audit_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_AuditPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/pair/code": {
+      "post": {
+        "summary": "Mint Pair Code",
+        "description": "Put a code, and a QR for it, in front of the person at the keyboard.\n\nMinting also clears the pair route's failure lockout. That is what makes\nthe accepted denial of service above tolerable rather than permanent: an\nattacker grinding at a code can lock the pairing window shut, and the one\nperson who can reopen it is somebody standing at this machine holding\nSYSTEM_CONTROL -- precisely the person being denied. It is not a way in\nfor the attacker, because reaching this line at all already required\neverything the attacker does not have.\n\n**Requested grants are capped at what this device already holds.**\n`require_admin` proves this device holds SYSTEM_CONTROL and is on a\nloopback listener -- it proves nothing about whether it also holds any\n*other* capability being asked for. Without the intersection below, a\ndevice paired with only SYSTEM_CONTROL could mint a code carrying RECALL,\nFILES and CHAT_SEND -- none of which it was ever issued -- and redeem that\ncode itself for a second credential wider than the one it holds.\n`Capability`'s own docstring is explicit that grants are \"granted per\ndevice, never implied\": SYSTEM_CONTROL does not subsume anything else, so\nneither does minting with it.",
+        "operationId": "mint_pair_code_v1_pair_code_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairCodeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_PairCodePayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/pair": {
+      "post": {
+        "summary": "Pair Device",
+        "description": "Redeem a code for a device credential, delivered as the cookie.\n\nNo auth dependency, by definition: this is how a device gets a credential\nin the first place. What stands in for one is the code -- ~40 bits, live\nfor at most 180 seconds, single-use, at most one outstanding, and mintable\nonly from this machine.\n\n**204 with no body, and the token only in `Set-Cookie`.** Returning the\ntoken in JSON as well would put a working credential into a response body\nthat a client could log, cache, or hand to a template; the cookie is\n`httpOnly`, so the page that just paired cannot read it either, and that\nis the whole point of moving off `localStorage` in Task 5. There is\nnothing else a caller needs back -- it learns what it may do by calling\n`GET /v1/session` with the credential it now holds.\n\n**Grants are narrowed at issue time to what this listener could EVER\ncarry -- `ceiling | raisable`, not `ceiling` alone.**\n`effective(pair_code.grants, policy, raised=policy.raisable)`, never the\ncode's own unnarrowed set and, as importantly, never `effective(grants,\npolicy)`'s everyday two-argument form either. The difference is the fix\nfor a live-test defect: narrowing to the bare ceiling at issue time\ndiscarded a raisable capability from the *device's own issued set*,\npermanently, the moment a code was redeemed on that transport -- and a\nraise can only ever widen the *transport* side of `effective()`'s\nintersection (`policy.py`'s own invariant), never manufacture a\ncapability the device side does not already hold. So a code minted with\nEXECUTE and SYSTEM_CONTROL, redeemed over `tailnet` (`raisable =\n{EXECUTE, SYSTEM_CONTROL}`), used to mint a device that could never\nreach either capability again on that transport, by any raise, ever --\nconfirmed live: ticking both boxes and pairing over tailnet stored\nneither. `tailnet`'s whole `raisable` set was unreachable configuration.\n\nReusing `effective()` with `raised=policy.raisable` rather than adding a\nnew function is deliberate -- the arithmetic\n`grants & (ceiling | (raisable & raisable))` collapses to\n`grants & (ceiling | raisable)` by construction, so this is the *same*\nintersection every other call site already trusts, evaluated at the one\nraised value that means \"everything this transport could ever carry,\"\nnot a second narrowing rule to keep in sync with the first.\n\n**This does not touch per-request narrowing.** `authenticate()` still\ncalls `effective()` with whatever the *live* raise store holds for this\ndevice and listener, not `policy.raisable` -- so a device that paired\nover `tailnet` and now has EXECUTE sitting in the vault is still refused\nEXECUTE on every ordinary request. The only thing this change does is\nmake the capability *reachable at all* by a live raise later; it does\nnot hand it out for free. That is the property the whole milestone rests\non, and it is what `funnel` proves by its absence: it has an empty\n`raisable`, so `ceiling | raisable` there is just `ceiling` -- identical\nto the old behaviour, and its redemption does not change shape at all.\n`funnel` was deliberately left without SYSTEM_CONTROL in its own\n`raisable` for a different reason (a public URL with no second\ncredential gating it), which this narrowing respects rather than\noverrides: `funnel`'s ceiling still excludes EXECUTE and SYSTEM_CONTROL\nfrom what any device paired there ever holds.\n\n**A transport declared `pairable=False` is refused outright, spec \u00a75.5,\nbefore the code is even consulted -- `pairing_denied_by_transport()` just\nbelow the policy lookup.** All three transports today are `pairable=True`;\nthe clause exists for the transport that isn't. The removed `quick`\ntransport (a Cloudflare tunnel, Milestone 6b) was that case: Cloudflare\nterminated TLS and read the plaintext of everything the listener\ncarried, including the code in this body and the `Set-Cookie` this route\nwould otherwise write, so narrowing to OBSERVE alone would still have\nhanded a third party a working (if watch-only) device credential in the\nclear -- a worse trade than refusing to pair over that transport at all.\nRefused before `store.consume()` runs, so a wrong code and a right one\nare indistinguishable on an unpairable listener and no attempt --\nhowever it would have turned out -- burns the operator's live code.\n\nEvery refusal is the same `UNAUTHORIZED` the rest of the API uses, with\ntwo exceptions, both load-bearing: 429 when the pairing budget is spent\n(a caller has to be able to tell that retrying immediately is pointless),\nand 503 when the vault itself could not be read or written (a caller has\nto be able to tell that retrying *at all* might still work -- unlike a\nwrong code, this one was never the caller's fault).",
+        "operationId": "pair_device_v1_pair_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PairRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/listener": {
+      "get": {
+        "summary": "Get Listener",
+        "description": "`{\"policy\": ..., \"allowBearer\": ..., \"canPair\": ...}`, nothing else.\n\nRate-limited on the anonymous key, exactly like every other unauthenticated\ncall this daemon answers (`authenticate()`'s own no-token branch) -- a\ncaller with no credential yet still spends the same shared per-listener\nbudget a wrong or missing token would, so this route cannot be turned into\nan unmetered probe.\n\nA port that resolves to no policy fails closed the same way the rest of\nthe API does for that case (`authenticate()`, `pair_device`): 401, not a\ndefault listener guessed at. There is nothing to tell a caller on a socket\nnobody declared.",
+        "operationId": "get_listener_v1_listener_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_ListenerPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/devices": {
+      "get": {
+        "summary": "List Devices",
+        "description": "Every device that holds a credential, as `vault.devices()` reports them,\neach with whatever ceiling raises are live for it right now.\n\nNothing else is added on top -- not which listener a device was last seen\non, not a source address, not whether it is the caller's own row. A caller\nthat needs to know which device it is asks `GET /v1/session`; inventing a\nsecond answer here would be a second thing that could disagree.",
+        "operationId": "list_devices_v1_devices_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_DevicesPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/devices/{device_id}": {
+      "delete": {
+        "summary": "Revoke Device",
+        "description": "Kill one credential. A device that is not there is a 404.\n\nNot a silent 200: this is the control somebody reaches for when they think\na device is compromised, and \"nothing was revoked\" has to be\ndistinguishable from \"it is gone now\". The distinction discloses nothing a\ncaller holding SYSTEM_CONTROL on the loopback listener could not read\nstraight off `GET /v1/devices` a line earlier.\n\nA third outcome, 503, is what `TokenVault.revoke()` raising\n`VaultUnavailableError` becomes -- either half of it. If the read fails,\ndevices.json could not be read at all, so whether `device_id` exists is\ngenuinely unknown; answering 404 there would tell the one person trying\nto cut a device off that it is already gone when the truth is \"ask again\nonce the file is readable\" -- exactly the control that must not lie\nunder duress. If the *write* fails instead (the same Windows lock\ncontention, on the save half), the underlying `PermissionError` would\notherwise reach `errors.py`'s app-wide mapping and answer 403 \"protected\npath\" -- which here would read as \"you are not allowed to revoke this\ndevice\", the same lie the 404 case argues against, just from the other\ndirection. Both halves become 503: unavailable, not unauthorised and not\nalready gone.",
+        "operationId": "revoke_device_v1_devices__device_id__delete",
+        "parameters": [
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Device Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_RevokedPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/devices/{device_id}/raise": {
+      "post": {
+        "summary": "Raise Device Ceiling",
+        "description": "Let one device do more, on one transport, for a bounded while.\n\nThree bounds stack and only the innermost one moves. What the device was\nissued is never widened -- a raise lifts a transport's refusal, it cannot\nmanufacture a grant. `ceiling | raisable` is static module data vetted once\nby a human, and `raisable` is empty on every listener but `tailnet`, which\nis what makes the public tunnels unraisable by construction rather than by\na check somebody could forget. Only the live record this route mints is\nnew, and it expires on a clock the caller does not control.\n\nRefused with distinct statuses, because each one is a different thing for\nthe operator to fix: 404 when the device does not exist, 422 when a\ncapability name is not one, 403 when the transport was never vetted to\ncarry it or the device was never issued it, and 409 when the transport is\nnot currently running -- a raise scoped to a listener that is down can\nnever be exercised, and must not be left behind for a future listener that\nreuses the name.\n\nAn over-long request is clamped to the seven-day cap rather than refused.\nThe cap is the safety property, not a promise the caller kept its word.",
+        "operationId": "raise_device_ceiling_v1_devices__device_id__raise_post",
+        "parameters": [
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Device Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RaiseRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_RaisePayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Revoke Device Raise",
+        "description": "Drop every live raise a device holds. A device with none is a 404.\n\nEvery raise, on every transport, rather than one named in the request.\nThis is the undo for a control that deliberately widens what a device may\ndo, so it must not be possible to half-revoke it by naming the wrong\ntransport -- the same reasoning that keeps `revoke_device` a single\nunconditional kill rather than a per-listener one.\n\n404, not a silent 200, and the argument is `revoke_device`'s: somebody\nreaching for this has decided a raise should stop, and \"there was nothing\nto stop\" has to be distinguishable from \"it is gone now\".",
+        "operationId": "revoke_device_raise_v1_devices__device_id__raise_delete",
+        "parameters": [
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Device Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_RevokedPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/transports": {
+      "get": {
+        "summary": "List Transports",
+        "description": "Every registered transport, running or not, with the capability set\nit may ever carry and the capability set it may carry if temporarily\nraised -- so a caller can explain why a control is unavailable on a given\ntransport.",
+        "operationId": "list_transports_v1_transports_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_TransportsPayload_"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/transports/{name}": {
+      "post": {
+        "summary": "Start Transport",
+        "description": "Start transport *name*. An unrecognised name -- including `\"local\"`,\nwhich is never a startable transport -- is a 404. A conflict that\nprevents the transport from starting is a 409, with a message describing\nwhat went wrong.",
+        "operationId": "start_transport_v1_transports__name__post",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_TransportPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Stop Transport",
+        "description": "Stop transport *name*. Not currently running -- including an unknown\nname -- is a 404: \"nothing happened\" has to be distinguishable from \"it\nis gone now\". A failure to confirm the stop actually took effect is a\n409, with a message describing what went wrong.",
+        "operationId": "stop_transport_v1_transports__name__delete",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope_TransportPayload_"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AbortPayload": {
+        "properties": {
+          "aborted": {
+            "type": "boolean",
+            "title": "Aborted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "aborted"
+        ],
+        "title": "AbortPayload"
+      },
+      "AuditEntryPayload": {
+        "properties": {
+          "at": {
+            "type": "string",
+            "title": "At"
+          },
+          "deviceId": {
+            "type": "string",
+            "title": "Deviceid"
+          },
+          "method": {
+            "type": "string",
+            "title": "Method"
+          },
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "outcome": {
+            "type": "string",
+            "title": "Outcome"
+          }
+        },
+        "type": "object",
+        "required": [
+          "at",
+          "deviceId",
+          "method",
+          "path",
+          "outcome"
+        ],
+        "title": "AuditEntryPayload"
+      },
+      "AuditPayload": {
+        "properties": {
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEntryPayload"
+            },
+            "type": "array",
+            "title": "Entries"
+          }
+        },
+        "type": "object",
+        "required": [
+          "entries"
+        ],
+        "title": "AuditPayload"
+      },
+      "BackupStatePayload": {
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "title": "Enabled"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Provider"
+          },
+          "lastBackupAt": {
+            "type": "string",
+            "title": "Lastbackupat"
+          },
+          "lastResult": {
+            "type": "string",
+            "title": "Lastresult"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "title": "Sizebytes"
+          },
+          "unlocked": {
+            "type": "boolean",
+            "title": "Unlocked"
+          }
+        },
+        "type": "object",
+        "required": [
+          "enabled",
+          "provider",
+          "lastBackupAt",
+          "lastResult",
+          "sizeBytes",
+          "unlocked"
+        ],
+        "title": "BackupStatePayload"
+      },
+      "ChatMessagePayload": {
+        "properties": {
+          "messageId": {
+            "type": "string",
+            "title": "Messageid"
+          },
+          "role": {
+            "type": "string",
+            "enum": [
+              "user",
+              "assistant"
+            ],
+            "title": "Role"
+          },
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "createdAt": {
+            "type": "string",
+            "title": "Createdat"
+          },
+          "intent": {
+            "type": "string",
+            "title": "Intent"
+          }
+        },
+        "type": "object",
+        "required": [
+          "messageId",
+          "role",
+          "text",
+          "createdAt",
+          "intent"
+        ],
+        "title": "ChatMessagePayload"
+      },
+      "ChatRequest": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "maxLength": 8000,
+            "minLength": 1,
+            "title": "Text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text"
+        ],
+        "title": "ChatRequest"
+      },
+      "ChatSendPayload": {
+        "properties": {
+          "turnId": {
+            "type": "string",
+            "title": "Turnid"
+          },
+          "conversationId": {
+            "type": "string",
+            "title": "Conversationid"
+          }
+        },
+        "type": "object",
+        "required": [
+          "turnId",
+          "conversationId"
+        ],
+        "title": "ChatSendPayload"
+      },
+      "CommandDefPayload": {
+        "properties": {
+          "commandId": {
+            "type": "string",
+            "title": "Commandid"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "destructive": {
+            "type": "boolean",
+            "title": "Destructive"
+          },
+          "requiredGrant": {
+            "type": "string",
+            "title": "Requiredgrant"
+          }
+        },
+        "type": "object",
+        "required": [
+          "commandId",
+          "label",
+          "description",
+          "destructive",
+          "requiredGrant"
+        ],
+        "title": "CommandDefPayload"
+      },
+      "CommandRunPayload": {
+        "properties": {
+          "commandId": {
+            "type": "string",
+            "title": "Commandid"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          }
+        },
+        "type": "object",
+        "required": [
+          "commandId",
+          "message"
+        ],
+        "title": "CommandRunPayload"
+      },
+      "CommandsPayload": {
+        "properties": {
+          "commands": {
+            "items": {
+              "$ref": "#/components/schemas/CommandDefPayload"
+            },
+            "type": "array",
+            "title": "Commands"
+          }
+        },
+        "type": "object",
+        "required": [
+          "commands"
+        ],
+        "title": "CommandsPayload"
+      },
+      "ConversationDetailPayload": {
+        "properties": {
+          "conversationId": {
+            "type": "string",
+            "title": "Conversationid"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ChatMessagePayload"
+            },
+            "type": "array",
+            "title": "Messages"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversationId",
+          "title",
+          "messages"
+        ],
+        "title": "ConversationDetailPayload"
+      },
+      "ConversationRefPayload": {
+        "properties": {
+          "conversationId": {
+            "type": "string",
+            "title": "Conversationid"
+          },
+          "title": {
+            "type": "string",
+            "title": "Title"
+          },
+          "updatedAt": {
+            "type": "string",
+            "title": "Updatedat"
+          },
+          "messageCount": {
+            "type": "integer",
+            "title": "Messagecount"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversationId",
+          "title",
+          "updatedAt",
+          "messageCount"
+        ],
+        "title": "ConversationRefPayload"
+      },
+      "ConversationsPayload": {
+        "properties": {
+          "conversations": {
+            "items": {
+              "$ref": "#/components/schemas/ConversationRefPayload"
+            },
+            "type": "array",
+            "title": "Conversations"
+          }
+        },
+        "type": "object",
+        "required": [
+          "conversations"
+        ],
+        "title": "ConversationsPayload"
+      },
+      "DeleteRequest": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Path"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "title": "DeleteRequest"
+      },
+      "DeletedPayload": {
+        "properties": {
+          "deleted": {
+            "type": "string",
+            "title": "Deleted"
+          }
+        },
+        "type": "object",
+        "required": [
+          "deleted"
+        ],
+        "title": "DeletedPayload"
+      },
+      "DevicePayload": {
+        "properties": {
+          "deviceId": {
+            "type": "string",
+            "title": "Deviceid"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "grants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Grants"
+          },
+          "createdAt": {
+            "type": "string",
+            "title": "Createdat"
+          },
+          "lastSeenAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastseenat"
+          },
+          "raises": {
+            "items": {
+              "$ref": "#/components/schemas/RaisePayload"
+            },
+            "type": "array",
+            "title": "Raises"
+          }
+        },
+        "type": "object",
+        "required": [
+          "deviceId",
+          "label",
+          "grants",
+          "createdAt",
+          "lastSeenAt",
+          "raises"
+        ],
+        "title": "DevicePayload",
+        "description": "One row of the revoke list, and deliberately nothing more.\n\nThis response describes every credential that reaches this machine, so it\ncarries only what a person needs to decide what to kill: which row, what\nit is called, what it can do, and when it was last used. No token, no\ntoken hash, no listener or address -- a device's grants say what it may\ndo, and where it happened to connect from is not a fact this list is\nallowed to make somebody act on.\n\n`raises` is Milestone 6b's one addition, and it belongs to the same\nquestion rather than widening it: a device that can currently do more than\nits grants column suggests is precisely the row somebody reading this list\nneeds to see. Empty, never omitted, for a device with no live raise --\nand there is deliberately no route that lists raises on their own, so\nnothing here becomes a second oracle for which device ids exist."
+      },
+      "DevicesPayload": {
+        "properties": {
+          "devices": {
+            "items": {
+              "$ref": "#/components/schemas/DevicePayload"
+            },
+            "type": "array",
+            "title": "Devices"
+          }
+        },
+        "type": "object",
+        "required": [
+          "devices"
+        ],
+        "title": "DevicesPayload"
+      },
+      "EnrolledItemPayload": {
+        "properties": {
+          "itemId": {
+            "type": "string",
+            "title": "Itemid"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "enrolledAt": {
+            "type": "string",
+            "title": "Enrolledat"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Count"
+          },
+          "lastSeenAt": {
+            "type": "string",
+            "title": "Lastseenat"
+          }
+        },
+        "type": "object",
+        "required": [
+          "itemId",
+          "name",
+          "enrolledAt",
+          "count",
+          "lastSeenAt"
+        ],
+        "title": "EnrolledItemPayload"
+      },
+      "EnrollmentPayload": {
+        "properties": {
+          "voices": {
+            "items": {
+              "$ref": "#/components/schemas/EnrolledItemPayload"
+            },
+            "type": "array",
+            "title": "Voices"
+          },
+          "faces": {
+            "items": {
+              "$ref": "#/components/schemas/EnrolledItemPayload"
+            },
+            "type": "array",
+            "title": "Faces"
+          }
+        },
+        "type": "object",
+        "required": [
+          "voices",
+          "faces"
+        ],
+        "title": "EnrollmentPayload"
+      },
+      "EntityPayload": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "canonicalName": {
+            "type": "string",
+            "title": "Canonicalname"
+          },
+          "displayName": {
+            "type": "string",
+            "title": "Displayname"
+          },
+          "properties": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "type": "object",
+            "title": "Properties"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "confidence": {
+            "type": "number",
+            "title": "Confidence"
+          },
+          "createdAt": {
+            "type": "string",
+            "title": "Createdat"
+          },
+          "updatedAt": {
+            "type": "string",
+            "title": "Updatedat"
+          },
+          "sourceTurnId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourceturnid"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "type",
+          "canonicalName",
+          "displayName",
+          "properties",
+          "source",
+          "confidence",
+          "createdAt",
+          "updatedAt",
+          "sourceTurnId"
+        ],
+        "title": "EntityPayload"
+      },
+      "Envelope_AbortPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/AbortPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[AbortPayload]"
+      },
+      "Envelope_AuditPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/AuditPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[AuditPayload]"
+      },
+      "Envelope_BackupStatePayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/BackupStatePayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[BackupStatePayload]"
+      },
+      "Envelope_ChatSendPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ChatSendPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[ChatSendPayload]"
+      },
+      "Envelope_CommandRunPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/CommandRunPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[CommandRunPayload]"
+      },
+      "Envelope_CommandsPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/CommandsPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[CommandsPayload]"
+      },
+      "Envelope_ConversationDetailPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ConversationDetailPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[ConversationDetailPayload]"
+      },
+      "Envelope_ConversationsPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ConversationsPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[ConversationsPayload]"
+      },
+      "Envelope_DeletedPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/DeletedPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[DeletedPayload]"
+      },
+      "Envelope_DevicesPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/DevicesPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[DevicesPayload]"
+      },
+      "Envelope_EnrollmentPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/EnrollmentPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[EnrollmentPayload]"
+      },
+      "Envelope_FileContentPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FileContentPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[FileContentPayload]"
+      },
+      "Envelope_FileEntryPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FileEntryPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[FileEntryPayload]"
+      },
+      "Envelope_FilesListingPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/FilesListingPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[FilesListingPayload]"
+      },
+      "Envelope_ForgetEnrolledPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ForgetEnrolledPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[ForgetEnrolledPayload]"
+      },
+      "Envelope_ForgottenPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ForgottenPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[ForgottenPayload]"
+      },
+      "Envelope_KnowledgeGraphPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/KnowledgeGraphPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[KnowledgeGraphPayload]"
+      },
+      "Envelope_ListenerPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ListenerPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[ListenerPayload]"
+      },
+      "Envelope_PairCodePayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PairCodePayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[PairCodePayload]"
+      },
+      "Envelope_PersonalityPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PersonalityPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[PersonalityPayload]"
+      },
+      "Envelope_PreferencesPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/PreferencesPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[PreferencesPayload]"
+      },
+      "Envelope_ProceduresPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/ProceduresPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[ProceduresPayload]"
+      },
+      "Envelope_RaisePayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/RaisePayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[RaisePayload]"
+      },
+      "Envelope_RemovedPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/RemovedPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[RemovedPayload]"
+      },
+      "Envelope_RestorePayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/RestorePayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[RestorePayload]"
+      },
+      "Envelope_RevokedPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/RevokedPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[RevokedPayload]"
+      },
+      "Envelope_RootsPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/RootsPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[RootsPayload]"
+      },
+      "Envelope_SaveOutcomePayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SaveOutcomePayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[SaveOutcomePayload]"
+      },
+      "Envelope_SessionPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SessionPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[SessionPayload]"
+      },
+      "Envelope_SettingsPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/SettingsPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[SettingsPayload]"
+      },
+      "Envelope_StatusPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/StatusPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[StatusPayload]"
+      },
+      "Envelope_TelemetryPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/TelemetryPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[TelemetryPayload]"
+      },
+      "Envelope_TransportPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/TransportPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[TransportPayload]"
+      },
+      "Envelope_TransportsPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/TransportsPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[TransportsPayload]"
+      },
+      "Envelope_UnlockPayload_": {
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/UnlockPayload"
+          },
+          "meta": {
+            "$ref": "#/components/schemas/Meta"
+          }
+        },
+        "type": "object",
+        "required": [
+          "data"
+        ],
+        "title": "Envelope[UnlockPayload]"
+      },
+      "FactPayload": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "subjectId": {
+            "type": "integer",
+            "title": "Subjectid"
+          },
+          "predicate": {
+            "type": "string",
+            "title": "Predicate"
+          },
+          "object": {
+            "type": "string",
+            "title": "Object"
+          },
+          "confidence": {
+            "type": "number",
+            "title": "Confidence"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "eventAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Eventat"
+          },
+          "invalidAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Invalidat"
+          },
+          "expiresAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Expiresat"
+          },
+          "verifiedAt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verifiedat"
+          },
+          "createdAt": {
+            "type": "string",
+            "title": "Createdat"
+          },
+          "sourceTurnId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourceturnid"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "subjectId",
+          "predicate",
+          "object",
+          "confidence",
+          "source",
+          "eventAt",
+          "invalidAt",
+          "expiresAt",
+          "verifiedAt",
+          "createdAt",
+          "sourceTurnId"
+        ],
+        "title": "FactPayload"
+      },
+      "FileContentPayload": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "contentKind": {
+            "type": "string",
+            "enum": [
+              "text",
+              "code",
+              "image",
+              "binary"
+            ],
+            "title": "Contentkind"
+          },
+          "content": {
+            "type": "string",
+            "title": "Content"
+          },
+          "language": {
+            "type": "string",
+            "title": "Language"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "contentKind",
+          "content",
+          "language",
+          "truncated"
+        ],
+        "title": "FileContentPayload"
+      },
+      "FileEntryPayload": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "dir",
+              "file"
+            ],
+            "title": "Kind"
+          },
+          "sizeBytes": {
+            "type": "integer",
+            "title": "Sizebytes"
+          },
+          "modifiedAt": {
+            "type": "string",
+            "title": "Modifiedat"
+          },
+          "contentKind": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "text",
+                  "code",
+                  "image",
+                  "binary"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contentkind"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "sizeBytes",
+          "modifiedAt",
+          "contentKind"
+        ],
+        "title": "FileEntryPayload"
+      },
+      "FilesListingPayload": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "title": "Path"
+          },
+          "entries": {
+            "items": {
+              "$ref": "#/components/schemas/FileEntryPayload"
+            },
+            "type": "array",
+            "title": "Entries"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "entries"
+        ],
+        "title": "FilesListingPayload"
+      },
+      "ForgetEnrolledPayload": {
+        "properties": {
+          "forgotten": {
+            "type": "string",
+            "title": "Forgotten"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "voice",
+              "face"
+            ],
+            "title": "Kind"
+          }
+        },
+        "type": "object",
+        "required": [
+          "forgotten",
+          "kind"
+        ],
+        "title": "ForgetEnrolledPayload"
+      },
+      "ForgottenPayload": {
+        "properties": {
+          "forgotten": {
+            "type": "string",
+            "title": "Forgotten"
+          }
+        },
+        "type": "object",
+        "required": [
+          "forgotten"
+        ],
+        "title": "ForgottenPayload"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "JsonValue": {},
+      "KnowledgeGraphPayload": {
+        "properties": {
+          "entities": {
+            "items": {
+              "$ref": "#/components/schemas/EntityPayload"
+            },
+            "type": "array",
+            "title": "Entities"
+          },
+          "facts": {
+            "items": {
+              "$ref": "#/components/schemas/FactPayload"
+            },
+            "type": "array",
+            "title": "Facts"
+          },
+          "relationships": {
+            "items": {
+              "$ref": "#/components/schemas/RelationshipPayload"
+            },
+            "type": "array",
+            "title": "Relationships"
+          }
+        },
+        "type": "object",
+        "required": [
+          "entities",
+          "facts",
+          "relationships"
+        ],
+        "title": "KnowledgeGraphPayload"
+      },
+      "ListenerPayload": {
+        "properties": {
+          "policy": {
+            "type": "string",
+            "title": "Policy"
+          },
+          "allowBearer": {
+            "type": "boolean",
+            "title": "Allowbearer"
+          },
+          "canPair": {
+            "type": "boolean",
+            "title": "Canpair"
+          }
+        },
+        "type": "object",
+        "required": [
+          "policy",
+          "allowBearer",
+          "canPair"
+        ],
+        "title": "ListenerPayload",
+        "description": "The three facts a caller needs before it holds any credential at all.\n\nServed by `GET /v1/listener`, the one unauthenticated read in this API\n(`POST /v1/pair` is the one unauthenticated *write*) -- Studio's\n`/connect` screen has no other way to learn which listener served it, and\nthat has to be known before it can decide whether to offer the\nbearer-token exchange at all. Deliberately nothing beyond these three:\nno device data, no hostname, no ceiling, no capability list. The caller\nalready knows which port it reached -- it chose it -- so none of this is\na secret; it is Studio being told what it could otherwise only guess by\ntrying the bearer exchange and reading the failure.\n\n`can_pair` is `pairing_denied_by_transport()`'s own answer negated, read\nfrom `routes/pairing.py` rather than re-derived here, so this field and\n`pair_device`'s actual refusal cannot drift apart."
+      },
+      "Meta": {
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "title": "Requestid"
+          },
+          "generatedAt": {
+            "type": "string",
+            "title": "Generatedat"
+          }
+        },
+        "type": "object",
+        "title": "Meta"
+      },
+      "PairCodePayload": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "expiresAt": {
+            "type": "string",
+            "title": "Expiresat"
+          },
+          "endpoints": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Endpoints"
+          },
+          "qrSvg": {
+            "type": "string",
+            "title": "Qrsvg"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code",
+          "expiresAt",
+          "endpoints",
+          "qrSvg"
+        ],
+        "title": "PairCodePayload",
+        "description": "What the laptop puts on screen. The code is in here exactly once, and\nit is the reason nothing on this route is logged.\n\n`qr_svg` encodes `<endpoint>/pair#<code>` -- the code in the URL\n*fragment*, which a browser never sends to a server, so it lands in no\naccess log on the way. `endpoints` is a list because a phone may have to\nbe told more than one way to reach this machine once transports exist; in\n6a it holds the loopback origin alone."
+      },
+      "PairCodeRequest": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Label"
+          },
+          "grants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "minItems": 1,
+            "title": "Grants"
+          },
+          "transport": {
+            "type": "string",
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Transport",
+            "default": "local"
+          }
+        },
+        "type": "object",
+        "required": [
+          "label",
+          "grants"
+        ],
+        "title": "PairCodeRequest",
+        "description": "What the laptop asks for when it puts a QR on screen.\n\n`grants` is a list of `Capability` *values* rather than the enum itself:\nan unknown string must be a 422 built by the route from a name it never\nechoes, not a Pydantic error whose `msg` might one day carry the\nsubmitted value back. The route parses and bounds it (`routes/pairing.py`).\n\n`transport` defaults to `\"local\"`, which reproduces 6a exactly: minting\nalways runs on the loopback listener (`require_admin`), so with no\ntransport named, the QR is built from that listener's own loopback\norigin. Naming a different transport asks the route to build the QR from\nTHAT transport's published `https://` host instead -- a plain string, for\nthe same reason `RaiseRequest.transport` is: naming an unknown listener\nmust not print the name back in a 422 either. The route refuses a name\nthat is not currently running, or one that has published no hostname\nyet, rather than silently falling back to loopback."
+      },
+      "PairRequest": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "maxLength": 16,
+            "minLength": 1,
+            "title": "Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "title": "PairRequest",
+        "description": "The only unauthenticated body this API accepts, and it carries exactly\none field.\n\nDeliberately without `extra=\"forbid\"`, unlike `ChatRequest`. A client that\nsends `{\"code\": ..., \"grants\": [\"system_control\"], \"label\": \"laptop\"}` must\nend up with exactly the grants and the name the laptop authorised --\nignoring the extra keys proves the request cannot influence either, where a\n422 would only prove they are spelled wrongly and could be routed around by\ndropping them.\n\n**There is no `label` field, and its absence is the point.** The device's\nname comes from the code, because that is what the person at the laptop\ntyped while choosing the grants, and it is the text the revoke list is read\nby. A field that validated and was then ignored would be worse than no\nfield: the next reader assumes it works, and a self-naming device could\noffer `laptop` as a lie at the exact moment somebody is deciding which row\nto cut off. `routes/pairing.py` carries the same note where the label is\nactually chosen."
+      },
+      "PersonalityPatch": {
+        "properties": {
+          "base": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Base"
+          }
+        },
+        "type": "object",
+        "required": [
+          "base"
+        ],
+        "title": "PersonalityPatch"
+      },
+      "PersonalityPayload": {
+        "properties": {
+          "base": {
+            "type": "string",
+            "title": "Base"
+          },
+          "available": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Available"
+          },
+          "traits": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Traits"
+          },
+          "sampleLine": {
+            "type": "string",
+            "title": "Sampleline"
+          }
+        },
+        "type": "object",
+        "required": [
+          "base",
+          "available",
+          "traits",
+          "sampleLine"
+        ],
+        "title": "PersonalityPayload"
+      },
+      "PreferenceChangePayload": {
+        "properties": {
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "changedAt": {
+            "type": "string",
+            "title": "Changedat"
+          }
+        },
+        "type": "object",
+        "required": [
+          "value",
+          "changedAt"
+        ],
+        "title": "PreferenceChangePayload"
+      },
+      "PreferenceRecordPayload": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "updatedAt": {
+            "type": "string",
+            "title": "Updatedat"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/PreferenceChangePayload"
+            },
+            "type": "array",
+            "title": "History"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "value",
+          "updatedAt",
+          "history"
+        ],
+        "title": "PreferenceRecordPayload"
+      },
+      "PreferencesPayload": {
+        "properties": {
+          "preferences": {
+            "items": {
+              "$ref": "#/components/schemas/PreferenceRecordPayload"
+            },
+            "type": "array",
+            "title": "Preferences"
+          }
+        },
+        "type": "object",
+        "required": [
+          "preferences"
+        ],
+        "title": "PreferencesPayload"
+      },
+      "ProcedureRecordPayload": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "steps": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Steps"
+          },
+          "taughtAt": {
+            "type": "string",
+            "title": "Taughtat"
+          },
+          "runCount": {
+            "type": "integer",
+            "title": "Runcount"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "steps",
+          "taughtAt",
+          "runCount"
+        ],
+        "title": "ProcedureRecordPayload"
+      },
+      "ProceduresPayload": {
+        "properties": {
+          "procedures": {
+            "items": {
+              "$ref": "#/components/schemas/ProcedureRecordPayload"
+            },
+            "type": "array",
+            "title": "Procedures"
+          }
+        },
+        "type": "object",
+        "required": [
+          "procedures"
+        ],
+        "title": "ProceduresPayload"
+      },
+      "RaisePayload": {
+        "properties": {
+          "deviceId": {
+            "type": "string",
+            "title": "Deviceid"
+          },
+          "transport": {
+            "type": "string",
+            "title": "Transport"
+          },
+          "capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Capabilities"
+          },
+          "expiresInSeconds": {
+            "type": "integer",
+            "title": "Expiresinseconds"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "deviceId",
+          "transport",
+          "capabilities",
+          "expiresInSeconds",
+          "reason"
+        ],
+        "title": "RaisePayload",
+        "description": "One live ceiling raise, as an admin listener reports it.\n\nFour of the five fields describe the raise; the fifth, `reason`, is the\nonly thing that makes a seven-day window reviewable a week later. It is\nfree text the operator typed at mint time, echoed back verbatim -- which\nis safe here and only here: this payload is served by\n`require_admin(SYSTEM_CONTROL)` routes, so the only reader is the loopback\ncaller who wrote it.\n\n`granted_by` is deliberately absent. The record holds it (`RaiseGrant`) and\nthe log line names it, but a device row in the revoke list is not the place\nto publish which *other* device authorised something -- the same reasoning\nthat keeps a listener and a source address off `DevicePayload`.\n\n`expires_in_seconds` counts down, converted from the store's\n`time.monotonic()` reading at request time. Never a wall-clock timestamp: a\nmonotonic reading means nothing to a client, and recomputing one as\n`now + duration` would drift the moment the store's cap changed."
+      },
+      "RaiseRequest": {
+        "properties": {
+          "transport": {
+            "type": "string",
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Transport"
+          },
+          "capabilities": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 7,
+            "minItems": 1,
+            "title": "Capabilities"
+          },
+          "minutes": {
+            "type": "integer",
+            "exclusiveMinimum": 0.0,
+            "title": "Minutes"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Reason"
+          }
+        },
+        "type": "object",
+        "required": [
+          "transport",
+          "capabilities",
+          "minutes",
+          "reason"
+        ],
+        "title": "RaiseRequest",
+        "description": "What the person at the keyboard asks for when lifting one device's\nceiling on one transport, for a while.\n\n`capabilities` is a list of `Capability` *values* rather than the enum\nitself, for the same reason `PairCodeRequest.grants` is: an unknown string\nmust become a 422 the route builds from a name it never echoes, not a\nPydantic error whose `msg` might one day carry the submitted value back.\n`transport` is a plain string for the mirror-image reason -- naming an\nunknown listener must not print the name back either.\n\n`minutes` is bounded below only, and it is the one field deliberately left\nopen at the top. The upper bound is `MAX_RAISE_SECONDS` and it lives in\n`RaiseStore.grant()`, where it *clamps* rather than refuses: the cap is the\nsafety property, not a promise the caller kept its word, and a 422 here\nwould hand back a retry instead of a bounded raise. Duplicating it as a\n`Field(le=...)` would also put the number in two places, which is how a cap\ndrifts.\n\nEvery other field is bounded here. `capabilities` is capped at the size of\nthe `Capability` enum, which is the largest request that could ever mean\nanything -- a list longer than that is either duplicates or names that do\nnot exist, and both are refused. Derived from the enum rather than written\nas a literal, because this one is an upper bound on a *list length* and can\nonly ever grow with the enum; it is not a ceiling, where `policy.py`'s\nargument against `frozenset(Capability)` applies and a literal is\nmandatory."
+      },
+      "RelationshipPayload": {
+        "properties": {
+          "id": {
+            "type": "integer",
+            "title": "Id"
+          },
+          "fromId": {
+            "type": "integer",
+            "title": "Fromid"
+          },
+          "toId": {
+            "type": "integer",
+            "title": "Toid"
+          },
+          "type": {
+            "type": "string",
+            "title": "Type"
+          },
+          "properties": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/JsonValue"
+            },
+            "type": "object",
+            "title": "Properties"
+          },
+          "confidence": {
+            "type": "number",
+            "title": "Confidence"
+          },
+          "source": {
+            "type": "string",
+            "title": "Source"
+          },
+          "sourceTurnId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourceturnid"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "fromId",
+          "toId",
+          "type",
+          "properties",
+          "confidence",
+          "source",
+          "sourceTurnId"
+        ],
+        "title": "RelationshipPayload"
+      },
+      "RemovedPayload": {
+        "properties": {
+          "removed": {
+            "type": "integer",
+            "title": "Removed"
+          }
+        },
+        "type": "object",
+        "required": [
+          "removed"
+        ],
+        "title": "RemovedPayload"
+      },
+      "RenameRequest": {
+        "properties": {
+          "path": {
+            "type": "string",
+            "maxLength": 1024,
+            "minLength": 1,
+            "title": "Path"
+          },
+          "newName": {
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Newname"
+          }
+        },
+        "type": "object",
+        "required": [
+          "path",
+          "newName"
+        ],
+        "title": "RenameRequest"
+      },
+      "RestorePayload": {
+        "properties": {
+          "restored": {
+            "type": "boolean",
+            "title": "Restored"
+          }
+        },
+        "type": "object",
+        "required": [
+          "restored"
+        ],
+        "title": "RestorePayload"
+      },
+      "RestoreRequest": {
+        "properties": {
+          "recoveryPhrase": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Recoveryphrase"
+          }
+        },
+        "type": "object",
+        "required": [
+          "recoveryPhrase"
+        ],
+        "title": "RestoreRequest"
+      },
+      "RevokedPayload": {
+        "properties": {
+          "revoked": {
+            "type": "string",
+            "title": "Revoked"
+          }
+        },
+        "type": "object",
+        "required": [
+          "revoked"
+        ],
+        "title": "RevokedPayload"
+      },
+      "RootsPayload": {
+        "properties": {
+          "roots": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Roots"
+          }
+        },
+        "type": "object",
+        "required": [
+          "roots"
+        ],
+        "title": "RootsPayload"
+      },
+      "SaveOutcomePayload": {
+        "properties": {
+          "saved": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Saved"
+          },
+          "rejected": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Rejected"
+          },
+          "restartRequired": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Restartrequired"
+          }
+        },
+        "type": "object",
+        "required": [
+          "saved",
+          "rejected",
+          "restartRequired"
+        ],
+        "title": "SaveOutcomePayload"
+      },
+      "SessionPayload": {
+        "properties": {
+          "deviceId": {
+            "type": "string",
+            "title": "Deviceid"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "grants": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Grants"
+          },
+          "effective": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Effective"
+          },
+          "raised": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Raised"
+          },
+          "raiseExpiresInSeconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Raiseexpiresinseconds"
+          },
+          "policy": {
+            "type": "string",
+            "title": "Policy"
+          }
+        },
+        "type": "object",
+        "required": [
+          "deviceId",
+          "label",
+          "grants",
+          "effective",
+          "raised",
+          "raiseExpiresInSeconds",
+          "policy"
+        ],
+        "title": "SessionPayload",
+        "description": "Who is calling, and what may this connection carry.\n\nThree lists, deliberately, not one -- each answers a different reason a\ncontrol might be greyed out in Studio, and collapsing any two would make\nthat reason unexplainable at the UI:\n\n- `grants` is what the device was issued at pairing. A control disabled\n  here means the device itself was never handed that capability, on any\n  connection, ever.\n- `effective` is what survives this listener's fixed ceiling on this\n  connection (`policy.py`'s `effective()`). A control disabled only here\n  means the device holds the capability, but the transport it arrived on\n  -- a Cloudflare tunnel that can read the plaintext, say -- refuses to\n  carry it.\n- `raised` is what Milestone 6b's third case, the ceiling lifting, is\n  reporting: a live, expiring, per-device raise minted by the operator at\n  the keyboard, on top of whatever `effective` already allows. A control\n  enabled only because of a raise is not the same story as one always\n  enabled -- Studio's banner needs to say a floor was deliberately and\n  temporarily raised, not render an ordinary control that looks\n  permanent. Empty, never omitted, when no raise is live: a payload\n  whose shape varied by transport would be worse for a client to read\n  than one whose values are simply empty.\n\n`raise_expires_in_seconds` is `None` exactly when `raised` is empty, and\notherwise counts down a live raise -- converted from the store's\n`time.monotonic()` reading at request time, never recomputed as\n`now + duration`, which would drift if the store's cap ever changed."
+      },
+      "SettingRowPayload": {
+        "properties": {
+          "key": {
+            "type": "string",
+            "title": "Key"
+          },
+          "group": {
+            "type": "string",
+            "title": "Group"
+          },
+          "description": {
+            "type": "string",
+            "title": "Description"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "toggle",
+              "slider",
+              "select",
+              "number",
+              "text"
+            ],
+            "title": "Kind"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "title": "Value"
+          },
+          "default": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              }
+            ],
+            "title": "Default"
+          },
+          "needsRestart": {
+            "type": "boolean",
+            "title": "Needsrestart"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "db",
+              "env",
+              "default"
+            ],
+            "title": "Source"
+          },
+          "options": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Options"
+          }
+        },
+        "type": "object",
+        "required": [
+          "key",
+          "group",
+          "description",
+          "kind",
+          "value",
+          "default",
+          "needsRestart",
+          "source",
+          "options"
+        ],
+        "title": "SettingRowPayload"
+      },
+      "SettingsPatch": {
+        "properties": {
+          "changes": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "boolean"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Changes"
+          }
+        },
+        "type": "object",
+        "title": "SettingsPatch"
+      },
+      "SettingsPayload": {
+        "properties": {
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/SettingRowPayload"
+            },
+            "type": "array",
+            "title": "Rows"
+          }
+        },
+        "type": "object",
+        "required": [
+          "rows"
+        ],
+        "title": "SettingsPayload"
+      },
+      "StatusPayload": {
+        "properties": {
+          "assistantName": {
+            "type": "string",
+            "title": "Assistantname"
+          },
+          "activeModel": {
+            "type": "string",
+            "title": "Activemodel"
+          },
+          "personality": {
+            "type": "string",
+            "title": "Personality"
+          },
+          "busy": {
+            "type": "boolean",
+            "title": "Busy"
+          }
+        },
+        "type": "object",
+        "required": [
+          "assistantName",
+          "activeModel",
+          "personality",
+          "busy"
+        ],
+        "title": "StatusPayload"
+      },
+      "TelemetryPayload": {
+        "properties": {
+          "cpuPercent": {
+            "type": "number",
+            "title": "Cpupercent"
+          },
+          "ramPercent": {
+            "type": "number",
+            "title": "Rampercent"
+          },
+          "batteryPercent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Batterypercent"
+          },
+          "activeModel": {
+            "type": "string",
+            "title": "Activemodel"
+          },
+          "uptimeSeconds": {
+            "type": "integer",
+            "title": "Uptimeseconds"
+          }
+        },
+        "type": "object",
+        "required": [
+          "cpuPercent",
+          "ramPercent",
+          "batteryPercent",
+          "activeModel",
+          "uptimeSeconds"
+        ],
+        "title": "TelemetryPayload"
+      },
+      "TransportPayload": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "running": {
+            "type": "boolean",
+            "title": "Running"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "ceiling": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Ceiling"
+          },
+          "raisable": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Raisable"
+          }
+        },
+        "type": "object",
+        "required": [
+          "name",
+          "running",
+          "url",
+          "ceiling",
+          "raisable"
+        ],
+        "title": "TransportPayload",
+        "description": "One transport, running or not.\n\n`ceiling` and `raisable` are read straight off `policy.py`'s `POLICIES`\nfor this transport's name, never hand-copied here -- so Studio can explain\n*why* a control is unavailable on a given transport without carrying a\nsecond copy of the table that could drift from the one the daemon\nactually enforces. `url` is `None` whenever `running` is `False`: a\nsession with no announced hostname does not serve\n(`transports/manager.py`'s `is_serving`), so there is nothing to show."
+      },
+      "TransportsPayload": {
+        "properties": {
+          "transports": {
+            "items": {
+              "$ref": "#/components/schemas/TransportPayload"
+            },
+            "type": "array",
+            "title": "Transports"
+          }
+        },
+        "type": "object",
+        "required": [
+          "transports"
+        ],
+        "title": "TransportsPayload"
+      },
+      "UnlockPayload": {
+        "properties": {
+          "unlocked": {
+            "type": "boolean",
+            "title": "Unlocked"
+          }
+        },
+        "type": "object",
+        "required": [
+          "unlocked"
+        ],
+        "title": "UnlockPayload"
+      },
+      "UnlockRequest": {
+        "properties": {
+          "recoveryPhrase": {
+            "type": "string",
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Recoveryphrase"
+          }
+        },
+        "type": "object",
+        "required": [
+          "recoveryPhrase"
+        ],
+        "title": "UnlockRequest",
+        "description": "Same field, deliberately a separate model from RestoreRequest.\n\nUnlock and restore take the same secret and mean entirely different\nthings: one arms an in-memory key, the other overwrites every memory she\nhas. Sharing a request model would make it a one-word edit to point a\ncaller at the wrong route, and would tie the two together the next time\neither needs a field the other must not accept."
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    }
+  }
+}

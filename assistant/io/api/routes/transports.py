@@ -55,6 +55,10 @@ def _row(name: str, session) -> TransportPayload:
         url=session.url if session is not None else None,
         ceiling=sorted(c.value for c in policy.ceiling),
         raisable=sorted(c.value for c in policy.raisable),
+        # Off the policy, never inferred from `name` -- see
+        # `TransportPayload`'s docstring for why a client must not have to
+        # guess this from a transport's name.
+        pairable=policy.pairable,
     )
 
 
