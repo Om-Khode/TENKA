@@ -218,6 +218,63 @@ class PendingState(Generic[T]):
         return time.time() - self._ts
 
 
+# ─── Arming without clobbering another principal's open question ─────────
+
+def try_arm(state: "PendingState", payload, *,
+            principal: "Optional[str] | _AmbientPrincipal" = AMBIENT_PRINCIPAL,
+            ) -> bool:
+    """Arm `state` with `payload`, unless that would replace another
+    principal's still-active state.
+
+    KI-13 closed the *answer* side of this: `main.py`'s dispatch loop skips a
+    caller who does not own an active state (`state.active and not
+    state.owned_by(principal)`) before it ever reaches a handler. Nothing
+    mirrored that check on the *arm* side, so a foreign caller who was
+    correctly skipped as an answer would fall through to ordinary
+    classification, reach a handler that arms the very same state, and
+    `PendingState.set()` — which unconditionally replaces, by design, so a
+    caller mid-flow can always refine or restart its own question — would
+    hand that caller ownership. The operator's own next "yes" then reads as a
+    foreign answer against her own request: a denial of service on her
+    confirmation, delivered by the mechanism meant to protect it.
+
+    This is that mirror. Same test, same shape, opposite side:
+
+    - **the same principal** re-arming its own active state (refining an open
+      question, or abandoning it for a new one) passes `owned_by` and
+      overwrites exactly as `set()` always has -- nothing about the ~14
+      legitimate multi-step flows in `actions/` changes.
+    - **a different principal** — or nobody, since an unowned active state is
+      owned_by nobody in either direction — is refused. The existing payload,
+      timestamp and owner are left untouched, and the refusal is parked on
+      the state via `note_foreign_attempt()` so the real owner learns about
+      it the same way she already learns about a foreign *answer*: on her
+      next turn, read-and-cleared by `take_foreign_attempts()`.
+
+    Deliberately not folded into `PendingState.set()` itself: several tests
+    (`test_a_bare_arm_inherits_the_turns_principal` and its neighbours) pin
+    `set()` as an unconditional replace at the mechanism layer, with ownership
+    enforced only where a caller is identified -- the dispatch loop for
+    answers, this function for arms. Collapsing the two would turn those
+    pinned, deliberate overwrites into refusals.
+
+    Returns True if armed, False if refused. Most callers do not need to look
+    at the return value: the caller that was refused gets back exactly the
+    same response text an ordinary first arm would have produced (whether it
+    succeeded or not is never disclosed), and a "yes" from that caller later
+    is skipped by the ordinary owner check exactly as it is today -- no new
+    disclosure, just a confirmation that quietly stayed the real owner's.
+    """
+    resolved = (current_principal.get()
+                if isinstance(principal, _AmbientPrincipal)
+                else principal)
+    if state.active and not state.owned_by(resolved):
+        state.note_foreign_attempt()
+        return False
+    state.set(payload, principal=principal)
+    return True
+
+
 class PendingRegistry:
     """Registry of all PendingStates so the planner can snapshot them.
 

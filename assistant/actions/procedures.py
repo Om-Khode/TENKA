@@ -13,6 +13,7 @@ async def handle_manage_procedure(params: dict, llm_response: str, bridge=None) 
     """Handle procedure listing, deletion, renaming, and editing. Zero LLM cost."""
     import assistant.actions as _act
     from .. import procedures
+    from ..pending import try_arm
 
     action = params.get("action", "").lower()
     name = params.get("name", "").strip()
@@ -69,7 +70,7 @@ async def handle_manage_procedure(params: dict, llm_response: str, bridge=None) 
         proc = procedures.find_by_name_or_trigger(name)
         if not proc:
             return personality_say("proc_not_found", name=name)
-        _act.teaching_session.set({
+        try_arm(_act.teaching_session, {
             "state":     "collecting",
             "name_seed": proc["name"],
             "steps":     [],

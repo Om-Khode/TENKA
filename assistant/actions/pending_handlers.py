@@ -327,7 +327,8 @@ async def handle_pending_messaging_disambig(text: str, bridge=None) -> str | Non
     if send_result.get("ok"):
         inner = send_result["result"]
         if isinstance(inner, dict) and inner.get("needs_confirmation"):
-            _act.pending_messaging_send.set(inner)
+            from ..pending import try_arm
+            try_arm(_act.pending_messaging_send, inner)
             resolved_name = inner.get("resolved_name", inner.get("phone", "someone"))
             text_preview = inner.get("text", "")
             if len(text_preview) > 50:

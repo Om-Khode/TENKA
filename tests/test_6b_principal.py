@@ -1065,3 +1065,266 @@ async def test_the_scheduler_arms_as_local():
     assert seen == [actions.LOCAL_PRINCIPAL], (
         f"the scheduler ran with principal {seen!r} -- anything it arms is "
         "owned by nobody and answerable by nobody")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# The arm-side mirror. KI-13 closed the answer side; this closes the arm
+# side. Six2's own read: an active state armed by another principal must
+# survive a foreign arm attempt, exactly as it already survives a foreign
+# answer. `pending.try_arm()` is the mechanism -- see its docstring for why
+# the guard sits there rather than inside `PendingState.set()` itself.
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_a_foreign_arm_cannot_replace_an_active_owned_state():
+    """The headline property. The operator's confirmation is armed; a foreign
+    principal's attempt to arm the SAME state must leave it exactly as it
+    was -- payload, timestamp-derived owner, everything -- not just refuse to
+    answer it."""
+    from assistant.actions import LOCAL_PRINCIPAL
+    from assistant.pending import PendingState, try_arm
+
+    state = PendingState[dict]("probe_arm_foreign", timeout=60.0)
+    ok = try_arm(state, {"op": "delete", "path": "downloads"},
+                 principal=LOCAL_PRINCIPAL)
+    assert ok is True
+
+    armed = try_arm(state, {"op": "delete", "path": "system32"},
+                     principal=_A_DEVICE)
+
+    assert armed is False, "a foreign arm attempt reported success"
+    assert state.principal == LOCAL_PRINCIPAL, (
+        "a foreign arm attempt changed who owns the state")
+    assert state.payload == {"op": "delete", "path": "downloads"}, (
+        "a foreign arm attempt replaced the operator's payload even though "
+        "it was refused")
+
+
+@pytest.mark.asyncio
+async def test_the_owner_can_still_answer_after_a_foreign_arm_attempt(
+        turn, monkeypatch):
+    """The property that actually matters: KI-13's DoS, closed. A foreign
+    device's arm attempt must not cost the operator her own confirmation --
+    she answers it afterwards exactly as if the attempt never happened."""
+    from assistant import main as main_mod
+    from assistant.actions import LOCAL_PRINCIPAL
+    from assistant.pending import try_arm
+
+    answered, spy = _spy()
+    state = _arm("destructive", LOCAL_PRINCIPAL)
+    monkeypatch.setattr(main_mod, "_PENDING_HANDLERS", _one_row(spy, state))
+
+    # A foreign device's turn reaches a handler that tries to re-arm the same
+    # state -- exactly the file_ops.py:627 shape, simulated directly at the
+    # mechanism `try_arm` guards, since driving the real intent/LLM parse
+    # path is out of scope for what this property pins.
+    from assistant.actions import set_principal, current_principal
+    token = set_principal(_A_DEVICE)
+    try:
+        armed = try_arm(state, {"op": "delete", "path": "system32"})
+    finally:
+        current_principal.reset(token)
+    assert armed is False
+
+    out = await turn("yes", _local_grants(), LOCAL_PRINCIPAL, source="stt")
+    assert answered == ["yes"], (
+        "the operator's own answer was refused after a foreign arm attempt "
+        "-- this is the KI-13-shaped denial of service the fix exists for")
+    said = [a[2] for a, _ in out.saved if len(a) > 2]
+    assert said and main_mod._FOREIGN_ATTEMPT_NOTICE in said[-1], (
+        "the owner answered but was never told an arm was attempted against "
+        f"her open question: {said}")
+
+
+def test_the_same_owner_can_still_rearm_its_own_open_question():
+    """The other direction the fix must not break: several flows in
+    `actions/` legitimately replace their own active state mid-interaction
+    (a new destructive request superseding an unanswered one, a disambiguation
+    reply re-arming the send confirmation, ...). `try_arm` must let the SAME
+    principal do this exactly as `set()` always has."""
+    from assistant.actions import LOCAL_PRINCIPAL
+    from assistant.pending import PendingState, try_arm
+
+    state = PendingState[dict]("probe_arm_same_owner", timeout=60.0)
+    assert try_arm(state, {"op": "delete", "path": "downloads"},
+                   principal=LOCAL_PRINCIPAL) is True
+
+    assert try_arm(state, {"op": "delete", "path": "old_report.docx"},
+                   principal=LOCAL_PRINCIPAL) is True, (
+        "the same principal could not replace its own open question")
+    assert state.payload == {"op": "delete", "path": "old_report.docx"}
+    assert state.principal == LOCAL_PRINCIPAL
+
+
+def test_file_ops_destructive_arm_lets_the_same_operator_start_a_new_request():
+    """The real flow, not just the bare mechanism: `file_ops.py`'s single
+    choke point for `pending_destructive` (`_set_pending_destructive`, all
+    seven call sites) now routes through `try_arm`. The operator asking for a
+    second deletion while the first is still unanswered must still work --
+    that is an ordinary re-ask, not a foreign takeover."""
+    from assistant.actions import LOCAL_PRINCIPAL, current_principal, set_principal
+    import assistant.actions as _act
+    from assistant.actions.file_ops import _set_pending_destructive
+    from pathlib import Path
+
+    token = set_principal(LOCAL_PRINCIPAL)
+    try:
+        _set_pending_destructive("delete", Path("C:/Users/x/Downloads/a.txt"), {})
+        assert _act.pending_destructive.payload["path"] == Path(
+            "C:/Users/x/Downloads/a.txt")
+
+        _set_pending_destructive("delete", Path("C:/Users/x/Downloads/b.txt"), {})
+        assert _act.pending_destructive.payload["path"] == Path(
+            "C:/Users/x/Downloads/b.txt"), (
+            "the operator could not replace her own unanswered destructive "
+            "request with a new one")
+        assert _act.pending_destructive.principal == LOCAL_PRINCIPAL
+    finally:
+        current_principal.reset(token)
+        _act.pending_destructive.clear()
+
+
+def test_a_foreign_arm_attempt_is_recorded_for_the_owner_to_learn():
+    """`note_foreign_attempt()` already exists for the answer side; the arm
+    side must feed the same channel, or the operator has no way to learn that
+    something reached for her confirmation by trying to re-arm it."""
+    from assistant.actions import LOCAL_PRINCIPAL
+    from assistant.pending import PendingState, try_arm
+
+    state = PendingState[dict]("probe_arm_notice", timeout=60.0)
+    try_arm(state, {"op": "delete"}, principal=LOCAL_PRINCIPAL)
+
+    assert try_arm(state, {"op": "delete", "path": "evil"},
+                   principal=_A_DEVICE) is False
+    assert try_arm(state, {"op": "delete", "path": "evil2"},
+                   principal=_ANOTHER_DEVICE) is False
+
+    assert state.take_foreign_attempts() == 2, (
+        "two refused arm attempts were not recorded for the owner")
+    # Read-and-clear, same contract as the answer side.
+    assert state.take_foreign_attempts() == 0
+
+
+def test_an_active_unowned_state_cannot_be_armed_by_anyone_either():
+    """The fail-closed extension `owned_by` already states for the answer
+    side: an unowned active state is answerable by nobody, in both
+    directions. `try_arm` inherits that -- even `LOCAL_PRINCIPAL` may not
+    silently annex a state nobody is recorded as owning."""
+    from assistant.actions import LOCAL_PRINCIPAL
+    from assistant.pending import PendingState, try_arm
+
+    state = PendingState[dict]("probe_arm_unowned", timeout=60.0)
+    try_arm(state, {"op": "delete"}, principal=None)
+    assert state.active and state.principal is None
+
+    assert try_arm(state, {"op": "delete", "path": "new"},
+                   principal=LOCAL_PRINCIPAL) is False
+    assert state.payload == {"op": "delete"}
+    assert state.principal is None
+
+
+def test_an_inactive_state_can_be_armed_by_anyone():
+    """The guard must not become a permanent lock. A state nobody currently
+    holds -- never armed, cleared, or expired -- is exactly the case an
+    ordinary first arm needs to keep working."""
+    from assistant.pending import PendingState, try_arm
+
+    state = PendingState[dict]("probe_arm_inactive", timeout=60.0)
+    assert try_arm(state, {"op": "delete"}, principal=_A_DEVICE) is True
+    assert state.principal == _A_DEVICE
+
+    state.clear()
+    assert try_arm(state, {"op": "delete"}, principal=_ANOTHER_DEVICE) is True
+    assert state.principal == _ANOTHER_DEVICE
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Structural: nobody arms with a raw `.set(` outside the two reasoned
+# exceptions. A hand-maintained list of "sites that use try_arm" is exactly
+# what the next arm site forgets -- so this walks every call, tree-wide.
+# ═════════════════════════════════════════════════════════════════════════
+
+# (path, enclosing-function-name) pairs where a raw `<state>.set(` call is
+# reasoned, not overlooked:
+#
+# - `pending_handlers.py::handle_pending_knowledge_approval` arms only behind
+#   `if ...payload is None`, i.e. only when the state is provably inactive --
+#   `try_arm`'s own guard is a no-op there by construction -- and it already
+#   carries the proposal's own principal and checks `owned_by` itself, both
+#   pinned by `test_a_lazily_arming_handler_carries_an_owner_and_checks_it`,
+#   `test_a_foreign_yes_cannot_write_a_knowledge_entry` and
+#   `test_a_proposal_that_lost_its_owner_is_answerable_by_nobody`.
+# - `main.py::_drain_and_announce_notifications` always arms with the fixed,
+#   explicit `principal=LOCAL_PRINCIPAL` -- TENKA's own notification loop is
+#   the only caller, so no foreign identity can ever reach this call.
+_RAW_SET_ALLOWLIST = {
+    ("pending_handlers.py", "handle_pending_knowledge_approval"),
+    ("main.py", "_drain_and_announce_notifications"),
+}
+
+
+def _all_pending_set_calls():
+    """(relative path, enclosing function or None, lineno, source line) for
+    every `<pending-state>.set(...)` call anywhere under `assistant/`,
+    tree-wide -- not just `main.py`. `pending.py` itself is excluded: that is
+    where the mechanism (`PendingState.set`, `try_arm`) is defined."""
+    names = _pending_state_attribute_names()
+    assistant_root = _ROOT / "assistant"
+    pending_py = assistant_root / "pending.py"
+    found = []
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self, path):
+            self.path = path
+            self.stack: list[str] = []
+
+        def _enclosing(self):
+            return self.stack[-1] if self.stack else None
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "set":
+                target = func.value
+                owner = (target.attr if isinstance(target, ast.Attribute)
+                          else target.id if isinstance(target, ast.Name)
+                          else None)
+                if owner in names:
+                    found.append((self.path.relative_to(_ROOT), self._enclosing(),
+                                   node.lineno))
+            self.generic_visit(node)
+
+    for path in sorted(assistant_root.rglob("*.py")):
+        if path == pending_py:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:  # pragma: no cover - not expected in this tree
+            continue
+        _Visitor(path).visit(tree)
+    return found
+
+
+def test_every_pending_arm_outside_the_two_reasoned_exceptions_uses_try_arm():
+    """The sweep this fix needed. An arm site added next month that calls
+    `<state>.set(...)` directly -- instead of `pending.try_arm(state, ...)`
+    -- must fail here, not ship a way to clobber another principal's active
+    confirmation."""
+    calls = _all_pending_set_calls()
+    assert calls, (
+        "the tree-wide walk found no pending-state .set() calls at all -- "
+        "either the spelling changed or _pending_state_attribute_names() "
+        "went empty, and a sweep that walks nothing passes forever")
+
+    offenders = [(str(path), fn, lineno) for path, fn, lineno in calls
+                 if (path.name, fn) not in _RAW_SET_ALLOWLIST]
+    assert not offenders, (
+        f"pending state armed with a raw `.set(` outside the two reasoned "
+        f"exceptions: {offenders}. Use `pending.try_arm(state, payload, "
+        f"principal=...)` instead, so an active state owned by someone else "
+        f"survives the arm attempt.")

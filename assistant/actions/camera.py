@@ -60,6 +60,7 @@ async def handle_camera_look(params: dict, llm_response: str, bridge=None) -> st
     from .. import faces
     from .. import llm as llm_module
     from .. import config as _config
+    from ..pending import try_arm
     import face_recognition as fr
 
     if not _config.CAMERA_ENABLED:
@@ -85,7 +86,7 @@ async def handle_camera_look(params: dict, llm_response: str, bridge=None) -> st
     )
 
     if frame_rgb is None:
-        _act.pending_camera_settings.set({"waiting": True})
+        try_arm(_act.pending_camera_settings, {"waiting": True})
         return (
             "I couldn't access the camera. Want me to open Windows camera "
             "settings so you can check the permissions?"
@@ -337,11 +338,12 @@ async def handle_recognize_face(params: dict, llm_response: str, bridge=None) ->
 async def handle_forget_face(params: dict, llm_response: str, bridge=None) -> str:
     import assistant.actions as _act
     from .. import faces
+    from ..pending import try_arm
 
     name = params.get("name", "").strip().title()
 
     if not name:
-        _act.pending_forget_face.set({"waiting": True})
+        try_arm(_act.pending_forget_face, {"waiting": True})
         return "Whose face should I forget? Say a name."
 
     removed = faces.forget_face(name)
