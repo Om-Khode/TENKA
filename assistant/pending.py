@@ -27,10 +27,13 @@ Usage:
     payload["dest_folder"] = candidate
     destructive.touch()             # reset the timeout
 """
+import logging
 import time
 from typing import Generic, Optional, TypeVar
 
 from .core.principal import current_principal
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -269,6 +272,14 @@ def try_arm(state: "PendingState", payload, *,
                 if isinstance(principal, _AmbientPrincipal)
                 else principal)
     if state.active and not state.owned_by(resolved):
+        # Logged because the *reply* deliberately is not: a refused arm answers
+        # exactly what an ordinary first arm would, so nothing about an open
+        # confirmation leaks to the caller. That non-disclosure is correct and
+        # it made the guard invisible -- a live test could not tell a refusal
+        # from a successful arm, which is no way to verify a security control.
+        # The log is the operator's own machine, which already knows.
+        logger.warning("[PENDING] Foreign arm refused: active state owned by "
+                       "another principal")
         state.note_foreign_attempt()
         return False
     state.set(payload, principal=principal)
@@ -327,6 +338,9 @@ def try_clear(state: "PendingState", *,
                 if isinstance(principal, _AmbientPrincipal)
                 else principal)
     if state.active and not state.owned_by(resolved):
+        # See `try_arm` for why this is logged and the reply is not.
+        logger.warning("[PENDING] Foreign clear refused: active state owned "
+                       "by another principal")
         state.note_foreign_attempt()
         return False
     state.clear()
