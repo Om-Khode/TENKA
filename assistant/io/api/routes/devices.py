@@ -79,6 +79,7 @@ def _device_body(device: Device, raises: list[RaisePayload]) -> DevicePayload:
         created_at=device.created_at,
         last_seen_at=device.last_seen_at,
         raises=raises,
+        paired_on=device.paired_on,
     )
 
 
@@ -90,10 +91,13 @@ async def list_devices(
     """Every device that holds a credential, as `vault.devices()` reports them,
     each with whatever ceiling raises are live for it right now.
 
-    Nothing else is added on top -- not which listener a device was last seen
-    on, not a source address, not whether it is the caller's own row. A caller
-    that needs to know which device it is asks `GET /v1/session`; inventing a
-    second answer here would be a second thing that could disagree.
+    Nothing else is added on top -- not which listener a device is connecting
+    from *right now*, not a source address, not whether it is the caller's
+    own row. A caller that needs to know which device it is asks
+    `GET /v1/session`; inventing a second answer here would be a second thing
+    that could disagree. `paired_on` is not that: it is the one listener a
+    device's credential was redeemed over, fixed at pairing time and never
+    updated again, not a live connection fact.
     """
     devices = request.app.state.auth.vault.devices()
     # One snapshot for the whole listing, not one lookup per row: `active()`

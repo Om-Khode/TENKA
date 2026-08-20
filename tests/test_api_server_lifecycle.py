@@ -1249,6 +1249,38 @@ async def test_a_successful_start_leaves_the_vault_reachable_for_shutdown(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_studio_startup_token_records_no_paired_on(tmp_path, monkeypatch):
+    """The Studio device token main.py mints at startup is never redeemed
+    over any listener -- it is minted directly, before any HTTP request or
+    listener policy resolution ever happens. `paired_on` must be `None`, not
+    a convenient guess like `"local"` just because that happens to be the
+    only listener this particular token is usable from.
+    """
+    import asyncio
+
+    import assistant.config as config
+    import assistant.main as m
+
+    monkeypatch.setattr(config, "SANDBOX_DIR", tmp_path)
+
+    async def _noop() -> None:
+        return None
+
+    def _fake_serve(*args, **kwargs):
+        return asyncio.create_task(_noop())
+
+    monkeypatch.setattr("assistant.io.api.server.serve", _fake_serve)
+
+    task = await m._start_studio_daemon()
+    try:
+        devices = m._studio_vault.devices()
+        assert len(devices) == 1
+        assert devices[0].paired_on is None
+    finally:
+        await task
+
+
+@pytest.mark.asyncio
 async def test_a_successful_start_leaves_the_dispatch_reachable_too(tmp_path, monkeypatch):
     """process_text_from_queue's finally block reads module-level
     `_studio_dispatch` the same way main.py's shutdown site reads

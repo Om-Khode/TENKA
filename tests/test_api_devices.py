@@ -65,11 +65,36 @@ def test_the_listing_carries_only_what_the_revoke_list_needs(tmp_path):
     assert set(data) == {"devices"}
     assert set(data["devices"][0]) == {
         "deviceId", "label", "grants", "createdAt", "lastSeenAt", "raises",
+        "pairedOn",
     }
     # Empty, never omitted, for a device with no raise -- and empty here also
     # because this app has no raise store attached at all, which must read as
     # "no raises" rather than as a missing key or a 500.
     assert data["devices"][0]["raises"] == []
+
+
+def test_the_listing_reports_paired_on_as_null_when_unknown(tmp_path):
+    """A device issued with no recorded origin -- the common case for the
+    Studio startup token, and for any v1 record -- must show up as JSON
+    `null`, not have the key omitted. A client cannot tell "unknown" from
+    "this build predates the field" from a key that silently isn't there.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))  # no paired_on given
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, token)
+    device = client.get("/v1/devices").json()["data"]["devices"][0]
+    assert "pairedOn" in device
+    assert device["pairedOn"] is None
+
+
+def test_the_listing_reports_the_recorded_paired_on_value(tmp_path):
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset(Capability), paired_on="tailnet")
+    client = _client(vault, policies={LOCAL_PORT: "local"})
+    client.cookies.set(COOKIE_NAME, token)
+    device = client.get("/v1/devices").json()["data"]["devices"][0]
+    assert device["pairedOn"] == "tailnet"
 
 
 def test_the_listing_never_carries_a_token_or_its_hash(tmp_path):

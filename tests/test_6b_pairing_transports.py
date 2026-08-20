@@ -298,6 +298,27 @@ def test_redemption_succeeds_on_tailnet_and_funnel(tmp_path):
     assert {d.label for d in vault.devices()} == {"phone-a", "phone-b"}
 
 
+# ─── paired_on: recorded from the listener the code was actually redeemed on
+def test_pairing_over_each_transport_records_which_listener_it_came_through(tmp_path):
+    """`paired_on` is set at redemption time from `policy.name` -- the
+    listener this specific request arrived on -- not from anything the
+    operator typed while minting. With three transports carrying three
+    different capability ceilings, which door a credential came through is
+    exactly the fact this field exists to answer.
+    """
+    vault = TokenVault(tmp_path)
+    store = PairCodeStore()
+    app = build(vault, store=store)
+
+    for transport in ("local", "tailnet", "funnel"):
+        code = store.mint(transport, frozenset({Capability.OBSERVE})).code
+        r = client_on(app, transport).post("/v1/pair", json={"code": code})
+        assert r.status_code == 204
+
+    by_label = {d.label: d.paired_on for d in vault.devices()}
+    assert by_label == {"local": "local", "tailnet": "tailnet", "funnel": "funnel"}
+
+
 def _register_unpairable_policy(monkeypatch) -> None:
     """A synthetic `pairable=False` policy, registered as `"unpairable"`.
 
