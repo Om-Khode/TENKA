@@ -833,7 +833,7 @@ def test_touch_raises_rather_than_silently_skipping(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("raw", [
-    '{"version": 2, "devices": []}',    # a schema version this build has never seen
+    '{"version": 3, "devices": []}',    # a schema version this build has never seen
     '{"version": 1, "devices": {}}',    # devices present but not a list
     "[1, 2, 3]",                        # not even a JSON object
     '"hello"',                          # a bare string
@@ -855,7 +855,7 @@ def test_issue_against_a_wrong_shape_document_raises_and_does_not_overwrite_it(t
     disk must survive completely untouched.
     """
     raw = json.dumps({
-        "version": 2,
+        "version": 3,
         "devices": [{"device_id": "future", "label": "from-a-newer-build"}],
     })
     (tmp_path / "devices.json").write_text(raw, encoding="utf-8")
@@ -1070,3 +1070,81 @@ def test_issue_racing_revoke_loses_neither_the_new_device_nor_the_revocation(tmp
     assert labels == ["new"], (
         f"expected only the new device to survive the race, got {labels}"
     )
+
+
+# ─── paired_on: which listener a credential was redeemed over ─────────────
+# Recorded at issue time from the listener policy name (`routes/pairing.py`
+# passes `policy.name`), never inferred or recomputed later -- see
+# `Device.paired_on`'s own docstring for why nothing downstream may ever
+# treat it as anything but a display fact.
+
+
+def test_issue_records_the_listener_it_was_paired_on(vault):
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}), paired_on="tailnet")
+    device = vault.verify(token)
+    assert device.paired_on == "tailnet"
+
+
+def test_issue_without_paired_on_records_none_not_a_guess(vault):
+    """A caller that mints a credential with no listener to attribute it to
+    -- main.py's Studio startup token is exactly this case -- must get `None`
+    back, not a convenient default like `"local"`."""
+    token = vault.issue("studio", frozenset({Capability.OBSERVE}))
+    device = vault.verify(token)
+    assert device.paired_on is None
+
+
+def test_v1_devices_json_loads_with_paired_on_as_none_and_does_not_guess(tmp_path):
+    """A record written before this field existed has no `paired_on` key at
+    all. It must load as `None` -- never inferred as `"local"` just because
+    that is the common case. A v1 record's true origin is genuinely unknown,
+    and guessing would be exactly the lie this field exists to avoid.
+    """
+    (tmp_path / "devices.json").write_text(json.dumps({
+        "version": 1,
+        "devices": [{"device_id": "a", "label": "old", "grants": ["observe"],
+                     "created_at": "2026-01-01T00:00:00+00:00", "token_hmac": "x"}],
+    }), encoding="utf-8")
+
+    devices = TokenVault(tmp_path).devices()
+
+    assert len(devices) == 1
+    assert devices[0].paired_on is None
+
+
+def test_v1_devices_json_does_not_crash_and_the_device_still_verifies(tmp_path):
+    """The migration must not perturb anything else about a genuine v1
+    record: a real token issued before this field existed keeps verifying,
+    with its device intact, once the field is added to the codebase.
+    """
+    vault = TokenVault(tmp_path)
+    token = vault.issue("phone", frozenset({Capability.OBSERVE}))
+    # Reproduce what a real pre-migration file looked like: version 1, and no
+    # `paired_on` key on the record at all (issue() now always writes one).
+    raw = json.loads((tmp_path / "devices.json").read_text(encoding="utf-8"))
+    raw["version"] = 1
+    del raw["devices"][0]["paired_on"]
+    (tmp_path / "devices.json").write_text(json.dumps(raw), encoding="utf-8")
+
+    fresh = TokenVault(tmp_path)
+    device = fresh.verify(token)
+
+    assert device is not None
+    assert device.label == "phone"
+    assert device.paired_on is None
+
+
+def test_touch_preserves_paired_on(tmp_path):
+    """`touch()` runs on every authenticated request and rewrites the record
+    -- it must not drop or blank a field it has no reason to touch, the same
+    way it already leaves `label`, `grants` and `created_at` alone.
+    """
+    vault = TokenVault(tmp_path)
+    vault.issue("phone", frozenset({Capability.OBSERVE}), paired_on="funnel")
+    device_id = vault.devices()[0].device_id
+
+    vault.touch(device_id)
+
+    reloaded = TokenVault(tmp_path).devices()[0]
+    assert reloaded.paired_on == "funnel"
+    assert reloaded.last_seen_at is not None

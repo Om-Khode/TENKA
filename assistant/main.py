@@ -447,7 +447,15 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
             # operator's own client of EXECUTE the next time the enum grows,
             # and it would read as a bug, not as a policy change. The ceiling
             # is where transports are decided; this is a device.
-            _studio_token = _studio_vault.issue("studio", frozenset(Capability))
+            # `paired_on=None`, explicitly: this token is minted directly by
+            # the daemon at startup, before any HTTP request or listener
+            # policy resolution ever happens, so there is no listener it was
+            # "redeemed" over to name. `"local"` would be a convenient guess
+            # -- it does end up usable only on the loopback listener -- but it
+            # is not a recorded fact this call site has, and inventing one is
+            # exactly the lie `paired_on` exists to avoid for a v1 record.
+            _studio_token = _studio_vault.issue("studio", frozenset(Capability),
+                                                paired_on=None)
             # The raw token goes to stdout ONLY -- a browser can't read a
             # file, so this is the one and only time the operator can
             # copy it into Studio's connect screen. The log line names

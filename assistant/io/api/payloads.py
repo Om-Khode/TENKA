@@ -363,9 +363,9 @@ class DevicePayload(CamelModel):
     This response describes every credential that reaches this machine, so it
     carries only what a person needs to decide what to kill: which row, what
     it is called, what it can do, and when it was last used. No token, no
-    token hash, no listener or address -- a device's grants say what it may
-    do, and where it happened to connect from is not a fact this list is
-    allowed to make somebody act on.
+    token hash, and no live address -- a device's grants say what it may do,
+    and where it happens to be connecting *from right now* is not a fact this
+    list is allowed to make somebody act on.
 
     `raises` is Milestone 6b's one addition, and it belongs to the same
     question rather than widening it: a device that can currently do more than
@@ -373,6 +373,16 @@ class DevicePayload(CamelModel):
     needs to see. Empty, never omitted, for a device with no live raise --
     and there is deliberately no route that lists raises on their own, so
     nothing here becomes a second oracle for which device ids exist.
+
+    `paired_on` is a second Milestone 6b addition and a different kind of fact
+    from `raises`: not a live connection address, but which listener policy --
+    `"local"`, `"tailnet"`, or `"funnel"` -- this credential was redeemed over
+    at pairing time, recorded once and never updated again. With three
+    transports carrying three different capability ceilings, which door a
+    device's credential came through is exactly what someone deciding whether
+    to trust or cut off a row needs. `None` for a device paired before this
+    field existed, or issued outside the pairing route entirely -- a genuinely
+    unknown origin, never guessed as `"local"` for convenience.
     """
 
     device_id: str
@@ -381,6 +391,7 @@ class DevicePayload(CamelModel):
     created_at: str
     last_seen_at: str | None
     raises: list[RaisePayload]
+    paired_on: str | None
 
 
 class DevicesPayload(CamelModel):

@@ -28,7 +28,19 @@ logger = logging.getLogger(__name__)
 
 _SECRET_FILE = "instance_secret"
 _DEVICES_FILE = "devices.json"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+
+# v1 -> v2: added `paired_on` (the listener policy name a device was redeemed
+# over -- `"local"`, `"tailnet"`, `"funnel"`) to each device record. `_load()`
+# recognises `version: 1` as a migratable legacy shape rather than an unknown
+# one -- see its own docstring -- so an existing devices.json keeps loading; a
+# v1 record simply has no `paired_on` key, and `_parse_device` defaults that
+# to `None` via `.get()` the same way it already does for `last_seen_at`.
+# `None` here is not "unknown, guess local" -- a device paired before this
+# version genuinely has no recorded origin, and inventing one would be a lie
+# in exactly the surface (which door a credential came through) this field
+# exists to answer honestly.
+_LOADABLE_VERSIONS = (1, _SCHEMA_VERSION)
 
 # "Last seen" carries no useful signal at sub-minute resolution, and
 # TokenVault.touch() is wired into the authenticated request path (Milestone
@@ -122,6 +134,14 @@ class Device:
     grants: frozenset[Capability]
     created_at: str
     last_seen_at: str | None = None
+    # The listener policy name (`"local"`, `"tailnet"`, `"funnel"`) this
+    # device's credential was redeemed over, recorded at issue time -- never
+    # recomputed or inferred later. `None` for a v1 record (paired before this
+    # field existed) and for a device issued outside the pairing route
+    # entirely (see `issue()`'s own docstring for that second case). A display
+    # fact only: nothing in `authenticate()` or `effective()` reads it, and it
+    # must stay that way -- see `issue()`'s docstring.
+    paired_on: str | None = None
 
 
 def _restrict_to_current_user(path: Path) -> None:
@@ -465,6 +485,19 @@ class TokenVault:
         verifies" or "nothing is listed" -- but that is now a decision each of
         them makes and documents for itself, not something this method decides
         for all of them by handing back a lie.
+
+        `version: 1` is the one exception to "not `_SCHEMA_VERSION` is wrong
+        shape": it is a *known* older shape (pre-`paired_on`), not an
+        unrecognised one, so it is migrated in memory rather than rejected --
+        the returned document's `version` is bumped to `_SCHEMA_VERSION`, and
+        every device dict is handed back exactly as stored, `paired_on` key
+        and all (i.e. absent). `_parse_device` already defaults a missing
+        `paired_on` to `None` the same way it defaults a missing
+        `last_seen_at`, so nothing here invents an origin for a device that
+        was paired before this field existed. The migration is lazy, not
+        eager: nothing is written back until some other caller mutates and
+        calls `_save()`, at which point the document persists as
+        `_SCHEMA_VERSION` from then on.
         """
         path = self._root / _DEVICES_FILE
         if not path.exists():
@@ -479,7 +512,7 @@ class TokenVault:
         # -- and short-circuit -- first.
         wrong_shape = (
             not isinstance(data, dict)
-            or data.get("version") != _SCHEMA_VERSION
+            or data.get("version") not in _LOADABLE_VERSIONS
             or not isinstance(data.get("devices"), list)
         )
         if wrong_shape:
@@ -490,13 +523,16 @@ class TokenVault:
             # pass proved -- a devices.json written by a newer build, read by
             # a rolled-back one, silently emptied and then overwritten with
             # only whatever `main.py`'s bootstrap re-issues). A version this
-            # build does not recognise is not evidence that nothing has ever
-            # been issued.
+            # build does not recognise -- including one newer than
+            # `_SCHEMA_VERSION` -- is not evidence that nothing has ever been
+            # issued.
             version = data.get("version") if isinstance(data, dict) else None
             raise VaultReadError(
                 f"devices.json parsed but its shape is not understood "
                 f"(version={version!r})"
             )
+        if data.get("version") == 1:
+            data = {**data, "version": _SCHEMA_VERSION}
         return data
 
     def _save(self, data: dict) -> None:
@@ -563,12 +599,29 @@ class TokenVault:
                 # required field (device_id, label, grants, created_at) should
                 # drop a record; this one must default instead.
                 last_seen_at=entry.get("last_seen_at"),
+                # Same shape, same reasoning: a v1 record (see `_load()`'s
+                # migration) and a device issued outside the pairing route
+                # entirely both have no `paired_on` key, and both cases are
+                # "genuinely unknown", never a value to guess at.
+                paired_on=entry.get("paired_on"),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.warning(f"[API] skipping malformed device record: {exc}")
             return None
 
-    def issue(self, label: str, grants: frozenset[Capability]) -> str:
+    def issue(self, label: str, grants: frozenset[Capability], *,
+              paired_on: str | None = None) -> str:
+        # `paired_on` names the listener policy (`"local"`, `"tailnet"`,
+        # `"funnel"`) this credential was redeemed over, for display only
+        # (`GET /v1/devices`'s `pairedOn`) -- see `Device.paired_on`'s own
+        # docstring for why nothing in `authenticate()`/`effective()` may ever
+        # read it. Keyword-only and defaulted to `None` rather than a required
+        # positional: a caller that mints a credential with no listener to
+        # attribute it to -- `main.py`'s Studio bootstrap token, minted
+        # directly at daemon startup before any request or policy resolution
+        # ever happens -- has no honest transport name to pass, and `None` is
+        # that honest answer, not a caller that forgot the argument.
+        #
         # A device with no grants can do nothing useful, but it can still
         # authenticate: every route gated by `authenticate` alone (rather
         # than `require(capability)`) would answer it before any capability
@@ -608,6 +661,7 @@ class TokenVault:
                 "grants": sorted(c.value for c in grants),
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "token_hmac": self._hash(token),
+                "paired_on": paired_on,
             })
             self._save(data)
         return token

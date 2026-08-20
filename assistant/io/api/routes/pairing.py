@@ -511,8 +511,13 @@ async def pair_device(body: PairRequest, request: Request) -> Response:
     # whole load-append-save sequence itself, so a worker thread is exactly
     # what that lock is for.
     try:
+        # `paired_on=policy.name` records which listener this credential was
+        # actually redeemed over -- `"local"`, `"tailnet"`, or `"funnel"` --
+        # at the one moment that fact is known. Nothing downstream reads it
+        # back as a decision; see `Device.paired_on`'s own docstring.
         token = await asyncio.to_thread(
-            request.app.state.auth.vault.issue, pair_code.label, grants)
+            request.app.state.auth.vault.issue, pair_code.label, grants,
+            paired_on=policy.name)
     except VaultUnavailableError as exc:
         # The code is already consumed and gone -- single-use, and
         # `consume()` never puts it back -- so this is not a "retry with the
