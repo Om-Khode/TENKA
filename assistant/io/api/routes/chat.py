@@ -13,16 +13,47 @@ from ..payloads import (
     ConversationRefPayload, ConversationsPayload,
 )
 from ..schemas import ChatRequest, Envelope
-from ..security import require
+from ..security import require, throttle
 from ..vault import Capability, Device
 
 router = APIRouter()
+
+# A message per second here is not an ordinary read: each one reaches
+# `_StudioDispatch.submit()`, which either arms a pending confirmation or is
+# refused by `try_arm` -- and a refusal returns exactly the same challenge
+# text an ordinary first arm would (deliberate, for non-disclosure), which
+# `main.py` then hands to TTS. That is 13-18 seconds of spoken audio per
+# message, and the shared per-device budget `authenticate()` already checks
+# (120/60s -- about two a second) never comes close to catching it. This is
+# the tighter, route-specific budget `throttle()` exists for -- the same
+# shape `routes/system.py`'s backup routes and `commands.py`'s
+# `_RUN_MAX_PER_WINDOW` already use for their own expensive routes. 10/60s is
+# generous to an operator holding a real back-and-forth (every genuine reply
+# waits out at least one full turn -- intent, dispatch, TTS -- which is
+# already seconds) and tight against a script sending as fast as the network
+# allows.
+#
+# `throttle()` already wraps `require(capability)` (see its own docstring),
+# so it replaces that dependency here rather than stacking beside it -- two
+# separate `Depends(require(...))` closures would both resolve the same
+# `Device`, just redundantly.
+#
+# Never reached by the person at the keyboard: local input ("stt"/"chat")
+# goes straight onto `_input_queue` from `main.py`'s own audio/console loops
+# and never touches this HTTP route at all -- `POST /v1/chat` is reachable
+# only by a paired device. Rate-limiting it costs a device nothing the
+# operator has, and costs the operator nothing at all.
+_CHAT_MAX_PER_WINDOW = 10
+_CHAT_WINDOW_SECONDS = 60.0
 
 
 # ─── Sending a turn ──────────────────────────────────────────────────────
 @router.post("/chat", status_code=status.HTTP_202_ACCEPTED)
 async def send_chat(body: ChatRequest, request: Request,
-                    device: Device = Depends(require(Capability.CHAT_SEND))
+                    device: Device = Depends(
+                        throttle(Capability.CHAT_SEND, "chat_send",
+                                 max_per_window=_CHAT_MAX_PER_WINDOW,
+                                 window_seconds=_CHAT_WINDOW_SECONDS)),
                     ) -> Envelope[ChatSendPayload]:
     # `device.grants` is already `effective(issued, listener ceiling)` --
     # `authenticate()` narrows before `require()` hands the Device back -- so

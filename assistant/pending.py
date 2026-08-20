@@ -275,6 +275,64 @@ def try_arm(state: "PendingState", payload, *,
     return True
 
 
+# ─── Clearing without discarding another principal's open question ───────
+
+def try_clear(state: "PendingState", *,
+              principal: "Optional[str] | _AmbientPrincipal" = AMBIENT_PRINCIPAL,
+              ) -> bool:
+    """Clear `state`, unless that would discard another principal's still-
+    active state.
+
+    The third door into the same room `try_arm` closed. KI-13's answer side
+    (the dispatch loop) and `try_arm`'s arm side both already refuse a foreign
+    principal; a bare `.clear()` reachable outside either check is the same
+    denial of service spelled a third way -- a foreign caller who cannot
+    answer the operator's confirmation and cannot re-arm over it can still
+    make it vanish, and the operator finds her open question gone with no
+    "something else tried" to explain why. Discarding a confirmation nobody
+    but its owner should be able to end is exactly as bad as overwriting it or
+    answering it.
+
+    Same test as `try_arm`, same shape, one more time:
+
+    - **the same principal** clearing its own active state passes `owned_by`
+      and tears it down exactly as a bare `.clear()` always has -- every
+      legitimate self-teardown in `actions/` (the flows already gated by the
+      dispatch loop's `state.active and not state.owned_by(principal)` check
+      before their handler is ever called, so the only principal that can
+      reach their `.clear()` calls is already the owner) keeps working
+      unchanged.
+    - **a different principal** -- or nobody, since an unowned active state is
+      owned_by nobody in either direction -- is refused. The state is left
+      untouched and the refusal is parked via `note_foreign_attempt()`, read
+      the same way a foreign answer or a foreign arm attempt already is: on
+      the owner's next answer, read-and-cleared by `take_foreign_attempts()`.
+
+    Most of the tree's `.clear()` call sites never needed this: they sit
+    inside a `handle_pending_*` function the dispatch loop (or, for
+    `teaching_session`, `main.py`'s own answer site; or, for
+    `knowledge_approval`, the handler's own lazily-armed `owned_by` check)
+    already refuses to reach for a non-owner, so by the time the body runs the
+    only caller who could still be executing it is the owner -- guarding
+    there again would be a no-op, not a hardening. This exists for the one
+    shape that check cannot reach: a clear sitting inside an *ordinary* tool
+    handler (`camera_look`'s tidy-up of a stale `pending_camera_settings`
+    offer, run for every caller of the `camera_look` intent, not just the one
+    who was asked about camera settings) rather than inside the pending-answer
+    chain itself.
+
+    Returns True if cleared, False if refused.
+    """
+    resolved = (current_principal.get()
+                if isinstance(principal, _AmbientPrincipal)
+                else principal)
+    if state.active and not state.owned_by(resolved):
+        state.note_foreign_attempt()
+        return False
+    state.clear()
+    return True
+
+
 class PendingRegistry:
     """Registry of all PendingStates so the planner can snapshot them.
 

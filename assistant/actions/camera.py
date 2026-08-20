@@ -60,7 +60,7 @@ async def handle_camera_look(params: dict, llm_response: str, bridge=None) -> st
     from .. import faces
     from .. import llm as llm_module
     from .. import config as _config
-    from ..pending import try_arm
+    from ..pending import try_arm, try_clear
     import face_recognition as fr
 
     if not _config.CAMERA_ENABLED:
@@ -69,8 +69,16 @@ async def handle_camera_look(params: dict, llm_response: str, bridge=None) -> st
             "Type /set camera_enabled true to turn it on."
         )
 
+    # Tidying up a stale settings offer, not answering the pending chain --
+    # this handler runs for every caller of the `camera_look` intent, not
+    # just the one `pending_camera_settings` was armed for, so unlike the
+    # `handle_pending_camera_settings` clears below (gated by the dispatch
+    # loop's ownership check before that handler is ever reached), nothing
+    # upstream of this line confirms the caller here owns the state. A
+    # foreign caller trying camera_look must not be able to discard the
+    # operator's still-open settings prompt as a side effect.
     if _act.pending_camera_settings.active:
-        _act.pending_camera_settings.clear()
+        try_clear(_act.pending_camera_settings)
 
     if bridge:
         await bridge.send_command("play_animation", name="thinking")
