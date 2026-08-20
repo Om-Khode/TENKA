@@ -147,6 +147,16 @@ WRAPPER_PAYLOADS_WITHOUT_A_DATACLASS: dict[type[payloads.CamelModel], str] = {
     payloads.DeletedPayload: "echoes the route's own request body path, not a dataclass",
     payloads.ForgetEnrolledPayload: "echoes the route's own path parameters, not a dataclass",
     payloads.DevicesPayload: "wraps list[Device]; the vault returns the list directly",
+    payloads.TransportsPayload: "wraps list[TransportPayload]; the route builds the "
+                                 "list from the transport registry directly",
+    payloads.TransportPayload: "sourced from a ListenerPolicy plus the live TransportSession "
+                                "-- `ceiling`, `raisable` and `pairable` are read off "
+                                "POLICIES, `running`/`url` off the session, and neither is "
+                                "a dataclass this file could pair it with",
+    payloads.ListenerPayload: "sourced from the resolved ListenerPolicy for the accepting "
+                               "port -- `policy`/`allowBearer` off the policy and `canPair` "
+                               "from pairing.py's own refusal predicate, so there is no "
+                               "dataclass counterpart to mirror",
     payloads.RevokedPayload: "echoes the route's device_id path parameter, not a dataclass",
     payloads.PairCodePayload: "sourced from the minted PairCode plus the endpoint list "
                               "and the QR the route renders from it; PairCode's own "
