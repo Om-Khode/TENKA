@@ -1328,3 +1328,337 @@ def test_every_pending_arm_outside_the_two_reasoned_exceptions_uses_try_arm():
         f"exceptions: {offenders}. Use `pending.try_arm(state, payload, "
         f"principal=...)` instead, so an active state owned by someone else "
         f"survives the arm attempt.")
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# The third door: `.clear()`. The answer side (dispatch loop) and the arm
+# side (`try_arm`) both already refuse a foreign principal; a bare `.clear()`
+# reachable outside either check discards the operator's open confirmation
+# just as effectively as answering or overwriting it would, and leaves no
+# trace for `note_foreign_attempt()` to report -- she just finds it gone.
+# `pending.try_clear()` mirrors `try_arm` for this; see its docstring.
+# ═════════════════════════════════════════════════════════════════════════
+
+def test_a_foreign_clear_cannot_discard_an_active_owned_state():
+    """The headline property, mechanism-level. The operator's confirmation is
+    armed; a foreign principal's attempt to CLEAR the SAME state (not answer
+    it, not re-arm it -- just discard it) must leave it exactly as it was."""
+    from assistant.actions import LOCAL_PRINCIPAL
+    from assistant.pending import PendingState, try_arm, try_clear
+
+    state = PendingState[dict]("probe_clear_foreign", timeout=60.0)
+    assert try_arm(state, {"op": "delete", "path": "downloads"},
+                   principal=LOCAL_PRINCIPAL) is True
+
+    cleared = try_clear(state, principal=_A_DEVICE)
+
+    assert cleared is False, "a foreign clear attempt reported success"
+    assert state.active, "a foreign clear attempt discarded the operator's state"
+    assert state.principal == LOCAL_PRINCIPAL, (
+        "a foreign clear attempt changed who owns the state")
+    assert state.payload == {"op": "delete", "path": "downloads"}, (
+        "a foreign clear attempt touched the payload even though it was refused")
+
+
+def test_the_same_owner_can_still_clear_its_own_open_question():
+    """The direction the fix must not break: an owner abandoning her own
+    question (cancelling, or a handler tearing down the state it was called
+    to answer) is not a foreign takeover and must keep working exactly as a
+    bare `.clear()` always has."""
+    from assistant.actions import LOCAL_PRINCIPAL
+    from assistant.pending import PendingState, try_arm, try_clear
+
+    state = PendingState[dict]("probe_clear_same_owner", timeout=60.0)
+    assert try_arm(state, {"op": "delete"}, principal=LOCAL_PRINCIPAL) is True
+
+    assert try_clear(state, principal=LOCAL_PRINCIPAL) is True, (
+        "the same principal could not clear its own open question")
+    assert not state.active
+    assert state.principal is None
+
+
+def test_an_active_unowned_state_cannot_be_cleared_by_anyone_either():
+    """The fail-closed extension `owned_by` already states for the answer and
+    arm sides: an unowned active state is answerable -- and now clearable --
+    by nobody, in every direction. Even `LOCAL_PRINCIPAL` may not silently
+    discard a state nobody is recorded as owning."""
+    from assistant.actions import LOCAL_PRINCIPAL
+    from assistant.pending import PendingState, try_arm, try_clear
+
+    state = PendingState[dict]("probe_clear_unowned", timeout=60.0)
+    try_arm(state, {"op": "delete"}, principal=None)
+    assert state.active and state.principal is None
+
+    assert try_clear(state, principal=LOCAL_PRINCIPAL) is False
+    assert state.active
+    assert state.payload == {"op": "delete"}
+
+
+def test_an_inactive_state_can_be_cleared_by_anyone():
+    """The guard must not become a permanent lock on an inactive state --
+    clearing something nobody currently holds is always a no-op-shaped
+    success, exactly like arming one."""
+    from assistant.pending import PendingState, try_clear
+
+    state = PendingState[dict]("probe_clear_inactive", timeout=60.0)
+    assert try_clear(state, principal=_A_DEVICE) is True
+    assert not state.active
+
+
+def test_a_foreign_clear_attempt_is_recorded_for_the_owner_to_learn():
+    """`note_foreign_attempt()` already carries the answer-side and arm-side
+    refusals to the owner; a refused clear must feed the same channel; or the
+    operator has no way to learn that something reached for her confirmation
+    by trying to discard it."""
+    from assistant.actions import LOCAL_PRINCIPAL
+    from assistant.pending import PendingState, try_arm, try_clear
+
+    state = PendingState[dict]("probe_clear_notice", timeout=60.0)
+    try_arm(state, {"op": "delete"}, principal=LOCAL_PRINCIPAL)
+
+    assert try_clear(state, principal=_A_DEVICE) is False
+    assert try_clear(state, principal=_ANOTHER_DEVICE) is False
+
+    assert state.take_foreign_attempts() == 2, (
+        "two refused clear attempts were not recorded for the owner")
+    assert state.take_foreign_attempts() == 0
+
+
+@pytest.mark.asyncio
+async def test_camera_look_cannot_discard_a_foreign_callers_settings_offer(
+        monkeypatch):
+    """Gap 1, the reported defect, pinned at the real site. `handle_camera_
+    look` tidies up a stale `pending_camera_settings` offer on entry, but
+    unlike every `handle_pending_*` answer handler, nothing upstream of it
+    (no dispatch-loop check, because `camera_look` is an ordinary tool intent,
+    not a pending-answer row) confirms the caller owns that state -- so
+    before this fix, any caller of `camera_look` discarded the operator's
+    still-open settings prompt as a side effect of looking at the camera.
+
+    Built directly with `state.set(..., principal=...)`, not `try_arm`, so
+    only the clear guard this test targets can be what keeps the state
+    alive -- an (irrelevant) arm guard refusing a foreign arm here would
+    prove nothing about the clear this test is pinning.
+
+    `face_recognition` is stubbed in `sys.modules` before the handler's own
+    `import face_recognition as fr` runs: the real package's `api.py` calls
+    `quit()` at import time on this machine (missing `face_recognition_
+    models`), which would kill the whole test process rather than fail one
+    test -- exactly the "anything touching vision" this milestone's SAFETY
+    note keeps out of this suite. Camera capture is mocked to return None
+    before that import would ever need to do real work anyway."""
+    import sys
+    import types
+    import assistant.actions as _act
+    from assistant import config as _config
+    from assistant.actions import LOCAL_PRINCIPAL, current_principal, set_principal
+    from assistant.actions.camera import handle_camera_look
+    from assistant.io import camera as camera_module
+
+    monkeypatch.setitem(sys.modules, "face_recognition", types.ModuleType("face_recognition"))
+    monkeypatch.setattr(_config, "CAMERA_ENABLED", True)
+    monkeypatch.setattr(camera_module, "capture_camera_frame_numpy",
+                        lambda *a, **k: None)
+
+    _act.pending_camera_settings.set({"waiting": True}, principal=LOCAL_PRINCIPAL)
+
+    token = set_principal(_A_DEVICE)
+    try:
+        result = await handle_camera_look({}, "", bridge=None)
+    finally:
+        current_principal.reset(token)
+
+    assert "camera" in result.lower(), result
+    assert _act.pending_camera_settings.active, (
+        "a foreign caller's camera_look discarded the operator's open "
+        "settings offer")
+    assert _act.pending_camera_settings.owned_by(LOCAL_PRINCIPAL), (
+        "the operator's settings offer lost its owner")
+
+
+def test_the_tier2_rearm_carries_the_searchers_principal(monkeypatch):
+    """Gap 3, pinned with a REAL `threading.Thread` -- not a stand-in that
+    runs inline in the test's own context, which would never actually cross
+    the thread boundary the bug lives in and would pass whether or not the
+    fix is present. `contextvars` do not propagate to a plain
+    `threading.Thread` the way they do to an asyncio task, so
+    `current_principal.get()` read INSIDE `_run_search` -- on a fresh OS
+    thread -- reads back the contextvar's default, None, regardless of who
+    asked. Before this fix the tier-2 offer was armed owned by nobody, and an
+    owned_by(None) state is answerable by nobody: the searcher who asked for
+    it could never accept her own follow-up.
+
+    Bounded with a `threading.Event` + timeout (never a bare `thread.join()`
+    with no bound), so a mechanism that hangs fails this test instead of the
+    test suite."""
+    import threading
+    import assistant.actions as _act
+    import assistant.file_manager as file_manager_module
+    from assistant.actions import LOCAL_PRINCIPAL, current_principal, set_principal
+    from assistant.actions import file_ops
+
+    monkeypatch.setattr(file_manager_module, "find_files",
+                        lambda *a, **k: [])
+
+    done = threading.Event()
+    orig_put = _act._search_result_queue.put
+
+    def _signal_put(msg):
+        orig_put(msg)
+        done.set()
+    monkeypatch.setattr(_act._search_result_queue, "put", _signal_put)
+
+    _act.pending_file_search.set({"name": "report.docx", "tier": 1},
+                                  principal=LOCAL_PRINCIPAL)
+
+    token = set_principal(LOCAL_PRINCIPAL)
+    try:
+        resp = asyncio.run(file_ops.handle_pending_file_search("fast"))
+    finally:
+        current_principal.reset(token)
+    assert resp is not None and "search" in resp.lower(), resp
+
+    assert done.wait(timeout=10), (
+        "the background tier-2 search thread never finished -- the test "
+        "cannot tell whether the mechanism is fixed or hanging")
+
+    assert _act.pending_file_search.active, (
+        "the tier-2 re-arm never happened")
+    assert _act.pending_file_search.principal == LOCAL_PRINCIPAL, (
+        f"the tier-2 re-arm lost the searcher's principal: "
+        f"{_act.pending_file_search.principal!r}")
+    assert _act.pending_file_search.owned_by(LOCAL_PRINCIPAL), (
+        "the re-armed state is not answerable by the person who asked for "
+        "the search")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Structural: `.clear()` on a registered PendingState is either reached only
+# after an ownership check already ran (the dispatch loop, `teaching_
+# session`'s own answer site, or `knowledge_approval`'s self-check), or it
+# goes through `try_clear`. A hand-maintained list of "safe" call sites is
+# exactly what the next one forgets, so this walks every call, tree-wide,
+# the same way `_all_pending_set_calls` already does for `.set(`.
+# ─────────────────────────────────────────────────────────────────────────
+
+# (path, enclosing-function) pairs where a raw `<state>.clear()` is reasoned,
+# grouped by WHY the clear cannot reach a non-owner:
+#
+# Group A -- every one of these functions is a row in `main.py`'s
+# `_PENDING_HANDLERS` table, and the dispatch loop tests `state.active and
+# not state.owned_by(_principal)` for that row's own `state` BEFORE the
+# handler is ever awaited (see the loop's own comment). So the only caller
+# who can be executing the function's body -- and therefore reach any
+# `.clear()` inside it -- is already the owner. Guarding these too would be a
+# no-op, not a hardening.
+_CLEAR_GATED_BY_DISPATCH_LOOP = {
+    ("backup_pending.py", "handle_pending_backup_confirm_phrase"),
+    ("backup_pending.py", "handle_pending_backup_oauth"),
+    ("backup_pending.py", "handle_pending_backup_unlock_phrase"),
+    ("backup_pending.py", "handle_pending_backup_restore_phrase"),
+    ("camera.py", "handle_pending_camera_settings"),
+    ("camera.py", "handle_pending_forget_face"),
+    ("file_ops.py", "handle_pending_file_search"),
+    ("file_ops.py", "handle_pending_destructive"),
+    ("pending_handlers.py", "handle_pending_device_auth"),
+    ("pending_handlers.py", "handle_pending_oauth_setup"),
+    ("pending_handlers.py", "handle_pending_messaging_disambig"),
+    ("pending_handlers.py", "handle_pending_messaging_send"),
+    ("pending_handlers.py", "handle_pending_incoming_message"),
+    # Not itself a row -- called only from `handle_pending_monitor_disambig`
+    # (monitors.py), which IS the row (`_s_monitor_disambig`). No other
+    # caller reaches it.
+    ("event_monitoring.py", "resolve_disambig"),
+}
+
+# Group B -- `handle_pending_knowledge_approval` is not gated by the loop (it
+# arms lazily, so `state.active` reads False at the loop's own check and the
+# row is never skipped for it) -- it is gated by its OWN `owned_by(
+# current_principal.get())` check, run before any branch that can reach a
+# `.clear()`. Pinned by `test_a_lazily_arming_handler_carries_an_owner_and_
+# checks_it`, `test_a_foreign_yes_cannot_write_a_knowledge_entry` and
+# `test_a_proposal_that_lost_its_owner_is_answerable_by_nobody` above.
+_CLEAR_GATED_BY_OWN_CHECK = {
+    ("pending_handlers.py", "handle_pending_knowledge_approval"),
+}
+
+# Group C -- `teaching_session` is the second answer site KI-13 names (the
+# first is the dispatch loop). `main.py` checks `_teaching.owned_by(
+# _principal)` itself, before `handle_pending_teaching` is ever awaited --
+# see the comment beside that check.
+_CLEAR_GATED_BY_TEACHING_ANSWER_SITE = {
+    ("teaching.py", "handle_pending_teaching"),
+}
+
+_CLEAR_ALLOWLIST = (_CLEAR_GATED_BY_DISPATCH_LOOP
+                    | _CLEAR_GATED_BY_OWN_CHECK
+                    | _CLEAR_GATED_BY_TEACHING_ANSWER_SITE)
+
+
+def _all_pending_clear_calls():
+    """(relative path, enclosing function or None, lineno) for every
+    `<pending-state>.clear()` call anywhere under `assistant/`, tree-wide.
+    `pending.py` itself is excluded: `self.clear()` inside `PendingState.
+    payload`'s expiry branch IS the mechanism, not a call site of it."""
+    names = _pending_state_attribute_names()
+    assistant_root = _ROOT / "assistant"
+    pending_py = assistant_root / "pending.py"
+    found = []
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self, path):
+            self.path = path
+            self.stack: list[str] = []
+
+        def _enclosing(self):
+            return self.stack[-1] if self.stack else None
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Call(self, node):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "clear":
+                target = func.value
+                owner = (target.attr if isinstance(target, ast.Attribute)
+                          else target.id if isinstance(target, ast.Name)
+                          else None)
+                if owner in names:
+                    found.append((self.path.relative_to(_ROOT), self._enclosing(),
+                                   node.lineno))
+            self.generic_visit(node)
+
+    for path in sorted(assistant_root.rglob("*.py")):
+        if path == pending_py:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:  # pragma: no cover - not expected in this tree
+            continue
+        _Visitor(path).visit(tree)
+    return found
+
+
+def test_every_pending_clear_outside_the_reasoned_exceptions_is_gated():
+    """The sweep Gap 1 needed. A `.clear()` added next month on a registered
+    pending state, outside a function the dispatch loop (or one of the two
+    per-row exceptions) already gates by ownership, must fail here -- not
+    ship a third way to discard another principal's active confirmation."""
+    calls = _all_pending_clear_calls()
+    assert calls, (
+        "the tree-wide walk found no pending-state .clear() calls at all -- "
+        "either the spelling changed or _pending_state_attribute_names() "
+        "went empty, and a sweep that walks nothing passes forever")
+
+    offenders = [(str(path), fn, lineno) for path, fn, lineno in calls
+                 if (path.name, fn) not in _CLEAR_ALLOWLIST]
+    assert not offenders, (
+        f"pending state cleared with a raw `.clear()` outside every reasoned "
+        f"exception: {offenders}. Either move the clear inside a function "
+        f"the dispatch loop gates by ownership, or use "
+        f"`pending.try_clear(state, principal=...)`, so an active state "
+        f"owned by someone else survives the clear attempt.")

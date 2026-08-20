@@ -759,9 +759,25 @@ async def handle_pending_file_search(text: str) -> str | None:
 
     import threading
     from .. import file_manager
+    from ..core.principal import current_principal
 
     timeout = file_manager.TIER2_TIMEOUT if tier == 2 else file_manager.TIER3_TIMEOUT
     tier_label = "fast" if tier == 2 else "deep"
+
+    # Captured here, on the event loop, where `current_principal` is whatever
+    # the dispatch loop installed for this turn -- not inside `_run_search`,
+    # which a plain `threading.Thread` runs on a fresh OS thread with no
+    # context of its own. `current_principal.get()` there would silently read
+    # back the contextvar's default (None) regardless of who actually asked,
+    # and the re-arm below would create a state owned by nobody -- not "the
+    # foreign-principal case try_arm already refuses", but a state the
+    # original searcher herself could never answer, since an unowned active
+    # state is owned_by nobody in either direction. Passed through explicitly
+    # rather than via `contextvars.copy_context()`, matching the tree's other
+    # lazily-arming carry (`_queue_knowledge_proposal`'s `principal=`): one
+    # named value crossing the thread boundary, not the whole ambient context
+    # (grants, raise context, ...) riding along implicitly.
+    searcher_principal = current_principal.get()
 
     def _run_search():
         import time
@@ -772,7 +788,8 @@ async def handle_pending_file_search(text: str) -> str | None:
 
         if not results:
             if tier == 2:
-                try_arm(_act.pending_file_search, {"name": name, "tier": 2})
+                try_arm(_act.pending_file_search, {"name": name, "tier": 2},
+                        principal=searcher_principal)
                 msg = (
                     f"I did a fast search and couldn't find '{name}' "
                     f"in {elapsed}s. Want me to try a deep full-computer search? "
