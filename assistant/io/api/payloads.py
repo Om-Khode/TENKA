@@ -456,6 +456,15 @@ class TransportPayload(CamelModel):
     actually enforces. `url` is `None` whenever `running` is `False`: a
     session with no announced hostname does not serve
     (`transports/manager.py`'s `is_serving`), so there is nothing to show.
+
+    `pairable` is read the same way, off `policy.pairable`, and it exists for
+    the transport that someday is not. All three standing transports are
+    pairable, so today this field is uniformly `True` -- but a client that
+    infers pairability from a transport's *name* is a client that will offer a
+    QR nobody can redeem the day a TLS-terminating transport ships, which is
+    exactly the shape the daemon removed from its own code when it replaced
+    `policy.name == "quick"` with `policy.pairable`. Studio should not be left
+    holding the name check the daemon just deleted.
     """
 
     name: str
@@ -463,6 +472,7 @@ class TransportPayload(CamelModel):
     url: str | None
     ceiling: list[str]
     raisable: list[str]
+    pairable: bool
 
 
 class TransportsPayload(CamelModel):

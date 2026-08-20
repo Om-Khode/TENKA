@@ -160,6 +160,7 @@ def test_the_listing_reports_each_transports_ceiling_and_raisable_set(tmp_path):
         policy = POLICIES[name]
         assert set(row["ceiling"]) == {c.value for c in policy.ceiling}
         assert set(row["raisable"]) == {c.value for c in policy.raisable}
+        assert row["pairable"] is policy.pairable
 
     running_row = rows[A_REAL_TRANSPORT]
     assert running_row["running"] is True
@@ -364,3 +365,45 @@ def test_an_unverified_stop_surfaces_as_a_409_naming_nothing_secret(tmp_path):
                              headers={CSRF_HEADER: "1"})
     assert response.status_code == 409
     assert response.json()["detail"] == refusal
+
+
+def test_the_listing_reports_pairable_off_the_policy_not_the_name(tmp_path,
+                                                                  monkeypatch):
+    """`pairable` must be read from `POLICIES`, not hardcoded and not inferred
+    from a transport's name.
+
+    Every standing transport is `pairable=True`, so a listing that simply
+    wrote `pairable=True` -- or that derived it from a name -- would satisfy
+    the sweep above and every other assertion in this file. The only thing
+    that can tell the difference is a policy that is *not* pairable, and none
+    exists today: `quick` was the sole one and was removed outright. So this
+    registers a synthetic one, exactly as `test_6b_pairing_transports.py` does
+    to keep the refusal itself honest.
+
+    The point is Studio's, not the daemon's. The daemon already refuses
+    redemption on such a listener; without this field on the wire a client has
+    to guess pairability from the transport's name, which is the check the
+    daemon deleted from its own code when it replaced `policy.name == "quick"`
+    with `policy.pairable`. A picker that guesses would offer a QR nobody can
+    redeem the day a TLS-terminating transport ships.
+    """
+    from assistant.io.api.policy import ListenerPolicy
+    monkeypatch.setitem(POLICIES, "unpairable", ListenerPolicy(
+        name="unpairable", admin=False, allow_bearer=False, secure_cookie=True,
+        ceiling=frozenset({Capability.OBSERVE}), raisable=frozenset(),
+        pairable=False,
+    ))
+    monkeypatch.setattr(transport_registry, "names",
+                        lambda: (*POLICIES,), raising=False)
+
+    vault = TokenVault(tmp_path)
+    token = vault.issue("laptop", frozenset(Capability))
+    app = build(vault, manager=FakeTransportManager(running={}))
+    client = client_on(app, "local", token)
+
+    rows = {row["name"]: row
+            for row in client.get("/v1/transports").json()["data"]["transports"]}
+
+    assert rows["unpairable"]["pairable"] is False
+    assert all(rows[name]["pairable"] is True
+               for name in POLICIES if name != "unpairable")
