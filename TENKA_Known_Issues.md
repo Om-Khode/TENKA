@@ -460,6 +460,17 @@ One arming site needed moving rather than gating: a code-executor knowledge-appr
 
 Tests: `tests/test_6a5_predispatch_gate.py` (`xfail` removed), `tests/test_6b_principal.py` (the new suite, including an AST walk over every arming site in `main.py` so a future site cannot silently forget to record a principal).
 
+**Correction, added after the 6b live test (2026-08-20): this closed one of three doors.** KI-13 as shipped covered who may *answer* a pending state. Nothing mirrored it on who may *arm* one, or who may *clear* one, and the live test hit both:
+
+- **Arming.** A device correctly skipped as an answer fell through to ordinary intent classification, reached a handler, and armed the *same* state via the ambient-principal default — taking ownership of it. The operator's own next answer was then refused as foreign against their own request: a denial of service on their own confirmations, observed live.
+- **Clearing.** `camera.py::handle_camera_look` discarded an active pending state unconditionally, with nothing upstream confirming the caller owned it.
+
+Both are now fixed. `pending.try_arm` (commit `3865e04`) and `pending.try_clear` (commit `d2c23de`) apply the same ownership condition the answer side already used — across 18 arm sites in nine modules (three of them `teaching_session` sites a grep missed because the state isn't `pending_*`-named) and the one real clear-side gap a 44-site sweep found. Each guard is backed by a tree-wide AST sweep that is itself a test (`test_every_pending_arm_outside_the_two_reasoned_exceptions_uses_try_arm`, `test_every_pending_clear_outside_the_reasoned_exceptions_is_gated` in `tests/test_6b_principal.py`), so a future site added without the guard breaks the sweep rather than shipping silently.
+
+A refused arm deliberately returns the identical text an ordinary first arm would — non-disclosure means refusing alone did not bound how often a remote caller could try, so it could make the machine speak a 13–18 second confirmation challenge on every message. See [KI-23](#ki-23) for how that was bounded, and [KI-27](#ki-27) for the sweep's one known blind spot — it is name-based, and a clear through a loop-local variable is invisible to it.
+
+Tests: `tests/test_6b_principal.py`.
+
 ---
 
 ## KI-14: A URL delegated to a file is still chosen by the file
@@ -529,17 +540,19 @@ Tests: `tests/test_6b_ki17.py`, `tests/test_api_hardening.py`'s per-listener hos
 
 ---
 
-## KI-18: The admin gate is not isolated by any test
+## KI-18: ~~The admin gate is not isolated by any test~~ FIXED
 
-**Priority:** Medium (security — a config-time footgun, not a live defect)
-**Effort:** Medium (a fixture exercising a listener no `POLICIES` entry currently produces)
+**Priority:** was Medium (security — a config-time footgun, not a live defect)
 **Discovered:** 2026-08-19, milestone 6b (Task 13's own vacuity audit, generalised by Task 18's review)
+**Fixed:** 2026-08-19, milestone 6b (`0e60df2`) — pinned with a new test rather than a code change, because the gate itself (`admin_capability_satisfied`, checked first on capability and second on `policy.admin`) was already correct; only its isolation from the capability check was untested.
 
-**Symptom:** `require_admin(Capability.SYSTEM_CONTROL)` checks two independent things — the caller's capability, and `policy.admin` — but every route gated this way (the raise routes, the transport management routes, `/v1/devices`) refuses on the **capability** first, because `SYSTEM_CONTROL` is outside every non-`local` ceiling today. Inverting `require_admin` to `require` in a live diff did not turn any of these tests red; only stripping all the way to bare `authenticate()` produced a real failure. That means **no test in the tree would fail if `admin=True` were set on a tunnel policy by accident** — the two controls are conflated in every assertion that currently exercises this gate.
+**What shipped:** `tests/test_6b_raise_routes.py::test_ki18_the_admin_gate_holds_even_when_the_ceiling_carries_system_control` builds the one shape that isolates the flag — a constructed `ListenerPolicy` (`admin=False`, `ceiling` holding `SYSTEM_CONTROL`) mounted at a synthetic port so no shipped policy is touched. `GET /v1/devices` refuses 403 against it; the test then flips only `admin` to `True` on the identical policy and the same request succeeds, proving the 403 really was `require_admin`'s own gate and not an unrelated refusal. `test_a_raise_never_changes_admin_or_bearer_or_secure_cookie` pins the companion invariant — a live raise on `tailnet` never flips `policy.admin`, `allow_bearer`, or `secure_cookie` — checked both off the module data and over the wire (`GET /v1/devices` still 403, a bearer header still 401 there).
 
-**How you would know:** flip `admin=False` on `"local"` or `admin=True` on `"tailnet"` in `io/api/policy.py` and run the full admin-gated route suite (`test_6b_raise_routes.py`, `test_6b_transport_routes.py`, `test_api_hardening.py`'s device-management tests). None of them should be expected to go red from the flip alone — that is the gap.
+Two independent mutations confirm both halves, re-run 2026-08-20: dropping `policy.admin` from `admin_capability_satisfied`'s predicate (`security.py`) reds the first test; setting `admin=True` on the `tailnet` policy (`policy.py`) reds the second.
 
-**What to check first:** whether a fix has landed a listener fixture whose `ceiling` contains `SYSTEM_CONTROL` but whose `admin` is `False`. That is the only shape that isolates the admin flag from the capability check — a policy `POLICIES` does not currently have (every ceiling containing `SYSTEM_CONTROL` today also has `admin=True`), so the probe needs a constructed `ListenerPolicy`, not one of the four shipped ones.
+The entry's own "What to check first" asked for exactly what now exists — a constructed `ListenerPolicy` whose `ceiling` holds `SYSTEM_CONTROL` while `admin` is `False`, rather than one of the shipped policies. Worth saying so, because it makes the entry's own advice the thing that resolved it. Correction to the entry's earlier count: there are **three** shipped policies now (`local`, `tailnet`, `funnel`), not four — `quick` was removed during the 6b live test. Its ceiling was unreachable by construction (pairing over `quick` is refused outright, `quick` accepts no bearer credential, and cookies are host-scoped so no cookie issued anywhere else is ever sent to it), so no device could ever authenticate over it.
+
+Tests: `tests/test_6b_raise_routes.py`.
 
 ---
 
@@ -598,3 +611,83 @@ Tests: `tests/test_6b_ki17.py`, `tests/test_api_hardening.py`'s per-listener hos
 **The cost, stated plainly:** an operator reading the audit trail after a raise's window (up to 7 days) cannot tell "a raised capability was walked through" from "the door was merely open." The method and path in each entry narrow it down after the fact, but do not close the gap.
 
 **What to check first** if this needs to become load-bearing later: whether the sites that check a grant without calling `require()` have since been enumerated and closed — if so, moving the audit point (or adding a second one) inside `require()` becomes a much cheaper change than it was at 6b.
+
+---
+
+## KI-23: ~~A refused arm could still make the machine speak on every remote message~~ FIXED
+
+**Priority:** was Medium (security/availability — a denial-of-service shape, not a disclosure one)
+**Discovered:** 2026-08-20, milestone 6b live test (Part 8)
+**Fixed:** 2026-08-20, milestone 6b (`d2c23de`).
+
+**What shipped:** a refused arm deliberately returns the same text an ordinary first arm would — that non-disclosure is the point, so a remote caller can't tell "you were skipped" from "you just armed a real confirmation" — but it meant refusing alone did not bound how often a remote device could try. A remote device could make the machine speak a 13–18 second confirmation challenge on every message it sent, with no cap anywhere on the path. Now bounded at the one choke point every remote turn crosses before it can reach dispatch or TTS: `POST /v1/chat` spends the existing per-device rate limiter (`throttle(Capability.CHAT_SEND, "chat_send", ...)` in `routes/chat.py`), already bounded against unbounded growth. A throttled caller gets an explicit 429, never a silent drop and never audio. The keyboard is unthrottled structurally — local sources never enter that route at all.
+
+Tests: `tests/test_api_chat.py::test_repeated_chat_sends_from_one_device_are_throttled`, `::test_a_different_device_is_not_throttled_by_anothers_budget`.
+
+---
+
+## KI-24: ~~A tier-2 re-arm on a fresh thread recorded no owner at all~~ FIXED
+
+**Priority:** was Medium (security — pre-existing, unrelated to 6b, surfaced by the new arm guard)
+**Discovered:** 2026-08-20, milestone 6b (found while auditing arm sites for KI-13's third-door fix)
+**Fixed:** 2026-08-20, milestone 6b (`d2c23de`).
+
+**What shipped:** `pending_file_search`'s tier-2 re-arm ran on a fresh thread, and a thread inherits no `contextvars` — so it armed with **no principal at all**, unownable by construction. Pre-existing and unrelated to 6b's own work; it was found only because the new arm guard forced someone to ask who owned each arming site. The principal is now captured on the loop and passed explicitly into the thread rather than relying on ambient context to cross a thread boundary it never crosses.
+
+Tests: `tests/test_6b_principal.py::test_the_tier2_rearm_carries_the_searchers_principal`.
+
+---
+
+## KI-25: `package_studio_ui.py` can vendor a bundle from a failed build and stamp it with the current contract
+
+**Priority:** Low (dev tooling, not a runtime security issue)
+**Effort:** Low–Medium (a success marker the packager requires, or a refusal when source is newer than `out/`)
+**Discovered:** 2026-08-20, caught by accident during the 6b live test — a build failed on a missing dependency and the packager ran anyway.
+
+**Symptom:** `tools/package_studio_ui.py` reopens and checks the finished archive for the marker and the contract hash, but neither check is derived from the bundle's own freshness. `ui.contract_hash()` fingerprints the **daemon's** OpenAPI schema and compares it to the marker written at packaging time — it catches "bundle built against an older API." It cannot catch "bundle content is stale but was packaged just now," because the marker is not derived from the bundle's content at all. So the one freshness guard that exists passes stale content clean.
+
+**How you would know:** let `npm run build:bundled` fail (e.g. a missing dependency after a merge, with `node_modules` not reinstalled) and run `package_studio_ui.py` anyway — it packages whatever is sitting in `out/` from the previous successful build, stamps it with the current daemon's contract hash, and reports success.
+
+**What to check first:** whether either candidate fix has landed — a success marker that `build:bundled` writes into `out/` and the packager requires, or a refusal when anything in the Studio source tree is newer than `out/`. Neither exists today.
+
+---
+
+## KI-26: `PairDeviceDialog.carryState()` special-cases `local` by name
+
+**Priority:** Low (a client-side assumption, not a daemon-side defect)
+**Effort:** Low on the daemon side (publish `local` in the transports listing)
+**Discovered:** 2026-08-20, milestone 6b live test (Ruling 82)
+
+**Symptom:** `carryState()` (`PairDeviceDialog.tsx:138`, Studio repo) opens with `if (transportName === LOCAL_TRANSPORT) return "ceiling"` — a hardcoded name comparison, the exact pattern removed from the daemon side the same day (see `quick`'s removal under [KI-18](#ki-18)). Not laziness: `GET /v1/transports` lists *transports*, and `local` is a listener with no row, so there is nothing for the dialog to read a ceiling from. The shortcut encodes "local carries everything" as an assumption rather than reading it, and would silently lie if `local`'s ceiling ever narrowed.
+
+**How you would know:** narrow `local`'s ceiling in `io/api/policy.py` and watch the pair dialog keep offering every capability against it anyway — nothing in Studio would notice.
+
+**What to check first:** whether the daemon-side fix has landed — listing `local` in the transports payload (or exposing its policy somewhere the dialog can read) so the client reads a ceiling instead of assuming one.
+
+---
+
+## KI-27: `planner/executor.py`'s auth-failure clear is invisible to the arm/clear AST sweeps
+
+**Priority:** Low (reasoned safe today; a promise gap, not a live defect)
+**Effort:** Low once someone decides how to widen the sweep past name-matching
+**Discovered:** 2026-08-20, milestone 6b (Ruling 84, live-test wrap-up)
+
+**Symptom:** `planner/executor.py:182` clears a pending state through a **loop-local variable** (`state = pending_registry.get(name); ...; state.clear()`), so it is invisible to both AST sweeps that cover every other arm and clear site in the tree ([KI-13](#ki-13)'s `test_every_pending_arm_outside_the_two_reasoned_exceptions_uses_try_arm` and `test_every_pending_clear_outside_the_reasoned_exceptions_is_gated`). Reasoned safe today — it is same-request teardown of a state that the same call armed — but the sweeps' whole promise is that a new unguarded site cannot ship silently, and this is the one shape where that promise does not hold: the sweeps are name-based, and a variable named `state` rather than `pending_*` sits outside what they can see.
+
+**How you would know:** a refactor that lets this clear reach a state armed by a *different* principal than the one clearing it would not turn any sweep red — nothing today produces that shape, which is exactly why it is unguarded rather than closed.
+
+**What to check first:** whether the sweep has grown a way to follow a variable back to its `pending_registry.get(...)` origin rather than matching on the receiver's name, or whether this one site has been moved onto `try_clear` directly despite the loop-local binding.
+
+---
+
+## KI-28: ~~A turn skipped by a security control could still claim the thing it refused~~ FIXED
+
+**Priority:** was Medium (security/correctness — a false claim about machine state, persisted into memory)
+**Discovered:** 2026-08-20, milestone 6b live test (Part 8) — the phone said "cancel" on a foreign confirmation, the control correctly skipped it, and TENKA replied "I've cancelled that deletion" (twice) while the pending delete was still armed.
+**Fixed:** 2026-08-20, milestone 6b (`04bfa79`).
+
+**What shipped:** a turn skipped by a security control used to fall through to a fallback that built its reply from conversation history alone, with no knowledge that a refusal had just happened — so it asserted the exact state change the control had refused to make. The snapshot then persisted that sentence verbatim into durable session memory, replayed at the start of the next session. Not two-principal-specific: a narrow device talking to itself hit the same blind fallback through the capability-skip path, which has the same shape and is covered by its own test with one principal on both sides.
+
+Both skip shapes (foreign-principal skip, capability skip) now mark the turn, and a marked turn answers from a fixed string **without calling the model at all** — the false claim is unreachable rather than discouraged, deliberately: a synthesis path that can assert a state change it did not make is a code problem, not a wording problem, and no prompt text was added anywhere. Schema v20 (`storage/db.py`) records which turns were skipped; the session summariser drops them before it reads, by exclusion rather than annotation, so no model is ever asked to interpret a flag correctly.
+
+Tests: `tests/test_reply_cannot_contradict_the_machine.py`.
