@@ -1005,6 +1005,42 @@ without it becoming the next finding.
 """
 
 
+# ─── What a caller hears when a control skipped this turn ────────────────
+_SECURITY_SKIP_FALLBACK = (
+    "I'm not sure what you're asking. Could you try rephrasing that?"
+)
+"""The reply for a turn the pending-handler chain skipped (a foreign answer,
+or a capability shortfall — see `_security_skip_this_turn` in the dispatch
+loop) while the state it would have answered is still armed, on a turn
+nothing else claimed.
+
+Live-tested defect this closes: a session where "cancel" was skipped by the
+foreign-answer control, fell through to the small_talk/unknown branch, and
+that branch's LLM call — built from `_build_conversation_messages()`, which
+carries no signal that an answer never landed — invented "the deletion...
+has been cancelled" from conversational context alone. The state was still
+armed. Deliberately identical to `handle_unknown`'s own fallback
+(`actions/simple.py`) rather than a bespoke sentence, because two properties
+have to hold at once and this is the only text found that satisfies both:
+
+- MUST NOT claim a state change that did not happen — inventing one is
+  exactly the defect above.
+- MUST NOT disclose that anything is pending — the skip itself is silent by
+  design (see the dispatch loop's comments on why a refusal is not used
+  here) specifically so a caller who cannot answer a confirmation cannot
+  learn one exists. "That's still waiting on someone else" would leak
+  precisely that to a caller the skip was built to keep in the dark.
+
+An ordinary "I didn't understand you" is true either way: whether the
+caller's message really was an attempt to answer, or had nothing to do with
+the pending state at all. The alternative — feeding the LLM a note that a
+skip happened — was rejected: CLAUDE.md rule 11 asks for the false claim to
+be made unreachable, not merely discouraged, and a prompt addition is still
+a suggestion the model can talk past. This is a code branch that never lets
+the LLM see the turn.
+"""
+
+
 # ─── Wake Word Listener (global reference) ───────────────────────────────────
 
 _wake_listener: WakeWordListener | None = None
@@ -1697,6 +1733,13 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # Plan resume is handled ONCE at the end — no per-handler changes.
         pending_handled = False
         pending_response = None
+        # True iff a row below skipped an *active* state this turn -- the
+        # caller could not answer something that is still armed. Read by the
+        # small_talk/unknown fallback further down: that branch builds its
+        # reply from `_build_conversation_messages()`, which has no signal of
+        # its own that an answer never landed, so it is the one place a false
+        # "I've cancelled that" gets invented. See `_SECURITY_SKIP_FALLBACK`.
+        _security_skip_this_turn = False
 
         for handler, label, mem_intent, needs_bridge, required, state in _PENDING_HANDLERS:
             # Skipped, not refused. Pending state is process-global, so the
@@ -1713,6 +1756,12 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             # cannot use it that a confirmation is waiting.
             if _actions_module.capability_refusal(required) is not None:
                 logger.info(f"[{label}] Skipped: caller lacks {required.value}")
+                # Only worth flagging if there is something armed this caller
+                # could plausibly have been trying (and failing) to answer --
+                # every row runs this check on every turn, active state or
+                # not, and most turns have nothing armed at all.
+                if state.active:
+                    _security_skip_this_turn = True
                 continue
             # Answer site two of two, and the one KI-13 is named for. The
             # check above cannot close a confused deputy that *holds* the
@@ -1749,6 +1798,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                     f"[{label}] Foreign answer skipped: armed by another "
                     f"principal")
                 state.note_foreign_attempt()
+                _security_skip_this_turn = True
                 continue
             if needs_bridge:
                 resp = await handler(transcription, bridge)
@@ -1958,9 +2008,20 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         _use_streaming = False
         _stream = None
         if intent_result.intent in ("small_talk", "unknown"):
+            if _security_skip_this_turn:
+                # A control above skipped an armed state this turn -- see
+                # `_security_skip_this_turn`'s definition and
+                # `_SECURITY_SKIP_FALLBACK`'s docstring for the defect this
+                # closes. Deliberately does not reach the LLM at all: no
+                # `_build_conversation_messages()`, no streaming, nothing that
+                # could compose a claim about what just happened. The pending
+                # state is untouched by this branch, exactly as the skip
+                # above left it.
+                response_text = _SECURITY_SKIP_FALLBACK
+                _tracker.action_dispatched = intent_result.intent
+                _tracker.action_outcome = "skipped"
             # Check if we're waiting for a yes/no on recording summary
-            pending = getattr(recording, "_pending_summary", None)
-            if pending is not None:
+            elif (pending := getattr(recording, "_pending_summary", None)) is not None:
                 lowered = transcription.strip().lower()
                 if any(w in lowered for w in ("yes", "yeah", "sure", "yep", "please", "go ahead")):
                     recording._pending_summary = None
@@ -2065,6 +2126,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                     intent=intent_result.intent,
                     response=clean_response,
                     session_id=session_id,
+                    security_skip=_security_skip_this_turn,
                 )
             except Exception as e:
                 logger.warning(f"Failed to save conversation turn: {e}")
@@ -3243,12 +3305,19 @@ async def async_main():
             sid = session_mod.get_current_session_id()
             if sid:
                 rows = memory._get_repo()._db.fetchall(
-                    "SELECT user_input, response, session_id FROM conversations "
-                    "WHERE session_id = ? ORDER BY id ASC",
+                    "SELECT user_input, response, session_id, security_skip "
+                    "FROM conversations WHERE session_id = ? ORDER BY id ASC",
                     (sid,),
                 )
                 if rows:
-                    turns = [{"user_input": r["user_input"], "response": r["response"]} for r in rows]
+                    turns = [
+                        {
+                            "user_input": r["user_input"],
+                            "response": r["response"],
+                            "security_skip": bool(r["security_skip"]),
+                        }
+                        for r in rows
+                    ]
                     await session_mod.save_snapshot(turns)
         except Exception as e:
             logger.debug(f"[SESSION] Shutdown snapshot failed (non-critical): {e}")

@@ -69,7 +69,7 @@ class Database:
 
     # --- Schema versioning ---
 
-    _LATEST_VERSION = 19
+    _LATEST_VERSION = 20
 
     def _get_version(self) -> int:
         row = self._conn.execute(
@@ -116,6 +116,7 @@ class Database:
             17: self._migrate_v17,
             18: self._migrate_v18,
             19: self._migrate_v19,
+            20: self._migrate_v20,
         }
 
         for v in range(current + 1, self._LATEST_VERSION + 1):
@@ -739,6 +740,31 @@ class Database:
             END;
         """)
         self._conn.commit()
+        self._conn.commit()
+
+    def _migrate_v20(self) -> None:
+        """V20: security_skip marker on conversations.
+
+        A turn a security control skipped this turn -- KI-13's foreign-answer
+        skip, or a capability shortfall in the pending-handler chain -- still
+        gets an honest deterministic reply from main.py's turn loop, but that
+        is only the first half of the fix. The reply still lands in the
+        `conversations` table the same way every turn's does, and
+        `session.save_snapshot()` folds recent turns into an LLM-written
+        session summary that gets replayed verbatim as fact at the start of
+        the next session (`get_resume_context`). This column is the
+        deterministic backstop for that second half: a turn flagged here is
+        excluded before it ever reaches the summarizer, regardless of what
+        its own reply text says -- no model judges its own output to decide.
+
+        NOT NULL DEFAULT 0 so every legacy row and every ordinary turn reads
+        as "not a skip" with no backfill required; `main.py` sets it to 1 only
+        on the turns its own skip-tracking flags.
+        """
+        self._conn.execute(
+            "ALTER TABLE conversations ADD COLUMN security_skip "
+            "INTEGER NOT NULL DEFAULT 0"
+        )
         self._conn.commit()
 
 
