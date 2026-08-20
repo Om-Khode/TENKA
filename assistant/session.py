@@ -115,6 +115,34 @@ def _format_gap(gap: timedelta) -> str:
     return f"{days} days ago"
 
 
+# ─── Security-skip backstop ──────────────────────────────────────────────
+
+def _exclude_security_skips(turns: list[dict]) -> list[dict] | None:
+    """Drop any turn a security control skipped, or None if that's all of them.
+
+    Deterministic backstop, independent of the reply text a security-skipped
+    turn carries. `main.py`'s turn loop already makes that reply itself
+    honest (it never asserts a state change that did not happen), but
+    `ask_for_session_summary` is an LLM judging conversation turns into a
+    summary that gets replayed verbatim as fact next session
+    (`get_resume_context`) -- and a live-test session showed exactly that
+    replay happen with a false "cancelled" claim before this fix existed.
+    Excluding flagged turns here, rather than trusting the reply text, means a
+    future skip site this module does not yet know about still cannot poison
+    next session's opening line -- no model is asked to judge its own output
+    to decide. Shared by both callers below (normal shutdown and crash
+    recovery) so the rule lives in one place.
+    """
+    safe = [t for t in turns if not t.get("security_skip")]
+    if not safe:
+        logger.debug(
+            "[SESSION] Every turn in this window was security-skipped -- "
+            "skipping the snapshot rather than summarizing none of them"
+        )
+        return None
+    return safe
+
+
 async def save_snapshot(turns: list[dict]) -> None:
     repo = _get_repo()
     if not _current_session_id:
@@ -127,9 +155,13 @@ async def save_snapshot(turns: list[dict]) -> None:
     if not row or row["turn_count"] < 2:
         return
 
+    safe_turns = _exclude_security_skips(turns)
+    if safe_turns is None:
+        return
+
     from .llm.contracts import ask_for_session_summary
     try:
-        result = await ask_for_session_summary(turns)
+        result = await ask_for_session_summary(safe_turns)
         last_intent_row = repo._db.fetchone(
             "SELECT last_intent FROM session_snapshots WHERE session_id = ?",
             (_current_session_id,),
@@ -156,7 +188,7 @@ async def recover_crashed_session() -> None:
     logger.info(f"[SESSION] Recovering crashed session: {crashed_id}")
 
     rows = repo._db.fetchall(
-        "SELECT user_input, response, timestamp FROM conversations "
+        "SELECT user_input, response, timestamp, security_skip FROM conversations "
         "WHERE session_id = ? ORDER BY id ASC",
         (crashed_id,),
     )
@@ -164,12 +196,23 @@ async def recover_crashed_session() -> None:
         logger.debug(f"[SESSION] No conversation turns found for {crashed_id}, skipping recovery")
         return
 
-    turns = [{"user_input": r["user_input"], "response": r["response"]} for r in rows]
+    turns = [
+        {
+            "user_input": r["user_input"],
+            "response": r["response"],
+            "security_skip": bool(r["security_skip"]),
+        }
+        for r in rows
+    ]
     last_timestamp = rows[-1]["timestamp"]
+
+    safe_turns = _exclude_security_skips(turns)
+    if safe_turns is None:
+        return
 
     from .llm.contracts import ask_for_session_summary
     try:
-        result = await ask_for_session_summary(turns)
+        result = await ask_for_session_summary(safe_turns)
         last_intent = crashed.get("last_intent") or "unknown"
         repo.save_summary(crashed_id, last_intent, result["task_summary"], result.get("blocker"))
         repo._db.execute(

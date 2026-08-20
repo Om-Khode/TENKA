@@ -43,8 +43,9 @@ def _get_repo() -> "MemoryRepo":
     return _repo
 
 
-def save_turn(user_input: str, intent: str, response: str, session_id: str) -> int:
-    return _get_repo().save_turn(user_input, intent, response, session_id)
+def save_turn(user_input: str, intent: str, response: str, session_id: str,
+              security_skip: bool = False) -> int:
+    return _get_repo().save_turn(user_input, intent, response, session_id, security_skip)
 
 
 def get_recent(n: int = 10, session_id: str = "") -> list[dict]:

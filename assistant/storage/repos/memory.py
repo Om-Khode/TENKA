@@ -351,11 +351,25 @@ class MemoryRepo:
 
     # ─── Conversation Storage ───────────────────────────────────────────
 
-    def save_turn(self, user_input: str, intent: str, response: str, session_id: str) -> int:
+    def save_turn(self, user_input: str, intent: str, response: str, session_id: str,
+                  security_skip: bool = False) -> int:
+        """Persist one conversation turn.
+
+        `security_skip` marks a turn a pending-handler control skipped this
+        turn (KI-13's foreign-answer skip, or a capability shortfall) while
+        the state it would have answered was still armed -- see
+        `session.save_snapshot()` for why this has to be a durable column
+        rather than something recomputed later: the summarizer that folds
+        turns into next-session memory needs to exclude these deterministically,
+        and by the time it runs the in-memory turn flag from `main.py` is long
+        gone.
+        """
         cur = self._db.execute(
-            "INSERT INTO conversations (timestamp, user_input, intent, response, session_id) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (datetime.now().isoformat(), user_input, intent, response, session_id),
+            "INSERT INTO conversations "
+            "(timestamp, user_input, intent, response, session_id, security_skip) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (datetime.now().isoformat(), user_input, intent, response, session_id,
+             int(security_skip)),
         )
         row_id = cur.lastrowid
         self._db.commit()
