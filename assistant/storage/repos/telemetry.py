@@ -1,6 +1,8 @@
 """storage/repos/telemetry.py — Interaction event persistence."""
 
 import logging
+
+from ...core.redact import redact_secrets
 from datetime import datetime, timedelta
 
 from ..db import Database
@@ -51,7 +53,12 @@ class TelemetryRepo:
             "  llm_providers_used, llm_models_used"
             ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                session_id, timestamp, input_modality, transcript,
+                # transcript is redacted at the write, not the read: it stores the
+                # raw utterance, and a credential pasted into the chat used to land
+                # here verbatim while main.py scrubbed the same string on its way to
+                # debug.log. io/backup snapshots this database off-machine.
+                session_id, timestamp, input_modality,
+                redact_secrets(transcript) if transcript else transcript,
                 intent_detected, intent_source,
                 action_dispatched, action_outcome, error_class,
                 latency_total_ms, latency_stt_ms, latency_intent_ms,
