@@ -251,7 +251,10 @@ class KnowledgeGraphRepo:
             "confidence, source, verified_at, expires_at, event_at, "
             "created_at, source_turn_id) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (subject_id, predicate, object, confidence, source,
+            # object redacted at the write: a fact extracted from a turn that
+            # contained a credential used to store it verbatim, and this table
+            # is replayed into prompts and snapshotted to cloud backup.
+            (subject_id, predicate, redact_secrets(object), confidence, source,
              None, expires_at, event_at, now, source_turn_id),
         )
         self._db.commit()

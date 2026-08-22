@@ -8,6 +8,8 @@ facade delegates here.
 
 import json
 import logging
+
+from ...core.redact import redact_secrets
 import os
 import warnings
 from datetime import datetime, timedelta
@@ -364,12 +366,26 @@ class MemoryRepo:
         and by the time it runs the in-memory turn flag from `main.py` is long
         gone.
         """
+        # Redact on the way in, not on the way out. `redact_secrets` runs at
+        # eight log/preview sites and used to run at none that write, so a
+        # credential pasted into the chat was scrubbed from debug.log and
+        # stored verbatim in the same turn -- the file an operator greps after
+        # an incident was the one clean copy. Storage is the worse place for
+        # it: this table is replayed into prompts, and `io/backup` snapshots
+        # the whole database to cloud storage.
+        #
+        # The lenient tier, not `redact_secrets_strict`: measured against the
+        # shapes actually found in this database (an OAuth client id, a
+        # GOCSPX- client secret, a 4/0... auth code, a labelled api key) the
+        # lenient tier catches all of them, while strict's blunt
+        # assignment-shaped-line rule risks eating ordinary conversation.
+        # Over-redaction here is unrecoverable -- this is her memory.
         cur = self._db.execute(
             "INSERT INTO conversations "
             "(timestamp, user_input, intent, response, session_id, security_skip) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (datetime.now().isoformat(), user_input, intent, response, session_id,
-             int(security_skip)),
+            (datetime.now().isoformat(), redact_secrets(user_input), intent,
+             redact_secrets(response), session_id, int(security_skip)),
         )
         row_id = cur.lastrowid
         self._db.commit()
@@ -573,7 +589,7 @@ class MemoryRepo:
         cur = self._db.execute(
             "INSERT INTO facts (timestamp, key, value, source, memory_type, expires_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (datetime.now().isoformat(), key, value, source, memory_type, expires_at),
+            (datetime.now().isoformat(), key, redact_secrets(value), source, memory_type, expires_at),
         )
         self._db.commit()
         logger.debug(f"[MEMORY] Saved typed fact: {key}={value} (type={memory_type}, expires={expires_at})")
@@ -773,7 +789,8 @@ class MemoryRepo:
         cur = self._db.execute(
             "INSERT INTO recording_sessions (session_id, chunk_index, timestamp, transcript) "
             "VALUES (?, ?, ?, ?)",
-            (session_id, chunk_index, datetime.now().isoformat(), transcript),
+            (session_id, chunk_index, datetime.now().isoformat(),
+             redact_secrets(transcript)),
         )
         row_id = cur.lastrowid
         self._db.commit()

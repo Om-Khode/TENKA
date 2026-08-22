@@ -407,7 +407,7 @@ The second call is a memory/fact-extraction synthesis run that summarises prior 
 
 Tests: `tests/test_security_pass_6a5_redaction.py`, `tests/test_6a5_api_fixes.py`, `tests/test_redact.py`.
 
-**Still open, tracked separately as [KI-15](#ki-15):** redaction runs at log and preview sites, never at storage-write sites. A secret that reaches `save_typed_fact` or the knowledge graph is stored in plaintext.
+**Was still open, and mis-pointed:** this note said "tracked separately as KI-15", but KI-15 is the unfenced-facts issue -- the storage-write gap had no ticket. Filed and fixed as [KI-29](#ki-29) on 2026-08-22, after it turned out to be wider than this note claimed (every turn, not just extracted facts) and to have already reached cloud backup.
 
 **Symptom:** When the user pastes a credential-shaped string into the chat console — e.g. a Spotify OAuth **authorization code** during the `code_executor` Spotify setup flow — it is logged verbatim at INFO level, twice:
 
@@ -691,3 +691,81 @@ Tests: `tests/test_6b_principal.py::test_the_tier2_rearm_carries_the_searchers_p
 Both skip shapes (foreign-principal skip, capability skip) now mark the turn, and a marked turn answers from a fixed string **without calling the model at all** — the false claim is unreachable rather than discouraged, deliberately: a synthesis path that can assert a state change it did not make is a code problem, not a wording problem, and no prompt text was added anywhere. Schema v20 (`storage/db.py`) records which turns were skipped; the session summariser drops them before it reads, by exclusion rather than annotation, so no model is ever asked to interpret a flag correctly.
 
 Tests: `tests/test_reply_cannot_contradict_the_machine.py`.
+
+---
+
+## KI-29: ~~Secrets pasted into the chat were stored in the database in plaintext~~ FIXED
+
+**Priority:** High (a live credential left the machine)
+**Effort:** Low — the redactor already existed; only the wiring was missing
+**Discovered:** 2026-08-22, while extracting a routing corpus from real history
+**Fixed:** 2026-08-22, same day
+
+**Symptom:** `core/redact.py` was wired into **eight** log and preview sites and **zero**
+write sites. So a credential pasted into the chat was scrubbed on its way to `debug.log`
+and written verbatim to SQLite in the same turn. The file an operator greps after an
+incident was the one clean copy of it.
+
+Found the hard way. Building a corpus of real utterances for a routing test pulled three
+live Google OAuth values straight out of the database — a client id, a `GOCSPX-` client
+secret, and a `4/0…` authorization code, all pasted months earlier during
+`manage_backup`'s OAuth setup. They were one `git add` away from a public repository.
+
+**Why storage was worse than the log**, and the reason this is High rather than the
+hygiene-grade Medium [KI-12](#ki-12) carried:
+
+- `conversations` is replayed into prompts, so a stored secret is re-sent to a cloud model
+  on later turns, indefinitely;
+- `io/backup/orchestrator.py:93` snapshots the whole database, so a stored secret **leaves
+  the machine** on the next backup. By the time this was found, it already had.
+
+**This was half-known and mis-filed.** [KI-12](#ki-12)'s closing note said:
+
+> Still open, tracked separately as KI-15: redaction runs at log and preview sites, never
+> at storage-write sites.
+
+[KI-15](#ki-15) is the unfenced-facts-in-the-system-prompt issue — a different problem. So
+the storage-write gap had no ticket at all, only a dangling cross-reference. The note also
+understated the scope twice: it named `save_typed_fact` and the knowledge graph, when the
+columns actually holding the credentials were `conversations.user_input` and
+`interaction_events.transcript` — **every turn**, not just extracted facts.
+
+**What shipped.** `redact_secrets` at five write sites in `storage/repos/`, chosen over
+`redact_secrets_strict` on measurement rather than instinct: against the four shapes
+actually found in this database the lenient tier catches all of them, while strict's blunt
+assignment-shaped-line rule risks eating ordinary conversation. Over-redaction here is
+unrecoverable — this is her memory, and a false positive silently deletes something the
+user said.
+
+| Site | Column |
+| --- | --- |
+| `repos/memory.py` `save_turn` | `conversations.user_input`, `.response` |
+| `repos/memory.py` `save_typed_fact` | `facts.value` |
+| `repos/memory.py` `save_chunk` | `recording_sessions.transcript` |
+| `repos/telemetry.py` `create` | `interaction_events.transcript` |
+| `repos/knowledge_graph.py` `add_fact` | `kg_facts.object` |
+
+Redaction is at the **repo**, not the facade, so a caller that bypasses `memory.py` is
+still covered. `conversations_fts` is filled by an INSERT trigger on `conversations`, so
+redacting the base column keeps the search index clean with no second mechanism.
+
+`tools/scrub_stored_secrets.py` cleans rows already stored — dry-run by default, backs the
+database up before writing, and rebuilds both FTS indexes afterwards because an UPDATE does
+not fire the INSERT triggers that populate them. It reuses the same `redact_secrets`, so
+there is exactly one definition of "looks like a secret" rather than a second one that
+drifts. Nine rows were scrubbed on 2026-08-22 across `conversations.user_input`,
+`conversations.response` and `interaction_events.transcript`.
+
+**Rotation is not optional.** Redacting the copy in this database does not un-leak a secret
+that already reached a cloud backup. The client secret found here was rotated.
+
+**Tests:** `tests/test_storage_write_redaction.py` — 35 cases. Both halves are pinned and
+both mutations were run: removing the redaction from `save_turn` reds 8 tests (including
+the FTS-index copy), and making `redact_secrets` return `[REDACTED]` unconditionally reds
+13 — because a redactor that blanks every turn would otherwise pass every secret assertion
+while quietly deleting her memory. Live-test the answer, not the refusal.
+
+**Still open:** redaction protects what TENKA *stores*. It does not protect what a user
+pastes from being sent to a cloud model in the turn it was pasted — the intent classifier
+sees the raw utterance. That is a separate boundary (the Context Builder's egress
+filtering) and is not closed by this fix.
