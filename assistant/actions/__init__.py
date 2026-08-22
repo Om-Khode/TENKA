@@ -115,7 +115,9 @@ import contextvars as _contextvars
 import dataclasses as _dataclasses
 
 from ..core.capabilities import Capability
-from ..core.intent_capabilities import DEFAULT_REQUIRED, REQUIRED_CAPABILITY
+from ..core.intent_capabilities import (
+    DEFAULT_REQUIRED, PERSISTS_AUTHORITY, REQUIRED_CAPABILITY,
+)
 
 current_grants: _contextvars.ContextVar["frozenset[Capability] | None"] = \
     _contextvars.ContextVar("tenka_current_grants", default=None)
@@ -201,13 +203,37 @@ from ..core.principal import (  # noqa: F401  (re-exported by design)
 # to move it, and every reader of it already imports `actions/`.
 @_dataclasses.dataclass(frozen=True)
 class RaiseContext:
-    """What this turn's caller was issued, and what this transport can ever
-    carry for it under a raise -- the two facts `_refuse` needs beyond
-    `current_grants` to tell "never issued" apart from "issued, raisable
-    here" and from "issued, but this transport can never carry it"."""
+    """What this turn's caller was issued, what this transport carries for it
+    without a raise, and what a raise could ever add.
+
+    `issued` and `raisable` are the two facts `_refuse` needs beyond
+    `current_grants` to tell "never issued" apart from "issued, raisable here"
+    and from "issued, but this transport can never carry it".
+
+    `ceiling` is the third, and it answers a different question:
+    **what does this caller hold when no raise is in force?** That is
+    `effective(issued, policy, raised=frozenset())`, i.e. `issued & ceiling` --
+    the caller's *durable* authority. `current_grants` cannot answer it,
+    because a raise has already been folded into that set and the narrowing
+    that produced it is gone.
+
+    The distinction is load-bearing. A raise is deliberately time-bounded, and
+    a capability spent on installing a monitor, a schedule, a procedure or a
+    shortcut is not: `automation/event_bus.py` and `scheduler.py` fire those
+    later with `LOCAL_GRANTS`, on the stated argument that "whoever installed
+    this already held EXECUTE". True -- for thirty minutes. Without the
+    durable set there is no way to tell, at install time, whether the caller
+    held the capability durably or only because a raise was live, so a
+    half-hour raise could be converted into permanent local execution. See
+    `durable_capability_refusal` below.
+    """
 
     issued: "frozenset[Capability]"
     raisable: "frozenset[Capability]"
+    # What this transport carries with no raise in force. Kept as the raw
+    # ceiling rather than a pre-computed intersection so the arithmetic lives
+    # in one place (`effective()`'s shape) and a reader can see both inputs.
+    ceiling: "frozenset[Capability]"
 
 
 current_raise_context: _contextvars.ContextVar["RaiseContext | None"] = \
@@ -219,7 +245,8 @@ wired it for yet) must degrade to the old, always-correct-if-generic
 sentence, never to a wrong one or a crash. See `_refuse` below.
 """
 
-LOCAL_RAISE_CONTEXT = RaiseContext(issued=LOCAL_GRANTS, raisable=frozenset())
+LOCAL_RAISE_CONTEXT = RaiseContext(issued=LOCAL_GRANTS, raisable=frozenset(),
+                                   ceiling=LOCAL_GRANTS)
 """What a caller physically at this machine was issued and could ever raise:
 everything, and therefore nothing left to raise. `_refuse` never actually
 reaches the raisable/never-raisable branches for a local caller -- holding
@@ -316,6 +343,71 @@ def capability_refusal(required: Capability) -> "str | None":
     logger.info(
         f"Refused: needs {required.value}, caller holds "
         f"{'nothing (grants unset)' if granted is None else sorted(c.value for c in granted)}"
+    )
+    return _refuse(required)
+
+
+def durable_capability_refusal(required: Capability) -> "str | None":
+    """May the turn in flight do a thing that keeps working after it ends?
+
+    Same shape as `capability_refusal`, different question. That one asks what
+    the caller may do *now*, which includes anything a live raise has lifted.
+    This one asks what the caller holds **durably** -- with no raise in force
+    -- because an effect that outlives the turn outlives the raise too.
+
+    The hole this closes: a raise is minted at the keyboard, scoped to one
+    device and one transport, and expires. But `manage_monitor`,
+    `manage_schedule`, `manage_procedure`, `manage_shortcut` and
+    `manage_backup` all *install* something that runs later, and
+    `automation/event_bus.py` and `scheduler.py` run it with `LOCAL_GRANTS` on
+    the argument that "whoever installed this already held EXECUTE". That
+    argument is sound only if "held" means durably. Spend a thirty-minute
+    raise on installing a monitor and the expiry stops mattering: the row
+    fires forever, attributed to `local`.
+
+    So the answer comes from `issued & ceiling` -- exactly
+    `effective(issued, policy, raised=frozenset())` -- never from
+    `current_grants`, which already has the raise folded in.
+
+    **`None` refuses here**, unlike in `_refuse` where an absent context
+    degrades to a generic sentence. The two defaults differ because the
+    questions differ: `_refuse` is choosing *wording* for a refusal that has
+    already happened, so a missing context can only make the sentence vaguer.
+    This is choosing whether to *permit* a durable effect, and a caller whose
+    durable authority cannot be established has not established it. A local
+    caller installs `LOCAL_RAISE_CONTEXT` explicitly, and so do the scheduler
+    and the event bus, so `None` means a call site nobody has wired -- which
+    is a bug, and doing nothing is the safe behaviour for it.
+
+    Returns `None` when the caller may, and a sentence when it may not.
+    """
+    context = current_raise_context.get()
+    if context is None:
+        logger.info(
+            f"Refused durable action needing {required.value}: no raise "
+            f"context installed, so durable authority cannot be established"
+        )
+        return (f"That needs the {required.value} permission on this "
+                f"connection, and I can't confirm it here.")
+
+    durable = context.issued & context.ceiling
+    if required in durable:
+        return None
+
+    # Held, but only because a raise is live. Say so plainly: the operator is
+    # the one who minted it and needs to know why it did not carry.
+    _live = current_grants.get() or frozenset()
+    if required in _live:
+        logger.info(
+            f"Refused durable action needing {required.value}: held only "
+            f"under a live raise, which would expire while the effect lasted"
+        )
+        return (f"A raised {required.value} can't install something that "
+                f"keeps running after the raise ends. Do it from the keyboard.")
+
+    logger.info(
+        f"Refused durable action needing {required.value}: not in the "
+        f"caller's durable set"
     )
     return _refuse(required)
 
@@ -496,6 +588,31 @@ async def execute(intent: str, params: dict, llm_response: str = "",
     if _refusal is not None:
         logger.info(f"Refused intent '{intent}'")
         return _refusal
+
+    # ── The durability gate ──────────────────────────────────────────────
+    # Immediately after the capability gate and before anything else, at the
+    # same choke point and for the same reason: this is the only site that
+    # resolves a handler, so a planned step re-entering through here is
+    # checked by the same rule as a direct turn.
+    #
+    # An intent that installs something which runs later must be paid for out
+    # of the caller's *durable* authority, not out of a live raise. A raise
+    # expires; a monitor does not. See `durable_capability_refusal` and
+    # `core/intent_capabilities.PERSISTS_AUTHORITY`.
+    #
+    # Membership, not a default: the two sets are exhaustive over
+    # `config.INTENTS` and a test fails on any intent in neither. An intent
+    # missing from both reaches this line, is not in `PERSISTS_AUTHORITY`, and
+    # is therefore treated as transient -- so the test is what closes that
+    # direction, not this branch.
+    if intent in PERSISTS_AUTHORITY:
+        _durable_refusal = durable_capability_refusal(_required)
+        if _durable_refusal is not None:
+            logger.info(
+                f"Refused intent '{intent}': installs something that outlives "
+                f"the turn, and {_required.value} is not held durably"
+            )
+            return _durable_refusal
 
     # Apply preference defaults before routing
     params = _apply_preference_defaults(intent, params)

@@ -87,3 +87,61 @@ REQUIRED_CAPABILITY: dict[str, Capability] = {
 
 # Unlisted intents require the strongest capability. See the module docstring.
 DEFAULT_REQUIRED: Capability = Capability.EXECUTE
+
+
+# ─── Does the effect outlive the turn? ───────────────────────────────────────
+#
+# `REQUIRED_CAPABILITY` above answers "what does this intent cost". This pair
+# answers a second question the raise mechanism made necessary: "does spending
+# it leave something behind that runs later?"
+#
+# A raise is deliberately time-bounded -- minted at the keyboard, scoped to one
+# device and one transport, expiring. But `manage_monitor` and friends install
+# something that `automation/event_bus.py` and `scheduler.py` later run with
+# `LOCAL_GRANTS`, on the stated argument that whoever installed it already held
+# `EXECUTE`. That is true for as long as the raise lasts and false afterwards,
+# so a half-hour raise could be converted into permanent local execution by
+# installing a monitor with it. `actions.durable_capability_refusal` is the
+# check; these two sets are the data it reads.
+#
+# **Exhaustive, with no default in either direction.** This is the one place a
+# strong default does not work, and the reason is worth stating because the
+# obvious choice is wrong both ways:
+#
+#   * defaulting to "persists" would refuse `code_executor` to a raised
+#     device, which destroys the entire purpose of a raise -- running code on
+#     a vetted machine is the thing it exists to permit;
+#   * defaulting to "transient" fails **open**: a future intent that installs
+#     something would be ungated by omission, which is exactly the silence
+#     `DEFAULT_REQUIRED` was written to avoid.
+#
+# Neither default is safe, so there is none. Every entry in `config.INTENTS`
+# appears in exactly one set below, and a test enumerates `config.INTENTS` and
+# fails on any intent in neither or in both. A new intent gets a red test, not
+# a silent answer.
+
+PERSISTS_AUTHORITY: frozenset[str] = frozenset({
+    # Each installs something that runs later, under grants the installer no
+    # longer has to be holding.
+    "manage_monitor",     # event_bus._fire_action -> execute("code_executor")
+    "manage_schedule",    # scheduler._async_run_handler, LOCAL_GRANTS
+    "manage_procedure",   # procedure_executor.run_procedure, replayed on demand
+    "manage_shortcut",    # a stored trigger that resolves to an intent later
+    "manage_backup",      # enables a recurring off-machine upload
+})
+
+TRANSIENT_AUTHORITY: frozenset[str] = frozenset({
+    # The effect ends with the turn. Running code is *not* durable in this
+    # sense: `code_executor` can do anything a shell can inside the window,
+    # and no in-process check changes that -- which is precisely what granting
+    # EXECUTE means and why a raise is a deliberate act. What this pair stops
+    # is TENKA's own machinery being used to make the window permanent.
+    "small_talk", "unknown", "create_note", "open_browser", "get_time",
+    "computer_task", "read_screen", "find_and_click", "code_executor",
+    "memory_query", "start_recording", "stop_recording", "get_recording",
+    "summarize_recording", "web_search", "browse_url", "file_task",
+    "set_reminder", "cancel_reminder", "hide_avatar", "show_avatar",
+    "meet_face", "recognize_face", "forget_face", "camera_look", "planner",
+    "enroll_voice", "forget_voice", "browser_cdp_setup", "store_memory",
+    "forget_memory", "shutdown", "manifest_dispatch",
+})

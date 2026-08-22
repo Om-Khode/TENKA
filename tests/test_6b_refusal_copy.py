@@ -55,6 +55,7 @@ def test_a_never_issued_capability_gets_the_original_sentence_even_with_context(
     rtoken = _raise_token(actions.RaiseContext(
         issued=frozenset({Capability.CHAT_SEND}),
         raisable=frozenset({Capability.EXECUTE}),
+        ceiling=frozenset({Capability.CHAT_SEND}),
     ))
     try:
         result = actions._refuse(Capability.EXECUTE)
@@ -70,6 +71,7 @@ def test_an_issued_ceilinged_raisable_capability_points_at_a_raise():
     rtoken = _raise_token(actions.RaiseContext(
         issued=frozenset({Capability.CHAT_SEND, Capability.EXECUTE}),
         raisable=frozenset({Capability.EXECUTE, Capability.SYSTEM_CONTROL}),
+        ceiling=frozenset({Capability.CHAT_SEND}),
     ))
     try:
         result = actions._refuse(Capability.EXECUTE)
@@ -88,6 +90,7 @@ def test_an_issued_never_raisable_capability_does_not_promise_a_raise():
     rtoken = _raise_token(actions.RaiseContext(
         issued=frozenset({Capability.CHAT_SEND, Capability.EXECUTE}),
         raisable=frozenset(),  # nothing raisable on this transport at all
+        ceiling=frozenset({Capability.CHAT_SEND}),
     ))
     try:
         result = actions._refuse(Capability.EXECUTE)
@@ -102,10 +105,17 @@ def test_an_issued_never_raisable_capability_does_not_promise_a_raise():
 # ─── Shape: every sentence stays speakable ────────────────────────────────
 @pytest.mark.parametrize("context", [
     None,
+    # `ceiling` is required rather than defaulted: it is what
+    # `durable_capability_refusal` reads, and a default would let a call site
+    # that forgot it answer "holds nothing durably" and refuse the operator.
+    # These two carry CHAT_SEND only, matching the tunnel ceilings that make
+    # the second and third refusal sentences reachable at all.
     actions.RaiseContext(issued=frozenset({Capability.CHAT_SEND, Capability.SYSTEM_CONTROL}),
-                         raisable=frozenset({Capability.SYSTEM_CONTROL})),
+                         raisable=frozenset({Capability.SYSTEM_CONTROL}),
+                         ceiling=frozenset({Capability.CHAT_SEND})),
     actions.RaiseContext(issued=frozenset({Capability.CHAT_SEND, Capability.SYSTEM_CONTROL}),
-                         raisable=frozenset()),
+                         raisable=frozenset(),
+                         ceiling=frozenset({Capability.CHAT_SEND})),
 ])
 def test_every_sentence_stays_speakable(context):
     """Under 120 chars, no path separator, no digits-as-error-code -- it may
@@ -126,11 +136,14 @@ def test_every_sentence_stays_speakable(context):
 # ─── The property that must not move: capability_refusal()'s decision ─────
 @pytest.mark.parametrize("context", [
     None,
-    actions.RaiseContext(issued=frozenset({Capability.CHAT_SEND}), raisable=frozenset()),
+    actions.RaiseContext(issued=frozenset({Capability.CHAT_SEND}), raisable=frozenset(),
+                         ceiling=frozenset({Capability.CHAT_SEND})),
     actions.RaiseContext(issued=frozenset({Capability.CHAT_SEND, Capability.EXECUTE}),
-                         raisable=frozenset({Capability.EXECUTE})),
+                         raisable=frozenset({Capability.EXECUTE}),
+                         ceiling=frozenset({Capability.CHAT_SEND})),
     actions.RaiseContext(issued=frozenset({Capability.CHAT_SEND, Capability.EXECUTE}),
-                         raisable=frozenset()),
+                         raisable=frozenset(),
+                         ceiling=frozenset({Capability.CHAT_SEND})),
 ])
 def test_capability_refusal_still_refuses_regardless_of_raise_context(context):
     """The decision is a function of current_grants alone. Four different
@@ -148,7 +161,8 @@ def test_capability_refusal_still_refuses_regardless_of_raise_context(context):
 @pytest.mark.parametrize("context", [
     None,
     actions.RaiseContext(issued=frozenset({Capability.CHAT_SEND, Capability.EXECUTE}),
-                         raisable=frozenset()),
+                         raisable=frozenset(),
+                         ceiling=frozenset({Capability.CHAT_SEND})),
 ])
 def test_capability_refusal_still_allows_regardless_of_raise_context(context):
     """The mirror image: when the capability IS in current_grants, no raise
@@ -184,7 +198,8 @@ def test_a_studio_queue_item_without_a_fifth_slot_degrades_to_none():
 def test_a_studio_queue_item_carries_its_raise_context():
     from assistant import main as main_mod
     context = actions.RaiseContext(issued=frozenset({Capability.EXECUTE}),
-                                   raisable=frozenset({Capability.EXECUTE}))
+                                   raisable=frozenset({Capability.EXECUTE}),
+                                   ceiling=frozenset({Capability.EXECUTE}))
     item = ("studio", "hi", frozenset(), "device:x", context)
     assert main_mod._raise_context_for_item(item) is context
 

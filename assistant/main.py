@@ -254,6 +254,7 @@ class _StudioDispatch:
                      principal: str,
                      issued: "frozenset[Capability] | None" = None,
                      raisable: "frozenset[Capability] | None" = None,
+                     ceiling: "frozenset[Capability] | None" = None,
                      ) -> tuple[str, str, bool, str]:
         if self._busy:
             return ("", "", False, "busy")
@@ -278,8 +279,14 @@ class _StudioDispatch:
         # the type meet. `_raise_context_for_item` reads it back the same
         # defensive way `_grants_for_item` reads the grant set: absent means
         # `_refuse` degrades to its original, generic sentence.
-        if issued is not None and raisable is not None:
-            raise_context = _actions_module.RaiseContext(issued=issued, raisable=raisable)
+        # All three or none. `ceiling` is what makes the durability gate
+        # answerable (actions.durable_capability_refusal), and a context with
+        # two of the three would let that gate read an empty ceiling as
+        # "holds nothing durably" and refuse every install on every
+        # transport -- including the operator's own. Missing means missing.
+        if issued is not None and raisable is not None and ceiling is not None:
+            raise_context = _actions_module.RaiseContext(
+                issued=issued, raisable=raisable, ceiling=ceiling)
             _input_queue.put(("studio", text, grants, principal, raise_context))
         else:
             _input_queue.put(("studio", text, grants, principal))

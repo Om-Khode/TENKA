@@ -81,7 +81,9 @@ async def send_chat(body: ChatRequest, request: Request,
     # `GET /v1/session` response already.
     ref = await request.app.state.runtime.chat.send(
         body.text, device.grants, f"device:{device.device_id}",
-        issued=request.state.issued_grants, raisable=request.state.policy.raisable)
+        issued=request.state.issued_grants,
+        raisable=request.state.policy.raisable,
+        ceiling=request.state.policy.ceiling)
     if not ref.accepted:
         # Deliberately generic: a caller that cannot authenticate any further
         # than "holds a read token" should not learn *what* she is doing --
