@@ -88,6 +88,21 @@ CASES = [
     ("remember that I prefer dark mode", "store_memory"),
     ("remember my birthday is in March", "store_memory"),
 
+    # ── _MEMORY_RE / _MEMORY_KNOW_RE ──────────────────────────────────────
+    # "do you know X" is ordinary English for any question. Claiming it
+    # answered general knowledge and capability questions out of the fact
+    # store. Found by tools/routing_differential.py, which caught
+    # "do you know who created you?" routing to memory_query.
+    ("do you remember what I said", "memory_query"),
+    ("what do you know about my job", "memory_query"),
+    ("recall my last order", "memory_query"),
+    ("do you know my name?", "memory_query"),
+    ("do you know if I have a meeting", "memory_query"),
+    ("do you know who created you?", None),
+    ("do you know how to code?", None),
+    ("do you know the capital of France?", None),
+    ("do you know what time the shop opens", None),
+
     # ── monitors / schedules must keep winning over the memory pattern ────
     ("delete all monitors", "manage_monitor"),
     ("remove the song monitor", "manage_monitor"),

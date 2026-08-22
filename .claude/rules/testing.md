@@ -55,6 +55,33 @@ before claiming a feature is done — and live-test **the answer, not the refusa
 that refuses correctly while silently corrupting what it permits passes every red-green
 check there is.
 
+## The routing differential harness
+
+`tools/routing_differential.py` replays recorded regex-routed turns through the
+classifier and prints the disagreements. `pre_route`'s failure mode is claiming too
+much, and a fast path never asks a second opinion -- this asks it in bulk, after the
+fact. About $0.002 for the whole local history on Flash-Lite; free on the free tier.
+
+    py -3.11 tools/routing_differential.py            # cost estimate only
+    py -3.11 tools/routing_differential.py --all --run
+
+Three things it taught on its first run (2026-08-22), all of them still true:
+
+- **It found a real over-claim.** `do you know who created you?` routed to
+  `memory_query`, because `do you know` claims all of ordinary English.
+- **The classifier is not an oracle.** It called `shut down` and `exit`
+  `computer_task`. Acting on that would have broken the shutdown fast path.
+  Disagreements get triaged; pairs where the regex is right go in `KNOWN_GOOD`.
+- **Compare what the pipeline dispatches, not what resolved.** `main.py` overrides
+  any intent to `planner` for a multi-step utterance, so two of the first seven
+  "disagreements" were convergent paths.
+
+It reads the local database and **never writes a file.** Its first version was a
+committed fixture generated from real history, which pulled three live OAuth
+credentials out of `interaction_events` and came within one `git add` of a public
+repo -- KI-29. A case worth keeping is hand-copied, with inert content, into
+`tests/test_routing_overclaim.py`.
+
 ## Existing structural sweeps
 
 Do not break these, and move them if you move their target:
