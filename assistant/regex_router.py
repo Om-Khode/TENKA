@@ -222,12 +222,28 @@ _REMEMBER_ACTION_RE = re.compile(
 # Memory query — only unambiguous recall patterns.
 # "what's my X" is too broad (matches "what's my IP address?" which needs
 # code_executor). The LLM + Guard 5 handle the ambiguous "my X" cases.
+# Memory recall.
+#
+# `remember` and `recall` are memory verbs. `know` is not -- "do you know X"
+# is ordinary English for any question at all, so the old pattern claimed
+# "do you know how to code?" and "do you know the capital of France?" as
+# memory queries. Found by tools/routing_differential.py on 2026-08-22, which
+# caught `do you know who created you?` going to memory_query instead of
+# small talk.
+#
+# So `do you know` claims only when what follows is about the *user* -- the
+# only thing a memory lookup could answer. First-person possessives are the
+# generic signal; anything else falls through to the classifier.
+_FIRST_PERSON_RE = re.compile(r"\b(?:my|mine|me|i|our|us|we)\b", re.I)
 _MEMORY_RE = re.compile(
     r"^(?:what\s+do\s+you\s+(?:know|remember)\s+about"
-    r"|do\s+you\s+(?:know|remember)"
+    r"|do\s+you\s+remember"
     r"|recall)\s+(.+)$",
     re.I,
 )
+# `do you know X` -- claimed only when X is about the user. Separate pattern
+# rather than a branch, so the two can be reasoned about independently.
+_MEMORY_KNOW_RE = re.compile(r"^do\s+you\s+know\s+(.+)$", re.I)
 
 # knowledge-graph livetest follow-up: first-person commitment / promise recall.
 # Without this, "what did I commit to this week" was getting routed to
@@ -570,6 +586,16 @@ def pre_route(text: str) -> IntentResult | None:
     m = _MEMORY_RE.match(t)
     if m:
         return IntentResult(intent="memory_query", response=t, params={"query": m.group(1).strip()})
+
+    # `do you know X` only when X is about the user. "do you know how to
+    # code?" and "do you know the capital of France?" are not memory lookups,
+    # and claiming them answered a general question from the fact store.
+    m = _MEMORY_KNOW_RE.match(t)
+    if m:
+        _q = m.group(1).strip()
+        if _FIRST_PERSON_RE.search(_q):
+            return IntentResult(intent="memory_query", response=t,
+                                params={"query": _q})
 
     # first-person commitment recall fast-path. Passes the FULL text
     # as the query so memory_search._is_commitment_query can detect the
