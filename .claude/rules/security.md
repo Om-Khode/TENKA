@@ -95,8 +95,8 @@ found a raise in that window leaking a grant set into the queue consumer.
 | `scheduler.py:~169` | scheduled `procedure` | `LOCAL_GRANTS` |
 
 The last three grant everything on one argument: *"whoever installed this already held
-`EXECUTE`."* That is sound only if "held" means **durably** — see KI-29 in
-`TENKA_Known_Issues.md`. Do not add a fifth entry point that reasons this way.
+`EXECUTE`."* Do not add a fourth site that reasons this way, and do not widen the three
+that do. An authority that was true once is not automatically true later.
 
 ## When you touch this
 
@@ -105,5 +105,6 @@ The last three grant everything on one argument: *"whoever installed this alread
 - Reviewing pieces in isolation systematically passes things that do not compose. 6b
   produced this four times, and two were found only by a person using the product. Live-test
   the **answer**, not the refusal.
-- Open items live in `TENKA_Known_Issues.md`. KI-13, KI-17, KI-18, KI-23, KI-24 and KI-28
-  are closed; KI-19/20/21/22/27 are open and low; KI-29 is open and High.
+- Open items live in `TENKA_Known_Issues.md` — the only ledger. Read it before changing
+  anything in this area; several closed issues are closed *because* of a specific mechanism
+  here, and removing the mechanism reopens them silently.
