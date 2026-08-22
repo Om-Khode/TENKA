@@ -58,3 +58,24 @@ def set_principal(principal: "str | None") -> "contextvars.Token":
     means "nobody said" -- it owns nothing, which is the fail-closed answer.
     """
     return current_principal.set(principal)
+
+
+def installer_label() -> str:
+    """Who to record as having installed something that will run later.
+
+    `event_monitors`, `schedules`, `user_procedures` and `user_shortcuts` all
+    store something that fires after the turn that created it, under grants
+    the installer no longer has to be holding. Schema v21 records who asked.
+
+    Read at the write boundary rather than threaded through every caller, for
+    the reason `redact_secrets` is: a parameter is something a future caller
+    forgets, and a forgotten one here writes a confident lie. The repos may
+    read this because `storage/ -> core/` is a legal edge; `actions/` is not.
+
+    **`None` becomes `"unknown"`, never `"local"`.** The column's migration
+    default is `'local'`, which is honest for rows that predate it -- a remote
+    device could not reach these intents at all before the raise mechanism
+    existed. It is not honest for a new row whose principal nobody set, and a
+    row that says `local` when nobody knows is worse than a row that says so.
+    """
+    return current_principal.get() or "unknown"

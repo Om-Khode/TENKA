@@ -7,6 +7,8 @@ filler-tolerant matching.
 
 import json
 import logging
+
+from ...core.principal import installer_label
 from datetime import datetime
 from typing import Optional
 
@@ -106,14 +108,18 @@ class ShortcutRepo:
 
         self._db.execute(
             "INSERT INTO user_shortcuts "
-            "(trigger, intent, params_json, description, times_used, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, 0, ?, ?) "
+            "(trigger, intent, params_json, description, times_used, "
+            "created_at, updated_at, installed_by) "
+            "VALUES (?, ?, ?, ?, 0, ?, ?, ?) "
             "ON CONFLICT(trigger) DO UPDATE SET "
             "intent = excluded.intent, "
             "params_json = excluded.params_json, "
             "description = excluded.description, "
-            "updated_at = excluded.updated_at",
-            (trigger_clean, intent, params_json, description, now, now),
+            "updated_at = excluded.updated_at, "
+            # An upsert re-installs: whoever overwrote the shortcut owns it now.
+            "installed_by = excluded.installed_by",
+            (trigger_clean, intent, params_json, description, now, now,
+             installer_label()),
         )
         self._db.commit()
 

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+
+from ...core.principal import installer_label
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -32,12 +34,13 @@ class MonitorRepo:
             """INSERT INTO event_monitors
                (name, event_type, source_filter, condition_mode,
                 condition_expr, condition_prompt, action_type,
-                action_payload, cooldown_secs, user_goal, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                action_payload, cooldown_secs, user_goal, created_at,
+                installed_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (name, event_type, source_filter, condition_mode,
              condition_expr, condition_prompt, action_type,
              action_payload, cooldown_secs, user_goal,
-             datetime.now().isoformat()),
+             datetime.now().isoformat(), installer_label()),
         )
         self._db.commit()
         row_id = cursor.lastrowid

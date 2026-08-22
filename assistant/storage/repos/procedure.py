@@ -8,6 +8,8 @@ resolution, conflict detection against both procedures and shortcuts.
 
 import json
 import logging
+
+from ...core.principal import installer_label
 import re
 from datetime import datetime
 from typing import Optional
@@ -104,9 +106,11 @@ class ProcedureRepo:
 
         cursor = self._db.execute(
             "INSERT INTO user_procedures "
-            "(trigger, name, description, steps, backend, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (trigger_clean, name.strip(), description.strip(), steps_json, backend, now, now),
+            "(trigger, name, description, steps, backend, created_at, "
+            "updated_at, installed_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (trigger_clean, name.strip(), description.strip(), steps_json,
+             backend, now, now, installer_label()),
         )
         self._db.commit()
 

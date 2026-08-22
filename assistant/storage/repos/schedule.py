@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+
+from ...core.principal import installer_label
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -28,10 +30,11 @@ class ScheduleRepo:
         cursor = self._db.execute(
             """INSERT INTO schedules
                (name, cron_expr, task_type, task_goal, notify_mode,
-                condition_text, next_fire_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                condition_text, next_fire_at, created_at, installed_by)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (name, cron_expr, task_type, task_goal, notify_mode,
-             condition_text, next_fire_at, datetime.now().isoformat()),
+             condition_text, next_fire_at, datetime.now().isoformat(),
+             installer_label()),
         )
         self._db.commit()
         row_id = cursor.lastrowid

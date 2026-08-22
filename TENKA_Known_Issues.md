@@ -850,7 +850,24 @@ window permanent.
 
 **Audit half.** Schema **v21** adds `installed_by TEXT NOT NULL DEFAULT 'local'` to
 `event_monitors`, `schedules`, `user_procedures` and `user_shortcuts`, written from
-`current_principal` at install and logged at fire. It does **not** gate: a fire-time check
+`core.principal.installer_label()` at the repo write.
+
+*Corrected the next day, and worth recording as its own lesson.* The first commit added the
+column and **never wired the write**, while this entry and the commit message both stated
+it was populated. Every row would have read `'local'` from the migration default whoever
+installed it -- worse than an absent column, because it is confidently wrong. Same shape as
+6b's `quick`: individually correct decisions producing unreachable configuration, and the
+same "verified the wrong artifact and reported fine" failure this project has already
+recorded once. Caught only because the operator asked whether a live test was needed and
+the answer required checking what had actually shipped.
+
+The write reads `current_principal` at the repo rather than taking a parameter, for the
+reason `redact_secrets` does: a parameter is something a future caller forgets, and a
+forgotten one here writes a lie. `None` records `"unknown"`, never `"local"` -- the
+migration default is honest for rows predating the column, since a remote device could not
+reach these intents before the raise existed, but it is not honest for a new row whose
+principal nobody set. An upsert on a shortcut reassigns `installed_by`, because
+re-installing is installing. It does **not** gate: a fire-time check
 would need a live policy for a device that may not be connected. The default backfills
 honestly — before this, a remote device could not reach these intents at all without a
 raise, and the raise mechanism is newer than every existing row.
