@@ -1,0 +1,72 @@
+---
+paths:
+  - "tests/**"
+  - "pyproject.toml"
+---
+
+# Testing
+
+Tests live in `tests/`. Never at repo root, never inside `assistant/`. Name them
+`tests/test_<feature>.py`.
+
+## Never run the whole suite
+
+```bash
+py -3.11 -m pytest tests/test_<feature>.py -v     # per file
+```
+
+`pyproject.toml` sets `addopts = "-m 'not live_automation'"`, which protects only tests that
+**carry the marker**. An unmarked desktop-driving test is still collected — on 2026-08-08 a
+bare `pytest tests/` typed into someone's foreground window while they were working. The
+suite is also too slow to run whole, which is how a route-completeness sweep sat red on
+`main` for days.
+
+Any new test that drives the desktop or launches a real browser gets
+`@pytest.mark.live_automation`, and is run only on a machine nobody is using.
+
+## A test that does not fail when its mechanism is removed is not a test
+
+Before claiming a test covers something: **delete or invert the thing it is supposed to
+catch and confirm it goes red.** Report which tests you checked this way and what you
+deleted. Milestone 6b caught six tests passing vacuously — three were security tests, and
+four had been authored in a plan rather than by an implementer.
+
+Three failure shapes to watch for:
+
+1. **Sibling refusal.** A test can pass because some *other* check happens to refuse the
+   same input. Isolate the mechanism under test — assert the specific refusal's wording, or
+   remove whatever else could answer. 6b's KI-17 containment test asserted a `Host` the
+   pre-change code already refused: green before the feature existed, green after.
+2. **A walk over nothing.** A structural test whose target set is empty passes forever. The
+   route-completeness sweep iterated `app.routes`, which in this FastAPI version yields
+   wrapper nodes with no paths, so `actual` was the empty set. Every AST or registry sweep
+   needs an explicit `assert <collection>, "walked nothing"`.
+3. **A hang is not a failure.** A test that stalls on a mutant never goes red. Bound
+   anything that waits with `asyncio.wait_for`.
+
+**A green mutant is investigated, not accepted.** It may be proof the test measures the
+wrong thing. 6b's transport work found a test pinning the wrong depth of a cancellation
+hazard exactly this way — chasing the green mutant found more than any review round.
+
+## Unit tests are not feature tests
+
+Type checks and unit tests verify code correctness, not feature correctness. Live-test
+before claiming a feature is done — and live-test **the answer, not the refusal.** A control
+that refuses correctly while silently corrupting what it permits passes every red-green
+check there is.
+
+## Existing structural sweeps
+
+Do not break these, and move them if you move their target:
+
+| Test | Walks |
+| --- | --- |
+| `test_6a5_predispatch_gate.py` | `main.py`'s pre-dispatch region — fails on a new unguarded `return` |
+| `test_6b_principal.py` | every pending arming site in `main.py` — fails on one with no principal |
+| `test_layering.py`, `test_api_layering.py` | import boundaries |
+| `test_s5_config_no_sqlite.py` | `config.py` never reaches SQLite |
+
+Both AST sweeps are bound to `main.py` by path and to their function by name. Renaming the
+function errors loudly; **splitting** it shrinks the walked region and passes while
+measuring almost nothing (KI-32). If you move that code, move the sweep and add a count
+assertion.
