@@ -33,6 +33,7 @@ class FakeChatRuntime:
         # even though most tests never inspect them.
         self.sent_issued: list[frozenset] = []
         self.sent_raisable: list[frozenset] = []
+        self.sent_ceilings: list[frozenset] = []
         self.aborted = 0
         self._messages = [
             ChatMessage("m1", "user", "what did I ask you yesterday", "2026-08-07T09:00:00Z"),
@@ -42,7 +43,8 @@ class FakeChatRuntime:
 
     async def send(self, text: str, grants: frozenset, principal: str,
                    issued: frozenset | None = None,
-                   raisable: frozenset | None = None) -> TurnRef:
+                   raisable: frozenset | None = None,
+                   ceiling: frozenset | None = None) -> TurnRef:
         if self.busy:
             return TurnRef("", "c1", accepted=False, reason="busy")
         self.sent.append(text)
@@ -50,6 +52,11 @@ class FakeChatRuntime:
         self.sent_principals.append(principal)
         self.sent_issued.append(issued)
         self.sent_raisable.append(raisable)
+        # `ceiling` is the third leg of RaiseContext: what the transport
+        # carries with no raise in force, which is what the durability gate
+        # reads. Recorded so a route that stops passing it is a visible
+        # failure here rather than a silently ungated install.
+        self.sent_ceilings.append(ceiling)
         return TurnRef(f"t{len(self.sent)}", "c1", accepted=True)
 
     async def conversations(self) -> list[ConversationRef]:

@@ -95,8 +95,17 @@ found a raise in that window leaking a grant set into the queue consumer.
 | `scheduler.py:~169` | scheduled `procedure` | `LOCAL_GRANTS` |
 
 The last three grant everything on one argument: *"whoever installed this already held
-`EXECUTE`."* Do not add a fourth site that reasons this way, and do not widen the three
-that do. An authority that was true once is not automatically true later.
+`EXECUTE`."* True when written, false once a raise exists -- "held" has to mean *durably*.
+See KI-30. Do not add a fourth site that reasons this way, and do not widen the three that
+do.
+
+**Two predicates, two questions.** `capability_refusal` asks what the caller may do *now*,
+which includes anything a live raise lifted. `durable_capability_refusal` asks what it
+holds with **no raise in force** (`issued & ceiling`), and gates the intents in
+`PERSISTS_AUTHORITY` -- the ones that install something which runs later. A raise expires;
+a monitor does not. The two durability sets are exhaustive over `config.INTENTS` with no
+default, because "persists" would refuse `code_executor` to a raised device and
+"transient" fails open for the next intent nobody classified.
 
 ## When you touch this
 

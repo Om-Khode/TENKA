@@ -769,3 +769,99 @@ while quietly deleting her memory. Live-test the answer, not the refusal.
 pastes from being sent to a cloud model in the turn it was pasted — the intent classifier
 sees the raw utterance. That is a separate boundary (the Context Builder's egress
 filtering) and is not closed by this fix.
+
+---
+
+## KI-30: ~~A live raise could be converted into permanent local `EXECUTE`~~ FIXED
+
+**Priority:** High (a time-bounded control could be made unbounded)
+**Effort:** Low–Medium — a second predicate beside the existing one, plus data
+**Discovered:** 2026-08-22, auditing the authority model to write `TENKA-v2.md`
+**Fixed:** 2026-08-23
+
+**Symptom:** A capability raise is deliberately time-bounded — minted at the keyboard,
+`require_admin(SYSTEM_CONTROL)`, scoped to one device and one transport, expiring. But
+`manage_monitor`, `manage_schedule`, `manage_procedure`, `manage_shortcut` and
+`manage_backup` all **install something that runs later**, and `automation/event_bus.py`
+and `scheduler.py` run it with `LOCAL_GRANTS`.
+
+Spend a thirty-minute raise on installing a monitor and the expiry stops mattering: the row
+fires on a cadence forever, attributed in every log to `local`. The bound the raise exists
+to provide was defeated by the artefact it was spent on.
+
+The chain, every link verified in the tree:
+
+1. a device pairs over `tailnet` with `EXECUTE` ticked. 6b's issue-time fix
+   (`routes/pairing.py`) deliberately *stores* it in the vault rather than stripping it, so
+   a later raise can reach it — that fix is correct and is not the defect;
+2. on ordinary requests `effective(issued, policy, raised=∅)` narrows it away. Refused;
+3. the operator mints a raise at the keyboard;
+4. during the window the device reaches `manage_monitor`, gated on `EXECUTE`, which now
+   passes;
+5. `handle_manage_monitor` (`actions/monitors.py:41`) has no other guard — it goes straight
+   to `event_monitoring.create_monitor`;
+6. the raise expires;
+7. the row still fires, with `LOCAL_GRANTS` and `LOCAL_PRINCIPAL`.
+
+**Why it survived four review rounds and a live test.** The installer *was* gated, and
+correctly. The gate asks "does this caller hold `EXECUTE` **now**". The fire path asks "did
+whoever installed this hold `EXECUTE`" and answers from the first question's result — which
+was true, for thirty minutes. `scheduler.py:135` states the assumption in its own comment:
+
+> scheduling one requires EXECUTE (`manage_schedule` in `core/intent_capabilities.py`), so
+> whoever installed this task already held it.
+
+Sound when written. The raise mechanism, shipped in a later milestone, is what made it
+false. This is the project's recurring shape for the third time — a correct boundary with an
+unenumerated path beside it — and the first instance produced by the *interaction* of two
+milestones rather than by either alone. Neither milestone's review could have caught it:
+6a.5 had no raise, and 6b had no reason to re-read the scheduler.
+
+**What shipped.** A property, not a special case for five intents:
+
+> A capability held only by virtue of a live raise may not be spent on an action whose
+> effect outlives the raise.
+
+`RaiseContext` gains `ceiling`, so a turn can be asked what it holds with **no raise in
+force** — `issued & ceiling`, which is exactly `effective(issued, policy, raised=∅)`.
+`current_grants` cannot answer that: the raise is already folded in and the narrowing that
+produced it is gone. `durable_capability_refusal()` reads it, beside
+`capability_refusal()` and at the same choke point in `actions/__init__.py`, immediately
+after the existing gate.
+
+`ceiling` is a **required** field, not defaulted — the same discipline as the policy
+literals. A default would let a call site that forgot it report "holds nothing durably" and
+refuse the operator's own keyboard.
+
+**The classification is exhaustive, with no default in either direction.**
+`PERSISTS_AUTHORITY` and `TRANSIENT_AUTHORITY` in `core/intent_capabilities.py` partition
+all 38 entries of `config.INTENTS`. This is the one place a strong default does not work,
+and both obvious choices are wrong: defaulting to "persists" would refuse `code_executor`
+to a raised device and destroy the entire purpose of a raise, while defaulting to
+"transient" fails **open** for a future intent that installs something. So there is none,
+and a test enumerates `config.INTENTS` and fails on any intent in neither set or in both.
+Adding an intent is now a five-place change, not four.
+
+`code_executor` is classified transient **deliberately**, and a test says so, because it
+looks like an omission. Running code can do anything a shell can inside the window and no
+in-process check changes that — which is what granting `EXECUTE` means and why a raise is a
+deliberate act. What this gate stops is TENKA's *own* machinery being used to make the
+window permanent.
+
+**Audit half.** Schema **v21** adds `installed_by TEXT NOT NULL DEFAULT 'local'` to
+`event_monitors`, `schedules`, `user_procedures` and `user_shortcuts`, written from
+`current_principal` at install and logged at fire. It does **not** gate: a fire-time check
+would need a live policy for a device that may not be connected. The default backfills
+honestly — before this, a remote device could not reach these intents at all without a
+raise, and the raise mechanism is newer than every existing row.
+
+**Tests:** `tests/test_raise_cannot_outlive_itself.py` — 28 cases. Six mutations run, and
+the sixth is the one worth recording: the first five all reded, while **deleting the gate's
+wiring in `execute()` left all seventeen unit tests green**. The predicate was perfect and
+nothing called it. Three dispatch-level tests were added, which red on both removing the
+hook and moving it after handler resolution. A perfect predicate nobody calls refuses
+nothing.
+
+**Not closed by this:** a raise spent directly on `code_executor` can install an OS-level
+scheduled task outside TENKA. No in-process check can prevent that. The raise's value is
+that it is deliberate and narrow, not that it is containment.

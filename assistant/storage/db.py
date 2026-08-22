@@ -69,7 +69,7 @@ class Database:
 
     # --- Schema versioning ---
 
-    _LATEST_VERSION = 20
+    _LATEST_VERSION = 21
 
     def _get_version(self) -> int:
         row = self._conn.execute(
@@ -117,6 +117,7 @@ class Database:
             18: self._migrate_v18,
             19: self._migrate_v19,
             20: self._migrate_v20,
+            21: self._migrate_v21,
         }
 
         for v in range(current + 1, self._LATEST_VERSION + 1):
@@ -765,6 +766,45 @@ class Database:
             "ALTER TABLE conversations ADD COLUMN security_skip "
             "INTEGER NOT NULL DEFAULT 0"
         )
+        self._conn.commit()
+
+
+    def _migrate_v21(self) -> None:
+        """V21: who installed this, on everything that runs later.
+
+        `event_monitors`, `schedules`, `user_procedures` and `user_shortcuts`
+        all store something that fires after the turn that created it, and
+        `automation/event_bus.py` and `scheduler.py` run it with
+        `LOCAL_GRANTS`. Until now the row recorded nothing about who asked
+        for it, so the audit trail said the machine had done it to itself.
+
+        The gate that stops a temporary raise installing one of these is at
+        dispatch (`actions.durable_capability_refusal`), not here. This column
+        is the *record*, deliberately: a fire-time check would need a live
+        policy for a device that may not be connected, and inventing one is
+        worse than knowing who to ask.
+
+        NOT NULL DEFAULT 'local' so every existing row reads as
+        keyboard-installed with no backfill. That is honest rather than
+        convenient: before this migration a remote device could not reach any
+        of these intents at all without a raise, and the raise mechanism is
+        newer than every row in the table.
+        """
+        for table in ("event_monitors", "schedules",
+                      "user_procedures", "user_shortcuts"):
+            cols = {
+                r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            if not cols:
+                # A table this schema has not created yet. Nothing to alter,
+                # and its own CREATE will carry the column.
+                continue
+            if "installed_by" in cols:
+                continue
+            self._conn.execute(
+                f"ALTER TABLE {table} ADD COLUMN installed_by "
+                "TEXT NOT NULL DEFAULT 'local'"
+            )
         self._conn.commit()
 
 
