@@ -26,7 +26,7 @@ git config core.hooksPath   # -> hooks
 
 | Hook | Enforces |
 | --- | --- |
-| `pre-commit` | No direct commits to `main`; no non-squash merges into `main`; `import-linter` contracts hold whenever a `.py` file is staged |
+| `pre-commit` | No direct commits to `main`; no non-squash merges into `main`; no `task/` branch squashed into `main`; every branch named `<type>/<slug>`; `import-linter` contracts hold whenever a `.py` **or `pyproject.toml`** is staged |
 | `commit-msg` | The `.gitmessage` template — type prefix, ≤72-char subject, and the mandatory `TENKA ~ "…"` trailer |
 
 `_common.sh` holds shared helpers and is sourced, not executed.
@@ -46,6 +46,65 @@ git commit                       # allowed
 as the signal for a legitimate squash commit. A plain `git merge` leaves
 `MERGE_HEAD` instead and is rejected, because it would replay the branch's whole
 history onto `main`.
+
+### One commit on `main` per unit of work
+
+`pre-commit` used to ask only *"is this a squash?"*, never *"a squash of what?"*.
+Milestone 6b satisfied it twenty-plus times: every task branch squashed into `main`
+separately, each commit individually legitimate, and `main` ended up with the whole
+milestone smeared across it.
+
+Two namespaces fix the part a hook can fix:
+
+```
+feat/milestone-7               integration branch  ──squash──▶ main   (ONCE)
+task/milestone-7/1-listeners   task branch         ──squash──▶ feat/milestone-7
+task/milestone-7/2-verifier    task branch         ──squash──▶ feat/milestone-7
+```
+
+The full flow:
+
+```bash
+git switch -c feat/milestone-7                    # integration branch, once
+git switch -c task/milestone-7/1-listeners        # a step inside it
+#   ... work, commit freely ...
+git switch feat/milestone-7
+git merge --squash task/milestone-7/1-listeners && git commit
+
+#   ... repeat per task ...
+
+git switch main                                   # once, at the end
+git merge --squash feat/milestone-7 && git commit
+```
+
+`main` gets one commit. `feat/milestone-7` keeps one commit per task. Each
+`task/…` branch keeps every individual step. Nothing is lost, and nothing is
+deleted — the never-delete-a-branch rule covers `task/` too.
+
+**Why `task/` is a separate top level, not a child of the integration branch.**
+Git stores refs as files, so `refs/heads/feat/milestone-7` cannot also be a
+directory. Creating `feat/milestone-7/1-listeners` while `feat/milestone-7`
+exists fails in git itself:
+
+```
+fatal: cannot lock ref 'refs/heads/feat/milestone-7/1-listeners':
+       'refs/heads/feat/milestone-7' exists; cannot create ...
+```
+
+Measured 2026-08-22. The nested-under-the-integration-branch layout is
+impossible, not merely discouraged — which is why the task namespace is
+`task/<unit>/<slug>`.
+
+**How the hook knows the source branch.** `git merge --squash` writes no
+`MERGE_HEAD` and records the source branch nowhere. But `SQUASH_MSG` lists the
+squashed commits, so the hook takes the newest SHA and runs
+`git branch --contains` on it to recover which branches hold it. `@{-1}` and the
+reflog were both rejected: each depends on how you happened to arrive at `main`.
+
+**What this does *not* enforce.** No hook can tell that twenty separate
+`feat/thing-1` … `feat/thing-20` branches were one unit of work. The hook rejects
+the obvious mistake (`task/` reaching `main`) and makes the intended path the easy
+one. Deciding what counts as one unit is still a judgement call.
 
 ## Notes for anyone editing these
 

@@ -1,7 +1,9 @@
 #!/bin/sh
-# pre-commit — enforces TENKA's two hard pre-commit rules:
+# pre-commit — enforces TENKA's hard pre-commit rules:
 #   1. never commit directly to main (squash-merge commits excepted)
-#   2. import-linter boundaries hold whenever Python changes
+#   2. a task branch never squashes into main
+#   3. every branch name starts with an approved type
+#   4. import-linter boundaries hold whenever Python or the contracts change
 #
 # Enabled by `git config core.hooksPath hooks` (see SETUP.md).
 
@@ -9,6 +11,10 @@
 
 GIT_DIR_PATH=$(git rev-parse --git-dir)
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+# Types that may reach main, and the one that may not.
+MERGE_TYPES='feat fix refactor chore docs test perf'
+TASK_TYPE='task'
 
 # ─── 1. Protect main ─────────────────────────────────────────────────────────
 #
@@ -34,12 +40,91 @@ if [ "$BRANCH" = "main" ]; then
             "  git switch -c fix/short-description   # or feat/, refactor/, chore/, docs/, test/, perf/" \
             "  git stash pop"
     fi
+
+    # ─── 2. One commit on main per unit of work ──────────────────────────
+    #
+    # Rule 1 only ever asked "is this a squash?", never "a squash of what?".
+    # Milestone 6b satisfied it twenty-plus times: every task branch squashed
+    # into main separately, each commit legitimate, and main ended up with the
+    # milestone smeared across it.
+    #
+    # Two namespaces fix the part a hook can fix:
+    #
+    #   feat/milestone-7            integration branch -> squashes to main, ONCE
+    #   task/milestone-7/3-verifier task branch        -> squashes to the above
+    #
+    # `task/` is a separate top level rather than a child of the integration
+    # branch because git stores refs as files: `refs/heads/feat/milestone-7`
+    # cannot be both a file and a directory, so `feat/milestone-7/3-verifier`
+    # is rejected by git itself ("cannot lock ref ... exists"). Measured
+    # 2026-08-22; the nested-under-the-integration-branch layout is impossible,
+    # not merely discouraged.
+    #
+    # `git merge --squash` records no MERGE_HEAD and names no source branch, so
+    # we recover it from SQUASH_MSG: it lists the squashed commits, and
+    # `git branch --contains` maps the newest of them back to the branches that
+    # hold it. `@{-1}` and the reflog were rejected as alternatives - both
+    # depend on how the user happened to arrive at main.
+    SRC_SHA=$(grep -m1 '^commit ' "$GIT_DIR_PATH/SQUASH_MSG" 2>/dev/null \
+              | awk '{print $2}')
+
+    if [ -n "$SRC_SHA" ]; then
+        for _b in $(git branch --contains "$SRC_SHA" --format='%(refname:short)' \
+                    2>/dev/null); do
+            [ "$_b" = "main" ] && continue
+            case "$_b" in
+                "$TASK_TYPE"/*)
+                    _unit=${_b#"$TASK_TYPE"/}      # milestone-7/3-verifier
+                    _unit=${_unit%%/*}             # milestone-7
+                    die "task branch squashed straight into main: $_b" \
+                        "A task/ branch is one step inside a larger unit of work. It merges" \
+                        "into that unit's integration branch, which reaches main exactly once." \
+                        "" \
+                        "  git reset --merge                     # undo this staged squash" \
+                        "  git switch feat/$_unit                # or fix/, refactor/, ..." \
+                        "  git merge --squash $_b && git commit" \
+                        "" \
+                        "Then, once the whole unit of work is done:" \
+                        "  git switch main" \
+                        "  git merge --squash feat/$_unit && git commit"
+                    ;;
+            esac
+        done
+    fi
 fi
 
-# ─── 2. Import boundaries ────────────────────────────────────────────────────
+# ─── 3. Branch naming ────────────────────────────────────────────────────────
+#
+# Checked on every branch, not just main, because a misnamed branch is
+# otherwise only discovered at merge time - after the work is done and the name
+# is expensive to change. Detached HEAD (rebase, bisect) is left alone.
 
-STAGED_PY=$(git diff --cached --name-only --diff-filter=ACMR -- '*.py')
-[ -z "$STAGED_PY" ] && exit 0
+if [ "$BRANCH" != "main" ] && [ "$BRANCH" != "HEAD" ]; then
+    _type=${BRANCH%%/*}
+    _rest=${BRANCH#*/}
+    _ok=0
+    for _t in $MERGE_TYPES $TASK_TYPE; do [ "$_type" = "$_t" ] && _ok=1; done
+
+    if [ "$_ok" -eq 0 ] || [ "$_rest" = "$BRANCH" ] || [ -z "$_rest" ]; then
+        die "branch name is not <type>/<slug>: $BRANCH" \
+            "Mergeable types: $MERGE_TYPES" \
+            "Task type:       $TASK_TYPE/<unit>/<slug>  (never squashes into main)" \
+            "The prefix must match the commit type this branch will carry." \
+            "" \
+            "  git branch -m fix/short-description"
+    fi
+fi
+
+# ─── 4. Import boundaries ────────────────────────────────────────────────────
+#
+# Triggered by a staged .py OR by pyproject.toml, which is where the contracts
+# themselves live. Editing a contract without touching a .py used to skip this
+# check entirely - so the one commit most able to break layering was the one
+# commit that went unverified.
+
+STAGED_TRIGGER=$(git diff --cached --name-only --diff-filter=ACMR \
+                 -- '*.py' 'pyproject.toml')
+[ -z "$STAGED_TRIGGER" ] && exit 0
 
 PY=$(find_python) || die "no usable Python found (need 3.10+)." \
     "import-linter cannot run, so layering is unverified." \
