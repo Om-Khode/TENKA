@@ -85,9 +85,12 @@ docs/
 # Ignore everything under .claude/ EXCEPT shared project tooling:
 #   settings.json — .env-protection hook; benefits every contributor
 #   skills/       — project smoke-test skill
+#   rules/        — path-scoped instructions, split out of the gitignored
+#                   CLAUDE.md on 2026-08-22 so the rules survive a disk failure
 # Uses .claude/* (not .claude/) so the negations below can take effect —
 # git cannot re-include a file whose parent directory is excluded.
 # settings.local.json stays ignored: personal per-machine overrides.
 .claude/*
 !.claude/settings.json
 !.claude/skills/
+!.claude/rules/
