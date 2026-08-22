@@ -166,6 +166,10 @@ _FILE_EXT_RE = re.compile(r"\.\w{1,5}(?:\s|$)")
 _FILE_KEYWORDS = frozenset({
     "file", "files", "folder", "folders", "directory", "desktop",
     "documents", "downloads", "drive",
+    # Bare format nouns: "my tax return pdf" carries no dot, so _FILE_EXT_RE
+    # cannot see it. Generic formats only -- never a product name.
+    "pdf", "pdfs", "docx", "xlsx", "csv", "png", "jpg", "jpeg", "webp",
+    "zip", "txt", "screenshot", "screenshots", "spreadsheet",
 })
 
 # Create note (file)
@@ -176,8 +180,26 @@ _NOTE_RE = re.compile(
 
 # Forget / delete a stored fact — must precede _REMEMBER_FACT_RE so
 # "forget that cilantro is bad" doesn't match "don't forget that ..."
+# Forget / delete a stored fact.
+#
+# The qualifier is optional after `forget` and MANDATORY after the generic
+# verbs, because the two are not equally memory-flavoured. `forget X` is
+# almost always about something she was told; `delete X` is almost always
+# about a file, a window, or a monitor. The single pattern that treated them
+# alike claimed every utterance beginning with any of the four verbs, so
+# `delete "C:/.../notes.txt"` answered "I don't have anything about that"
+# while the classifier -- asked one turn later about the identical path --
+# got it right as `file_task`. Measured 2026-08-22.
+#
+# Widening either branch is the failure mode, so both directions are pinned
+# in tests/test_routing_overclaim.py: the memory phrasings this must still
+# claim, and the file work it must decline.
+_MEMORY_QUALIFIER = r"(?:that\s+|the\s+(?:fact|memory)\s+(?:that\s+)?|about\s+)"
 _FORGET_MEMORY_RE = re.compile(
-    r"^(?:forget|delete|remove|erase)\s+(?:that\s+|the\s+(?:fact|memory)\s+(?:that\s+)?|about\s+)?(.+)$",
+    r"^(?:"
+    rf"forget\s+{_MEMORY_QUALIFIER}?"          # `forget` alone is enough
+    rf"|(?:delete|remove|erase)\s+{_MEMORY_QUALIFIER}"   # these need saying so
+    r")(.+)$",
     re.I,
 )
 
@@ -498,6 +520,24 @@ def pre_route(text: str) -> IntentResult | None:
     m = _FORGET_MEMORY_RE.match(t)
     if m:
         content = m.group(1).strip()
+        # File-shaped content declines even when the qualifier is present:
+        # "remove that screenshot from the desktop" reads as memory phrasing
+        # and is file work. Same vocabulary `_SEARCH_RE` already applies to
+        # "find X" -- one definition of "looks like a file", two consumers.
+        #
+        # Quotes are stripped first, and separators flattened to spaces:
+        # `_FILE_EXT_RE` needs whitespace or end-of-string after the
+        # extension, so a quoted path failed the extension check on its
+        # trailing quote alone, and a backslash path is a single "word" that
+        # no keyword can match.
+        #
+        # A false decline costs one classifier call. A false claim answers
+        # from the wrong handler and never asks. The asymmetry is why this
+        # guard is deliberately eager.
+        _bare = content.strip("'\"")
+        _words = set(_bare.lower().replace("\\", " ").replace("/", " ").split())
+        if _FILE_EXT_RE.search(_bare + " ") or (_words & _FILE_KEYWORDS):
+            return None
         if not re.match(r"(?:my|this|the)\s+(?:face|voice)\b", content, re.I):
             return IntentResult(
                 intent="forget_memory",
