@@ -724,5 +724,8 @@ class TestSchemaV5:
             "id", "name", "cron_expr", "task_type", "task_goal",
             "notify_mode", "condition_text", "last_result_hash",
             "last_fired_at", "next_fire_at", "enabled", "created_at",
+            # v21. A schedule fires later with LOCAL_GRANTS, so the row has to
+            # say who asked for it -- see KI-30.
+            "installed_by",
         }
         assert expected == columns

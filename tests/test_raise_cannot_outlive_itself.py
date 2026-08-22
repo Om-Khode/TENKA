@@ -335,3 +335,89 @@ async def test_dispatch_allows_a_durable_install(turn, intent, monkeypatch):
 
     await actions.execute(intent, {"goal": "every morning"})
     assert ran, f"{intent} was refused at the keyboard, holding {required.value}"
+
+
+# ─── the audit column is actually written ────────────────────────────────────
+#
+# The column landed one commit before the write did, and both the ledger entry
+# and the commit message claimed it was populated. It was not: every row read
+# `'local'` from the migration default, regardless of who installed it -- which
+# is worse than an absent column, because it is confidently wrong. Same shape
+# as 6b's `quick`: correct decisions producing unreachable configuration.
+#
+# So these test the value, not the schema. A column nobody writes is not an
+# audit trail.
+
+@pytest.mark.parametrize("principal,expected", [
+    ("local", "local"),
+    ("device:phone", "device:phone"),
+    (None, "unknown"),
+])
+def test_the_installer_is_recorded_on_every_durable_trigger(
+        tmp_path, principal, expected):
+    """`None` records `unknown`, never `local`. The migration default is
+    `'local'` and that is honest for rows predating the column -- a remote
+    device could not reach these intents before the raise mechanism existed.
+    It is not honest for a new row whose principal nobody set."""
+    from assistant.core.principal import set_principal
+    from assistant.storage.db import Database
+    from assistant.storage.repos.monitor import MonitorRepo
+    from assistant.storage.repos.procedure import ProcedureRepo
+    from assistant.storage.repos.schedule import ScheduleRepo
+    from assistant.storage.repos.shortcut import ShortcutRepo
+
+    db = Database(tmp_path / "t.db")
+    try:
+        set_principal(principal)
+
+        MonitorRepo(db).create("m", "file_created", None, "code", "True", None,
+                               "code_executor", "x", 60, "g")
+        ScheduleRepo(db).create("s", "0 9 * * *", "web_search", "g",
+                                "silent", None, "2026-01-01T09:00:00")
+        ProcedureRepo(db, assistant_name_lower="tenka").create_procedure(
+            "trigger one", "p", [{"action": "noop"}], "auto", "d")
+        ShortcutRepo(db, assistant_name_lower="tenka",
+                     intents=["get_time"]).create_shortcut(
+            "trigger two", "get_time", {}, "d")
+
+        for table in ("event_monitors", "schedules",
+                      "user_procedures", "user_shortcuts"):
+            rows = db.fetchall(f"SELECT installed_by FROM {table}")
+            assert rows, f"{table} stored nothing -- this would pass vacuously"
+            for r in rows:
+                assert r["installed_by"] == expected, (
+                    f"{table}.installed_by is {r['installed_by']!r}, expected "
+                    f"{expected!r}. A row that names the wrong installer is "
+                    f"worse than one that names none."
+                )
+    finally:
+        set_principal(None)
+        db._conn.close()
+
+
+def test_an_upsert_reassigns_the_shortcut_to_whoever_overwrote_it(tmp_path):
+    """`create_shortcut` upserts on trigger. Re-installing is installing, so
+    the row must not keep the first installer's name forever."""
+    from assistant.core.principal import set_principal
+    from assistant.storage.db import Database
+    from assistant.storage.repos.shortcut import ShortcutRepo
+
+    db = Database(tmp_path / "t.db")
+    try:
+        repo = ShortcutRepo(db, assistant_name_lower="tenka",
+                            intents=["get_time"])
+        set_principal("local")
+        repo.create_shortcut("same one", "get_time", {}, "first")
+        set_principal("device:phone")
+        repo.create_shortcut("same one", "get_time", {}, "second")
+
+        row = db.fetchone(
+            "SELECT installed_by FROM user_shortcuts "
+            "WHERE trigger = 'same one'")
+        assert row["installed_by"] == "device:phone", (
+            f"the upsert kept {row['installed_by']!r} -- the row now belongs "
+            f"to whoever overwrote it, and the audit trail must say so"
+        )
+    finally:
+        set_principal(None)
+        db._conn.close()
