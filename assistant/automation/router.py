@@ -927,6 +927,109 @@ async def _tavily_recon_search(query: str) -> list[dict]:
 #: A recon query is a phrase naming a site or a task, never a document.
 _MAX_RECON_QUERY_CHARS = 400
 
+# ─── Recon query shaping and host choice ────────────────────────────────────
+#
+# Both of these were inline in `_url_recon` and both were wrong in the same
+# way: an unvalidated guess that silently won. Extracted as pure functions so
+# they can be tested without a search provider -- the bug they caused took a
+# live run and a log read to find, and neither needed a network call to
+# reproduce once the decision was separable.
+
+# Words that mean "answer this for where I am". The city is appended to a
+# recon query only when one is present.
+#
+# Appending it unconditionally is what produced `hif.wikipedia.org` for
+# "Open Wikipedia and find Alan Turing's birth year" on 2026-08-22: the query
+# that left this machine carried a city name that had nothing to do with the
+# question, and the search provider ranked a regional-language Wikipedia
+# first. Alan Turing's birth year is the same in every city.
+#
+# Locality cues only -- never a category or product name. "restaurant" and
+# "hotel" are *domains* that often want a location; "near me" is a request
+# for one. Listing domains here would be a hardcoded topic table, which is
+# exactly what THE-rule forbids.
+# Single words only where the word cannot mean anything else. "open" was in
+# this set for one round and matched "**Open** Wikipedia" -- the most common
+# verb in the whole system -- which is the same over-claiming mistake as the
+# routing pattern this pass also fixed, made while fixing it. Ambiguous
+# state words (open, closes, drive, walk) live in the phrase list instead,
+# where the surrounding words disambiguate them.
+_LOCALITY_CUES = frozenset({
+    "near", "nearby", "nearest", "closest", "local", "locally",
+    "directions", "distance", "commute", "delivery",
+})
+_LOCALITY_PHRASES = ("near me", "around here", "around me", "in my area",
+                     "close to me", "next to me", "where i am",
+                     "open now", "still open", "closest to me",
+                     "how far", "walking distance")
+
+
+def _is_locality_query(text: str) -> bool:
+    """Does answering this depend on where the user is?"""
+    low = (text or "").lower()
+    if any(p in low for p in _LOCALITY_PHRASES):
+        return True
+    return bool({w.strip(".,!?") for w in low.split()} & _LOCALITY_CUES)
+
+
+def _host_specificity(host: str) -> int:
+    """How many labels sit in front of the registrable domain.
+
+    `wikipedia.org` -> 0, `en.wikipedia.org` -> 1, `a.b.wikipedia.org` -> 2.
+    Lower is more canonical. Deliberately arithmetic on labels rather than a
+    list of preferred subdomains: a preferred-subdomain list would need an
+    entry per site, which is the app-specific table THE-rule forbids.
+    """
+    labels = [l for l in (host or "").lower().split(".") if l]
+    # `co.uk`-style public suffixes make the registrable domain two labels.
+    # Two is the floor either way, so anything beyond it is a subdomain.
+    return max(0, len(labels) - 2)
+
+
+def _choose_recon_url(results: list[dict], hints: list[str]) -> tuple[str | None, str]:
+    """Pick a URL from search results. Returns (url, reason).
+
+    The old version returned the *first* result whose hostname contained a
+    hint and discarded the rest silently, so `"wikipedia" in "hif.wikipedia.org"`
+    won on search rank alone and the log printed only the winner -- there was
+    no way to see from the log that `en.wikipedia.org` had also matched.
+
+    Now: every hint match is collected, the least specific host wins, and ties
+    keep search order. The reason string names how many candidates there were,
+    so an ambiguous choice is visible in the log rather than invisible.
+    """
+    usable = [r for r in results if r.get("url")]
+    if not usable:
+        return None, "no results"
+
+    for hint in hints:
+        matches = [
+            r for r in usable
+            if hint in ((urlparse(r["url"]).hostname or "").lower())
+        ]
+        if not matches:
+            continue
+        best = min(
+            enumerate(matches),
+            key=lambda pair: (
+                _host_specificity(urlparse(pair[1]["url"]).hostname or ""),
+                pair[0],
+            ),
+        )[1]
+        host = urlparse(best["url"]).hostname or ""
+        if len(matches) > 1:
+            others = ", ".join(
+                sorted({(urlparse(r["url"]).hostname or "") for r in matches})
+            )
+            reason = (f"matched {hint!r} in {len(matches)} hosts ({others}); "
+                      f"chose {host} as least specific")
+        else:
+            reason = f"matched {hint!r} in {host}"
+        return best["url"], reason
+
+    return usable[0]["url"], "no domain hint match, using first result"
+
+
 
 async def _url_recon(goal: str, *, planner_goal: str = "") -> str | None:
     if _URL_PATTERN.search(goal):
@@ -950,11 +1053,16 @@ async def _url_recon(goal: str, *, planner_goal: str = "") -> str | None:
             f"document, not a search phrase — not sending it"
         )
         return None
-    from ..core.geolocation import get_cached_region
-    _geo = get_cached_region() or {}
-    _city = _geo.get("city", "")
-    if _city and _city.lower() not in search_query.lower():
-        search_query = f"{search_query} {_city}"
+    # The city is a *disambiguator*, not context: it only helps when the
+    # answer depends on where the user is. Appending it to every query is
+    # what sent "Alan Turing's birth year" to a regional-language Wikipedia
+    # -- see _is_locality_query above.
+    if _is_locality_query(search_query):
+        from ..core.geolocation import get_cached_region
+        _geo = get_cached_region() or {}
+        _city = _geo.get("city", "")
+        if _city and _city.lower() not in search_query.lower():
+            search_query = f"{search_query} {_city}"
 
     try:
         results = await _tavily_recon_search(search_query)
@@ -972,15 +1080,10 @@ async def _url_recon(goal: str, *, planner_goal: str = "") -> str | None:
         if len(w) > 2 and w.lower().strip(".,!?") not in _DETECT_STOP_WORDS
     ]
 
-    for hint in hints:
-        for r in results:
-            host = urlparse(r["url"]).hostname or ""
-            if hint in host.lower():
-                logger.info(f"[DA] URL recon: matched '{hint}' in {host} → {r['url']}")
-                return r["url"]
-
-    url = results[0]["url"]
-    logger.info(f"[DA] URL recon: no domain hint match, using first result → {url}")
+    url, reason = _choose_recon_url(results, hints)
+    if url is None:
+        return None
+    logger.info(f"[DA] URL recon: {reason} → {url}")
     return url
 
 
