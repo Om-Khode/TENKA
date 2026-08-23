@@ -9,7 +9,7 @@ facade delegates here.
 import json
 import logging
 
-from ...core.redact import redact_secrets
+from ...core.redact import redact_secrets, redact_secrets_strict
 import os
 import warnings
 from datetime import datetime, timedelta
@@ -438,6 +438,28 @@ class MemoryRepo:
         self, limit: int = 25, header: str = "RECENT CONVERSATION HISTORY:",
         session_id: str = "",
     ) -> str:
+        """Render recent turns as prompt text, **strictly redacted**.
+
+        This function exists only to build a string for a model, and three of
+        its callers put the result into a code-generation prompt
+        (`code_executor/orchestrator.py`) or a plan-generation one
+        (`actions/planner/planner.py`). So it is an egress boundary, and the
+        tier is chosen for that:
+
+        `redact_secrets_strict`, not the lenient `redact_secrets` used on the
+        way into `conversations`. The asymmetry is the point, and it follows
+        from the argument written at that write site: over-redaction on write is
+        **unrecoverable**, because the stored row is her memory. Over-redaction
+        here costs one degraded prompt while the stored value stays intact. The
+        two directions have opposite failure costs, so they get opposite
+        defaults.
+
+        Belt to the write-side braces rather than a replacement for them.
+        Redaction at write (KI-29) only protects rows written since it shipped:
+        anything older, anything the historical scrub's patterns missed, and
+        anything restored from a backup taken before it all arrives here
+        unscrubbed. This is the last point before the bytes leave the machine.
+        """
         try:
             turns = self.get_recent(limit, session_id=session_id)
             if not turns:
@@ -446,8 +468,8 @@ class MemoryRepo:
             if header:
                 lines.append(header)
             for t in turns:
-                lines.append(f"User: {t['user_input']}")
-                lines.append(f"Assistant: {t['response']}")
+                lines.append(f"User: {redact_secrets_strict(t['user_input'])}")
+                lines.append(f"Assistant: {redact_secrets_strict(t['response'])}")
             return "\n".join(lines)
         except Exception:
             return ""
