@@ -24,6 +24,46 @@ suite is also too slow to run whole, which is how a route-completeness sweep sat
 Any new test that drives the desktop or launches a real browser gets
 `@pytest.mark.live_automation`, and is run only on a machine nobody is using.
 
+**The marker is a courtesy, not a guarantee.** `-m 'not live_automation'` filters *after*
+collection, so a module's import-time side effects run whatever its markers say, and a file
+can reach the desktop through something no signal list mentions. On 2026-08-23 a run of all
+271 files -- serially, from a script written to be the safe way to do this -- seized the
+mouse and keyboard while the operator was working. The marker audit had flagged one file
+that day, and it was not the one that did it.
+
+So the rule is not "audit, then run". It is: **run only files you have read, one at a time,
+and never while someone is using the machine.** `scripts/baseline.py` now refuses a
+whole-suite run unless given `--all-i-know-what-this-does`.
+
+## The baseline
+
+`tests/BASELINE.md` records the status of every test file, one pytest invocation each,
+written by `scripts/baseline.py`. It exists so a failure during a change can be told apart
+from one that was already there.
+
+    py -3.11 scripts/baseline.py            # run everything, rewrite the ledger
+    py -3.11 scripts/baseline.py --check    # compare, write nothing (exit 1 on a regression)
+    py -3.11 scripts/baseline.py --files test_foo.py test_bar.py
+
+Not theoretical: three changes in two days hit pre-existing failures
+(`test_schema_versioning`, `test_verification_vision`, `test_repo_preference`) and each cost
+a revert-and-rerun to attribute. **Check the ledger before assuming a red file is yours.**
+
+It classifies six states, and the four unobvious ones are all shapes this project has been
+bitten by: `HUNG` (a test that stalls on a mutant never goes red), `EMPTY` (a file that
+collects nothing passes every assertion it does not contain), `SKIPPED` (not coverage), and
+`UNKNOWN` (no parseable summary — fail closed, exactly as the `import-linter` hook does).
+
+**Per-file is a safety requirement, not an equivalence claim.** Process-wide singletons —
+one SQLite connection, `pending_registry`, `abort`, the contextvars — mean it cannot see a
+test that only fails when another file ran first. `test_repo_preference` shows 1 failure
+alone and 12 in company. A change that touches singleton lifetime must also run its own
+affected files together in one pass, and say so.
+
+It also audits markers: a file that imports something able to move the real mouse, without
+`live_automation` and without mocking or a skip guard, is listed. `addopts` only protects
+tests that carry the marker.
+
 ## A test that does not fail when its mechanism is removed is not a test
 
 Before claiming a test covers something: **delete or invert the thing it is supposed to
