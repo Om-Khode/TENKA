@@ -2565,15 +2565,29 @@ async def _build_conversation_messages() -> tuple[list[dict], str | None]:
         logger.debug(f"[CC] Below threshold ({len(turns)} <= 15), no compression")
         verbatim_turns = turns
 
+    # Strict redaction on the way out. These turns came out of storage and are
+    # about to be sent to a model, so this is egress: `redact_secrets_strict`,
+    # not the lenient tier that guards the write. The write side is lenient
+    # because over-redaction there is unrecoverable -- it is her memory; here
+    # it costs one degraded prompt and the stored row is untouched.
+    #
+    # Only replayed content is scrubbed, never the caller's live utterance,
+    # which is handled by the turn itself. That distinction is deliberate: a
+    # user who says "call the API with this key" has to be able to.
+    from .core.redact import redact_secrets_strict
     messages: list[dict] = []
     for t in verbatim_turns:
-        messages.append({"role": "user", "content": t["user_input"]})
+        messages.append({
+            "role": "user",
+            "content": redact_secrets_strict(t["user_input"]),
+        })
         if since and t.get("timestamp", "") < since:
             messages.append({"role": "assistant", "content": "(responded)"})
         else:
             messages.append({
                 "role": "assistant",
-                "content": _strip_name_prefix(t["response"]),
+                "content": redact_secrets_strict(
+                    _strip_name_prefix(t["response"])),
             })
 
     return messages, summary
@@ -2590,13 +2604,18 @@ def _build_facts_context() -> str:
         if not facts:
             return ""
 
+        # Egress, so strict -- see `_build_conversation_messages`. A fact value
+        # is the likeliest stored secret of the lot: `save_typed_fact` is what
+        # records "my api key is ..." as a durable fact about the user, and this
+        # string goes into the system prompt on every single turn.
+        from .core.redact import redact_secrets_strict
         lines = ["KNOWN FACTS ABOUT THE USER:"]
         seen_keys = set()
         for f in facts:
             key = f["key"]
             if key not in seen_keys:
                 seen_keys.add(key)
-                lines.append(f"  {key}: {f['value']}")
+                lines.append(f"  {key}: {redact_secrets_strict(f['value'])}")
 
         return "\n".join(lines) if len(lines) > 1 else ""
     except Exception:

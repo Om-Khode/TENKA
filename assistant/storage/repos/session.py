@@ -55,17 +55,33 @@ class SessionRepo:
         self._db.commit()
 
     def get_last_snapshot(self) -> dict | None:
+        """The most recent summarised session.
+
+        `ORDER BY started_at DESC, id DESC` -- the `id` tie-break is not
+        decoration. `started_at` is `datetime.now().isoformat()`, and the system
+        clock's granularity on this platform is around 15ms, so two sessions
+        started in quick succession get **identical** timestamps and the
+        ordering between them is whatever SQLite happens to do. That made
+        `test_get_last_snapshot_returns_most_recent_summarized` fail roughly one
+        run in three, on `main`, for a reason that had nothing to do with
+        sessions.
+        A flaky test is worse than a red one: it teaches everyone to re-run
+        rather than to look. Fixed in the query rather than by spacing out the
+        timestamps in the test, because the ambiguity is real -- `id` is
+        monotonic, so on a tie the later insert is genuinely the later session.
+        """
         row = self._db.fetchone(
             "SELECT * FROM session_snapshots "
             "WHERE summarized = 1 "
-            "ORDER BY started_at DESC LIMIT 1"
+            "ORDER BY started_at DESC, id DESC LIMIT 1"
         )
         return dict(row) if row else None
 
     def get_last_interaction_time(self) -> str | None:
+        """Same tie-break, same reason -- see `get_last_snapshot`."""
         row = self._db.fetchone(
             "SELECT started_at FROM session_snapshots "
-            "ORDER BY started_at DESC LIMIT 1"
+            "ORDER BY started_at DESC, id DESC LIMIT 1"
         )
         return row["started_at"] if row else None
 
