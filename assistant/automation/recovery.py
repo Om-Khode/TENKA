@@ -46,16 +46,46 @@ class RecoveryAttempt:
     diagnose_class: str          # "overlay_appeared" | "error_shown" | "no_change" | "success" | "unknown"
     detail: str                  # human-readable observation from diagnose
     action_taken: str            # "bbox_click" | "replan_input" | "retry" | "escalated"
-    succeeded: bool              # True if verify passed after recovery
+    outcome: Outcome             # what re-verification concluded about THIS attempt
     cost_calls: int              # vision/text calls used in this attempt
 
 
 @dataclass
 class RecoveryOutcome:
-    succeeded: bool
+    """What came of trying to recover, and on what evidence.
+
+    **One `Outcome`, not two booleans.** `succeeded` and `escalated` made four
+    combinations of which two were meaningless, and neither could express the
+    two states that matter most here:
+
+      `UNCERTAIN`   -- the recovery action ran and nothing could confirm what
+                       it did. Reported as a failure before this, which
+                       asserts positive evidence the step did not work when
+                       there is none.
+      `UNSUPPORTED` -- there is no strategy for what went wrong, so nothing was
+                       attempted. Reported as a failure too, and worse, only
+                       after paying for a diagnosis, a dispatch into a stub and
+                       a re-verification, once per attempt.
+
+    The caller still halts on all three non-success outcomes -- halting on
+    uncertainty is the safe direction and P6 did not change that. What changes
+    is what it says about why.
+    """
+
+    outcome: Outcome
     attempts: list[RecoveryAttempt] = field(default_factory=list)
     final_observation: str = ""  # last verify observation, used for user message
-    escalated: bool = False      # True if we gave up and need user input
+
+    @property
+    def succeeded(self) -> bool:
+        """Positive evidence the recovery worked. Nothing else counts.
+
+        Kept as a property, unlike `VerifyResult.ok`, because its meaning did
+        not change -- it was already `Outcome.SUCCEEDED`'s question, asked with
+        a narrower type. `escalated` is *not* kept: it meant "not succeeded"
+        and reading it that way is what let uncertainty be reported as failure.
+        """
+        return self.outcome.is_evidence_of_success
 
 
 # ─── Diagnose prompt ─────────────────────────────────────────────────────────
@@ -365,6 +395,40 @@ async def _recover_no_change(step: dict, page, active_window) -> tuple[bool, int
     return False, 0
 
 
+_UNIMPLEMENTED_STRATEGIES: "frozenset[str]" = frozenset({
+    "error_shown", "no_change",
+})
+"""Classes `_diagnose` can return that no strategy actually handles.
+
+Declared as data so the loop can stop *before* spending anything, which is the
+deterministic-before-semantic rule applied where it pays here. What it replaced:
+a classification of either of these dispatched into a stub returning
+`(False, 0)`, paid for a post-verification (and a vision escalation on top when
+that came back ambiguous), found nothing changed, and went round again -- so
+roughly four model calls to reach a conclusion available for free after the
+first diagnosis. Now one diagnosis, then `UNSUPPORTED`.
+
+Both stay stubs, and the reason is worth writing down rather than leaving as a
+TODO:
+
+`no_change` is "settle, then do the step again", and doing a step again is only
+safe if the step is safe to repeat. Nothing in a step dict says whether it is:
+re-clicking a submit control or re-typing into a field that did take the first
+keystrokes is a second effect, not a retry. The metadata that would answer it
+is the affordance model, so this waits for it rather than guessing per action
+type.
+
+`error_shown` is "replan the input given what the error said", which means
+handing a model an on-screen string and running what it writes back. That is an
+untrusted-input path into a step generator, and it wants the fencing discipline
+`code_executor/prompts.py` already has, not a quick `_diagnose` follow-up.
+
+Removing a name from this set without writing the strategy re-opens the burn --
+`tests/test_recovery_verdict.py` pins that every class either has a strategy or
+is listed here.
+"""
+
+
 # ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 async def attempt_recovery(
@@ -378,17 +442,26 @@ async def attempt_recovery(
 ) -> RecoveryOutcome:
     """Generic, goal-driven recovery loop.
 
-    Caller invokes this on verification failure. Returns RecoveryOutcome with
-    succeeded=True if recovery worked, or escalated=True if max_attempts
-    reached, unknown class encountered, or the same observation was seen
-    twice (loop guard).
+    Caller invokes this on verification failure. Returns a `RecoveryOutcome`
+    whose `outcome` says what the evidence supports:
 
-    Caller responsibilities:
-      - succeeded → continue to next step
-      - escalated → halt the run and surface final_observation to the user
+      SUCCEEDED   re-verification confirmed the recovery. Continue.
+      FAILED      positive evidence it did not work -- the world was observably
+                  unchanged after acting, or the last verification said so.
+      UNCERTAIN   something was attempted and nothing could confirm what it
+                  did, or the diagnosis could not classify what went wrong.
+      UNSUPPORTED nothing was attempted: no strategy exists for this class.
+
+    Caller responsibilities: continue on SUCCEEDED, halt on the other three --
+    and say which one, because "I could not tell" and "it did not work" are
+    different things to tell someone.
     """
     attempts: list[RecoveryAttempt] = []
     last_observation = getattr(verify_result, "observation", "") or ""
+    # What to report if the attempt budget runs out. FAILED until a
+    # verification says otherwise: exhausting every attempt with nothing
+    # confirmed is the one place a bare "did not work" is the honest summary.
+    last_outcome = Outcome.FAILED
 
     for attempt_num in range(max_attempts):
         diag = await _diagnose(goal, last_observation, step)
@@ -397,38 +470,64 @@ async def attempt_recovery(
 
         # Success — verification was a false alarm, step actually worked.
         if cls == "success":
-            attempts.append(RecoveryAttempt(cls, detail, "false_alarm", True, 1))
+            attempts.append(
+                RecoveryAttempt(cls, detail, "false_alarm", Outcome.SUCCEEDED, 1))
             logger.info(f"[recovery] success class — false alarm, step OK: {detail}")
             return RecoveryOutcome(
-                succeeded=True,
+                outcome=Outcome.SUCCEEDED,
                 attempts=attempts,
                 final_observation=detail or last_observation,
-                escalated=False,
             )
 
         # Bail out on unknown — never improvise a strategy.
+        #
+        # UNCERTAIN, not FAILED: `_diagnose` fails open to this class on a
+        # missing screenshot, an LLM crash, a parse failure or a class it does
+        # not recognise, and none of those is evidence about the step. Calling
+        # them failure would have this reporting the world unchanged whenever
+        # the free tier ran out.
         if cls == "unknown":
-            attempts.append(RecoveryAttempt(cls, detail, "escalated", False, 1))
+            attempts.append(
+                RecoveryAttempt(cls, detail, "escalated", Outcome.UNCERTAIN, 1))
             logger.info(f"[recovery] unknown class — escalating: {detail}")
             return RecoveryOutcome(
-                succeeded=False,
+                outcome=Outcome.UNCERTAIN,
                 attempts=attempts,
                 final_observation=detail or last_observation,
-                escalated=True,
+            )
+
+        # No strategy for this class — stop before paying for anything else.
+        # See `_UNIMPLEMENTED_STRATEGIES` for why these two are stubs and what
+        # each would need first.
+        if cls in _UNIMPLEMENTED_STRATEGIES:
+            attempts.append(
+                RecoveryAttempt(cls, detail, "no_strategy", Outcome.UNSUPPORTED, 1))
+            logger.info(
+                f"[recovery] {cls} has no strategy — escalating without "
+                f"attempting anything: {detail}"
+            )
+            return RecoveryOutcome(
+                outcome=Outcome.UNSUPPORTED,
+                attempts=attempts,
+                final_observation=detail or last_observation,
             )
 
         # Loop guard: same detail twice in a row → immediate escalate.
         # Compares against the previous attempt's diagnose detail (not its
         # post-recovery verify observation). If the world looks the same
         # after one recovery cycle, more cycles won't help.
+        #
+        # FAILED, and this is the one branch that earns it: a recovery action
+        # ran and the re-perception describes the same world it described
+        # before. That is evidence about the step, not an absence of evidence.
         if attempts and detail and detail == attempts[-1].detail:
-            attempts.append(RecoveryAttempt(cls, detail, "escalated", False, 1))
+            attempts.append(
+                RecoveryAttempt(cls, detail, "escalated", Outcome.FAILED, 1))
             logger.info(f"[recovery] same diagnose detail twice — escalating: {detail}")
             return RecoveryOutcome(
-                succeeded=False,
+                outcome=Outcome.FAILED,
                 attempts=attempts,
                 final_observation=detail,
-                escalated=True,
             )
 
         # Dispatch — strategy ↔ class is 1:1.
@@ -438,21 +537,23 @@ async def attempt_recovery(
                 target_hint=diag.get("recovery_target", ""),
             )
             action = "bbox_click"
-        elif cls == "error_shown":
-            ok, calls = await _recover_error(step, detail, page, active_window)
-            action = "replan_input"
-        elif cls == "no_change":
-            ok, calls = await _recover_no_change(step, page, active_window)
-            action = "retry"
         else:
-            # _VALID_CLASSES is closed and unknown is handled above; this
-            # branch is unreachable. Treat as escalate to be safe.
-            attempts.append(RecoveryAttempt(cls, detail, "escalated", False, 1))
+            # `_VALID_CLASSES` is closed, `success` and `unknown` return above,
+            # and the remaining two are in `_UNIMPLEMENTED_STRATEGIES` and also
+            # return above -- so this is unreachable. UNSUPPORTED rather than
+            # FAILED: reaching it means a class was added to `_VALID_CLASSES`
+            # with neither a strategy nor a listing, which is precisely "no
+            # route exists", and nothing was attempted.
+            logger.warning(
+                f"[recovery] class {cls!r} has no dispatch branch — a class "
+                f"was added without a strategy or a listing"
+            )
+            attempts.append(
+                RecoveryAttempt(cls, detail, "no_strategy", Outcome.UNSUPPORTED, 1))
             return RecoveryOutcome(
-                succeeded=False,
+                outcome=Outcome.UNSUPPORTED,
                 attempts=attempts,
                 final_observation=detail,
-                escalated=True,
             )
 
         # Re-verify after the recovery action. Diagnose was 1 vision call;
@@ -461,13 +562,16 @@ async def attempt_recovery(
             from . import verification
             vr = await verification.post_verify(step, page=page, active_window=active_window)
         except Exception as e:
+            # UNCERTAIN, not FAILED. The recovery action already ran; what
+            # broke is the check on it, so nothing here is evidence about the
+            # step. Same distinction `VerifyResult.crashed()` draws.
             logger.warning(f"[recovery] post-verify after recovery crashed: {e}")
-            attempts.append(RecoveryAttempt(cls, detail, action, False, calls + 1))
+            attempts.append(
+                RecoveryAttempt(cls, detail, action, Outcome.UNCERTAIN, calls + 1))
             return RecoveryOutcome(
-                succeeded=False,
+                outcome=Outcome.UNCERTAIN,
                 attempts=attempts,
                 final_observation=f"post-verify crashed: {e}",
-                escalated=True,
             )
 
         # `VerifyResult.ok` is True for three different things: confident
@@ -501,16 +605,15 @@ async def attempt_recovery(
         # "ambiguous"` -- was correct but was reconstructing, at one call site,
         # what the type should have said itself. `Outcome.SUCCEEDED` is the only
         # positive evidence there is; a recovery has nothing to claim without it.
-        _confirmed = vr.outcome is Outcome.SUCCEEDED
-        attempts.append(RecoveryAttempt(cls, detail, action, _confirmed, calls + 2))
+        attempts.append(RecoveryAttempt(cls, detail, action, vr.outcome, calls + 2))
+        last_outcome = vr.outcome
 
-        if _confirmed:
+        if vr.outcome.is_evidence_of_success:
             logger.info(f"[recovery] recovered via {action} on attempt {attempt_num + 1}")
             return RecoveryOutcome(
-                succeeded=True,
+                outcome=Outcome.SUCCEEDED,
                 attempts=attempts,
                 final_observation=getattr(vr, "observation", "") or "",
-                escalated=False,
             )
 
         if vr.outcome in (Outcome.UNCERTAIN, Outcome.UNVERIFIED):
@@ -529,13 +632,18 @@ async def attempt_recovery(
 
         last_observation = getattr(vr, "observation", "") or ""
 
-    # Exhausted attempts.
-    logger.info(f"[recovery] exhausted {max_attempts} attempts — escalating")
+    # Exhausted attempts. Report what the last verification concluded rather
+    # than a blanket failure: running out of tries after three inconclusive
+    # checks is not evidence the step did not work, and saying so would be the
+    # same overclaim in the opposite direction from the one KI-31 fixed.
+    logger.info(
+        f"[recovery] exhausted {max_attempts} attempts — escalating "
+        f"({last_outcome.value})"
+    )
     return RecoveryOutcome(
-        succeeded=False,
+        outcome=last_outcome,
         attempts=attempts,
         final_observation=last_observation,
-        escalated=True,
     )
 
 

@@ -2127,6 +2127,21 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             from . import session as session_mod
             session_id = session_mod.get_current_session_id()
             conv_row_id: int | None = None
+            # A refusal anywhere in the turn counts, not only the two sites
+            # above. Those two are the ones this function can see; a capability
+            # decision inside a planner step happens six frames down and used
+            # to leave no trace here at all, so the turn was summarised into
+            # `session_snapshots` and replayed as fact next session -- the
+            # failure `session._exclude_security_skips` exists to stop, through
+            # a door it does not cover. `actions._note_refusal` writes the
+            # ledger; this is the only reader.
+            _refused_anywhere = bool(getattr(_tracker, "refused_capabilities", None))
+            if _refused_anywhere and not _security_skip_this_turn:
+                logger.info(
+                    f"[SECURITY] Turn marked security_skip: refusal(s) for "
+                    f"{sorted(_tracker.refused_capabilities)} during dispatch"
+                )
+            _security_skip_this_turn = _security_skip_this_turn or _refused_anywhere
             try:
                 conv_row_id = memory.save_turn(
                     user_input=transcription,

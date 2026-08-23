@@ -30,7 +30,8 @@ _ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from assistant.automation.verification import VerifyResult  # noqa: E402
+from assistant.automation.verification import VerifyResult
+from assistant.brain.task import Outcome  # noqa: E402
 
 STEP = {"type": "app", "action": "click", "params": {"name": "OK"}}
 
@@ -59,10 +60,16 @@ def recovered(monkeypatch):
 
         async def _fake_diagnose(goal, verify_observation, step):
             # `_diagnose` returns the dict the loop destructures, not a tuple.
-            return {"class": "no_change", "detail": "nothing changed",
-                    "recovery_target": ""}
+            #
+            # `overlay_appeared`, not `no_change`: the latter is in
+            # `_UNIMPLEMENTED_STRATEGIES`, so the loop now stops on the
+            # diagnosis and never reaches the re-verification these tests are
+            # about. The class is incidental here -- what is under test is what
+            # a verdict means once a strategy HAS run.
+            return {"class": "overlay_appeared", "detail": "a dialog is open",
+                    "recovery_target": "close button"}
 
-        async def _fake_strategy(step, page, active_window):
+        async def _fake_strategy(*args, **kwargs):
             return True, 1
 
         # `recovery.py` imports `verification` inside the function, so it is
@@ -72,7 +79,7 @@ def recovered(monkeypatch):
         monkeypatch.setattr(verification_mod, "post_verify", _fake_post_verify)
         monkeypatch.setattr(verification_mod, "vision_verify", _fake_vision)
         monkeypatch.setattr(recovery, "_diagnose", _fake_diagnose)
-        monkeypatch.setattr(recovery, "_recover_no_change", _fake_strategy)
+        monkeypatch.setattr(recovery, "_recover_overlay", _fake_strategy)
 
         from assistant import config
         monkeypatch.setattr(config, "VERIFY_VISION_FALLBACK", vision_enabled,
@@ -99,7 +106,11 @@ async def test_an_ambiguous_verdict_is_not_a_recovery(recovered):
         "recovery claimed success on a verdict that means 'the code cannot "
         "decide'. The step loop then continues on an unverified screen."
     )
-    assert outcome.escalated, "an unconfirmed recovery must escalate"
+    # UNCERTAIN, not FAILED: a strategy ran and nothing could confirm what it
+    # did. Reporting failure would assert positive evidence the step did not
+    # work, which is the same overclaim in the opposite direction.
+    assert outcome.outcome is Outcome.UNCERTAIN, (
+        f"an unconfirmed recovery reported {outcome.outcome.value}")
 
 
 @pytest.mark.asyncio
@@ -124,11 +135,11 @@ async def test_vision_being_switched_off_cannot_upgrade_uncertainty(recovered):
 
 @pytest.mark.asyncio
 async def test_the_attempt_record_matches_the_verdict(recovered):
-    """`RecoveryAttempt.succeeded` feeds the operator-facing summary. It used to
-    record `bool(vr.ok)`, so the log agreed with the lie."""
+    """`RecoveryAttempt.outcome` feeds the operator-facing summary. It used to
+    be a bool recording `bool(vr.ok)`, so the log agreed with the lie."""
     outcome = await recovered([VerifyResult.ambiguous("cannot tell")])
     assert outcome.attempts, "no attempt recorded -- test would pass vacuously"
-    assert not outcome.attempts[-1].succeeded, (
+    assert not outcome.attempts[-1].outcome.is_evidence_of_success, (
         "the attempt log records the recovery as verified while the outcome "
         "says it was not"
     )
@@ -159,8 +170,8 @@ async def test_a_confident_verdict_is_still_a_recovery(recovered):
         "a confident code-tier success was not reported as a recovery -- "
         "recovery is now unable to ever succeed"
     )
-    assert not outcome.escalated
-    assert outcome.attempts[-1].succeeded
+    assert outcome.outcome is Outcome.SUCCEEDED
+    assert outcome.attempts[-1].outcome is Outcome.SUCCEEDED
 
 
 @pytest.mark.asyncio
