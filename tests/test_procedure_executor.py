@@ -4,7 +4,46 @@ test_procedure_executor.py — TP-1c: procedure_executor unit tests
 Tests variable resolution, error detection, and step routing
 with mocked computer_task backends.
 
-Run: python test_procedure_executor.py
+Fifteen tests here stub the native-automation backend with
+`patch.dict(sys.modules, {"assistant.automation.native": mock})`, and that
+form only works by luck. `procedure_executor.py` reaches the backend as
+`from .automation import native as app_automation` (four sites), which reads an
+ATTRIBUTE on the `assistant.automation` package. `sys.modules` is consulted
+only while that attribute does not exist yet:
+
+    >>> hasattr(assistant.automation, "native")     # nothing imported it yet
+    False
+    >>> with patch.dict(sys.modules, {"assistant.automation.native": mock}):
+    ...     from assistant.automation import native
+    >>> native is mock
+    True
+
+    >>> import assistant.automation.native           # ANY earlier import
+    >>> hasattr(assistant.automation, "native")
+    True
+    >>> with patch.dict(sys.modules, {"assistant.automation.native": mock}):
+    ...     from assistant.automation import native
+    >>> native is mock
+    False                                            # the REAL module
+
+Every import of it inside `procedure_executor.py` is function-local, so running
+this file alone leaves the attribute unbound and all fifteen stubs hold. Run it
+after anything that imports the real module and they all stop holding at once
+-- and the calls behind them are `open_app` (launches an application),
+`click_element`, `type_text` and `focus_window`, driven through Terminator on
+the live desktop. Safe alone, hijacks the machine in company: the exact shape
+`.claude/rules/testing.md` records for `test_repo_preference`, except this one
+fails by taking the mouse rather than by going red.
+
+`_native_unbound` below removes the luck. See its docstring.
+
+Three tests in `TestClickWithWindowScope` already did the robust thing -- they
+patch the package ATTRIBUTE alongside `sys.modules` -- and they are the reason
+those patches carry `create=True`: the fixture unbinds the attribute, so there
+is no original for `patch` to save. Their pattern is the one to copy when
+adding a test here.
+
+Run: py -3.11 -m pytest tests/test_procedure_executor.py -q
 """
 
 import asyncio
@@ -13,6 +52,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -30,6 +71,144 @@ def _fresh_db():
     init_db(tmp)
     ps._repo = None
     ps.init_procedure_db()
+
+
+@pytest.fixture(autouse=True)
+def _no_screen_no_network():
+    """Make the self-heal path inert for every test in this file.
+
+    A second hazard, and nothing in this file stubs it. `run_procedure` retries
+    a failing step `_MAX_RETRIES` times and then calls `_self_heal`, which does:
+
+        from .io import screen as _screen        # package attribute
+        from . import llm as _llm                # package attribute
+        img = _screen.capture_screenshot_base64()
+
+    So any test that makes a step return an error -- `test_stops_on_error` does
+    it deliberately, three times over -- takes a real screenshot of whatever is
+    on the operator's display and then spends a real Gemini call describing it.
+    Neither is stubbed anywhere, and `patch.dict(sys.modules, ...)` would not
+    have reached them if it were: these are the same package-attribute reads as
+    `native`, and there is no `patch.dict` here to fix.
+
+    Blanket rather than per-test, because the correct rule for this file is
+    absolute: a unit test of procedure routing has no business reading the
+    screen or calling a model, so make both impossible instead of enumerating
+    which tests happen to trip them. `_self_heal` fails closed on a falsy
+    screenshot -- it returns `None`, meaning "not healed" -- so returning
+    `None` here exercises the same branch a screenshot failure would, without a
+    camera roll of the operator's desktop.
+    """
+    import assistant as _pkg
+    import assistant.io as _io_pkg
+    import assistant.io.screen as _real_screen
+    import assistant.llm as _real_llm
+
+    inert_screen = MagicMock(name="inert_screen")
+    inert_screen.capture_screenshot_base64 = MagicMock(return_value=None)
+    inert_llm = MagicMock(name="inert_llm")
+    inert_llm.get_vision_response = AsyncMock(
+        side_effect=AssertionError(
+            "a unit test in test_procedure_executor.py tried to call a model"))
+
+    _io_pkg.screen = inert_screen
+    _pkg.llm = inert_llm
+    try:
+        yield
+    finally:
+        _io_pkg.screen = _real_screen
+        _pkg.llm = _real_llm
+
+
+@pytest.fixture(autouse=True)
+def _no_real_retry_delays():
+    """Collapse the retry backoff.
+
+    `_RETRY_DELAYS` is `[0.8, 1.6]` and the error-path tests exhaust it, so each
+    one sleeps 2.4 real seconds for no benefit. Patched here rather than in each
+    test because no test in this file is about wall-clock behaviour.
+    """
+    with patch.object(pe, "_RETRY_DELAYS", [0, 0]):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _native_unbound():
+    """Unbind `assistant.automation.native` for the duration of every test.
+
+    With the attribute absent, `from .automation import native` falls through to
+    `sys.modules` -- so the fifteen `patch.dict` stubs in this file intercept
+    regardless of what any earlier test file imported. Without it they are
+    correct only when this file runs first, and wrong in a way that reaches the
+    real desktop rather than a red assertion.
+
+    Unbinding rather than binding the mock, deliberately: there is one fixture
+    instead of fifteen rewritten call sites, and a test that forgets to stub the
+    backend still gets the real module (a loud failure) rather than a silently
+    shared fake left over from its neighbour.
+
+    Autouse, and it covers `unittest.TestCase` subclasses -- pytest runs autouse
+    fixtures around those too, which is what makes one fixture enough here.
+    Restores whatever was bound, including nothing.
+    """
+    import assistant.automation as _auto
+    had = hasattr(_auto, "native")
+    original = getattr(_auto, "native", None)
+    if had:
+        delattr(_auto, "native")
+    try:
+        yield
+    finally:
+        if had:
+            _auto.native = original
+        elif hasattr(_auto, "native"):
+            # A test caused a real import; leaving that bound would hand the
+            # next file a different starting state than this one had.
+            delattr(_auto, "native")
+
+
+def test_the_native_stub_intercepts_only_while_the_attribute_is_unbound():
+    """The guard on the fixture above, and the reason it is not optional.
+
+    Both directions, because the first assertion alone would be vacuous -- it
+    would pass just as happily if `patch.dict` were reliable, which is the very
+    thing in question. The second half binds the attribute the way any earlier
+    real import does and shows the same stub being bypassed.
+
+    Not `live_automation`-marked: an ordinary pass is exactly the condition
+    being checked for, so it has to run in one.
+    """
+    import assistant.automation as _auto
+    sentinel = MagicMock(name="STUB")
+
+    # ── With the fixture's unbinding in force, the stub wins. ──
+    assert not hasattr(_auto, "native"), (
+        "the fixture did not unbind the attribute, so the fifteen backend "
+        "stubs below are bypassed and reach the real desktop"
+    )
+    with patch.dict(sys.modules, {"assistant.automation.native": sentinel}):
+        from assistant.automation import native as stubbed
+    assert stubbed is sentinel, (
+        "the native stub was bypassed: `_execute_app_step` would call "
+        "open_app / click_element / type_text against the live desktop"
+    )
+
+    # ── Bind it, and the identical stub loses. ──
+    # A repeat `import` does NOT restore a deleted parent attribute -- the
+    # setattr happens once, on first load -- so the binding is done explicitly
+    # here rather than by re-importing, which would prove nothing.
+    import assistant.automation.native as real_module
+    _auto.native = real_module
+    try:
+        with patch.dict(sys.modules, {"assistant.automation.native": sentinel}):
+            from assistant.automation import native as bypassed
+        assert bypassed is real_module, (
+            "the premise no longer holds: `from .automation import native` now "
+            "consults sys.modules even with the attribute bound, which would "
+            "make the fixture unnecessary. Verify before deleting it."
+        )
+    finally:
+        delattr(_auto, "native")
 
 
 def run(coro):
@@ -610,7 +789,8 @@ class TestClickWithWindowScope(unittest.TestCase):
         mock_aa = MagicMock()
         mock_aa.click_element = AsyncMock(return_value="Clicked search")
         with patch.dict(sys.modules, {"assistant.automation.native": mock_aa}), \
-             patch("assistant.automation.native", mock_aa):
+             patch("assistant.automation.native", mock_aa,
+                   create=True):   # see _native_unbound: the attribute is unbound
             result = run(pe._execute_app_step(
                 {"action": "click", "params": {"selector": "name:search"}},
                 active_window="chrome"
@@ -622,7 +802,8 @@ class TestClickWithWindowScope(unittest.TestCase):
         mock_aa = MagicMock()
         mock_aa.click_element = AsyncMock(return_value="Clicked save")
         with patch.dict(sys.modules, {"assistant.automation.native": mock_aa}), \
-             patch("assistant.automation.native", mock_aa):
+             patch("assistant.automation.native", mock_aa,
+                   create=True):   # see _native_unbound: the attribute is unbound
             result = run(pe._execute_app_step(
                 {"action": "click", "params": {"selector": "name:Save", "window": "Notepad"}},
                 active_window="chrome"
@@ -634,7 +815,8 @@ class TestClickWithWindowScope(unittest.TestCase):
         mock_aa.focus_window = AsyncMock(return_value="Focused chrome")
         mock_aa.type_text = AsyncMock(return_value="Typed text")
         with patch.dict(sys.modules, {"assistant.automation.native": mock_aa}), \
-             patch("assistant.automation.native", mock_aa):
+             patch("assistant.automation.native", mock_aa,
+                   create=True):   # see _native_unbound: the attribute is unbound
             result = run(pe._execute_app_step(
                 {"action": "type", "params": {"text": "hello"}},
                 active_window="chrome"
