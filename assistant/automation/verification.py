@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .. import config
-from ..brain.task import Outcome
+from ..core.verdict import Outcome
 
 logger = logging.getLogger("verification")
 

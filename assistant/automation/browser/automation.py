@@ -434,7 +434,7 @@ async def run_browser_steps(steps: List[Dict], *, _from_planner: bool = False, h
         return "Error: Playwright is not available."
 
     from .. import verification
-    from ...brain.task import Outcome
+    from ...core.verdict import Outcome
 
     global _planner_page, _planner_context, _pages
     page = None

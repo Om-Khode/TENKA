@@ -35,70 +35,19 @@ from ..core.capabilities import Capability
 
 
 # ─── What came of a step ─────────────────────────────────────────────────────
-
-class Outcome(str, enum.Enum):
-    """A step's verdict. Replaces the boolean that made three states look like
-    one (`VerifyResult.ok` is True for success, ambiguity and skip alike).
-
-    The distinction between `UNCERTAIN` and `UNVERIFIED` is the whole reason
-    this is an enum: one is a failure of knowledge, the other is a choice not
-    to acquire it, and only the first is a problem.
-    """
-
-    SUCCEEDED = "succeeded"      # positive evidence the effect happened
-    FAILED = "failed"            # positive evidence it did not
-    UNCERTAIN = "uncertain"      # verification ran and could not decide
-    UNVERIFIED = "unverified"    # verification did not run: policy, or nothing to verify
-    UNSUPPORTED = "unsupported"  # no route exists; never attempted at all
-
-    @property
-    def is_evidence_of_success(self) -> bool:
-        """Only `SUCCEEDED` is. Absence of an exception is not evidence.
-
-        A property rather than a bare comparison so there is one place that
-        answers it — the bug this type replaces was six call sites each
-        deciding for themselves what `ok` meant.
-        """
-        return self is Outcome.SUCCEEDED
-
-
-class ObservationKind(str, enum.Enum):
-    STATE_CHANGED = "state_changed"
-    EXPECTED_PRESENT = "expected_present"
-    EXPECTED_ABSENT = "expected_absent"
-    NOTHING_CHANGED = "nothing_changed"
-    ERROR = "error"
-
-
-@dataclass(frozen=True)
-class Observation:
-    """What was seen, by what, when, and how sure.
-
-    Freshness and provenance are fields rather than hopes: an observation of
-    the desktop is stale the moment it is taken, and a caller that cannot tell
-    a code-tier check from a vision guess cannot weigh them differently. The
-    thing this replaces is a bare string.
-    """
-
-    kind: ObservationKind
-    detail: str = ""
-    source: str = "code"          # code | dom | uia | vision | process | llm
-    confidence: float = 1.0
-    at: str = ""                  # ISO 8601; set by the observer, never inferred
-
-
-@dataclass(frozen=True)
-class Verdict:
-    """An outcome plus the evidence for it. **There is no `ok` field.**
-
-    `escalated` records that a cheaper tier was inconclusive and a dearer one
-    ran, which is what makes the cost of a verification legible after the fact.
-    """
-
-    outcome: Outcome
-    observation: Observation
-    tier: str = "code"            # pre | code | vision | skipped
-    escalated: bool = False
+#
+# Defined in `core/verdict.py` and re-exported here. These are vocabulary, not
+# coordination: `automation/` and `storage/` both need to say what a step
+# concluded, and both sit below `brain/` in the layer order -- so defining them
+# here put five wrong-way imports into the tree. What a Task *is*, who owns it
+# and whether it may resume are decisions, and those stay below.
+#
+# Re-exported rather than moved outright so that `from ..brain.task import
+# Outcome` keeps working; the point was to give the lower layers somewhere legal
+# to import from, not to rename anything.
+from ..core.verdict import (  # noqa: F401
+    Observation, ObservationKind, Outcome, Verdict,
+)
 
 
 # ─── Where a Task is in its life ─────────────────────────────────────────────

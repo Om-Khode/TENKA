@@ -100,10 +100,10 @@ forbidden_modules = ["assistant.brain"]
 # comment. Measured before writing: exactly one wrong-way import existed, and it
 # is gone.
 [[tool.importlinter.contracts]]
-name = "Automation never imports actions"
+name = "Automation never imports actions or brain"
 type = "forbidden"
 source_modules = ["assistant.automation"]
-forbidden_modules = ["assistant.actions"]
+forbidden_modules = ["assistant.actions", "assistant.brain"]
 # Direct edges only, for the same reason `brain ↛ io` uses it: `automation`
 # legitimately imports `verification`, which imports `brain.task`, which may
 # import `actions` -- forbidding the transitive chain would forbid edges nobody

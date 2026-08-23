@@ -22,7 +22,7 @@ from typing import Optional, Tuple, Dict, Any
 from urllib.parse import urlparse
 
 from .. import config
-from ..brain.task import Outcome
+from ..core.verdict import Outcome
 from ..core.known_apps import get_apps_by_category
 
 logger = logging.getLogger("desktop_automation")

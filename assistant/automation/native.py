@@ -12,7 +12,7 @@ import logging
 from typing import Optional, Dict, List
 
 from .. import config
-from ..brain.task import Outcome
+from ..core.verdict import Outcome
 
 logger = logging.getLogger("app_automation")
 

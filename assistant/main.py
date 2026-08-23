@@ -3357,6 +3357,12 @@ async def async_main():
 
     # event-driven monitors
     from .automation.event_bus import event_bus as _event_bus
+    # Injected here, not imported there. `main.py` owns both sides: the event
+    # bus is a source of turns and `brain.turn` runs one, and the layer order
+    # puts the runner above the source. Handing the callable down is what lets
+    # `automation` import neither `actions` nor `brain`.
+    from .brain.turn import run_local_intent as _run_local_intent
+    _event_bus.set_turn_dispatcher(_run_local_intent)
     try:
         _event_bus.start(loop=asyncio.get_running_loop())
     except Exception as e:

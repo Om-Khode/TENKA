@@ -45,6 +45,23 @@ def clean_context():
     A.current_grants.reset(g)
 
 
+def _bus_with_dispatcher():
+    """A bus with the turn dispatcher injected, as `main.py` does at startup.
+
+    Constructed properly rather than via `__new__`: `EventBus.__init__` only
+    sets fields (threads start in `start()`), and the dispatcher slot is one of
+    those fields. The earlier `__new__` shortcut skipped it, so these tests
+    started failing the moment the dependency was inverted -- correctly, since a
+    bus with no dispatcher is now a bus that refuses to run anything.
+    """
+    from assistant.automation.event_bus import EventBus
+    from assistant.brain.turn import run_local_intent
+
+    bus = EventBus()
+    bus.set_turn_dispatcher(run_local_intent)
+    return bus
+
+
 # ─── the layer inversion is gone, and stays gone ─────────────────────────────
 
 def test_the_event_bus_does_not_import_actions():
@@ -110,8 +127,7 @@ async def test_a_fired_monitor_runs_with_local_grants(monkeypatch):
 
     monkeypatch.setattr(A, "execute", _fake_execute)
 
-    from assistant.automation.event_bus import EventBus
-    bus = EventBus.__new__(EventBus)          # no threads, no sources
+    bus = _bus_with_dispatcher()
     out = await bus._run_code_executor("check the disk", "device:phone")
 
     assert out == "ran"
@@ -138,8 +154,7 @@ async def test_authority_does_not_leak_out_of_a_fired_monitor(monkeypatch):
     async def _boom(*a, **kw):
         raise RuntimeError("action failed")
 
-    from assistant.automation.event_bus import EventBus
-    bus = EventBus.__new__(EventBus)
+    bus = _bus_with_dispatcher()
 
     monkeypatch.setattr(A, "execute", _ok)
     await bus._run_code_executor("x", "local")
@@ -169,8 +184,7 @@ async def test_the_installer_is_logged_at_fire(monkeypatch, caplog):
 
     monkeypatch.setattr(A, "execute", _ok)
 
-    from assistant.automation.event_bus import EventBus
-    bus = EventBus.__new__(EventBus)
+    bus = _bus_with_dispatcher()
 
     with caplog.at_level("INFO", logger="event_bus"):
         await bus._run_code_executor("x", "device:phone")
@@ -191,8 +205,7 @@ async def test_a_monitor_with_no_recorded_installer_still_fires(monkeypatch, cap
 
     monkeypatch.setattr(A, "execute", _ok)
 
-    from assistant.automation.event_bus import EventBus
-    bus = EventBus.__new__(EventBus)
+    bus = _bus_with_dispatcher()
 
     with caplog.at_level("INFO", logger="event_bus"):
         out = await bus._run_code_executor("x", "")
@@ -209,4 +222,67 @@ def test_the_fire_path_passes_the_installer_through():
     call = call[:call.index(")") + 1]
     assert "installed_by" in call, (
         f"_fire_action does not pass the installer through: {call!r}"
+    )
+
+
+# ─── the dependency is inverted, not relocated ───────────────────────────────
+
+def test_the_event_bus_imports_neither_actions_nor_brain():
+    """P4b removed `automation -> actions` by importing `brain.turn` instead,
+    and that was the same inversion moved one layer up: the order is
+    `... -> automation -> actions -> brain -> main`, so `brain` is above
+    `automation` too. Honest accounting, and now fixed properly -- `main.py`
+    owns both sides and hands the callable down."""
+    src = _BUS.read_text(encoding="utf-8")
+    reaching = []
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            parts = node.module.split(".")
+            if "actions" in parts or "brain" in parts:
+                reaching.append(node.module)
+        elif isinstance(node, ast.Import):
+            reaching += [a.name for a in node.names
+                         if {"actions", "brain"} & set(a.name.split("."))]
+    assert not reaching, (
+        f"event_bus.py imports {reaching}; the dispatcher is injected so it "
+        f"needs neither"
+    )
+
+
+def test_main_injects_the_dispatcher():
+    """An injection point nothing calls leaves every monitor inert -- and the
+    refusal below would make that look like a deliberate safety feature."""
+    src = (_ROOT / "assistant" / "main.py").read_text(encoding="utf-8")
+    assert "set_turn_dispatcher" in src, (
+        "main.py never installs the dispatcher, so no monitor can run"
+    )
+    install = src.index("set_turn_dispatcher")
+    start = src.index("_event_bus.start(")
+    assert install < start, (
+        "the dispatcher is installed after the bus starts, so a monitor firing "
+        "in between is refused"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_bus_with_no_dispatcher_refuses_to_run(monkeypatch):
+    """**Fail closed.** A fired monitor with no dispatcher installed must not
+    fall back to inventing its own authority -- that is the entire thing this
+    indirection exists to prevent. It says so instead, which is also honest
+    about not having run."""
+    called = []
+
+    async def _spy(*a, **kw):
+        called.append(a)
+        return "ran"
+
+    monkeypatch.setattr(A, "execute", _spy)
+
+    from assistant.automation.event_bus import EventBus
+    bus = EventBus()                       # no dispatcher installed
+
+    out = await bus._run_code_executor("do something", "local")
+    assert not called, "a monitor ran with no dispatcher installed"
+    assert "could not run" in out.lower(), (
+        f"the refusal does not say it did not run: {out!r}"
     )

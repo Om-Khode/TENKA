@@ -33,7 +33,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from ..brain.task import Outcome
+from ..core.verdict import Outcome
 from typing import Any, Optional
 
 logger = logging.getLogger("recovery")
