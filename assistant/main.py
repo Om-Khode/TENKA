@@ -777,6 +777,64 @@ _IMPLICIT_PROC_DELETE_RE = re.compile(
 )
 
 
+_NAMES_AN_OBJECT: "frozenset[str]" = frozenset({
+    "manage_schedule", "manage_monitor", "manage_procedure",
+    "manage_shortcut", "manage_backup",
+    "set_reminder", "cancel_reminder",
+    "store_memory", "forget_memory", "memory_query",
+})
+"""Intents whose utterance *names* something rather than acting on the world.
+
+Used at one place: deciding whether a **weak** procedure-trigger match should
+yield to a deterministic intent. In every intent here, a procedure's name
+appearing in the sentence is the object of a command about durable state --
+"schedule the scratchpad procedure", "delete the scratchpad shortcut", "remind
+me about scratchpad" -- and never the command itself.
+
+The distinction is load-bearing rather than tidy. `computer_task` is
+deliberately absent: `pre_route("open scratchpad for me")` answers
+`computer_task`, and yielding there would launch an application called
+"scratchpad" instead of running the procedure someone taught under that name.
+That case is genuinely ambiguous and the procedure should win it. The ones
+listed are not ambiguous.
+
+Not exhaustive over `config.INTENTS` on purpose -- the default for an intent not
+listed is that the *procedure* wins, which is the direction that keeps a taught
+trigger working. A test pins that every member is a real intent, so a rename
+cannot leave a dead string in here silently granting precedence to nothing.
+"""
+
+
+def _weak_trigger_yields(proc_match: dict, text: str):
+    """Should this procedure-trigger match give way to a routed intent?
+
+    Returns the competing `IntentResult` when it should, or `None` when the
+    procedure wins.
+
+    A separate function rather than an `if` in the turn loop, and the reason is
+    a mutation result: the first version of this lived inline, and the tests for
+    it re-implemented the same two conditions in a helper of their own. Three
+    mutations of the real logic -- never deferring, always deferring, and
+    treating strong matches as weak -- all passed. A test that mirrors the code
+    it is testing measures the mirror.
+
+    The rule, in one place so it can be exercised:
+
+    * `exact` and `prefix` never yield. This whole block runs before routing so
+      that a taught trigger beats the classifier, and for a strong match that is
+      the point.
+    * `contained` and `subsequence` yield **only** to `_NAMES_AN_OBJECT` -- the
+      intents in which a procedure's name is the object of a command about
+      durable state rather than the command itself.
+    """
+    if proc_match.get("match_tier") not in ("contained", "subsequence"):
+        return None
+    competing = regex_router.pre_route(text)
+    if competing is not None and competing.intent in _NAMES_AN_OBJECT:
+        return competing
+    return None
+
+
 def _match_implicit_proc_command(text: str):
     """
     Catch 'edit X' / 'delete X' when X matches a known procedure.
@@ -1571,6 +1629,44 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
         # ─── Procedure execution (before shortcuts, before intent) ────────
         if not _proc_cmd:
             _proc_match = procedures.match_trigger(intent_input)
+
+            # A WEAK trigger match does not outrank a deterministic intent.
+            #
+            # This block runs before routing on purpose, so a taught trigger
+            # beats the classifier. That is right for a strong match -- the
+            # utterance *is* the trigger, or starts with it -- and wrong for a
+            # weak one. `contained` means the trigger appeared somewhere, so a
+            # one-word trigger claims any sentence containing that word:
+            # "schedule the scratchpad procedure every minute" ran the
+            # procedure instead of scheduling it, because `scratchpad` was in
+            # there and nothing asked whether the sentence was a request to run
+            # anything.
+            #
+            # Resolved by asking `pre_route`, which already knows what
+            # "schedule ...", "cancel ... schedule" and "list my monitors" are
+            # -- deterministic, no model call, and cheaper than keeping a second
+            # opinion about English here. Strong tiers never consult it, so "run
+            # scratchpad" still beats the classifier exactly as before.
+            #
+            # But only for the intents in `_NAMES_AN_OBJECT`, and that
+            # restriction is not caution -- it is a regression this would
+            # otherwise cause. `pre_route("open scratchpad for me")` answers
+            # `computer_task`, and deferring there would try to launch an
+            # application called "scratchpad" instead of running the procedure
+            # someone taught under that name. Those two are genuinely
+            # ambiguous and the procedure should win; the ones below are not
+            # ambiguous at all, because in each of them the procedure's name is
+            # the *object* of a command about durable state, never the command.
+            if _proc_match:
+                _competing = _weak_trigger_yields(_proc_match, intent_input)
+                if _competing is not None:
+                    logger.info(
+                        f"[PROC] Weak trigger match '{_proc_match['trigger']}' "
+                        f"(tier={_proc_match.get('match_tier')}) yields to "
+                        f"{_competing.intent}"
+                    )
+                    _proc_match = None
+
             if _proc_match:
                 # EXECUTE. `run_procedure` drives `automation.native` and
                 # `pyautogui` directly and never re-enters `actions.execute()`,

@@ -298,15 +298,37 @@ def test_run_procedure_reads_the_one_contextvar():
 
 def test_scheduler_grants_a_stored_procedure_before_running_it():
     """`scheduler.py` runs stored procedures with no requester attached. Before
-    this fix it called `run_procedure` with `current_grants` unset, which the
-    new backstop would refuse -- breaking every scheduled procedure. The
-    scheduler states the grant explicitly, exactly as it already does for its
-    `web_search` task type."""
+    the 6a.5 fix it called `run_procedure` with `current_grants` unset, which the
+    backstop would refuse -- breaking every scheduled procedure. The grant is
+    stated explicitly, exactly as it is for the `web_search` task type.
+
+    **Rewritten in P4a, and the reason is worth keeping.** This asserted the
+    literal string `set_grants(LOCAL_GRANTS)` in the branch. P4a moved authority
+    installation into `brain/turn.py:run_turn` -- because the scheduler was
+    installing grants *first*, the ordering `main.py` was explicitly fixed for --
+    so the string moved and this went red. The property never changed; the test
+    was pinned to an implementation of it, which is the same mistake as banning
+    a phrasing instead of a class.
+
+    It now checks that the branch hands `LOCAL_GRANTS` to the one installer.
+    The behavioural version -- an actual `_async_run_handler` call observing
+    `current_grants` inside `run_procedure` -- is
+    `tests/test_brain_turn.py::test_a_scheduled_procedure_still_meets_the_execute_backstop`,
+    and that is the one that would catch a narrower set actually reaching the
+    procedure. This is the cheap structural half.
+    """
     from assistant import scheduler
     src = inspect.getsource(scheduler._async_run_handler)
     proc_half = src[src.index('task_type == "procedure"'):]
-    assert "set_grants(LOCAL_GRANTS)" in proc_half, proc_half
-    assert "current_grants.reset" in proc_half
+    assert "run_turn(" in proc_half, proc_half
+    assert "grants=LOCAL_GRANTS" in proc_half, (
+        f"the procedure branch no longer states its grant: {proc_half}"
+    )
+    # The reset moved with the install, and lives in exactly one place now.
+    turn_src = (_ROOT / "assistant" / "brain" / "turn.py").read_text(encoding="utf-8")
+    assert "current_grants.reset" in turn_src, (
+        "nothing resets the grant set after a scheduled procedure"
+    )
 
 
 @pytest.mark.asyncio
