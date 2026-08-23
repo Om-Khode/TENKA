@@ -112,8 +112,20 @@ def set_preference(key: str, value: str, category: str,
     _get_repo().set_preference(key, value, category, confidence, source, reason)
 
 
-def bump_confidence(key: str, delta: float = 0.1) -> Optional[float]:
-    return _get_repo().bump_confidence(key, delta)
+def bump_confidence(key: str, delta: float = 0.1, *,
+                    counted_by_tenka: bool = True) -> Optional[float]:
+    """Raise a preference's confidence. See `PreferenceRepo.bump_confidence`
+    for what `counted_by_tenka` means -- in short, a model re-asserting a
+    preference it proposed earlier is not evidence, and passes False.
+
+    The default is True because the repo's own observation sites
+    (`record_preference_applied`, `record_preference_overridden`) call through
+    to it directly and are always reporting a real turn. Every caller that is
+    relaying a *model's* claim has to say so, and there is exactly one:
+    `reflection.py`.
+    """
+    return _get_repo().bump_confidence(key, delta,
+                                       counted_by_tenka=counted_by_tenka)
 
 
 def decay_preference(key: str, delta: float = DECAY_AMOUNT) -> Optional[float]:

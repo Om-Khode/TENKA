@@ -2240,6 +2240,46 @@ decision -- a decision with no recorded argument is one the next person re-opens
 | **D7** | P13 may leave a loop unmerged if merging would change behaviour. Confirm that "documented exception" is acceptable over "forced uniformity". | P13 | Accept. Forced uniformity here is the rewrite this project keeps refusing for good reason. |
 | **D8** | P3 must pick one of the two "exactly one router" resolutions (§7.3): move `detect_backend` into the resolver, or make the resolver a delegating adapter over it. | P3 | Move it. A delegating adapter leaves the decision in `automation/` while the Brain claims to own resolution, which is the ambiguity this document exists to remove. |
 | **D9** | §12.2 C3 states that fencing **mitigates** injection and does not close it, so KI-14/15/16 stay open after this plan. Confirm that an honest "mitigated" is acceptable over a claimed fix. | P10 | Accept. Claiming closure without an adversarial live test is how a check comes to point one step to the side of the property. |
+| **D10** | §10.5's reflection→routing key-namespace mismatch: reconcile the namespaces, or accept that the reflection cycle's routing proposals are unreadable and drop that category. **Needs the operator.** | P9 | **Open.** See below. |
+
+### D10 — what the nightly reflection cycle is actually for
+
+Recorded rather than decided, because either answer changes what a feature *is*
+and that is not a call to make quietly.
+
+The state after P9, measured rather than assumed:
+
+- `reflection.py` writes preference keys the model invents (`music_app`).
+- `automation/router.py` reads `automation_{word}`. **Different namespace, so a
+  reflection proposal has never been readable by the router at all.**
+- On top of that, the router's floor for a model-proposed source is
+  `CONFIDENCE_SILENT` (0.7), and P9 caps model-proposed provenance at
+  `CONFIDENCE_ASK` (0.4). So even in one namespace it could not qualify unaided.
+
+Two independent walls. The nightly cycle spends an LLM call producing routing
+preferences that nothing can read, and P9 closed the one path that *did* read
+them (`_build_goal_hints` → the code-generation prompt) — correctly, since that
+was the highest-blast-radius consumer in the tree.
+
+**Option A — reconcile the namespaces.** Reflection writes `automation_{word}`.
+Its proposals then become readable, but only after the user confirms one (which
+rewrites `source` to a user-stated spelling and clears the 0.4 cap) or TENKA
+observes it working. That is D3 behaving exactly as intended: the model
+proposes, evidence promotes. Cost: a proposal now has a route to routing, so
+the cap and the floor are load-bearing rather than redundant.
+
+**Option B — drop the routing category from reflection.** Honest about what is
+happening today, saves a nightly LLM call, and leaves personality traits as the
+cycle's real output. Cost: TENKA stops being able to notice "you always open
+this app for that" on her own, and every routing preference has to be stated.
+
+**Recommendation: A.** B removes a capability to tidy up a bug. The mismatch is
+not an argument against learned routing preferences; it is a missing two-line
+agreement about a key format. A also leaves the promotion ladder doing visible
+work, which is easier to reason about than a cap guarding a path nothing takes.
+
+Not implemented either way pending the decision. P9 shipped without it, and
+nothing in P9 depends on the answer.
 
 ---
 

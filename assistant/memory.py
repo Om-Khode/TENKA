@@ -79,7 +79,11 @@ def summarize_session(session_id: str) -> str:
     return _get_repo().summarize_session(session_id)
 
 
-def save_fact(key: str, value: str, source: str = "user") -> None:
+def save_fact(key: str, value: str, source: str) -> None:
+    """`source` is required. It used to default to `"user"`, the highest trust
+    tier, so a forgotten argument manufactured an explicit user statement --
+    see `PreferenceRepo`-adjacent provenance rules and
+    `storage/repos/memory.py:save_fact`."""
     _get_repo().save_fact(key, value, source)
 
 

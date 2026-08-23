@@ -279,8 +279,15 @@ def _process_discovered_preferences(discovered_prefs: list[dict]) -> None:
 
             if existing:
                 if existing["value"] == value:
-                    # Same value observed again — bump confidence
-                    new_conf = preferences.bump_confidence(key, delta=0.15)
+                    # Same value proposed again — ask for a bump, and say that
+                    # this is the model agreeing with itself rather than
+                    # anything TENKA observed. D3: the reflection cycle
+                    # proposes; it does not get to count its own evidence. The
+                    # bump is therefore capped below the level at which a
+                    # preference is applied silently or injected into a
+                    # code-generation prompt.
+                    new_conf = preferences.bump_confidence(
+                        key, delta=0.15, counted_by_tenka=False)
                     logger.info(
                         f"[REFLECTION] Preference '{key}' reconfirmed "
                         f"(confidence → {new_conf})"

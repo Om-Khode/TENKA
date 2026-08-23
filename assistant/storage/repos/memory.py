@@ -595,7 +595,16 @@ class MemoryRepo:
         logger.debug(f"[MEMORY] Saved typed fact: {key}={value} (type={memory_type}, expires={expires_at})")
         self._index_new_fact(cur.lastrowid, key, value)
 
-    def save_fact(self, key: str, value: str, source: str = "user") -> None:
+    def save_fact(self, key: str, value: str, source: str) -> None:
+        """`source` has no default, deliberately.
+
+        It defaulted to `"user"` -- the **highest** trust tier -- so a caller
+        that forgot the argument manufactured an explicit user statement out of
+        whatever it happened to be storing. Every provenance rule downstream
+        reads this field, so the one value it must never be is "whichever the
+        caller did not think about". Every existing caller already passes it;
+        removing the default costs nothing and closes the shape permanently.
+        """
         self.save_typed_fact(key, value, source, memory_type="fact")
 
     def get_active_facts(self, query: str | None = None) -> list[dict]:
@@ -642,9 +651,28 @@ class MemoryRepo:
         return count
 
     def search_facts(self, key: str) -> list[dict]:
+        """Facts whose key matches, **excluding expired ones**.
+
+        The filter was missing, and this is the read that matters most for it:
+        `main._build_facts_context()` calls `search_facts("user_")` and puts the
+        result into the system prompt as `KNOWN FACTS ABOUT THE USER`, on every
+        turn. So a fact past its `expires_at` was still asserted as currently
+        true to the model.
+
+        `cleanup_expired()` runs at startup and hourly, so the window was
+        bounded rather than permanent -- which is why this is a correctness fix
+        and not an incident. But "a background job will delete it soon" is not
+        the same promise as "an expired fact is not returned", and the prompt is
+        the wrong place to be relying on the difference. Cheap to state here,
+        and it holds in the hour before the sweep and on the turn right after a
+        fact lapses.
+        """
+        now = datetime.now().isoformat()
         pattern = f"%{key}%"
         rows = self._db.fetchall(
-            "SELECT * FROM facts WHERE key LIKE ? ORDER BY id DESC", (pattern,)
+            "SELECT * FROM facts WHERE key LIKE ? "
+            "AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC",
+            (pattern, now),
         )
         return [dict(row) for row in rows]
 
@@ -668,11 +696,19 @@ class MemoryRepo:
 
         if not semantic_results and not fts_results:
             logger.info(f"[MEMORY] Hybrid facts: no results, falling back to LIKE")
+            # Expiry filtered here too. The fused path below already did it and
+            # this fallback did not -- so the guarantee held on the normal route
+            # and lapsed on the degraded one, which is the shape that keeps
+            # costing this project (`vision_verify` failing open was the same
+            # thing one phase ago). This branch runs precisely when semantic and
+            # FTS both came back empty, so it is the path taken when things are
+            # already going badly.
             pattern = f"%{query}%"
             rows = self._db.fetchall(
                 "SELECT * FROM facts WHERE (key LIKE ? OR value LIKE ?) "
+                "AND (expires_at IS NULL OR expires_at > ?) "
                 "ORDER BY id DESC LIMIT ?",
-                (pattern, pattern, limit),
+                (pattern, pattern, datetime.now().isoformat(), limit),
             )
             results = [dict(row) for row in rows]
             for r in results:
