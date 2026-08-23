@@ -1297,8 +1297,64 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                                   grants: "frozenset[Capability] | None" = None,
                                   principal: "str | None" = None,
                                   raise_context: "_actions_module.RaiseContext | None" = None):
+    """Install this turn's authority, then run the pipeline under it.
+
+    The three contextvars used to be installed here by hand, in a sequence
+    whose order carries an argument an adversarial review had to find twice
+    (see `brain/turn.py`). Four sites installed them; this was the fourth and
+    the only one that had the order right. They now all call one
+    implementation, so there is one ordering rather than four agreeing by
+    inspection.
+
+    Nothing else moved. `_turn_pipeline` below is the same function it was,
+    with the same `_gate` closure, the same `_respond` helper and the same
+    pre-dispatch region -- travelling as a unit, because `_respond`'s three
+    properties (record the turn under the session id, speak only to a local
+    source, reopen the microphone only for a local source) were three separate
+    defects with one fix, and separating them again reopens all three.
+
+    `grants` is what the caller driving this turn is allowed to ask for.
+    `None` means "nobody said", and `actions.execute()` refuses everything in
+    that state -- it is not a synonym for the local full set. Callers that
+    know the answer state it; `_grants_for_item` is the one that decides for
+    a queued item.
+
+    `principal` is *who* that caller is, and it fails closed the same way:
+    `None` means "nobody said", it owns no pending state, and a turn carrying
+    it can answer no confirmation. `_principal_for_item` decides for a queued
+    item. The pair is what closes KI-13 -- grants say what a caller may do,
+    the principal says whose question it may answer, and 6a.5 could only ask
+    the first.
+
+    `raise_context` is what a refusal needs to say whether a raise at the
+    keyboard would fix it: what the caller was issued, and what this
+    transport's `raisable` literal holds. Unlike `grants`/`principal`, `None`
+    degrades rather than refuses -- `_refuse` falls back to its original,
+    generic sentence when no context was ever installed. `_raise_context_for_item`
+    decides for a queued item.
+    """
+    from .brain.turn import run_turn as _run_turn
+
+    return await _run_turn(
+        grants=frozenset() if grants is None else grants,
+        principal=principal,
+        raise_context=raise_context,
+        work=lambda: _turn_pipeline(source, transcription, bridge, stt_ms),
+        label=f"pipeline:{source}",
+    )
+
+
+async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
+                         stt_ms: int | None = None):
     """
     Run Intent → Policy → Action/LLM → TTS → Unity animations
+
+    Called only by `process_text_from_queue` above, which is what installs the
+    authority every branch in here consults. Split out rather than nested in a
+    closure so the two AST sweeps that walk this region keep walking real
+    statements: a nested body would put the pre-dispatch `try:` one level
+    deeper than they look, which is KI-32's vacuity exactly -- the sweep would
+    find a shorter region, or none, and pass.
 
     `grants` is what the caller driving this turn is allowed to ask for.
     `None` means "nobody said", and `actions.execute()` refuses everything in
@@ -1338,35 +1394,17 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     if _wake_listener:
         _wake_listener.pause()
 
-    # The principal's token, set in the same statement group as the grant
-    # token below and reset in the same `finally`. It goes *above* the comment
-    # that follows rather than between it and `set_grants` because that
-    # comment's constraint is literal: nothing may sit between the grant token
-    # and the `try`. The ordering also fails in the safer direction -- a raise
-    # in `set_grants` would strand an identity, and an identity with no grants
-    # can do nothing, whereas the reverse would strand privilege.
-    _principal_token = _actions_module.set_principal(principal)
-
-    # Installed between the principal token above and the grants token below
-    # -- after principal for the same reason principal comes before grants
-    # (a raise here would strand an identity, never the reverse), and before
-    # grants so the comment on the grants line stays literally true: nothing
-    # may sit between that line and the `try`. A raise context has no
-    # fail-closed property of its own to protect -- `None` only ever makes
-    # `_refuse` fall back to its generic sentence, never grants or refuses
-    # anything -- so it is not the one the ordering exists to guard.
-    _raise_ctx_token = _actions_module.set_raise_context(raise_context)
-
-    # Set LAST, immediately before the `try` whose `finally` resets it, and
-    # after `_wake_listener.pause()` rather than before. An adversarial
-    # review found this three statements higher up: a raise anywhere in that
-    # window skipped the reset entirely and left the grant set installed in
-    # the queue consumer's context after the turn ended. The documented
-    # fail-closed property inverts there -- whatever ran next inherited the
-    # last turn's grants instead of none. Nothing may be added between this
-    # line and the `try`.
-    _grants_token = _actions_module.set_grants(
-        frozenset() if grants is None else grants)
+    # The three authority contextvars are installed by the caller, through
+    # `brain/turn.py:run_turn`, and reset in its `finally`. The order they go
+    # in is the contract and the argument for it is written there; it is not
+    # repeated here, because a copy of an argument is a copy that can drift.
+    #
+    # What this function must not do is install them again. A second install
+    # inside the region would take a second token, and the outer reset would
+    # then restore the *inner* value -- leaving a turn's grants live in the
+    # queue consumer's context after the turn ended, which is the exact
+    # failure the ordering exists to prevent, reintroduced from the other end.
+    # `tests/test_brain_turn_pipeline.py` asserts there is one install site.
 
     try:
         # ─── The pre-dispatch gate ───────────────────────────────────────
@@ -2519,9 +2557,15 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     finally:
         _tracker.save()
         _telemetry.reset_current_tracker(_tracker_token)
-        _actions_module.current_grants.reset(_grants_token)
-        _actions_module.current_raise_context.reset(_raise_ctx_token)
-        _actions_module.current_principal.reset(_principal_token)
+        # The three authority resets used to sit here. They are `run_turn`'s
+        # `finally` now, which runs immediately after this one -- so the
+        # window in which they stay installed grew by exactly this block:
+        # a tracker save, a status publish, a studio flag and the wake
+        # listener, none of which reads grants, a principal or a raise
+        # context. What has not changed is the property that matters: they
+        # are reset before control returns to whatever queued this turn, on
+        # the success path, the exception path and the early-return path
+        # alike, because `run_turn` wraps all three.
         # The turn this "studio" item started is only now actually over --
         # success, failure or an early return above all reach this
         # `finally`. Clearing the busy flag here, not at the instant

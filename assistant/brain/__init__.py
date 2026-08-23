@@ -7,7 +7,8 @@ make the handler package an orchestrator, and `core/` imports nothing by design.
 **Contracts only, for now.** P2 lands the types; the coordinator that uses them
 is P4. Nothing here dispatches, and nothing here is wired into a turn yet.
 
-Layering, enforced by `pyproject.toml` and by `tests/test_brain_layering.py`:
+Layering, enforced by `pyproject.toml`'s four brain contracts and read back
+by `tests/test_layering.py` (which judges the summary line, not the exit code):
 
     brain -> core, config, storage, llm, domain, automation, actions   allowed
     brain -> io                                                       FORBIDDEN

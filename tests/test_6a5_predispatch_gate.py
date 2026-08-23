@@ -870,29 +870,114 @@ _EXPECTED_EXEMPTIONS = frozenset({
 _GUARD_CALLS = frozenset({"_gate", "capability_refusal"})
 
 
+# ─── KI-32: the sweep must survive the function being split ─────────────────
+#
+# This used to find its region by name -- `process_text_from_queue`, then the
+# first `Try` in its body. P4c split that function in two: the name now belongs
+# to a nine-line wrapper that installs the turn's authority through
+# `brain/turn.py`, and the branches live in `_turn_pipeline`. Under the old
+# finder the walk found a body with no `Try` at all.
+#
+# That particular split failed loudly, which was luck: `next()` raised
+# StopIteration rather than returning an empty region. The shape KI-32 actually
+# names is the quiet one -- a split where a `Try` still exists but half the
+# branches have moved out of it, so the region shrinks and the sweep passes on
+# what is left.
+#
+# Two changes. The region is located by **the dispatch call**, which is the
+# thing the region is defined against, so any function holding it is found
+# whatever it is called. And the branches are pinned **by guard signature and
+# count**, not merely counted, so a branch leaving the walk is named in the
+# failure instead of being absorbed by a floor.
+
+_DISPATCH_CALL = "execute_action"
+
+
 def _predispatch_region():
     """Return (statements, source_lines, dispatch_line).
 
-    The pre-dispatch region is every top-level statement of
-    `process_text_from_queue`'s `try:` body that begins before the
-    `execute_action(...)` call -- the point where the real gate takes over.
+    The pre-dispatch region is every top-level statement of the `try:` body
+    containing the `execute_action(...)` call that begins before that call --
+    the point where the real gate in `actions/__init__.py` takes over.
     """
     src = _MAIN_PY.read_text(encoding="utf-8")
     lines = src.splitlines()
     tree = ast.parse(src)
 
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.AsyncFunctionDef)
-              and n.name == "process_text_from_queue")
-    try_stmt = next(s for s in fn.body if isinstance(s, ast.Try))
-
-    dispatch_line = min(
-        n.lineno for n in ast.walk(try_stmt)
-        if isinstance(n, ast.Call)
-        and getattr(n.func, "id", None) == "execute_action"
+    # Every `try:` block anywhere in the file that contains the dispatch call,
+    # innermost first. Anchoring on the call rather than on a function name is
+    # what makes this survive a rename or a split.
+    candidates = [
+        (t, min(n.lineno for n in ast.walk(t)
+                if isinstance(n, ast.Call)
+                and getattr(n.func, "id", None) == _DISPATCH_CALL))
+        for t in ast.walk(tree)
+        if isinstance(t, ast.Try)
+        and any(isinstance(n, ast.Call)
+                and getattr(n.func, "id", None) == _DISPATCH_CALL
+                for n in ast.walk(t))
+    ]
+    assert candidates, (
+        f"no `try:` block in main.py contains a `{_DISPATCH_CALL}(...)` call. "
+        "Either dispatch was renamed -- update _DISPATCH_CALL -- or the turn "
+        "pipeline no longer dispatches from inside a try, in which case this "
+        "whole sweep is walking the wrong shape and must be rewritten before "
+        "it is trusted."
     )
+    # The outermost such block: an inner `try` around the dispatch call itself
+    # would give a region of one statement, which is the vacuity being closed.
+    try_stmt, dispatch_line = max(candidates, key=lambda c: c[0].end_lineno or 0)
     region = [s for s in try_stmt.body if s.lineno < dispatch_line]
     return region, lines, dispatch_line
+
+
+def _guard_signatures(region):
+    """{signature: count} for every guard call in a returning branch.
+
+    A signature is stable across edits that do not change what a branch is
+    for: `_gate` contributes its label argument, `capability_refusal` the
+    expression it was asked about. Counted rather than collected into a set,
+    because two branches consult `capability_refusal(required)` -- the pending
+    chain and the pending-answer path -- and a set would let one of them
+    vanish without a word.
+    """
+    from collections import Counter
+
+    sigs: "Counter[str]" = Counter()
+    for stmt in region:
+        if not any(isinstance(n, ast.Return) for n in ast.walk(stmt)):
+            continue
+        for n in ast.walk(stmt):
+            if not isinstance(n, ast.Call):
+                continue
+            name = (getattr(n.func, "id", None)
+                    or getattr(n.func, "attr", None))
+            if name not in _GUARD_CALLS:
+                continue
+            if name == "_gate":
+                # _gate(capability, label, ...) -- the label names the branch.
+                arg = n.args[1] if len(n.args) > 1 else None
+            else:
+                arg = n.args[0] if n.args else None
+            rendered = ast.unparse(arg).strip("'\"") if arg is not None else "?"
+            sigs[f"{name}:{rendered}"] += 1
+    return dict(sigs)
+
+
+# Every guarded pre-dispatch branch, by guard signature and how many times it
+# appears. A branch that leaves the walked region -- moved into a helper, or
+# split out of the pipeline -- disappears from here and is named in the
+# failure. A new one has to be added deliberately.
+_PINNED_GUARDS = {
+    "_gate:slash_command": 1,
+    "_gate:batch_teaching": 1,
+    "_gate:teaching_trigger": 1,
+    "_gate:procedure": 1,
+    "_gate:speaker_verify": 2,
+    "_gate:shutdown": 1,
+    "capability_refusal:required": 2,
+    "capability_refusal:Capability.EXECUTE": 1,
+}
 
 
 def test_every_returning_predispatch_branch_is_guarded():
@@ -962,6 +1047,33 @@ def test_the_region_the_structural_test_walks_is_not_empty():
     assert len(returning) >= 8, (
         f"only {len(returning)} returning branches found before line "
         f"{dispatch_line} -- the region moved or the parse is wrong")
+
+
+def test_no_guarded_branch_leaves_the_walked_region():
+    """KI-32. The floor above says "at least eight"; this says *which*.
+
+    A floor cannot tell a branch that was deleted from a branch that was moved
+    somewhere the sweep no longer looks -- both just make the number smaller,
+    and while it stays above eight neither is reported. Pinning the guard
+    signatures means a branch leaving is named, and a branch arriving has to be
+    argued for the same way a new exemption does.
+    """
+    region, _, _ = _predispatch_region()
+    found = _guard_signatures(region)
+
+    missing = {k: v for k, v in _PINNED_GUARDS.items() if found.get(k, 0) < v}
+    extra = {k: v for k, v in found.items()
+             if v > _PINNED_GUARDS.get(k, 0)}
+    assert not missing, (
+        f"guarded pre-dispatch branches left the walked region: {missing} "
+        f"(found {found}). If the branch was deleted, remove it from "
+        "_PINNED_GUARDS. If it moved, the sweep is no longer covering it and "
+        "the move is the bug."
+    )
+    assert not extra, (
+        f"new guarded pre-dispatch branches: {extra}. Add them to "
+        "_PINNED_GUARDS -- deliberately, so the count keeps meaning something."
+    )
 
 
 def test_there_is_one_source_of_truth_about_the_turns_grants():
