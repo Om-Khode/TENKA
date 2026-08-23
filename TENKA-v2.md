@@ -2231,7 +2231,7 @@ decision -- a decision with no recorded argument is one the next person re-opens
 
 | # | Decision | Blocks | Recommendation |
 | --- | --- | --- | --- |
-| **D1** | Approve `assistant/brain/` as a tenth subpackage (`CLAUDE.md` rule 4). | P2 | Approve. There is no existing package whose responsibility this is; putting it in `actions/` would make the handler package an orchestrator. |
+| ~~**D1**~~ | Approve `assistant/brain/` as a tenth subpackage (`CLAUDE.md` rule 4). | ~~P2~~ | **APPROVED 2026-08-23.** Created with `task.py` and `authority.py`, plus three `forbidden` contracts: `brain ↛ io` (direct edges only — `brain → actions → io.audio.tts` is legal by construction and forbidding it would forbid `brain → actions` by proxy), `brain ↛ main`, `io ↛ brain`. |
 | **D2** | Accept §4.3's cost: restart-surviving Tasks resume only on a qualifying turn, never on a timer. | P2 | Accept. The alternative is pre-authorised work a revoked device can still fire. |
 | **D3** | Accept that intents stay as the execution ABI (§7), which is narrower than the source documents propose. | P3 | Accept. It preserves the security key domain, the published API and the fail-closed default, at no cost to the actual complaint. |
 | ~~**D4**~~ | KI-30's fix refuses a raised device the ability to install monitors, schedules, procedures, shortcuts or backup jobs. | ~~P-1~~ | **DECIDED 2026-08-23: accepted, and widened.** After seeing it live the operator confirmed the gate should cover *all* of `manage_*` -- listing and deleting a monitor are refused too, not only creating one. Pinned by `test_the_gate_covers_management_not_only_creation` so it is not narrowed on sight. |

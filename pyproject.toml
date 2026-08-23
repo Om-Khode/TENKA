@@ -54,6 +54,40 @@ ignore_imports = [
     "assistant.core.runtime_config -> assistant.storage.repos.settings",
 ]
 
+# ─── brain/ ─────────────────────────────────────────────────────────────────
+# The tenth subpackage, approved 2026-08-23. It sits between `actions/` and
+# `main.py`: it may reach everything below it and nothing beside or above it.
+#
+# `io ↛ brain` is the one that needs saying out loud. `io.api` already may not
+# reach past `core`+`config`, so it takes the Brain the way it already takes
+# the pipeline -- through the `ChatDispatch` protocol in `actions/`, injected by
+# `main.py`. A direct import would re-litigate a boundary that was argued once.
+
+[[tool.importlinter.contracts]]
+name = "Brain never imports io directly"
+type = "forbidden"
+source_modules = ["assistant.brain"]
+forbidden_modules = ["assistant.io"]
+# Direct edges only. `brain -> actions` is legal and `actions -> io.audio.tts`
+# is legal (the deferred-import convention), so the transitive chain exists by
+# construction and forbidding it would forbid `brain -> actions` by proxy. What
+# this contract is for is the direct reach: the Brain must never pick up a
+# transport, a speaker or a socket itself. The indirect path is `actions`'
+# business, governed by its own contracts.
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "Brain never imports main"
+type = "forbidden"
+source_modules = ["assistant.brain"]
+forbidden_modules = ["assistant.main"]
+
+[[tool.importlinter.contracts]]
+name = "IO never imports brain"
+type = "forbidden"
+source_modules = ["assistant.io"]
+forbidden_modules = ["assistant.brain"]
+
 [[tool.importlinter.contracts]]
 name = "Overlay never imports actions or automation"
 type = "forbidden"

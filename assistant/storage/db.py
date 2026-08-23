@@ -69,7 +69,7 @@ class Database:
 
     # --- Schema versioning ---
 
-    _LATEST_VERSION = 21
+    _LATEST_VERSION = 22
 
     def _get_version(self) -> int:
         row = self._conn.execute(
@@ -118,6 +118,7 @@ class Database:
             19: self._migrate_v19,
             20: self._migrate_v20,
             21: self._migrate_v21,
+            22: self._migrate_v22,
         }
 
         for v in range(current + 1, self._LATEST_VERSION + 1):
@@ -805,6 +806,84 @@ class Database:
                 f"ALTER TABLE {table} ADD COLUMN installed_by "
                 "TEXT NOT NULL DEFAULT 'local'"
             )
+        self._conn.commit()
+
+
+    def _migrate_v22(self) -> None:
+        """V22: tasks and task_steps.
+
+        A Task that survives a restart is the point of persisting one, and the
+        two columns that make that safe rather than dangerous are `principal`
+        and `granted` -- see `brain/authority.py`. Without them a resumed Task
+        is either refused by every step (an unset grant set refuses) or run
+        with LOCAL_GRANTS by whatever picked it up, which is a phone's banked
+        work laundered into keyboard privilege.
+
+        `granted` stores a **sorted comma-joined list of capability values**,
+        never an integer bitmask. A bitmask silently re-maps if the enum's
+        member order changes, which is exactly the kind of quiet re-grant the
+        explicit-literal discipline in `io/api/policy.py` exists to prevent. A
+        name that no longer exists in the enum must be a load error, not a
+        dropped member.
+
+        No foreign key from `task_steps` to `tasks`: `PRAGMA foreign_keys` is
+        ON for this connection, and a cascade delete on a task would silently
+        discard the step history that explains what it did. Steps are cleaned
+        up explicitly or not at all.
+
+        `status` is a TEXT enum value rather than an integer for the same
+        reason `intent` is a string: a database someone opens by hand should
+        say `suspended_needs_authority`, not `10`.
+        """
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id      TEXT PRIMARY KEY,
+                intent       TEXT NOT NULL,
+                principal    TEXT NOT NULL,
+                granted      TEXT NOT NULL,
+                affordance   TEXT NOT NULL DEFAULT '',
+                operation    TEXT NOT NULL DEFAULT '',
+                parameters   TEXT NOT NULL DEFAULT '{}',
+                constraints  TEXT NOT NULL DEFAULT '{}',
+                source       TEXT NOT NULL DEFAULT '',
+                created_at   TEXT NOT NULL DEFAULT '',
+                expected     TEXT NOT NULL DEFAULT '',
+                context_ref  TEXT,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                parent       TEXT,
+                updated_at   TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS task_steps (
+                task_id      TEXT NOT NULL,
+                step_id      INTEGER NOT NULL,
+                intent       TEXT NOT NULL,
+                affordance   TEXT NOT NULL DEFAULT '',
+                operation    TEXT NOT NULL DEFAULT '',
+                parameters   TEXT NOT NULL DEFAULT '{}',
+                depends_on   TEXT NOT NULL DEFAULT '',
+                condition    TEXT,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                goal         TEXT NOT NULL DEFAULT '',
+                outcome      TEXT,
+                observation  TEXT,
+                tier         TEXT,
+                escalated    INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (task_id, step_id)
+            )
+            """
+        )
+        # Resumption asks two questions -- "whose is this?" and "what is still
+        # open?" -- so those are the two indexes. `status` alone would scan
+        # every task a device ever created.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_principal_status "
+            "ON tasks (principal, status)"
+        )
         self._conn.commit()
 
 
