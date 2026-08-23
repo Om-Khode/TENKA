@@ -71,9 +71,18 @@ def test_v18_kg_commitments_columns_present(db):
     assert expected <= names
 
 
-def test_v18_schema_version_at_18(db):
+def test_v18_schema_version_at_least_18(db):
+    """v18 is the migration that added `kg_commitments`; this asserts it has
+    run, not that it is the newest.
+
+    Was `== 18`, which meant every later migration broke a test about
+    commitments. It had been failing since v19 and was still failing at v22 --
+    a red test nobody could act on, because the thing it complained about was
+    the schema moving forward as designed. The floor is the property; the exact
+    head belongs to `test_schema_versioning`.
+    """
     row = db.fetchone("SELECT version FROM _schema_version WHERE id = 1")
-    assert row["version"] == 18
+    assert row["version"] >= 18
 
 
 def test_v18_indexes_present(db):
