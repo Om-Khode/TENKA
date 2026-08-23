@@ -70,6 +70,16 @@ by hand is how a document acquires a wrong one.
 24. Glossary
 25. Revision record — what the first draft got wrong
 
+**Part VI — The subsystems this document under-audited**
+26. Why this part exists
+27. Personality — "robotic" is quantisation, not architecture
+28. Vision agent — a second implementation of Part III's contracts
+29. Topic tracking — KI-16's description is stale
+30. Code executor — measured, not audited
+31. DOM orchestrator and knowledge graph — measured, not audited
+32. What this part changes above
+33. P11, rewritten
+
 ---
 
 # Part I — Why this document exists
@@ -2370,3 +2380,252 @@ One earlier claim did **not** hold and is corrected in §11.3: an initial count 
 `PrimitiveResult`, `HealResult` and `DispatchResult` and are untouched. A phase brief
 carrying the wrong number would have sent an implementer to rewrite four unrelated result
 types.
+
+---
+
+# Part VI — The subsystems this document under-audited
+
+## 26. Why this part exists
+
+Sections 1–25 were written after measuring the tree, and then weighted wrong. The
+6a.5/6b security surface is **12,580 of 74,641 lines — 17%** — and it took the majority of
+the document's attention, because `CLAUDE.md` was itself ~38% milestone content and the
+emphasis was inherited rather than derived. Word counts in the first draft: `grant` 62,
+`capability` 67, `raise` 45 — against `vision/agent` 2, `dom_orchestrator` 2,
+`knowledge_graph` 2, `topic_tracker` 0, and "robotic" — the operator's own word for the
+complaint that started this — **0**.
+
+This part is the correction. Six subsystems, **12,059 lines**, read for the first time on
+2026-08-23. Three findings change phases above; one changes what the whole document is for.
+
+**The headline: the plan's diagnosis of personality is wrong, and the operator's complaint
+has a two-constant cause.** See §27.
+
+Honesty about depth: §27 and §28 are read closely. §29–§31 are measured and skimmed, and
+are marked so. A part that claims uniform depth would repeat the first draft's mistake in
+the opposite direction.
+
+---
+
+## 27. Personality — "robotic" is quantisation, not architecture
+
+§16 and §21.4 say *"do not rely on a giant prompt as the entire personality system"* and ask
+for personality to emerge from memory, continuity, context and preferences.
+
+**It already does.** `llm/prompts.py:build_personality_prompt` composes four live sources:
+
+```
+personalities/<name>/prompt.txt        the base character
+  + trait-tiered modifiers             from live SQLite trait state
+  + relationship context summary       conversation count + recent snippets
+  + preference behavioural block       from the preference store
+```
+
+Per personality, as data: `prompt.txt`, `traits.json`, `modifiers.json`, `responses.json`.
+Adding a personality is a folder. That is the architecture §16 asks for, shipped.
+
+So P11 as written — "make personality depend more on context and less on prompt" — is
+aimed at a problem that does not exist, and would spend a phase rebuilding what works.
+
+### 27.1 What actually makes it feel predictable
+
+Two constants and a JSON file. All three measured:
+
+| Mechanism | Resolution | Consequence |
+| --- | --- | --- |
+| `_get_trait_tier` (`llm/prompts.py:16-24`) | **3 tiers**, boundaries 0.34 / 0.67 | 6 traits × 3 tiers. Trait drift *within* a tier changes the prompt by **zero bytes** |
+| `MAX_DELTA_PER_CYCLE = 0.05` | tier width 0.33 | **~6.6 reflection cycles** to cross one boundary. Nightly, that is a week before anything she says changes |
+| `responses.json` | 41 keys, median **3** variants, minimum **1** | Common paths repeat verbatim. Some keys have exactly one sentence, forever |
+
+`personality_say` (`actions/responses.py`) random-picks from the pool — 13 modules use it,
+deliberately, for "variety without LLM cost". The design is sound; the pool is three
+sentences deep.
+
+So the felt experience is: a fixed base prompt, modifiers that change once a week, and a
+handful of canned lines on the paths hit most often. That reads as robotic because it *is*
+nearly deterministic — not because personality is prompt-shaped.
+
+### 27.2 What to do instead of P11
+
+**None of this needs the Brain.** In rough order of felt improvement per unit of work:
+
+1. **Widen the pools.** 41 keys × 3 → 41 × 8 is a data change, no code. Biggest effect,
+   lowest risk, and it is the thing the operator actually notices.
+2. **Interpolate instead of tiering.** Pass the trait *value* into the prompt, or use more
+   than three bands. A continuous input makes a week of drift visible the day it happens.
+3. **Then** consider P11's structural work, if anything still feels flat.
+
+P11 is therefore **rewritten** (§33) from "restructure personality" to "raise its
+resolution, then re-measure". This is the one place where the correct plan is smaller than
+the one that was written.
+
+### 27.3 The invariant that survives unchanged
+
+§18's `system truth → personality → expression` is right and is not what this touches.
+Widening a response pool cannot make a refusal claim success — the pools are keyed by
+outcome, and KI-28's fix means a refused turn answers from a fixed string with no model
+call at all. Raising resolution and keeping personality out of truth are independent.
+
+---
+
+## 28. Vision agent — a second implementation of Part III's contracts
+
+`automation/vision/agent.py` is **3,146 lines**, the largest module after `main.py`, and
+§2.1 counted it as one of six "orchestration loops" to unify in P13. That undersells what it
+is. Roughly:
+
+| Lines | What |
+| --- | --- |
+| ~1,270 | pyautogui action primitives — click, type, hotkey, OCR snap, app focus |
+| ~250 | the agent system prompt |
+| ~390 | TODO tracking (`_generate_initial_todos`, `_update_todos_after_batch`) |
+| ~440 | action-to-TODO matching and visual confirmation |
+| ~480 | the planning loop |
+
+`_TaskState.todo_list` is a list of dicts carrying `id, task, done, kind, target, field,
+value, pending_visual_confirm, confirm_strikes`. **That is a TaskStep with a verification
+state machine**, hand-rolled, alongside its own stuck detector
+(`zero_progress_streak`, aborts at 3), its own dynamic budget (`loop_budget`), and its own
+escalation (`_MAX_CONFIRM_STRIKES = 3`).
+
+So it is not a loop that needs the shared state machine bolted on. It is a **parallel
+implementation of P2's `Task`/`TaskStep`/`Verdict`** with ~830 lines of semantics the
+contracts do not currently express. P13 as written would either discard that or wrap it.
+
+**Consequence for P2:** design `TaskStep` and `Verdict` against this, not only against
+`actions/planner/planner.py`'s `PlanStep`. The planner's step is `(id, tool, goal, depends_on,
+condition, status, output, error)` — coarse. The vision agent's carries per-step
+verification state, which is the harder case and the one that will break a contract designed
+for the easy one.
+
+### 28.1 It is ahead of the plan on honesty
+
+The thing I expected to find here was the ambiguity-reads-as-success defect fixed in
+`recovery.py` (real KI-31). It is not here. When vision cannot confirm a TODO, the agent
+marks it done-as-abandoned and `_append_abandoned_suffix` appends
+`"(couldn't visually confirm: <fields>)"` to the spoken reply.
+
+That is exactly §11's `UNCERTAIN` discipline, implemented before it was specified, in the
+subsystem this document ignored. **P6 should adopt its shape rather than invent one**: a
+per-item confirmation state, an explicit abandoned flag, and disclosure in the user-facing
+sentence.
+
+Two smaller notes: the `~250`-line system prompt is a P10 context-profile consumer nobody
+listed, and `MAX_STEPS = 15` / `MAX_LOOPS = 8` are budgets P14's cost work should read rather
+than re-derive.
+
+---
+
+## 29. Topic tracking — KI-16's description is stale
+
+**Measured, not deeply read.** 248 lines.
+
+KI-16 says pronoun resolution *"rewrites pronouns with the previous turn's trailing noun"*,
+with examples resolving `it` to `a public` and `the shell command`.
+
+The code no longer works that way. `push_turn` runs spaCy, then ranks candidates in three
+bands — named entities filtered to `_ENTITY_LABELS`, copula predicates ("Y" in "X is Y"),
+then generic noun chunks — inserting so that proper nouns end up on top. `resolve_query`
+additionally skips code-shaped bodies, protects fenced and quoted spans, and skips
+`this`/`that` when they act as determiners. Each guard carries a comment naming the live
+test that produced it.
+
+**But the failure mode survives where the ranking has nothing better.** A turn with no
+named entity and no copula predicate still promotes a generic noun chunk, which is exactly
+what KI-16's examples are. So: **mitigated by ranking, not eliminated**, and the ticket's
+description is wrong in a way that would send someone looking for code that no longer
+exists.
+
+Action: re-describe KI-16 against the current implementation before anyone works on it.
+This is the "verify a report against the current tree" rule applied to the project's own
+ledger.
+
+---
+
+## 30. Code executor — measured, not audited
+
+**Measured only.** ~2,900 lines across `orchestrator.py` (896), `sandbox.py` (723),
+`retry.py` (590), `templates.py` (444), `discovery.py` (722), `_utils.py`,
+`router_examples.py`, `routing.py`, `prompts.py`, `packages.py`.
+
+What is visible without reading it properly, and what it implies:
+
+- It has a **retry loop with its own knowledge feedback** — `knowledge.py`'s per-service
+  `works`/`never` entries are written from execution outcomes and injected into fix prompts.
+  That is a *learning* loop, not just a retry loop, and §10's durable-state inventory lists
+  the store but not the loop that feeds it.
+- `templates.py` + `router_examples.py` mean generated code is **saved and replayed**. §10
+  counts per-service knowledge as durable state; saved templates are a twelfth store and are
+  missing from the table.
+- `sandbox.py` at 723 lines is the actual boundary for "run arbitrary code", and §3 discusses
+  `EXECUTE` as a *permission* without once describing what the sandbox does with it.
+
+**This is the largest remaining gap in the document.** P0's audit must cover it properly, and
+until it does, P5's claim that execution migration is well understood rests on nothing for
+~2,900 lines of the most privileged code in the tree.
+
+---
+
+## 31. DOM orchestrator and knowledge graph — measured, not audited
+
+**Measured only.** `browser/dom_orchestrator.py` (1,739) and `knowledge_graph.py` (829).
+
+The orchestrator is the browser tier's own step loop, with the same standing as §28's
+finding: expect it to carry step semantics the contracts must accommodate, and check before
+assuming P13 can absorb it.
+
+The knowledge graph gets one paragraph in §15 — "demote it from the Brain to an
+implementation behind a Memory Service" — for 829 lines plus `kg_entities`, `kg_facts`,
+`kg_relationships` and `kg_commitments`. Whether a Memory Service abstraction fits it is
+unexamined. §15's instruction may be correct; it is currently unsupported.
+
+---
+
+## 32. What this part changes above
+
+| Section | Change |
+| --- | --- |
+| §2.1 | The vision agent is not merely a sixth loop; it is a parallel implementation of P2's contracts (§28) |
+| §9.3 | `TaskStep` must be designed against the vision agent's per-step verification state, not only `PlanStep` |
+| §10.2 | The durable-state table is missing saved code templates. Twelve stores, not eleven (§30) |
+| §11 | P6 should adopt the vision agent's abandoned-with-disclosure shape rather than invent one (§28.1) |
+| §16 | **P11 is rewritten** — raise personality resolution and re-measure, do not restructure (§27, §33) |
+| §17.P0 | The audit must cover `code_executor/` properly. It is the largest unexamined surface and the most privileged (§30) |
+| §20 | KI-16's description is stale and must be rewritten before anyone acts on it (§29) |
+
+---
+
+## 33. P11, rewritten
+
+### P11 — Personality resolution (replaces "personality and truth separation")
+
+**Intent.** The composition is already right (§27). Raise its resolution, then measure
+whether anything structural is still needed.
+
+**Files.** `personalities/*/responses.json`, `llm/prompts.py`,
+`storage/repos/personality.py`.
+
+**Deliverables, in order, stopping when it feels right:**
+
+1. **Widen the response pools** from a median of 3 variants to at least 8, and fix the keys
+   that have exactly 1. Data only, no code.
+2. **Replace the 3-tier collapse** with either the raw trait value in the prompt or a finer
+   band count. A week of drift should be visible the day it happens, not on the seventh
+   reflection cycle.
+3. **Re-measure before doing anything else.** If it no longer reads as robotic, the rest of
+   this phase does not happen.
+
+**Properties to pin.**
+
+- personality still cannot change a `Verdict` — structurally, it never receives a mutable one
+- a refused turn's reply still comes from the fixed string with no model call (KI-28)
+- every response key has at least the minimum variant count, asserted over all personality
+  folders so a new personality cannot ship with one-sentence pools
+- trait resolution is finer than three bands, asserted numerically rather than by inspection
+
+**Required mutations.** Collapse the trait bands back to three → the resolution test reds.
+Reduce a pool to one variant → the pool-depth test reds. Hand personality a mutable verdict
+→ the structural test reds.
+
+**Exit.** The operator says it no longer feels robotic, or says what still does. That is the
+only exit criterion that matters here, and it is not something a test can assert.
