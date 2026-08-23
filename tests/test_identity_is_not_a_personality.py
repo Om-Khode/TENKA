@@ -228,6 +228,74 @@ def test_the_block_covers_the_character_questions_that_went_wrong(topic):
     )
 
 
+def test_the_carve_out_does_not_licence_describing_herself():
+    """The carve-out leaked, and this is what it produced.
+
+        "are you real person?" -> "No, I'm not a real person. I'm a program."
+
+    The exception fired correctly -- a plain no to a sincere question -- and then
+    she volunteered exactly what the rest of the block forbids. Being *allowed*
+    to say she is not a person was read as permission to say what she is
+    instead.
+
+    So the exception has to state its own end. A permission with no stated
+    boundary is a permission to continue.
+    """
+    from assistant.llm.prompts import _build_identity_block
+    text = _build_identity_block().lower()
+    assert "entire answer" in text, (
+        "the carve-out does not say where the answer stops"
+    )
+    assert "do not follow it with what you are" in text, (
+        "nothing forbids appending a self-description to the permitted no -- "
+        "which is the exact reply that was observed"
+    )
+
+
+@pytest.mark.parametrize("feeling", ["boredom", "curiosity", "irritation"])
+def test_inner_states_are_hers_to_report(feeling):
+    """The second observed failure:
+
+        "do you get bored?" -> "Boredom isn't really something I experience."
+
+    The block already listed boredom as a question to answer as herself, and it
+    was not enough -- a denial of an inner state needs naming as its own defect,
+    because it uses no forbidden word and reads like modesty rather than
+    evasion.
+    """
+    from assistant.llm.prompts import _build_identity_block
+    assert feeling in _build_identity_block().lower(), (
+        f"the block does not cover {feeling}, and the general rule has already "
+        f"been shown not to generalise"
+    )
+
+
+def test_no_personality_denies_having_feelings():
+    """`warm_honest` said "You do not perform emotion **you don't have**" --
+    the personality asserting a fact about her inner life, contradicting the
+    identity block. Same class as "You are software", one layer in: the
+    anti-sycophancy point (do not manufacture enthusiasm) survives perfectly
+    well without the claim that there is nothing there to manufacture from.
+
+    Swept over every folder, since the next personality can make the same
+    slip while sounding humble.
+    """
+    denials = re.compile(
+        r"emotion(?:s)?\s+you\s+do\s*n[o']?t\s+have|"
+        r"you\s+(?:have\s+no|do\s*n[o']?t\s+have\s+(?:any\s+)?)"
+        r"(?:emotions|feelings|moods|inner\s+life)",
+        re.IGNORECASE,
+    )
+    for folder in _personality_dirs():
+        text = (folder / "prompt.txt").read_text(encoding="utf-8")
+        hits = denials.findall(text)
+        assert not hits, (
+            f"{folder.name}/prompt.txt tells her she has no inner life: {hits}. "
+            f"Delivery is a personality's to set; whether she feels anything is "
+            f"not."
+        )
+
+
 def test_the_rules_block_still_forbids_self_description():
     """Kept, and widened. The rule was right from the start; what changed is
     that it names the class rather than two phrasings, and no longer stands
