@@ -68,6 +68,47 @@ def get_all_preferences() -> list[dict]:
 
 def set_preference(key: str, value: str, category: str,
                    confidence: float, source: str, reason: str) -> None:
+    """Record a preference, capping what a proposal is allowed to be worth.
+
+    **A writer that is not the user cannot start a preference above
+    `CONFIDENCE_FIRST_OBSERVATION`**, whatever confidence it asked for.
+
+    The ladder in `storage/repos/preference.py` already encoded the intended
+    design: discover a pattern at 0.4, +0.15 per re-observation, 0.7 to be
+    applied silently. Repetition earns trust. `reflection.py` walked around it
+    by passing the *model's own* confidence straight through, and its prompt
+    offers 0.8 for "the user explicitly stated this" -- so a single nightly
+    cycle could put a preference above `CONFIDENCE_SILENT` on the model's
+    assessment of its own evidence. `automation/router.py` reads preferences as
+    routing **priority 1**, ahead of URL detection, so that assessment steered
+    how goals were executed.
+
+    Here rather than in the repo: every production writer goes through this
+    facade (`reflection.py` ×2, `router.teach_routing`, `check_for_corrections`),
+    so this *is* the write boundary, while a repo that silently rewrote the
+    value it was handed could not be used to restore or migrate one. Ten tests
+    in `test_repo_preference.py` demonstrated the difference by failing when
+    the clamp was briefly a layer lower.
+
+    `not in USER_STATED_SOURCES` rather than `in _MODEL_PROPOSED_SOURCES`: an
+    unrecognised writer is capped rather than trusted, matching
+    `DEFAULT_REQUIRED`'s direction in `core/intent_capabilities.py`. Keying on
+    the permissive set would let a source nobody has classified start wherever
+    it liked.
+
+    A model may propose. Only repetition TENKA counted itself
+    (`bump_confidence`) or the user can raise it.
+    """
+    from .storage.repos.preference import (
+        CONFIDENCE_FIRST_OBSERVATION, USER_STATED_SOURCES,
+    )
+    if source not in USER_STATED_SOURCES and confidence > CONFIDENCE_FIRST_OBSERVATION:
+        logger.info(
+            f"[PREFERENCES] '{key}' proposed at {confidence} by {source!r}; "
+            f"capped to {CONFIDENCE_FIRST_OBSERVATION} — a proposal is not "
+            f"evidence, and only repetition or the user raises it"
+        )
+        confidence = CONFIDENCE_FIRST_OBSERVATION
     _get_repo().set_preference(key, value, category, confidence, source, reason)
 
 

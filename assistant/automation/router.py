@@ -224,11 +224,38 @@ def _check_routing_preference(goal: str) -> Optional[str]:
     words = [w.lower().strip(".,!?") for w in goal.split() if len(w) > 2]
     candidates = [w for w in words if w not in _SKIP_WORDS]
     
+    # Provenance, not just confidence. This is routing **priority 1** -- it
+    # runs before URL detection -- so what it accepts decides how a goal is
+    # executed before anything else gets a say.
+    #
+    # The old bar was a bare `>= 0.4`, which is `CONFIDENCE_ASK`: enough to
+    # apply while mentioning it, never enough to apply silently. Routing is
+    # silent. Combined with `reflection.py` passing the model's own confidence
+    # straight through, one nightly cycle could steer execution on a pattern
+    # the model said it had seen.
+    #
+    # Now: a preference the *user* stated acts at `CONFIDENCE_ASK`, because
+    # they said it. Anything else -- reflection, or a writer nobody has
+    # classified -- has to reach `CONFIDENCE_SILENT`, which the ladder only
+    # grants after repetition TENKA counted itself (`bump_confidence`,
+    # +0.15 each) or an explicit confirmation. A proposal is not evidence.
+    from ..storage.repos.preference import (
+        CONFIDENCE_ASK, CONFIDENCE_SILENT, USER_STATED_SOURCES,
+    )
     for word in candidates:
         try:
             pref = preferences.get_preference(f"automation_{word}")
-            if pref and pref.get("confidence", 0) >= 0.4:
+            if not pref:
+                continue
+            _stated = pref.get("source") in USER_STATED_SOURCES
+            _floor = CONFIDENCE_ASK if _stated else CONFIDENCE_SILENT
+            if pref.get("confidence", 0) >= _floor:
                 return pref["value"]
+            logger.info(
+                f"[DA] routing preference 'automation_{word}' ignored: "
+                f"source={pref.get('source')!r} confidence={pref.get('confidence')} "
+                f"below {_floor} for that provenance"
+            )
         except Exception:
             pass
     return None
@@ -2028,11 +2055,24 @@ async def teach_routing(app_name: str, backend: str) -> str:
     """
     try:
         from .. import preferences
+        # `source` and `reason` are required and were both missing, so this
+        # raised TypeError on every call, the bare `except` swallowed it, and
+        # the user was told "I couldn't save that" -- the one path where they
+        # explicitly teach a routing preference never once worked. Found while
+        # adding provenance to the read side, which is what made it matter:
+        # `_check_routing_preference` now admits a user-stated preference at
+        # the lower bar, and this is the writer that produces one.
+        #
+        # "correction" rather than "user" so it lands in the same class the
+        # correction detector uses -- both are the user saying "no, do it this
+        # way", and `USER_STATED_SOURCES` carries both.
         preferences.set_preference(
-            category="automation_routing",
             key=f"automation_{app_name.lower().strip()}",
             value=backend,
-            confidence=0.85
+            category="automation_routing",
+            confidence=0.85,
+            source="correction",
+            reason=f"user asked for {backend} automation for {app_name}",
         )
         return f"Got it, I'll use {backend} automation for {app_name} from now on."
     except Exception as e:

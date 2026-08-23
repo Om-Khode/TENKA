@@ -26,6 +26,27 @@ CONFIDENCE_USER_CORRECTS = 0.85       # user provides a correction (new pref)
 CONFIDENCE_APPLIED_NO_COMPLAINT = 0.05  # preference used, user didn't object
 CONFIDENCE_APPLIED_OVERRIDDEN = -0.2    # preference used, user overrode it
 
+# --- Provenance ---
+#
+# `source` is free text, so these two sets are what turns it into a decision.
+# A writer whose source is not listed anywhere is treated as model-proposed:
+# the strict direction, matching `DEFAULT_REQUIRED` in
+# `core/intent_capabilities.py`, because a new writer nobody has classified
+# should not be trusted to steer routing on its first night.
+_MODEL_PROPOSED_SOURCES = frozenset({"reflection", "inference", "assistant"})
+
+# The user said it, in one form or another. These may start high.
+#
+# `explicit` was missing from the first version of this set, and
+# `tests/test_repo_preference.py` is what found it -- eleven of its cases use
+# `explicit` to mean exactly "the user stated this" while testing unrelated
+# storage mechanics, and every one of them started failing. The set was wrong,
+# not the tests. A spelling that plainly means user-stated has to be in here,
+# or the clamp treats a deliberate statement as a guess.
+USER_STATED_SOURCES = frozenset({
+    "user", "explicit", "correction", "confirmed",
+})
+
 # --- Decay ---
 
 DECAY_THRESHOLD_DAYS = 30
@@ -95,8 +116,18 @@ class PreferenceRepo:
         """
         Create or update a preference with full logging.
         Clamps confidence to [0.0, 1.0]. Logs old value before overwriting.
+
+        Storage only. The provenance ceiling on a model-proposed confidence
+        lives in `preferences.set_preference` -- every production writer goes
+        through that facade, and a repo that silently rewrites the value it was
+        handed is a repo that cannot be used to restore or migrate one. Ten
+        tests in `test_repo_preference.py` said so by failing when the clamp
+        was briefly here: they pass `source="reflection"` as filler while
+        testing bump, decay and threshold arithmetic, and a repo-level clamp
+        rewrote their inputs out from under them.
         """
         now = datetime.now().isoformat()
+
 
         # Clamp confidence
         confidence = max(0.0, min(1.0, confidence))
