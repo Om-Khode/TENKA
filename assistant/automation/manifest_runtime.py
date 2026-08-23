@@ -18,18 +18,64 @@ coverage is unaffected.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from .manifest_dispatcher import ManifestDispatcher
+
+logger = logging.getLogger("manifest_runtime")
 
 _dispatcher: ManifestDispatcher | None = None
 
 
 # ─── Singleton helpers ──────────────────────────────────────────────────
 def init_dispatcher(dispatcher: ManifestDispatcher) -> None:
-    """Cache the singleton dispatcher. Called once from main.py at startup."""
+    """Cache the singleton dispatcher. Called once from main.py at startup.
+
+    Also subscribes to telemetry's correction signal, which is how a user
+    immediately re-asking for something becomes a failure counter on the
+    selector that was used (demote-after-3).
+
+    The subscription lives here rather than telemetry reaching in, because
+    `telemetry -> automation` inverts the layering while
+    `automation -> telemetry` does not. Telemetry publishes and stays ignorant
+    of who cares; a future consumer registers instead of adding an import
+    there.
+    """
     global _dispatcher
     _dispatcher = dispatcher
+
+    try:
+        from .. import telemetry
+        telemetry.register_correction_observer(_on_correction)
+    except Exception as e:  # noqa: BLE001 -- feedback is never load-bearing
+        logger.debug(f"[MANIFEST] correction observer not registered: {e}")
+
+
+def _on_correction(intent_name: str) -> None:
+    """Telemetry's correction signal, filtered to our own dispatches.
+
+    A module-level function, NOT a closure inside `init_dispatcher`. The first
+    version built a fresh closure per call, so
+    `register_correction_observer`'s dedupe-by-identity never matched and every
+    re-init added another observer -- each reading the same module global, so
+    one correction bumped the selector's failure counter once per init. A
+    demote-after-3 counter that counts to three on the first correction after
+    three rebuilds is worse than no feedback.
+
+    Caught by `test_telemetry.py::TestMe1CorrectionFeedback` failing only when
+    run alongside other tests that also init a dispatcher -- it passed alone.
+    Reads the global rather than capturing, so it always sees the current
+    dispatcher and needs no re-registration.
+
+    The intent filter is here rather than in telemetry: the publisher announces
+    every correction and stays ignorant of who cares.
+    """
+    if intent_name != "manifest_dispatch":
+        return
+    disp = _dispatcher
+    if disp is not None:
+        disp.record_last_dispatch_correction()
 
 
 def get_dispatcher() -> ManifestDispatcher | None:
