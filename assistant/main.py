@@ -2591,19 +2591,50 @@ async def _build_conversation_messages() -> tuple[list[dict], str | None]:
     # user who says "call the API with this key" has to be able to.
     from .core.redact import redact_secrets_strict
     messages: list[dict] = []
-    for t in verbatim_turns:
-        messages.append({
-            "role": "user",
-            "content": redact_secrets_strict(t["user_input"]),
-        })
-        if since and t.get("timestamp", "") < since:
-            messages.append({"role": "assistant", "content": "(responded)"})
+
+    def _add_user(text: str) -> None:
+        """Append a user turn, merging into the previous one if it is also user.
+
+        Merging matters because pre-switch turns contribute no assistant
+        message, so several user turns can end up adjacent. Gemini tolerates
+        consecutive same-role content, but the OpenAI-shaped fallbacks (Groq,
+        Cerebras) are happier with strict alternation and there is no reason to
+        depend on the difference.
+        """
+        if messages and messages[-1]["role"] == "user":
+            messages[-1]["content"] += "\n" + text
         else:
-            messages.append({
-                "role": "assistant",
-                "content": redact_secrets_strict(
-                    _strip_name_prefix(t["response"])),
-            })
+            messages.append({"role": "user", "content": text})
+
+    for t in verbatim_turns:
+        _add_user(redact_secrets_strict(t["user_input"]))
+
+        if since and t.get("timestamp", "") < since:
+            # Said before the personality was switched: keep WHAT was
+            # discussed, drop HOW the previous personality said it.
+            #
+            # No placeholder. This branch used to append an assistant message
+            # reading `"(responded)"`, and immediately after a switch *every*
+            # turn is pre-switch -- so the only assistant behaviour in the
+            # history was that one string, repeated. The model did the obvious
+            # thing and copied it: asked her favourite colour one turn after
+            # `/personality warm_honest`, she replied `(responded)`, and the
+            # TTS said it out loud.
+            #
+            # The mistake was putting a marker in a role reserved for things
+            # she actually said. Anything plausible-looking there is an example
+            # to imitate, and a masked turn is exactly the case where there is
+            # no example to give. Omitting the message says the same thing to
+            # the model -- this turn has no assistant text -- without handing
+            # it words. Her voice for the new personality comes from the
+            # personality prompt, which is the point of switching.
+            continue
+
+        messages.append({
+            "role": "assistant",
+            "content": redact_secrets_strict(
+                _strip_name_prefix(t["response"])),
+        })
 
     return messages, summary
 
