@@ -84,7 +84,47 @@ Three failure shapes to watch for:
 3. **A hang is not a failure.** A test that stalls on a mutant never goes red. Bound
    anything that waits with `asyncio.wait_for`.
 
-**A green mutant is investigated, not accepted.** It may be proof the test measures the
+**A green mutant is investigated, not accepted.**
+
+## A stub that does not intercept
+
+**Patch where the importing module will look, not where the name lives.** This has now
+cost five separate places, and twice the failure was a test reaching the real desktop
+rather than a red assertion.
+
+| Code does | Patch this | `patch.dict(sys.modules)` works? |
+| --- | --- | --- |
+| `import pyautogui` | `sys.modules["pyautogui"]` | **always** — a plain import consults it first |
+| `from ..io import screen` | the attribute: `assistant.io.screen` | **only while the attribute is unbound** |
+| `from ..llm.contracts import f` | `contracts.f` on the real module | needs `llm` to stay a real *package* |
+
+The middle row is the trap. `from X import Y` tries `getattr(X, "Y")` first, and a submodule
+is bound as an attribute of its parent the moment anything imports it — so the stub works
+when the file runs alone and silently stops working once something else imports the real
+module first. Safe alone, wrong in company, and "wrong" means `open_app` launching an
+application on the live desktop.
+
+Two consequences worth stating separately:
+
+- **`patch.object(package, name)` is not `patch.object(module, name)`.** A function resolves
+  a global in the namespace where *it* was compiled.
+  `test_planner_integration.py` patched `_run_computer_task_inner` on
+  `assistant.automation.vision` while the entry point resolves it inside `agent.py`, so the
+  patch bound a name nothing reads and the real vision agent ran.
+- **Import before you overwrite.** `import a.b.c` *rebinds* `a.b` on the parent as a side
+  effect, so an import placed after `pkg.b = fake` silently reinstates the real module. One
+  such line put a live Gemini call inside a unit test.
+
+Two shapes of fix, both in the tree: bind the fake on the attribute
+(`test_planner_integration.py:_install_screen_llm`), or unbind the attribute so `sys.modules`
+is consulted (`test_procedure_executor.py:_native_unbound`). Either way, **add a test that
+asserts the interception happened**, in both directions — the assertion that the stub won is
+vacuous on its own, since it passes just as well if patching were reliable.
+
+**A unit test has no business reading the screen or calling a model.** Where a failure path
+reaches one — `procedure_executor._self_heal` takes a screenshot and calls a model after the
+retries are exhausted — make it inert for the whole file rather than per test. Enumerating
+which tests happen to trip it is how one gets missed. It may be proof the test measures the
 wrong thing. 6b's transport work found a test pinning the wrong depth of a cancellation
 hazard exactly this way — chasing the green mutant found more than any review round.
 
