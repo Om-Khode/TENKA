@@ -879,6 +879,33 @@ nothing called it. Three dispatch-level tests were added, which red on both remo
 hook and moving it after handler resolution. A perfect predicate nobody calls refuses
 nothing.
 
+**The gate covers the whole intent, not just the create — decided, not overlooked.**
+Confirmed by the operator on 2026-08-23 after seeing it in a live run.
+
+`manage_monitor` covers create, list, pause, resume and delete; `manage_backup` covers both
+"back up now" and "enable scheduled backups". Gating the intent gates all of them, so a
+raised device cannot list or delete its own monitors either — the live log shows
+`Delete firefox monitor` refused with the durability sentence.
+
+That looks wrong at first glance, because deleting *reduces* authority. It is kept anyway,
+on three grounds:
+
+- **The precise version costs the property.** Only the handler knows whether a given call
+  creates something (`monitors.py:_detect_action` parses the goal). Moving the check there
+  makes every handler responsible for remembering it, which is exactly the shape that left
+  five doors unguarded in 6a.5. Duplicating the parse at the choke point would be a second
+  source of truth about what "create" means.
+- **Managing a durable trigger is a keyboard activity.** A raise is for doing a thing on a
+  vetted machine, not for administering what runs on this one afterwards.
+- **It fails in the safe direction.** The cost is a raised phone cannot tidy up after
+  itself; the alternative risks the gate being narrowed into uselessness.
+
+Pinned by `test_the_gate_covers_management_not_only_creation`, so the next person who reads
+the refusal as a bug and narrows the gate gets a red test and this paragraph. Revisit only
+by splitting the intents (`create_monitor` vs `manage_monitor`), which is a five-place
+intent change per intent and an API contract change — not by moving the check into a
+handler.
+
 **Not closed by this:** a raise spent directly on `code_executor` can install an OS-level
 scheduled task outside TENKA. No in-process check can prevent that. The raise's value is
 that it is deliberate and narrow, not that it is containment.
