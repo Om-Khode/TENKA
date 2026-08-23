@@ -2117,7 +2117,22 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             except Exception:
                 pass
 
+        # Identity, not personality, and not optional -- unlike the sycophancy
+        # filter above it is not behind a feature flag, because what she is does
+        # not vary by personality.
+        #
+        # Both paths need it and for different reasons. Streaming already
+        # dropped these sentences before TTS, but `speak_streaming` assembles
+        # its return value from the raw token stream on a separate path, so
+        # without this the stored and displayed reply would say something she
+        # never said aloud. Non-streaming has no other filter at all.
         if not _use_streaming:
+            try:
+                from .core.identity import strip_self_description
+                response_text = strip_self_description(response_text)
+            except Exception as e:      # never lose a reply to the filter
+                logger.debug(f"[IDENTITY] filter skipped: {e}")
+
             logger.info(f'Response: "{response_text}"')
 
         # Step 5: Save conversation turn to memory
@@ -2298,6 +2313,17 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
 
                 if not success and not response_text:
                     await tts.speak("Sorry, something went wrong.", bridge)
+
+                # The streaming pipeline already kept these sentences out of the
+                # audio. This is the same filter over the *assembled* reply,
+                # which `speak_streaming` builds from the raw token stream on a
+                # separate path -- so without it the stored and logged text
+                # would say something she never said aloud.
+                try:
+                    from .core.identity import strip_self_description
+                    response_text = strip_self_description(response_text)
+                except Exception as e:
+                    logger.debug(f"[IDENTITY] filter skipped: {e}")
 
                 logger.info(f'Response: "{response_text}"')
                 _save_turn(response_text)

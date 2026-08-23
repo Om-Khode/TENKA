@@ -41,16 +41,54 @@ async def _accumulate_sentences(
     sentence_queue: asyncio.Queue,
     buffer: SentenceBuffer,
 ):
+    # Self-description is removed here, before the chunk reaches TTS, which is
+    # the only point where it still matters: audio is generated as each chunk
+    # arrives, so a filter over the finished reply would run after the speaker
+    # had already said it. See `core/identity.py` for why this is a code-level
+    # check rather than a fourth attempt at prompt wording.
+    #
+    # A REWRITE, not a drop. `SentenceBuffer` accumulates to a length threshold
+    # before emitting, so one chunk routinely holds several sentences -- "No,
+    # I'm not. I'm a program that lives here." arrives as a single unit.
+    # Dropping the chunk would take the good sentence with the bad one, which
+    # is why the first version of this was wrong.
+    from ...core.identity import _FALLBACK, strip_self_description
+
+    queued_any = False
+
+    def _speakable(chunk: str) -> "str | None":
+        """The chunk as it should be spoken, or None to skip it entirely."""
+        cleaned = strip_self_description(chunk)
+        if cleaned == chunk:
+            return chunk
+        if cleaned == _FALLBACK:
+            # Nothing survived. If earlier chunks already carried the reply,
+            # appending the fallback would be a non-sequitur -- "It's forest
+            # green. I live in your computer." -- so skip it and let what was
+            # already said stand. Only when this is the whole reply is the
+            # fallback the honest thing to say instead of silence.
+            if queued_any:
+                logger.info(f'[streaming] Skipped self-description chunk: "{chunk[:60]}"')
+                return None
+        logger.info(f'[streaming] Rewrote self-description before TTS: "{chunk[:60]}"')
+        return cleaned
+
     try:
         async for token in token_stream:
             for sentence in buffer.add(token):
-                await sentence_queue.put(sentence)
-                logger.info(f'[streaming] Sentence ready: "{sentence[:50]}..." ({len(sentence)} chars)')
+                speakable = _speakable(sentence)
+                if speakable is None:
+                    continue
+                await sentence_queue.put(speakable)
+                queued_any = True
+                logger.info(f'[streaming] Sentence ready: "{speakable[:50]}..." ({len(speakable)} chars)')
 
         remainder = buffer.flush()
         if remainder:
-            await sentence_queue.put(remainder)
-            logger.info(f'[streaming] Final sentence: "{remainder[:50]}..." ({len(remainder)} chars)')
+            speakable = _speakable(remainder)
+            if speakable is not None:
+                await sentence_queue.put(speakable)
+                logger.info(f'[streaming] Final sentence: "{speakable[:50]}..." ({len(speakable)} chars)')
     except asyncio.CancelledError:
         pass
     except Exception as e:
