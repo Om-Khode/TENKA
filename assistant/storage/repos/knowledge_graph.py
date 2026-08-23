@@ -10,6 +10,8 @@ import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Callable
 
+from ...core.redact import redact_secrets
+
 if TYPE_CHECKING:
     from assistant.storage.db import Database
 
