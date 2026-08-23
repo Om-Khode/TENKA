@@ -118,10 +118,20 @@ def _run_handler(task: dict) -> str:
 
 async def _async_run_handler(task: dict) -> str:
     from assistant.actions import (
-        LOCAL_GRANTS, LOCAL_PRINCIPAL, LOCAL_RAISE_CONTEXT, current_grants,
-        current_principal, current_raise_context, execute, set_grants,
-        set_principal, set_raise_context,
+        LOCAL_GRANTS, LOCAL_PRINCIPAL, LOCAL_RAISE_CONTEXT, execute,
     )
+    # `run_turn` installs the three authority contextvars in one place, in the
+    # order `main.py` argued for -- grants LAST, nothing between that line and
+    # the `try`. These two branches installed them by hand with grants FIRST,
+    # which is the arrangement `main.py` was fixed for: a raise between the
+    # first install and the `try` left the grant set installed with no reset.
+    # Neither setter plausibly raises, which is why it survived two reviews and
+    # is the same argument that was rejected over there.
+    #
+    # `brain.turn` and not `brain` -- see `tests/test_brain_authority.py`'s A5
+    # test. This file may reach the authority installer and must not reach
+    # anything that can construct or resume a Task.
+    from assistant.brain.turn import run_turn
 
     task_type = task["task_type"]
     goal = task["task_goal"]
@@ -137,19 +147,17 @@ async def _async_run_handler(task: dict) -> str:
         # this task arms is the operator's question to answer, and an unset
         # principal would arm it for nobody -- a confirmation she could not
         # answer at her own keyboard. See core/principal.py.
-        token = set_grants(LOCAL_GRANTS)
-        ptoken = set_principal(LOCAL_PRINCIPAL)
-        # Installed alongside the pair above for the same reason: a scheduled
-        # task never reaches a refusal in practice (LOCAL_GRANTS holds
-        # everything), but every set_grants() call site installs the raise
-        # context too, so an unset one is never mistaken for a forgotten one.
-        rtoken = set_raise_context(LOCAL_RAISE_CONTEXT)
-        try:
-            return await execute("web_search", {"query": goal})
-        finally:
-            current_raise_context.reset(rtoken)
-            current_principal.reset(ptoken)
-            current_grants.reset(token)
+        # The raise context rides along for the same reason it always did: a
+        # scheduled task never reaches a refusal in practice (LOCAL_GRANTS
+        # holds everything), but every install site installs all three, so an
+        # unset one is never mistaken for a forgotten one.
+        return await run_turn(
+            grants=LOCAL_GRANTS,
+            principal=LOCAL_PRINCIPAL,
+            raise_context=LOCAL_RAISE_CONTEXT,
+            work=lambda: execute("web_search", {"query": goal}),
+            label="schedule:web_search",
+        )
     elif task_type == "http_check":
         return await _http_check(goal)
     elif task_type == "procedure":
@@ -166,15 +174,13 @@ async def _async_run_handler(task: dict) -> str:
         # required EXECUTE (`manage_schedule`), so the grant being spent here
         # is the installer's, stated rather than inherited. The principal
         # rides along for the reason the web_search branch above gives.
-        token = set_grants(LOCAL_GRANTS)
-        ptoken = set_principal(LOCAL_PRINCIPAL)
-        rtoken = set_raise_context(LOCAL_RAISE_CONTEXT)
-        try:
-            return await run_procedure(proc, goal)
-        finally:
-            current_raise_context.reset(rtoken)
-            current_principal.reset(ptoken)
-            current_grants.reset(token)
+        return await run_turn(
+            grants=LOCAL_GRANTS,
+            principal=LOCAL_PRINCIPAL,
+            raise_context=LOCAL_RAISE_CONTEXT,
+            work=lambda: run_procedure(proc, goal),
+            label="schedule:procedure",
+        )
     else:
         logger.warning(f"[scheduler] Unknown task_type: {task_type}")
         return ""
