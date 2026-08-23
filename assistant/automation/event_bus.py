@@ -279,49 +279,53 @@ class EventBus:
         elif action_type == "code_executor":
             if self._main_loop is not None:
                 future = asyncio.run_coroutine_threadsafe(
-                    self._run_code_executor(payload),
+                    self._run_code_executor(
+                        payload, monitor.get("installed_by", "")
+                    ),
                     self._main_loop,
                 )
                 future.add_done_callback(self._on_action_complete)
                 logger.info("[event-monitor] Code executor fired: %s", payload[:80])
 
-    async def _run_code_executor(self, goal: str) -> str:
-        from assistant.actions import (
-            LOCAL_GRANTS, LOCAL_PRINCIPAL, LOCAL_RAISE_CONTEXT, current_grants,
-            current_principal, current_raise_context, execute, set_grants,
-            set_principal, set_raise_context,
+    async def _run_code_executor(self, goal: str, installed_by: str = "") -> str:
+        """Run a fired monitor's code_executor action on local authority.
+
+        A fired monitor is not a request from anyone -- there is no turn around
+        it, so `current_grants` would be unset and `execute()` would refuse (it
+        fails closed by design). The grant is stated instead: installing a
+        monitor requires EXECUTE durably (`manage_monitor` in
+        `core/intent_capabilities.py`), so whoever installed this one already
+        held it, and the machine it fires on is this one.
+
+        The principal is stated for the matching reason, and as defence in depth
+        rather than to fix a live path: nothing armed from here today asks the
+        user anything, but `code_executor` can arm something --
+        `_arm_knowledge_approval` does -- and a state armed without a principal
+        would be owned by nobody and answerable by nobody, which reads as TENKA
+        forgetting rather than as a bug.
+
+        All three used to be installed here by hand, grants first. That is the
+        ordering `main.py` was fixed for -- a raise between the first install and
+        the `try` leaves the grant set installed with no reset. `run_local_intent`
+        installs them in one order, in one place, and its import is what removes
+        the last `automation -> actions` edge in the tree.
+        """
+        from ..brain.turn import run_local_intent
+
+        # `installed_by` (schema v21, KI-30) recorded at fire rather than only at
+        # install: the row says who paid for this, and the moment it matters is
+        # the moment it runs. A monitor installed months ago by a device since
+        # revoked still fires with LOCAL_GRANTS, which is exactly the argument
+        # KI-30 examined -- so the log has to say whose grant is being spent.
+        logger.info(
+            "[event-monitor] Firing code_executor on local authority "
+            "(installed_by=%s): %s", installed_by or "unknown", goal[:80]
         )
-        # A fired monitor is not a request from anyone -- there is no turn
-        # around it, so `current_grants` would be unset and `execute()` would
-        # refuse (it fails closed by design). The grant is stated here
-        # instead: installing a monitor requires EXECUTE (`manage_monitor` in
-        # core/intent_capabilities.py), so whoever installed this one already
-        # held it, and the machine it fires on is this one.
-        #
-        # The principal is stated for the matching reason, and as
-        # defence-in-depth rather than to fix a live path: nothing armed from
-        # here today asks the user anything (`pending_monitor_disambig` is
-        # armed by `event_monitoring._set_disambig`, reached from
-        # `pause_monitor` and its siblings under the `manage_monitor` intent,
-        # inside an ordinary turn that already has a principal). But
-        # `code_executor` can arm one -- `_arm_knowledge_approval` does -- and
-        # a state armed here without a principal would be owned by nobody and
-        # answerable by nobody, which reads as TENKA forgetting rather than as
-        # a bug.
-        token = set_grants(LOCAL_GRANTS)
-        ptoken = set_principal(LOCAL_PRINCIPAL)
-        # Installed alongside grants/principal for the same reason
-        # scheduler.py's two call sites now do: every set_grants() site
-        # installs the raise context too, so a missing one never reads as
-        # "forgotten" -- LOCAL_GRANTS holds everything, so _refuse is never
-        # actually reached from here.
-        rtoken = set_raise_context(LOCAL_RAISE_CONTEXT)
-        try:
-            return await execute("code_executor", {"goal": goal}, "")
-        finally:
-            current_raise_context.reset(rtoken)
-            current_principal.reset(ptoken)
-            current_grants.reset(token)
+        return await run_local_intent(
+            intent="code_executor",
+            params={"goal": goal},
+            label="monitor:code_executor",
+        )
 
     def _on_action_complete(self, future: asyncio.Future) -> None:
         try:

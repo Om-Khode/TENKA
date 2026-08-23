@@ -100,3 +100,45 @@ async def run_turn(
         current_raise_context.reset(raise_token)
         current_principal.reset(principal_token)
         logger.debug(f"[BRAIN] {label}: authority reset")
+
+
+async def run_local_intent(
+    *,
+    intent: str,
+    params: dict,
+    llm_response: str = "",
+    label: str,
+) -> Any:
+    """Dispatch `intent` on local authority -- what a background trigger does.
+
+    One sentence, said in one place: *this fired on this machine, on the
+    authority of whoever installed the trigger.* Installing a schedule or a
+    monitor requires `EXECUTE` durably (`PERSISTS_AUTHORITY`), so the grant
+    being spent is the installer's, and the principal is local because whatever
+    the fired work arms is the operator's question to answer at her own
+    keyboard.
+
+    **This exists so `automation/` need not import `actions/`.** The event bus is
+    a *source* of turns, not an orchestrator of them, and it was the single
+    place in `automation/` reaching forward into `actions/` -- for `execute`,
+    and for the three local-authority constants that live there. Both now come
+    from here, which is allowed to reach `actions/` and is where the
+    coordination boundary belongs. That import was the fourth layer inversion in
+    §8.3, and removing it is what lets `automation ↛ actions` be asserted
+    tree-wide rather than argued.
+
+    `label` is required, not defaulted: it is the only thing distinguishing one
+    background turn from another in the log, and a default would mean every
+    trigger looked the same on the day one of them misbehaved.
+    """
+    from ..actions import (
+        LOCAL_GRANTS, LOCAL_PRINCIPAL, LOCAL_RAISE_CONTEXT, execute,
+    )
+
+    return await run_turn(
+        grants=LOCAL_GRANTS,
+        principal=LOCAL_PRINCIPAL,
+        raise_context=LOCAL_RAISE_CONTEXT,
+        work=lambda: execute(intent, params, llm_response),
+        label=label,
+    )
