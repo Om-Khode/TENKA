@@ -156,9 +156,31 @@ _NOISE_WORDS = frozenset({
 })
 
 
-def _fuzzy_match(monitors: list[dict], goal: str) -> list[dict]:
+def _fuzzy_match(
+    monitors: list[dict],
+    goal: str,
+    *,
+    nameless_matches_all: bool = False,
+) -> list[dict]:
+    """Rank `monitors` by how well their names match `goal`.
+
+    `nameless_matches_all` handles the utterance that names no monitor at all
+    -- "pause monitor", "delete the monitor" -- where every word is noise and
+    there is nothing left to score against. Scoring that produced no match and
+    the reply "I couldn't find a monitor matching that name", which is false:
+    the operator named nothing to fail to match. Treating it as "every monitor
+    is an equally good candidate" gives the two answers she meant -- act
+    directly when there is one monitor, ask which when there are several.
+
+    It is **off by default**, and the one caller that must keep it off is
+    `resolve_disambig`. Answering "which one?" with another nameless phrase is
+    not a selection, and returning all of them there would make `picked[0]` an
+    arbitrary choice -- for the `delete` action, an arbitrary deletion.
+    """
     goal_lower = goal.lower()
     goal_words = {w for w in goal_lower.split() if w not in _NOISE_WORDS}
+    if nameless_matches_all and not goal_words:
+        return list(monitors)
 
     scored = []
     for m in monitors:
@@ -200,7 +222,7 @@ def pause_monitor(goal: str) -> str:
     if not monitors:
         return "You don't have any monitors to pause."
 
-    matches = _fuzzy_match(monitors, goal)
+    matches = _fuzzy_match(monitors, goal, nameless_matches_all=True)
     if not matches:
         return "I couldn't find a monitor matching that name."
     if len(matches) > 1:
@@ -219,7 +241,7 @@ def resume_monitor(goal: str) -> str:
     if not monitors:
         return "You don't have any monitors to resume."
 
-    matches = _fuzzy_match(monitors, goal)
+    matches = _fuzzy_match(monitors, goal, nameless_matches_all=True)
     if not matches:
         return "I couldn't find a monitor matching that name."
     if len(matches) > 1:
@@ -246,7 +268,7 @@ def delete_monitor(goal: str) -> str:
         event_bus.reload_monitors(flush_pending=True)
         return f"Deleted all {count} monitors."
 
-    matches = _fuzzy_match(monitors, goal)
+    matches = _fuzzy_match(monitors, goal, nameless_matches_all=True)
     if not matches:
         return "I couldn't find a monitor matching that name."
     if len(matches) > 1:

@@ -337,6 +337,7 @@ TOP PRIORITY RULES (read first — these settle the common edge cases):
 11. IMPORTANT: "remember my X is Y" / "remember the X is Y" / "remember that X" → store_memory for a SINGLE fact. If the sentence contains multiple facts joined by "and"/"also"/"plus" (e.g. "remember X and Y", "remember X, also Y"), use planner instead — it will split into separate store_memory steps. NOT create_note, NOT manage_shortcut, NOT meet_face. Only use meet_face when the user is introducing themselves face-to-face ("this is Sarah", "I'm Alex"), not for "remember my name is X".
 12. "forget X" / "delete the fact about X" / "remove the memory of X" → forget_memory. User wants to delete a previously stored fact. NOT forget_face/forget_voice (those delete biometric data).
 13. "schedule X" / "every N minutes check X" / "daily at X" → manage_schedule (time-based, cron). "remind me X" → set_reminder (one-time alert). "when X happens do Y" / "skip songs that..." / "notify me when..." / "watch for..." → manage_monitor (event-driven, reacts to OS events like media changes or window focus).
+15. "shut down" / "exit" / "quit" / "close yourself" / "go to sleep" addressed to YOU → shutdown (you exit; the machine keeps running). "shut down the computer / PC / laptop" → code_executor (the machine powers off). Read who the object is — these are different actions and one of them is not undoable.
 14. "back up my data" / "enable cloud backup" / "unlock backup" / "when was my last backup" / "restore from backup" → manage_backup. Distinct from manage_schedule (time-based recurring tasks) and manage_monitor (event-driven) — this is specifically about TENKA's own data durability.
 
 Intent catalog (intent | params | when to use):
@@ -375,6 +376,7 @@ forget_voice        | {}              | delete saved voiceprint
 store_memory        | content         | "remember my/the X is Y" — storing a fact (NOT meet_face, NOT reminder)
 forget_memory       | content         | "forget about X" / "delete memory of X" — removing a stored fact (NOT forget_face/forget_voice)
 browser_cdp_setup   | mode            | configure browser --remote-debugging-port (setup/undo/preview)
+shutdown            | {}              | YOU exit ("shut down", "exit", "quit", "close yourself") — not the machine
 unknown             | {}              | truly unintelligible/empty input ONLY
 
 Param rules:
@@ -402,6 +404,8 @@ Few-shot (ambiguous cases):
   "show my monitors" → {"intent":"manage_monitor","params":{"goal":"show my monitors"}}
   "back up now" → {"intent":"manage_backup","params":{"goal":"back up now"}}
   "remind me in 5 minutes to drink water" → {"intent":"set_reminder","params":{"goal":"remind me in 5 minutes to drink water"}}
+  "close yourself" → {"intent":"shutdown","params":{}}
+  "shut down my laptop" → {"intent":"code_executor","params":{"goal":"shut down my laptop"}}
 
 Output the JSON object only. Empty params → {}."""
 

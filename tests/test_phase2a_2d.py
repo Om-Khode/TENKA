@@ -16,6 +16,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from assistant import code_executor, memory
+from assistant.code_executor import routing
 
 
 # ─── Phase 2A — memory.build_recent_context() ─────────────────────────────────
@@ -26,13 +27,32 @@ def test_build_recent_context_is_exported():
     assert callable(memory.build_recent_context)
 
 
-def test_build_recent_context_formats_turns():
-    fake_turns = [
-        {"user_input": "hello", "response": "[neutral] hi"},
-        {"user_input": "weather?", "response": "[happy] 25C"},
-    ]
-    with patch.object(memory, "get_recent", return_value=fake_turns):
-        out = memory.build_recent_context(limit=10)
+# `memory.build_recent_context` used to compose the string itself out of
+# `memory.get_recent`, so these tests patched `get_recent` and read the result.
+# It now delegates one layer down to `MemoryRepo.build_recent_context`, which
+# composes it *and* applies `redact_secrets_strict` on the way out -- so the
+# patch stopped intercepting and every one of these died on "init_memory()
+# called before init_db()" rather than on an assertion.
+#
+# Rewritten against the real formatter with a real (temporary) database. No
+# patching of the thing under test, and the redaction that arrived with the
+# move is covered too, since that is the half the old tests could not see.
+
+@pytest.fixture
+def mem_repo(tmp_path):
+    from assistant.storage.db import Database, _reset_for_testing
+    from assistant.storage.repos.memory import MemoryRepo
+
+    repo = MemoryRepo(Database(tmp_path / "m.db"), tmp_path)
+    yield repo
+    _reset_for_testing()
+
+
+def test_build_recent_context_formats_turns(mem_repo):
+    mem_repo.save_turn("hello", "small_talk", "[neutral] hi", "s1")
+    mem_repo.save_turn("weather?", "web_search", "[happy] 25C", "s1")
+
+    out = mem_repo.build_recent_context(limit=10)
     assert "RECENT CONVERSATION HISTORY:" in out
     assert "User: hello" in out
     assert "Assistant: [neutral] hi" in out
@@ -40,54 +60,103 @@ def test_build_recent_context_formats_turns():
     assert "Assistant: [happy] 25C" in out
 
 
-def test_build_recent_context_respects_custom_header():
-    fake_turns = [{"user_input": "x", "response": "y"}]
-    with patch.object(memory, "get_recent", return_value=fake_turns):
-        out = memory.build_recent_context(limit=5, header="CUSTOM HEADER:")
+def test_build_recent_context_respects_custom_header(mem_repo):
+    mem_repo.save_turn("x", "small_talk", "y", "s1")
+
+    out = mem_repo.build_recent_context(limit=5, header="CUSTOM HEADER:")
     assert out.startswith("CUSTOM HEADER:")
     assert "RECENT CONVERSATION HISTORY:" not in out
 
 
-def test_build_recent_context_empty_when_no_turns():
-    with patch.object(memory, "get_recent", return_value=[]):
-        assert memory.build_recent_context(limit=25) == ""
+def test_build_recent_context_empty_when_no_turns(mem_repo):
+    assert mem_repo.build_recent_context(limit=25) == ""
 
 
-def test_build_recent_context_swallows_errors():
-    """A DB error should give an empty string, not crash the caller."""
-    with patch.object(memory, "get_recent", side_effect=RuntimeError("DB down")):
-        assert memory.build_recent_context(limit=25) == ""
+def test_build_recent_context_swallows_errors(mem_repo):
+    """A DB error gives an empty string, not a crash in the caller -- this
+    string is built for a prompt, and a failed history is not a failed turn."""
+    with patch.object(mem_repo, "get_recent", side_effect=RuntimeError("DB down")):
+        assert mem_repo.build_recent_context(limit=25) == ""
 
 
-def test_build_recent_context_passes_limit_through():
-    """Caller's limit value must reach get_recent()."""
+def test_build_recent_context_passes_limit_through(mem_repo):
+    """The caller's limit must reach `get_recent` -- callers pass 8 for
+    reference resolution and 25 for conversation context, and the difference
+    only means anything if it survives the hop."""
     captured = {}
 
-    def fake_get_recent(n):
+    def fake_get_recent(n, session_id=""):
         captured["n"] = n
         return []
 
-    with patch.object(memory, "get_recent", side_effect=fake_get_recent):
-        memory.build_recent_context(limit=8)
+    with patch.object(mem_repo, "get_recent", side_effect=fake_get_recent):
+        mem_repo.build_recent_context(limit=8)
     assert captured["n"] == 8
 
 
-# ─── Phase 2A — main.py bumped window to 25 ───────────────────────────────────
+def test_build_recent_context_redacts_on_the_way_out(mem_repo):
+    """**The half that arrived with the move.** This string is an egress
+    boundary: three callers put it into a code-generation or plan-generation
+    prompt. Write-side redaction (KI-29) only covers rows written since it
+    shipped, so anything older, anything its patterns missed, and anything
+    restored from an older backup arrives here unscrubbed."""
+    # Two things this test had to get right, and the first draft got neither.
+    #
+    # **A run of 40 identical characters is not redacted.** The bare rule
+    # carries an entropy floor -- that floor is what stops it eating long
+    # ordinary words out of prose -- so the fixture has to look like a key.
+    #
+    # **It cannot go in through `save_turn`.** That applies the lenient
+    # `redact_secrets` on write, so the row never held the secret and the test
+    # passed with the egress redaction deleted: a sibling mechanism refusing
+    # the same input. Inserting directly is the only way to produce the row
+    # this guard exists for -- one written before KI-29 shipped, or restored
+    # from a backup taken before it.
+    secret = "sk-" + "aB3xQ9zKmN7pR2tV5wY8uI1oL4jH6gF0dS2eC5vB"
+    mem_repo._db.execute(
+        "INSERT INTO conversations "
+        "(timestamp, user_input, intent, response, session_id, security_skip) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        ("2026-01-01T00:00:00", "my key is " + secret, "small_talk",
+         "noted", "s1", 0),
+    )
+    mem_repo._db.commit()
+    assert secret in mem_repo.get_recent(5)[0]["user_input"], (
+        "the fixture never got the unredacted row into the table, so this test "
+        "would pass with the egress redaction removed"
+    )
+
+    out = mem_repo.build_recent_context(limit=5)
+    assert secret not in out, "a stored secret reached a model-bound string"
+    assert "my key is" in out, "redaction ate the whole turn"
+
+
+def test_the_facade_delegates_to_the_repo():
+    """`memory.build_recent_context` is a one-line facade, and the tests above
+    are only about the app's behaviour if that hop actually happens."""
+    src = inspect.getsource(memory.build_recent_context)
+    assert "_get_repo().build_recent_context(" in src
+
+
+# ─── Phase 2A — the conversation window is 25 turns ───────────────
 
 
 def test_main_conversation_context_uses_limit_25():
-    """main._build_conversation_context should delegate with limit=25."""
+    """`_build_conversation_context` became `_build_conversation_messages`: the
+    history reaches the model as native multi-turn messages now instead of a
+    text blob, so it calls `memory.get_recent` directly. The window is the part
+    that was being pinned, and it survived the rewrite."""
     from assistant import main as main_mod
 
-    captured_limit = {}
+    captured = {}
 
-    def fake_build(limit=25, header="RECENT CONVERSATION HISTORY:"):
-        captured_limit["limit"] = limit
-        return ""
+    def fake_get_recent(n, *a, **kw):
+        captured["limit"] = n
+        return []
 
-    with patch.object(memory, "build_recent_context", side_effect=fake_build):
-        main_mod._build_conversation_context()
-    assert captured_limit.get("limit") == 25
+    with patch.object(memory, "get_recent", side_effect=fake_get_recent):
+        asyncio.run(main_mod._build_conversation_messages())
+    assert captured.get("limit") == 25
 
 
 # ─── Phase 2D — preference hints in system prompt, not user message ───────────
@@ -108,7 +177,7 @@ def test_route_goal_preference_hints_move_to_system_prompt():
         captured["system_prompt"] = kwargs.get("system_prompt", "")
         return '{"tier": 2, "template_slug": "foo", "requires": [], "params": {}}'
 
-    asyncio.run(code_executor._route_goal(
+    asyncio.run(routing._route_goal(
         goal="play music",
         llm_func=fake_llm,
         preference_hints="music_app: spotify",
@@ -116,8 +185,14 @@ def test_route_goal_preference_hints_move_to_system_prompt():
 
     # Hints live in the system prompt now
     assert "music_app: spotify" in captured["system_prompt"]
-    # The user message is the naked goal — no IMPORTANT prefix hack
-    assert captured["user_message"] == "Goal: play music"
+    # The user message carries the goal and nothing borrowed from the hints --
+    # no IMPORTANT prefix hack. It is no longer *only* the goal: a literal
+    # date/time line is prepended, because the model never computes datetimes
+    # (`core/datetime_utils.py` does, and passes a string in). The property
+    # being pinned is where the hints live, so assert that, not equality with
+    # a message shape that has since gained an unrelated line.
+    assert "Goal: play music" in captured["user_message"]
+    assert "music_app" not in captured["user_message"]
     assert "IMPORTANT" not in captured["user_message"]
 
 
@@ -130,7 +205,7 @@ def test_route_goal_no_hints_leaves_system_prompt_unchanged():
         captured["system_prompt"] = kwargs.get("system_prompt", "")
         return '{"tier": 1, "template_slug": null, "requires": [], "params": {}}'
 
-    asyncio.run(code_executor._route_goal(
+    asyncio.run(routing._route_goal(
         goal="what time is it",
         llm_func=fake_llm,
         preference_hints="",
@@ -144,9 +219,14 @@ def test_route_goal_no_hints_leaves_system_prompt_unchanged():
 
 def test_code_executor_imports_memory_build_recent_context():
     """Static check: the gen_prompt construction calls memory.build_recent_context."""
-    src = inspect.getsource(code_executor)
+    # `inspect.getsource(code_executor)` reads the package's `__init__.py`, and
+    # the call moved into `orchestrator.py` when code_executor became a package.
+    # The old form was asserting against a file that never had the call.
+    from assistant.code_executor import orchestrator
+
+    src = inspect.getsource(orchestrator)
     assert "memory.build_recent_context" in src, (
-        "code_executor.py must call memory.build_recent_context() for gen prompt injection"
+        "orchestrator.py must call memory.build_recent_context() for gen prompt injection"
     )
     # And specifically with limit=8 (reference-resolution size, not the 25-turn small_talk size)
     assert "limit=8" in src
@@ -177,11 +257,14 @@ def test_intent_prompt_is_under_diet_target():
     assert line_count > 40, f"Intent prompt suspiciously short ({line_count} lines)"
 
 
-def test_intent_prompt_covers_all_registered_intents():
-    """Every intent name in config.INTENTS must appear in the prompt text."""
-    from assistant import config
-    missing = [name for name in config.INTENTS if name not in config.INTENT_SYSTEM_PROMPT]
-    assert not missing, f"Intent prompt missing names: {missing}"
+# `test_intent_prompt_covers_all_registered_intents` was here, and it was a
+# copy of `test_intent_prompt.py::test_all_intents_present_in_prompt` -- with no
+# notion of an intent that is deliberately kept out of the classifier's
+# catalogue. That is exactly how it went red: `manifest_dispatch` is synthetic,
+# fired only by `regex_router.py`, and the canonical test records that in
+# `_ALIAS_INTENTS` while this copy could not. Two tests for one property, with
+# different policies, is worse than one. Deleted rather than re-synced; the
+# canonical one also checks the catalogue row-by-row, which this never did.
 
 
 def test_intent_prompt_preserves_critical_routing_rules():
@@ -195,8 +278,12 @@ def test_intent_prompt_preserves_critical_routing_rules():
         "web_search",                 # current vs stable knowledge
         "browse_url",                 # specific page rule
         "planner",                    # multi-step rule
-        "read_file",                  # deprecation callout
-        "DEPRECATED",                 # explicit mark
+        # "read_file" / "DEPRECATED" stood here. `read_file` was never an
+        # intent -- it was a callout telling the classifier to prefer
+        # `file_task` -- and it went out with the prompt diet these tests were
+        # written to guard. `file_task` now owns every file operation in one
+        # catalogue row, so there is nothing left to deprecate and the two
+        # checks were pinning the absence of a rule rather than a rule.
         "exact spoken words",         # param verbatim rule
         "infer",                      # URL inference rule
     ]
@@ -209,7 +296,8 @@ def test_intent_prompt_preserves_critical_routing_rules():
 
 def test_personality_context_summary_includes_count_and_snippets():
     from unittest.mock import patch
-    from assistant import config, personality
+    from assistant import personality
+    from assistant.llm import prompts as _prompts
 
     fake_turns = [
         {"user_input": "what time is it", "response": "r1"},
@@ -218,7 +306,7 @@ def test_personality_context_summary_includes_count_and_snippets():
     ]
     with patch.object(personality, "get_conversation_count", return_value=17):
         with patch.object(memory, "get_recent", return_value=fake_turns):
-            out = config._build_personality_context_summary()
+            out = _prompts._build_personality_context_summary()
 
     assert "Relationship Context" in out
     assert "17 conversations" in out
@@ -229,21 +317,23 @@ def test_personality_context_summary_includes_count_and_snippets():
 
 def test_personality_context_summary_empty_when_no_data():
     from unittest.mock import patch
-    from assistant import config, personality
+    from assistant import personality
+    from assistant.llm import prompts as _prompts
 
     with patch.object(personality, "get_conversation_count", return_value=0):
         with patch.object(memory, "get_recent", return_value=[]):
-            assert config._build_personality_context_summary() == ""
+            assert _prompts._build_personality_context_summary() == ""
 
 
 def test_personality_context_summary_truncates_long_utterances():
     from unittest.mock import patch
-    from assistant import config, personality
+    from assistant import personality
+    from assistant.llm import prompts as _prompts
 
     long_utt = "this is a really long message with plenty of words that should get chopped early"
     with patch.object(personality, "get_conversation_count", return_value=3):
         with patch.object(memory, "get_recent", return_value=[{"user_input": long_utt, "response": "r"}]):
-            out = config._build_personality_context_summary()
+            out = _prompts._build_personality_context_summary()
     # 8-word cap means the trailing words must NOT appear
     assert "chopped early" not in out
     # but the first few words DO
@@ -252,7 +342,8 @@ def test_personality_context_summary_truncates_long_utterances():
 
 def test_personality_context_summary_dedupes_repeats():
     from unittest.mock import patch
-    from assistant import config, personality
+    from assistant import personality
+    from assistant.llm import prompts as _prompts
 
     repeats = [
         {"user_input": "play music", "response": "r"},
@@ -261,19 +352,20 @@ def test_personality_context_summary_dedupes_repeats():
     ]
     with patch.object(personality, "get_conversation_count", return_value=5):
         with patch.object(memory, "get_recent", return_value=repeats):
-            out = config._build_personality_context_summary()
+            out = _prompts._build_personality_context_summary()
     # Only one occurrence in the snippet list
     assert out.count('"play music"') == 1
 
 
 def test_personality_context_summary_survives_db_errors():
     from unittest.mock import patch
-    from assistant import config, personality
+    from assistant import personality
+    from assistant.llm import prompts as _prompts
 
     with patch.object(personality, "get_conversation_count", side_effect=RuntimeError("boom")):
         with patch.object(memory, "get_recent", side_effect=RuntimeError("boom")):
             # Should swallow and return empty, not propagate
-            assert config._build_personality_context_summary() == ""
+            assert _prompts._build_personality_context_summary() == ""
 
 
 # ─── Phase 2C — preference block enhancements ─────────────────────────────────
@@ -282,13 +374,14 @@ def test_personality_context_summary_survives_db_errors():
 def test_preference_block_uses_humanized_fallback():
     """Unmapped preferences render as natural language, not 'key = value'."""
     from unittest.mock import patch
-    from assistant import config, preferences
+    from assistant import preferences
+    from assistant.llm import prompts as _prompts
 
     fake_prefs = [
         {"key": "unknown_thing", "value": "special_mode", "confidence": 0.9},
     ]
     with patch.object(preferences, "get_preferences_by_category", return_value=fake_prefs):
-        block = config._build_preference_prompt_block()
+        block = _prompts._build_preference_prompt_block()
     assert "unknown_thing = special_mode" not in block, "Old key=value fallback must be gone"
     assert "unknown thing" in block  # humanized key
     assert "special mode" in block   # humanized value
@@ -342,13 +435,14 @@ def test_trait_modifiers_contain_concrete_phrasings():
 def test_preference_block_uses_updated_verbosity_text():
     """The new mappings should emit the punchier imperative phrasing."""
     from unittest.mock import patch
-    from assistant import config, preferences
+    from assistant import preferences
+    from assistant.llm import prompts as _prompts
 
     fake_prefs = [
         {"key": "verbosity", "value": "brief", "confidence": 0.9},
     ]
     with patch.object(preferences, "get_preferences_by_category", return_value=fake_prefs):
-        block = config._build_preference_prompt_block()
+        block = _prompts._build_preference_prompt_block()
     assert "Don't ramble" in block, "verbosity:brief should use the punchier phrasing"
 
 

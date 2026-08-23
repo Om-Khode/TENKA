@@ -328,7 +328,12 @@ class TestSchedulerModule:
         assert scheduler._thread.is_alive()
 
         scheduler.stop()
-        assert not scheduler._thread.is_alive()
+        # `stop()` joins the thread and sets `_thread = None`, so there is
+        # nothing left to ask `is_alive()` -- the original assertion raised
+        # AttributeError on the *success* path. Cleared is the stronger claim
+        # anyway: a stopped scheduler that still holds a thread reference is
+        # what a leak looks like.
+        assert scheduler._thread is None
 
         loop.call_soon_threadsafe(loop.stop)
         t.join(timeout=2)
@@ -512,7 +517,14 @@ class TestHandleManageSchedule:
         result = await handle_manage_schedule(
             {"goal": "cancel nonexistent", "action": "cancel"}, ""
         )
-        assert "couldn't find" in result.lower() or "no " in result.lower()
+        # Property, not phrasing. The reply is "You don't have any schedules
+        # to cancel." -- which contains neither of the two strings this used to
+        # look for, so the test failed on wording while the behaviour was right.
+        # What matters is that it does not claim to have cancelled anything.
+        lowered = result.lower()
+        assert "cancelled" not in lowered, result
+        assert any(p in lowered for p in
+                   ("don't have", "couldn't find", "no schedule")), result
 
     @pytest.mark.asyncio
     async def test_toggle_pause(self, mock_repo):
@@ -561,13 +573,29 @@ class TestScheduleRegexRouting:
         assert result.intent == "manage_schedule"
         assert result.params["action"] == "create"
 
-    def test_monitor_create(self):
+    # ── "monitor" belongs to event monitors now ────────────────────────────
+    #
+    # These five tests were written when a scheduled task was the only thing
+    # called a monitor, and `_list_schedules()` said "You have 1 monitor" to
+    # match. Event monitors then arrived and took the word: `manage_monitor` is
+    # a real intent with its own `event_monitors` table, and "show my monitors"
+    # is unambiguously about those.
+    #
+    # So the routing is right and the assertions were stale -- they encoded a
+    # vocabulary that changed underneath them. Fixed on both sides: the tests
+    # now expect `manage_monitor`, and `actions/schedule.py` stopped calling a
+    # schedule "a monitor" in what it says out loud, which is what made these
+    # assertions look reasonable for as long as they did.
+
+    def test_monitor_create_has_no_regex_fast_path(self):
+        """"monitor GitHub ... daily" is genuinely ambiguous -- daily makes it a
+        schedule, "monitor" makes it sound like an event monitor, and event
+        monitors only understand media/window events so it cannot be one. No
+        regex claims it, and the classifier decides. This asserted a fast path
+        that never existed."""
         from assistant.regex_router import pre_route
 
-        result = pre_route("monitor GitHub for new AI projects daily")
-        assert result is not None
-        assert result.intent == "manage_schedule"
-        assert result.params["action"] == "create"
+        assert pre_route("monitor GitHub for new AI projects daily") is None
 
     def test_list_schedules(self):
         from assistant.regex_router import pre_route
@@ -577,13 +605,12 @@ class TestScheduleRegexRouting:
         assert result.intent == "manage_schedule"
         assert result.params["action"] == "list"
 
-    def test_show_monitors(self):
+    def test_show_monitors_lists_event_monitors(self):
         from assistant.regex_router import pre_route
 
         result = pre_route("show my monitors")
         assert result is not None
-        assert result.intent == "manage_schedule"
-        assert result.params["action"] == "list"
+        assert result.intent == "manage_monitor"
 
     def test_list_schedule_singular(self):
         from assistant.regex_router import pre_route
@@ -601,10 +628,19 @@ class TestScheduleRegexRouting:
         assert result.intent == "manage_schedule"
         assert result.params["action"] == "list"
 
-    def test_cancel_schedule(self):
+    def test_cancelling_a_monitor_reaches_manage_monitor(self):
         from assistant.regex_router import pre_route
 
         result = pre_route("cancel the morning AI monitor")
+        assert result is not None
+        assert result.intent == "manage_monitor"
+
+    def test_cancelling_a_schedule_still_reaches_manage_schedule(self):
+        """The other half, and the one that matters: the word "schedule" routes
+        to schedules, whatever else is in the sentence."""
+        from assistant.regex_router import pre_route
+
+        result = pre_route("cancel the morning AI schedule")
         assert result is not None
         assert result.intent == "manage_schedule"
         assert result.params["action"] == "cancel"
@@ -622,6 +658,14 @@ class TestScheduleRegexRouting:
 
         result = pre_route("pause the GitHub monitor")
         assert result is not None
+        assert result.intent == "manage_monitor"
+
+    def test_pause_a_schedule_by_name(self):
+        """The word "schedule" still routes to schedules."""
+        from assistant.regex_router import pre_route
+
+        result = pre_route("pause the GitHub schedule")
+        assert result is not None
         assert result.intent == "manage_schedule"
         assert result.params["action"] == "toggle"
 
@@ -629,6 +673,14 @@ class TestScheduleRegexRouting:
         from assistant.regex_router import pre_route
 
         result = pre_route("resume the GitHub monitor")
+        assert result is not None
+        assert result.intent == "manage_monitor"
+
+    def test_resume_a_schedule_by_name(self):
+        """The word "schedule" still routes to schedules."""
+        from assistant.regex_router import pre_route
+
+        result = pre_route("resume the GitHub schedule")
         assert result is not None
         assert result.intent == "manage_schedule"
         assert result.params["action"] == "toggle"
@@ -714,8 +766,13 @@ class TestSchemaV5:
         assert row is not None
 
     def test_schema_version_is_5(self, db):
+        # `>=`, not `==`. This pinned an absolute number and went red the moment
+        # the schema moved past v5 -- which it has, many times, for reasons that
+        # have nothing to do with schedules. What the test is about is that
+        # opening a database migrates it far enough to have the `schedules`
+        # table, and the test below checks exactly that.
         row = db.fetchone("SELECT version FROM _schema_version WHERE id = 1")
-        assert row["version"] == 5
+        assert row["version"] >= 5
 
     def test_schedules_table_columns(self, db):
         cursor = db.execute("PRAGMA table_info(schedules)")
