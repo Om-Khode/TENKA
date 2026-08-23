@@ -88,6 +88,38 @@ Three failure shapes to watch for:
 wrong thing. 6b's transport work found a test pinning the wrong depth of a cancellation
 hazard exactly this way — chasing the green mutant found more than any review round.
 
+## When to live-test — decide, do not ask
+
+Stating the decision is part of the report: either "live-test this, here are the steps" or
+"proceeding". Asking after every change costs the operator time; skipping it when it was
+needed cascades. Wrong in the cautious direction is the cheaper mistake.
+
+**Live-test when any of these holds:**
+
+- **the tests exercise a fake of the thing that changed.** The strongest signal, and it has
+  already bitten: `ceiling` was added to `ChatRuntime.send`, the route and
+  `FakeChatRuntime` — but not `LiveChatRuntime` — and every `POST /v1/chat` 500'd while 201
+  tests passed. A `Protocol` is not a contract, and `isinstance` against a
+  `runtime_checkable` one checks method *names* only.
+  `tests/test_runtime_signature_conformance.py` now pins impl-vs-protocol and
+  fake-vs-impl for the chat chain; extend it rather than relying on noticing.
+- a **turn entry point**, the grants/principal/raise-context plumbing, or anything reachable
+  only through a real turn — STT, TTS, the Unity bridge, an automation tier
+- a **schema migration** against the live database, or the first write to a new column
+- a change whose **failure mode is silent**: it degrades rather than raises, so nothing goes
+  red and no exception appears
+- **low confidence.** Say so rather than shipping and hoping
+
+**Proceed without one for:** docs, tests, a pure function with mutation-proven tests, a
+layering change `lint-imports` verifies, or anything whose *real* object is exercised.
+
+**Batch them**, at a natural boundary, as numbered steps with what each should show. Always
+include the step that proves the permitted path still works — a control that refuses
+correctly while corrupting what it permits passes every red-green check there is.
+
+**Never run one yourself.** Hand the operator the commands and read `assistant/debug.log`
+afterwards.
+
 ## Unit tests are not feature tests
 
 Type checks and unit tests verify code correctness, not feature correctness. Live-test
