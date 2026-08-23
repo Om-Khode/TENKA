@@ -47,6 +47,21 @@ USER_STATED_SOURCES = frozenset({
     "user", "explicit", "correction", "confirmed",
 })
 
+# The highest confidence a preference can reach on model assertions alone.
+#
+# Set to `CONFIDENCE_ASK` deliberately, and the value is doing real work rather
+# than being a round number: at this level the router applies the preference
+# *and mentions it*, so a wrong guess gets corrected by the person who can see
+# it. Above it, two things change at once -- the preference is applied silently,
+# and it becomes eligible for `actions._build_goal_hints`, which injects it into
+# a code-generation prompt. Neither belongs to a value no human has confirmed
+# and no observed turn has supported.
+#
+# The same number as the write-side clamp in `preferences.set_preference`, on
+# purpose: one ceiling for model-proposed provenance, applied on write and on
+# every later bump, rather than two that can drift apart.
+MODEL_PROPOSED_CEILING = CONFIDENCE_ASK
+
 # --- Decay ---
 
 DECAY_THRESHOLD_DAYS = 30
@@ -172,11 +187,44 @@ class PreferenceRepo:
                 f"(category={category}, confidence={confidence:.2f}, {source})"
             )
 
-    def bump_confidence(self, key: str, delta: float = 0.1) -> Optional[float]:
+    def bump_confidence(self, key: str, delta: float = 0.1, *,
+                        counted_by_tenka: bool = True) -> Optional[float]:
         """
         Increase a preference's confidence score.
         Capped at 1.0. Skips if no actual change.
         Returns new confidence value, or None if preference doesn't exist.
+
+        **`counted_by_tenka` is the D3 rule, and it is the whole point of this
+        parameter existing.** A preference's confidence decides how it is used:
+        at `CONFIDENCE_ASK` it is applied and mentioned, at `CONFIDENCE_SILENT`
+        it is applied silently *and* becomes eligible for injection into a
+        code-generation prompt (`actions._build_goal_hints`). So what may raise
+        it matters more than the number.
+
+        Two kinds of caller ask for a bump, and only one of them is evidence:
+
+        - **`counted_by_tenka=True`** — something happened in the world that
+          TENKA observed. `record_preference_applied` fires after a preference
+          was actually used on a real turn and the user did not override it;
+          `record_preference_overridden` fires when she did. That is a fact
+          about a turn, so it may move confidence anywhere.
+        - **`counted_by_tenka=False`** — a model said the same thing again.
+          `reflection.py` re-proposes a preference it discovered on an earlier
+          night and asks for +0.15. That is not repetition TENKA counted; it is
+          one model asserting one thing three nights running, which it will do
+          whenever the pattern is in its context and also whenever it was
+          consistently wrong. Capped at `MODEL_PROPOSED_CEILING`.
+
+        The reflection prompt already says "minimum 3 occurrences of a pattern"
+        and nothing ever checked; `source="reflection"` records the *provider*,
+        not the *evidence*. Without this cap, three nights of the model
+        agreeing with itself walked a preference from 0.4 to 0.70 and into a
+        prompt whose output runs in a subprocess.
+
+        The cap makes reflection's bump a no-op in practice, which is correct
+        and is the intent: the reflection cycle **proposes**. The routes to
+        higher confidence are the user confirming, the user correcting, or
+        TENKA watching the preference work.
         """
         now = datetime.now().isoformat()
 
@@ -187,6 +235,20 @@ class PreferenceRepo:
 
         old_confidence = existing["confidence"]
         new_confidence = min(1.0, old_confidence + delta)
+
+        if not counted_by_tenka and new_confidence > MODEL_PROPOSED_CEILING:
+            # Never *lower* an existing value here: a preference already above
+            # the ceiling earned that from real evidence, and a model
+            # re-assertion must not be able to move it at all -- in either
+            # direction.
+            capped = max(old_confidence, MODEL_PROPOSED_CEILING)
+            if round(capped, 4) != round(new_confidence, 4):
+                logger.info(
+                    f"[PREFERENCES] {key}: model re-assertion capped at "
+                    f"{capped:.2f} (asked for {new_confidence:.2f}) — a model "
+                    f"repeating itself is not repetition TENKA counted"
+                )
+            new_confidence = capped
 
         # Skip if no change
         if round(new_confidence, 4) == round(old_confidence, 4):

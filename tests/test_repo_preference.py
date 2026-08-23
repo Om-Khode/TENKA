@@ -50,15 +50,18 @@ def test_get_missing_returns_none(repo):
 def test_get_with_category_filter(repo):
     repo.set_preference("music_app", "spotify", "app_routing", 0.5, "reflection", "r")
     repo.set_preference("music_app", "vlc", "media", 0.6, "explicit", "r")
+    # `key` is the PRIMARY KEY, so the second write overwrites the first
+    # regardless of category -- the row's category is now "media".
+    #
+    # The first query asked for `category="media"` and asserted `is None`, then
+    # the next line ran the identical query and asserted it was NOT None. The
+    # comment beside it says what was meant ("so 'app_routing' filter returns
+    # None"), so the assertion had drifted from its own explanation. Both halves
+    # now match what they claim.
+    assert repo.get_preference("music_app", category="app_routing") is None
     pref = repo.get_preference("music_app", category="media")
-    # category filter only applies when key+category both match;
-    # but key is PRIMARY KEY so second set_preference overwrites the first
-    # (key is unique regardless of category).
-    # The result depends on upsert behavior: last write wins.
-    assert pref is None  # category changed to "media", so "app_routing" filter returns None
-    pref2 = repo.get_preference("music_app", category="media")
-    assert pref2 is not None
-    assert pref2["value"] == "vlc"
+    assert pref is not None
+    assert pref["value"] == "vlc"
 
 
 def test_upsert_updates_existing(repo):

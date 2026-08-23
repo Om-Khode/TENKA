@@ -636,13 +636,37 @@ def _build_goal_hints() -> str:
     """
     try:
         from .. import preferences
+        from ..storage.repos.preference import USER_STATED_SOURCES
 
         prefs = preferences.get_active_preferences(
             min_confidence=preferences.CONFIDENCE_SILENT
         )
+        # Provenance, not just confidence -- and this consumer is the strictest
+        # in the tree for a reason that is about the destination, not the value.
+        #
+        # These pairs are appended to the `code_executor` and `planner`
+        # prompts, so what a wrong one buys is generated code that runs in a
+        # subprocess. `automation/router.py` reads preferences too and accepts
+        # a model-proposed one at a lower floor, because the worst case there
+        # is opening the wrong application. The blast radii are not comparable,
+        # so the rules are not either.
+        #
+        # Confidence alone was the whole check, and it was reachable: a
+        # reflection-written preference clamps to 0.4 on write, and
+        # `bump_confidence` used to add +0.15 per re-proposal with nothing
+        # verifying the count -- so three nights of the model agreeing with
+        # itself reached CONFIDENCE_SILENT and entered this prompt. That path is
+        # capped now (see `MODEL_PROPOSED_CEILING`), and this check is the other
+        # half: even at confidence 1.0, a value no human stated does not go into
+        # a code-generation prompt.
+        #
+        # A user-stated value needs no untrusted-content fence here, and that is
+        # the point of filtering rather than fencing: after this line the value
+        # is the user's own words, which is what the trusted position is for.
         routing = [
             p for p in prefs
             if p["category"] in ("app_routing", "contact_routing", "environment")
+            and p.get("source") in USER_STATED_SOURCES
         ]
         if not routing:
             return ""
