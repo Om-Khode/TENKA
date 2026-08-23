@@ -12,6 +12,17 @@ Covers:
 Run: python test_verification_vision.py
 """
 
+# P6: `VerifyResult.ok` was removed. It was True for confident success,
+# `ambiguous()` and `skip()` alike, so six call sites each decided what it meant
+# and `recovery.py` decided wrong (KI-31). Assertions here are rewritten against
+# `.outcome` / `.confirmed`, which say which of the three a result actually is.
+#
+#   assert r.ok          ->  assert r.confirmed        (success OR unverified)
+#   assert not r.ok      ->  assert not r.confirmed    (failed OR uncertain)
+#
+# Where a test means specifically "succeeded" or "failed" it says so with
+# `Outcome`, because that is the distinction the boolean could not carry.
+
 from __future__ import annotations
 
 import asyncio
@@ -80,7 +91,7 @@ class TestVisionVerifyHappy(unittest.IsolatedAsyncioTestCase):
             amb,
         )
         self.assertEqual(out.tier, "vision")
-        self.assertTrue(out.ok)
+        self.assertTrue(out.confirmed)
         self.assertEqual(out.observation, "search bar focused")
         self.assertEqual(out.confidence, 0.9)
         screen.capture_screenshot_base64.assert_called_once()
@@ -96,7 +107,7 @@ class TestVisionVerifyHappy(unittest.IsolatedAsyncioTestCase):
             amb,
         )
         self.assertEqual(out.tier, "vision")
-        self.assertFalse(out.ok)
+        self.assertFalse(out.confirmed)
         self.assertIn("country code", out.observation)
 
     async def test_strips_markdown_fences(self):
@@ -107,7 +118,7 @@ class TestVisionVerifyHappy(unittest.IsolatedAsyncioTestCase):
         out = await ver.vision_verify(
             {"type": "app", "action": "click", "params": {}}, amb,
         )
-        self.assertTrue(out.ok)
+        self.assertTrue(out.confirmed)
         self.assertEqual(out.tier, "vision")
 
 
@@ -127,7 +138,7 @@ class TestVisionVerifyPageScreenshot(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "click", "params": {"selector": "button"}},
             amb, page=mock_page,
         )
-        self.assertTrue(out.ok)
+        self.assertTrue(out.confirmed)
         self.assertEqual(out.tier, "vision")
         mock_page.screenshot.assert_awaited_once()
         screen_mod = sys.modules["assistant.io.screen"]
@@ -146,7 +157,7 @@ class TestVisionVerifyPageScreenshot(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "click", "params": {}},
             amb, page=mock_page,
         )
-        self.assertTrue(out.ok)
+        self.assertTrue(out.confirmed)
         mock_page.screenshot.assert_awaited_once()
         screen.capture_screenshot_base64.assert_called_once()
 
@@ -159,7 +170,7 @@ class TestVisionVerifyPageScreenshot(unittest.IsolatedAsyncioTestCase):
             {"type": "app", "action": "click", "params": {}},
             amb, page=None,
         )
-        self.assertTrue(out.ok)
+        self.assertTrue(out.confirmed)
         screen.capture_screenshot_base64.assert_called_once()
 
 

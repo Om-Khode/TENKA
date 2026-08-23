@@ -960,11 +960,18 @@ mutations run: restoring `bool(vr.ok)` reds five; making recovery never succeed 
 which is the guard against "fixing" this by refusing everything; deleting the vision
 escalation reds one.
 
-**Still open, and wider than this:** `VerifyResult.ambiguous()` and `.skip()` still carry
-`ok=True`, so any *future* reader of `.ok` inherits the same trap. The type is the defect;
-this fixed the one caller that had fallen into it. Replacing the boolean with an explicit
-outcome (`SUCCEEDED` / `FAILED` / `UNCERTAIN` / `UNVERIFIED` / `UNSUPPORTED`) is specified
-in `TENKA-v2.md` §11 and is a larger change touching seven call sites.
+**Closed fully on 2026-08-23.** `VerifyResult.ok` no longer exists. The field was removed
+rather than kept as a derived property, so a reader that was not updated raises
+`AttributeError` instead of quietly receiving a boolean whose meaning changed. The five
+`Outcome` members replace it, and the two the boolean could not express are the point:
+`UNCERTAIN` (ran, could not decide) and `UNVERIFIED` (did not run -- policy, or nothing to
+check). Folding those together would make `VERIFY_ENABLED=False` turn every task uncertain,
+which is a rule nobody adopts.
+
+Also closed with it: a crash now returns `UNCERTAIN` rather than sharing `skip()` with an
+operator decision, and `data.get("ok", True)` no longer defaults a *missing* vision verdict
+to success. `vision_verify` still fails open, which is now safe in a way it was not: what it
+hands back is the code tier's own verdict, and an ambiguous one is `UNCERTAIN`.
 
 ---
 

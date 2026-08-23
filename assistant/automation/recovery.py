@@ -32,6 +32,8 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+
+from ..brain.task import Outcome
 from typing import Any, Optional
 
 logger = logging.getLogger("recovery")
@@ -494,7 +496,12 @@ async def attempt_recovery(
         # recovery, and calling either one succeeded is the failure this
         # project has already paid for once -- a control that behaves
         # correctly while the report about it lies (KI-28).
-        _confirmed = bool(vr.ok) and not vr.skipped and vr.tier != "ambiguous"
+        # Now a single question with a single answer. The three-clause version
+        # this replaces -- `bool(vr.ok) and not vr.skipped and tier !=
+        # "ambiguous"` -- was correct but was reconstructing, at one call site,
+        # what the type should have said itself. `Outcome.SUCCEEDED` is the only
+        # positive evidence there is; a recovery has nothing to claim without it.
+        _confirmed = vr.outcome is Outcome.SUCCEEDED
         attempts.append(RecoveryAttempt(cls, detail, action, _confirmed, calls + 2))
 
         if _confirmed:
@@ -506,7 +513,7 @@ async def attempt_recovery(
                 escalated=False,
             )
 
-        if vr.ok:
+        if vr.outcome in (Outcome.UNCERTAIN, Outcome.UNVERIFIED):
             # Not a failure, an unknown: the recovery action ran and nothing
             # could confirm what it did. Say that, rather than reporting the
             # original failure text as though the attempt had changed nothing.
