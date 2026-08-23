@@ -840,6 +840,29 @@ def _match_implicit_proc_command(text: str):
     Catch 'edit X' / 'delete X' when X matches a known procedure.
     Only fires when regex_router didn't match (no 'procedure' keyword).
     Zero LLM cost — just a regex + DB lookup.
+
+    **The capture is `(.+)$`, so it claims the rest of the sentence**, and the
+    name lookup then matches on a prefix or substring. Observed, and it deleted
+    real work:
+
+        'delete scratchpad schedule'
+        [PROC-MGMT] Implicit delete -> 'scratchpad'
+        [PROCEDURES] Soft-deleted id=1
+
+    The schedule survived and the procedure did not. Same shadowing as the
+    execution path (`match_trigger`'s `contained` tier), one door along: this
+    block runs before `pre_route`, so a command *about* a schedule or a monitor
+    that happens to name a procedure is read as a command about the procedure.
+
+    Resolved the same way and with the same short list. `pre_route` knows what
+    "delete X schedule" and "delete the X monitor" are, deterministically;
+    `manage_procedure` is excluded from the comparison because that is what this
+    function itself produces. "delete scratchpad" still routes here -- nothing
+    else claims it -- so the ordinary case is untouched.
+
+    Deferring is also the safe direction on a tie: it leaves a taught procedure
+    in place, and a wrongly-surviving procedure is recoverable in a way a
+    wrongly-deleted one is not.
     """
     from .intent import IntentResult
 
@@ -853,6 +876,29 @@ def _match_implicit_proc_command(text: str):
         name = m.group(1).strip().rstrip(".!?")
         if not name or len(name) < 3:
             continue
+
+        # `_NAMES_AN_OBJECT` rather than "any intent pre_route names", and the
+        # honest note is that the two are **behaviourally identical here
+        # today**: every `delete X` / `edit X` phrasing `pre_route` recognises
+        # happens to be object-naming, so no input distinguishes them. The
+        # narrow form is kept because it is the same rule as the execution path
+        # in `_weak_trigger_yields`, where the distinction *is* live
+        # (`open scratchpad` routes to `computer_task` and must not yield), and
+        # two doors applying one rule differently is how they drift apart.
+        #
+        # No `!= "manage_procedure"` guard: it looked necessary and is dead.
+        # `pre_route` never answers `manage_procedure` for these inputs --
+        # `regex_router.match_procedure_command` handles the explicit
+        # "... procedure" wording and runs first -- so the guard could not fire,
+        # and an untestable branch is worse than no branch.
+        competing = regex_router.pre_route(text)
+        if competing is not None and competing.intent in _NAMES_AN_OBJECT:
+            logger.info(
+                f"[PROC-MGMT] Implicit {action} on {name!r} yields to "
+                f"{competing.intent}"
+            )
+            return None
+
         proc = procedures.find_by_name_or_trigger(name)
         if proc:
             logger.info(f"[PROC-MGMT] Implicit {action} → '{proc['trigger']}'")
