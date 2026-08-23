@@ -276,6 +276,37 @@ _TEACH_YES = (
     "correct", "right", "perfect", "good",
 )
 
+
+_NAMING_PREAMBLE_RE = re.compile(
+    r"^(?:"
+    r"(?:let'?s\s+|you\s+can\s+|just\s+|please\s+)*"
+    r"(?:call|name)\s+(?:it|this|that)\b"
+    r"|(?:it'?s|its)\s+called\b"
+    r"|(?:the\s+)?(?:trigger|name|phrase)\s+(?:is|should\s+be|will\s+be)\b"
+    r"|(?:i'?ll|i\s+will|i)\s+call\s+(?:it|this|that)\b"
+    r")\s*[:,-]?\s*",
+    re.IGNORECASE,
+)
+"""The wrapper around a name, when the answer is a sentence about the name.
+
+Asked "what should I call it?", people answer either with the name or with a
+sentence containing it, and the whole utterance was taken as the trigger:
+
+    'call it scratchpad'  ->  trigger 'call it scratchpad'
+
+Which then matched nothing. A schedule pointing at "scratchpad" logged
+"Procedure not found" once a minute, and saying "scratchpad" out loud ran
+nothing either -- the procedure existed under a name nobody would ever say.
+
+Stripped rather than parsed: this removes a leading preamble and keeps
+everything after it, so "call it my morning routine" gives "my morning
+routine". A trigger is whatever the person will actually say, and the only
+thing wrong with the old behaviour was the four words in front of it.
+
+Nothing is stripped from the middle or the end -- "call it call it twice" is
+not a case worth handling, and the length guard below catches an empty result.
+"""
+
 _TEACH_NO = (
     "no", "nope", "nah", "wrong", "incorrect",
 )
@@ -317,6 +348,36 @@ def _enter_confirming(session: dict) -> str:
             "Fill these in when you run the procedure."
         )
     return personality_say("teach_confirm", steps=step_lines) + slot_note
+
+
+def _trigger_from_naming_reply(text: str) -> str:
+    """The trigger a naming reply is offering.
+
+    "call it scratchpad" -> "scratchpad". The whole sentence used to become the
+    trigger, so the procedure was stored under a phrase nobody would ever say:
+    saying "scratchpad" ran nothing, and a schedule pointing at it logged
+    "Procedure not found" once a minute.
+
+    A function rather than four lines inline, and the reason is a mutation
+    result: with the logic inline, the test for it exercised
+    `_NAMING_PREAMBLE_RE` directly and re-implemented the surrounding
+    strip-and-fallback in a helper of its own. Removing the strip from the real
+    code changed nothing that the test could see. Third time in one session that
+    a test mirrored the code instead of calling it.
+
+    Falls back to the raw text when stripping leaves too little: better to keep
+    what the person said and let the length guard reject it than to invent a
+    name.
+    """
+    raw = text.strip().rstrip(".!?").strip()
+    stripped = _NAMING_PREAMBLE_RE.sub("", raw).strip().rstrip(".!?").strip()
+    if len(stripped) < 3:
+        return raw
+    if stripped != raw:
+        logger.info(
+            f"[TEACH] Trigger taken from naming phrase: {raw!r} -> {stripped!r}"
+        )
+    return stripped
 
 
 async def handle_pending_teaching(text: str) -> str | None:
@@ -473,7 +534,8 @@ async def handle_pending_teaching(text: str) -> str | None:
     elif state == "naming":
         name_seed = _act.teaching_session.payload["name_seed"]
         is_yes    = any(w == lowered or lowered.startswith(w + " ") for w in _TEACH_YES)
-        trigger   = name_seed if is_yes else text.strip().rstrip(".!?").strip()
+        trigger = (name_seed if is_yes
+                   else _trigger_from_naming_reply(text))
 
         if len(trigger) < 3:
             return "That trigger is too short. Say a phrase like 'start my coding session'."
