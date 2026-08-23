@@ -468,9 +468,36 @@ async def attempt_recovery(
                 escalated=True,
             )
 
-        attempts.append(RecoveryAttempt(cls, detail, action, bool(vr.ok), calls + 2))
+        # `VerifyResult.ok` is True for three different things: confident
+        # success, `ambiguous()` (code could not decide), and `skip()`
+        # (bypassed). Reading it bare -- which this did -- reported
+        # `succeeded=True` for all three, so "the code cannot tell whether the
+        # recovery worked" became "recovered" and the step loop continued on
+        # an unverified screen.
+        #
+        # The three step loops that call post_verify directly
+        # (`native.py`, `browser/automation.py`, `router.py`) all escalate an
+        # ambiguous verdict to the vision tier first. This one did not, which
+        # is why it was the only site where recovery itself could claim
+        # success on uncertainty. It escalates the same way now.
+        from .. import config as _cfg   # deferred, as everywhere else here
+        if vr.tier == "ambiguous" and getattr(_cfg, "VERIFY_VISION_FALLBACK", True):
+            try:
+                vr = await verification.vision_verify(
+                    step, vr, page=page, active_window=active_window)
+            except Exception as e:
+                logger.warning(f"[recovery] vision verify after recovery crashed: {e}")
 
-        if vr.ok:
+        # Positive evidence only. `ambiguous` survives here when the vision
+        # tier is off, errored, or came back no more certain than the code
+        # tier did; `skipped` means nothing was checked at all. Neither is a
+        # recovery, and calling either one succeeded is the failure this
+        # project has already paid for once -- a control that behaves
+        # correctly while the report about it lies (KI-28).
+        _confirmed = bool(vr.ok) and not vr.skipped and vr.tier != "ambiguous"
+        attempts.append(RecoveryAttempt(cls, detail, action, _confirmed, calls + 2))
+
+        if _confirmed:
             logger.info(f"[recovery] recovered via {action} on attempt {attempt_num + 1}")
             return RecoveryOutcome(
                 succeeded=True,
@@ -478,6 +505,20 @@ async def attempt_recovery(
                 final_observation=getattr(vr, "observation", "") or "",
                 escalated=False,
             )
+
+        if vr.ok:
+            # Not a failure, an unknown: the recovery action ran and nothing
+            # could confirm what it did. Say that, rather than reporting the
+            # original failure text as though the attempt had changed nothing.
+            logger.info(
+                f"[recovery] {action} on attempt {attempt_num + 1} could not be "
+                f"confirmed (tier={vr.tier}) — not counting it as recovered"
+            )
+            last_observation = (
+                getattr(vr, "observation", "")
+                or f"could not confirm whether {action} worked"
+            )
+            continue
 
         last_observation = getattr(vr, "observation", "") or ""
 

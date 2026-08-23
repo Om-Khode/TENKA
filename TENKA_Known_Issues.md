@@ -909,3 +909,59 @@ handler.
 **Not closed by this:** a raise spent directly on `code_executor` can install an OS-level
 scheduled task outside TENKA. No in-process check can prevent that. The raise's value is
 that it is deliberate and narrow, not that it is containment.
+
+---
+
+## KI-31: ~~Recovery reported success when nothing could confirm it~~ FIXED
+
+**Priority:** Medium (honesty, not privilege — she claimed work she could not verify)
+**Effort:** Low — one predicate at one site
+**Discovered:** 2026-08-22, auditing `VerifyResult` while writing `TENKA-v2.md`
+**Fixed:** 2026-08-23
+
+**Symptom:** `VerifyResult.ok` is `True` for three different things — confident success,
+`ambiguous()` (the code tier could not decide), and `skip()` (nothing was checked at all).
+`automation/recovery.py` read it bare:
+
+```python
+attempts.append(RecoveryAttempt(cls, detail, action, bool(vr.ok), calls + 2))
+if vr.ok:
+    return RecoveryOutcome(succeeded=True, ...)
+```
+
+So "the code cannot tell whether the recovery worked" became `succeeded=True`, the browser
+step loop took the `continue` branch, and execution carried on across an unverified screen.
+The attempt log recorded `succeeded=True` beside it, so the operator-facing summary agreed
+with the claim.
+
+**It was the only site with this shape.** The three loops that call `post_verify` directly —
+`native.py:1007`, `browser/automation.py:587`, `router.py:1324` — all check
+`tier == "ambiguous"` and escalate to the vision tier first. Recovery did not, which is why
+recovery alone could report success on uncertainty.
+
+**What shipped.** Recovery escalates an ambiguous verdict to vision exactly as the three step
+loops do, and then requires positive evidence:
+
+```python
+_confirmed = bool(vr.ok) and not vr.skipped and vr.tier != "ambiguous"
+```
+
+An unconfirmed attempt is neither a success nor a repeat of the original failure — it
+continues to the next attempt with an observation that says nothing could confirm the
+action, rather than replaying "the button is still there" when the truth is that nobody
+looked.
+
+This changes nothing about what recovery *does*. It changes what it is willing to claim,
+and it belongs to [KI-28](#ki-28)'s family: a control behaving correctly while the report
+about it lies.
+
+**Tests:** `tests/test_recovery_needs_evidence.py` — 8 cases, both directions. Three
+mutations run: restoring `bool(vr.ok)` reds five; making recovery never succeed reds two,
+which is the guard against "fixing" this by refusing everything; deleting the vision
+escalation reds one.
+
+**Still open, and wider than this:** `VerifyResult.ambiguous()` and `.skip()` still carry
+`ok=True`, so any *future* reader of `.ok` inherits the same trap. The type is the defect;
+this fixed the one caller that had fallen into it. Replacing the boolean with an explicit
+outcome (`SUCCEEDED` / `FAILED` / `UNCERTAIN` / `UNVERIFIED` / `UNSUPPORTED`) is specified
+in `TENKA-v2.md` §11 and is a larger change touching seven call sites.
