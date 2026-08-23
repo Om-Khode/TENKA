@@ -2135,20 +2135,35 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             # failure `session._exclude_security_skips` exists to stop, through
             # a door it does not cover. `actions._note_refusal` writes the
             # ledger; this is the only reader.
-            _refused_anywhere = bool(getattr(_tracker, "refused_capabilities", None))
+            # A NEW local, never an assignment to the closure variable. This
+            # code lives in the nested `_save_turn`, so writing
+            # `_security_skip_this_turn = ...` here made that name a local of
+            # *this* function and shadowed the enclosing one -- so reading it on
+            # the same line raised `UnboundLocalError` and killed every turn
+            # that reached this point, after the work was done and before the
+            # conversation row was written. Python decides local-vs-closure at
+            # compile time from the presence of an assignment, which is why the
+            # fix is to stop assigning rather than to reorder anything.
+            #
+            # Typed check rather than a bare truth test, for the same
+            # never-lose-the-turn reason: a stand-in tracker returns a truthy
+            # object for any attribute, and `sorted()` of one raises.
+            _refused = getattr(_tracker, "refused_capabilities", None)
+            _refused_anywhere = bool(_refused) and isinstance(
+                _refused, (set, frozenset, list, tuple))
+            _skip_this_turn = _security_skip_this_turn or _refused_anywhere
             if _refused_anywhere and not _security_skip_this_turn:
                 logger.info(
                     f"[SECURITY] Turn marked security_skip: refusal(s) for "
-                    f"{sorted(_tracker.refused_capabilities)} during dispatch"
+                    f"{sorted(str(c) for c in _refused)} during dispatch"
                 )
-            _security_skip_this_turn = _security_skip_this_turn or _refused_anywhere
             try:
                 conv_row_id = memory.save_turn(
                     user_input=transcription,
                     intent=intent_result.intent,
                     response=clean_response,
                     session_id=session_id,
-                    security_skip=_security_skip_this_turn,
+                    security_skip=_skip_this_turn,
                 )
             except Exception as e:
                 logger.warning(f"Failed to save conversation turn: {e}")

@@ -18,12 +18,44 @@ _TRAIT_TIER_HIGH = 0.67
 
 
 def _get_trait_tier(value: float) -> str:
-    """Map a trait float (0.0-1.0) to a tier string."""
+    """Map a trait float (0.0-1.0) to a tier string.
+
+    Still three tiers, because a tier selects which *sentence* a personality
+    supplies for a trait and each one ships exactly three
+    (`loader.get_modifiers()[trait][tier]`). Changing that count would mean
+    rewriting every personality's data. What changes is that the tier is no
+    longer the only thing that reaches the prompt -- see `_trait_intensity`.
+    """
     if value < _TRAIT_TIER_LOW:
         return "low"
     elif value < _TRAIT_TIER_HIGH:
         return "mid"
     return "high"
+
+
+def _trait_intensity(value: float) -> int:
+    """A trait's position on a 0-100 scale, for the prompt.
+
+    **Why this exists.** The tier above was the *entire* signal a trait sent to
+    the model, and it collapses 0.0-1.0 into three buckets a third of the range
+    wide. The reflection cycle moves a trait by at most
+    `MAX_DELTA_PER_CYCLE = 0.05`, so crossing one band takes about 6.6 cycles --
+    nearly a week in which a trait can drift steadily and the prompt is
+    byte-identical every single day. Personality evolution that cannot be
+    observed until the seventh night reads as no evolution at all, which is
+    most of what "robotic" was measuring.
+
+    A number rather than more bands, deliberately: more bands need more
+    sentences from every personality (three exist per trait), while this is
+    resolution the tree already has and was discarding. At 1/100 granularity a
+    single cycle's movement is visible the day it happens, which is the
+    property the phase asks for.
+
+    Rendered as an integer, never a float: `0.5700000000000001` in a prompt is
+    noise, and the model is being told how something feels, not handed a
+    measurement.
+    """
+    return int(round(max(0.0, min(1.0, value)) * 100))
 
 
 # --- DB-accessing helpers (mockable seams) ---
@@ -272,7 +304,12 @@ def build_personality_prompt() -> str:
             tier = _get_trait_tier(value)
             modifier = modifiers.get(trait_name, {}).get(tier)
             if modifier:
-                modifier_lines.append(f"- {modifier}")
+                # The personality's own sentence carries the voice; the number
+                # carries the movement. Without it a week of drift produced an
+                # identical prompt every day -- see `_trait_intensity`.
+                modifier_lines.append(
+                    f"- {modifier} (intensity {_trait_intensity(value)}/100)"
+                )
 
         if not modifier_lines:
             return base + context_summary + pref_block
@@ -287,7 +324,10 @@ def build_personality_prompt() -> str:
             f"{base}\n\n"
             f"--- Current Behavioral State ---\n"
             f"(These reflect how you're currently feeling based on your "
-            f"relationship with the user. Follow these naturally.)\n"
+            f"relationship with the user. Follow these naturally. The "
+            f"intensity figures are your own internal sense of degree -- let "
+            f"them shape how strongly each one comes through, and never "
+            f"mention or read out a number.)\n"
             f"{modifiers_block}"
             f"{context_summary}"
             f"{pref_block}"

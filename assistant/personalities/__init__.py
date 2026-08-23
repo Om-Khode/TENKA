@@ -60,11 +60,27 @@ class PersonalityLoader:
         if responses_path.exists():
             with open(responses_path, encoding="utf-8") as f:
                 self._responses = json.load(f)
-            if self._name == "tsundere" and os.getenv("VOCAL_CASUAL_LANGUAGE", "false").lower() == "true":
-                extras = self._responses.pop("_casual_extras", {})
+            # `_casual_extras` is an opt-in overlay: a personality that ships
+            # one gets those variants ADDED to its base pools when the operator
+            # turns the flag on. It is never a pool of its own, which is why it
+            # is popped either way -- leaving it in would make it look like a
+            # response key called "_casual_extras".
+            #
+            # No personality name appears in this condition, and that is the
+            # fix rather than an accident: it used to read
+            # `if self._name == "tsundere" and ...`, which is THE rule's
+            # "never special-case by name" applied to a personality instead of
+            # an app. A second personality shipping casual variants would have
+            # silently had them ignored. Whether the overlay exists is data;
+            # whether it is wanted is a preference; neither is an identity.
+            extras = self._responses.pop("_casual_extras", {})
+            if extras and os.getenv(
+                    "VOCAL_CASUAL_LANGUAGE", "false").lower() == "true":
                 for key, variants in extras.items():
                     if key in self._responses:
                         self._responses[key].extend(variants)
+                    else:
+                        self._responses[key] = list(variants)
         else:
             self._responses = {}
 

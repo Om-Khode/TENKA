@@ -9,6 +9,7 @@
   },
   "emotion_mode": "neutral",
   "has_modifiers": false,
+  "terse": true,
   "sycophancy_filter": false,
   "wellbeing_checkin": false,
   "reflection_hints": {
