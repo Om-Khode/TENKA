@@ -200,3 +200,99 @@ def test_the_turn_loop_applies_both_conditions():
         "the turn loop no longer consults the decision function, so every test "
         "in this file is measuring something the pipeline does not run"
     )
+
+
+# ─── the management door, same shadowing one along ───────────────────────────
+#
+# `_match_implicit_proc_command` captures `(.+)$` after "delete"/"edit", so it
+# claims the rest of the sentence, and the name lookup then matches on a prefix
+# or substring. Observed, and it destroyed real work:
+#
+#     'delete scratchpad schedule'
+#     [PROC-MGMT] Implicit delete -> 'scratchpad'
+#     [PROCEDURES] Soft-deleted id=1
+#
+# The schedule survived; the procedure did not. The execution fix above did not
+# cover this because it is a different function on a different door.
+
+
+@pytest.fixture()
+def taught(tmp_path, monkeypatch):
+    """A real procedure in a real database, reachable through the facade that
+    `_match_implicit_proc_command` uses.
+
+    Not a mock: the defect is in how the *name lookup* resolves a greedy
+    capture, so a stubbed lookup would answer whatever the test wanted and
+    prove nothing.
+    """
+    import assistant.config as cfg
+    import assistant.procedures as procs
+    from assistant.storage.db import _reset_for_testing, init_db
+
+    monkeypatch.setattr(cfg, "SANDBOX_DIR", tmp_path, raising=False)
+    _reset_for_testing()
+    init_db(tmp_path / "memory" / "personality.db")
+    procs._repo = None
+    procs.init_procedure_db()
+    procs.create_procedure(
+        trigger="scratchpad", name="A New Thing",
+        steps=[{"type": "app", "action": "open", "params": {"name": "notepad"}}])
+    yield procs
+    _reset_for_testing()
+
+
+@pytest.mark.parametrize("text,intent", [
+    ("delete scratchpad schedule", "manage_schedule"),
+    ("delete the scratchpad monitor", "manage_monitor"),
+])
+def test_a_command_about_another_object_does_not_delete_the_procedure(
+        taught, text, intent):
+    """**The data-loss case.** Deferring here is also the safe direction on a
+    tie: a wrongly-surviving procedure is recoverable, a wrongly-deleted one is
+    not."""
+    from assistant.main import _match_implicit_proc_command
+
+    assert regex_router.pre_route(text).intent == intent, "premise moved"
+    assert _match_implicit_proc_command(text) is None, (
+        f"{text!r} still resolves to deleting the procedure"
+    )
+
+
+@pytest.mark.parametrize("text,action", [
+    ("delete scratchpad", "delete"),
+    ("remove scratchpad", "delete"),
+    ("edit scratchpad", "edit"),
+])
+def test_managing_the_procedure_itself_still_works(taught, text, action):
+    """The other direction, and the one a blunt fix would break. Nothing else
+    claims these, so they must still reach `manage_procedure`."""
+    from assistant.main import _match_implicit_proc_command
+
+    result = _match_implicit_proc_command(text)
+    assert result is not None, f"{text!r} no longer manages the procedure"
+    assert result.intent == "manage_procedure"
+    assert result.params["action"] == action
+
+
+def test_pre_route_never_claims_manage_procedure_for_these_inputs():
+    """Why there is no `!= "manage_procedure"` guard, recorded because adding
+    one is the obvious next thought.
+
+    `regex_router.match_procedure_command` handles the explicit "... procedure"
+    wording and runs before this function, so `pre_route` never answers
+    `manage_procedure` for anything that reaches it. A guard against that could
+    not fire, and a branch no test can distinguish is worse than no branch.
+
+    Also the limit of the narrowing, stated rather than implied: for *this*
+    function, `_NAMES_AN_OBJECT` and "any routed intent" are behaviourally
+    identical today -- no `delete X` / `edit X` phrasing `pre_route` recognises
+    is outside the set. The narrow form is kept only so that both doors apply
+    one rule; on the execution path the distinction is live.
+    """
+    for text in ("delete the scratchpad procedure", "delete scratchpad",
+                 "edit scratchpad", "delete scratchpad file"):
+        competing = regex_router.pre_route(text)
+        assert competing is None or competing.intent != "manage_procedure", (
+            f"pre_route now answers manage_procedure for {text!r}; the guard "
+            f"removed as dead code may be needed after all"
+        )
