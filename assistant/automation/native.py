@@ -12,6 +12,7 @@ import logging
 from typing import Optional, Dict, List
 
 from .. import config
+from ..brain.task import Outcome
 
 logger = logging.getLogger("app_automation")
 
@@ -924,7 +925,7 @@ async def run_app_steps(steps: List[Dict]) -> str:
 
             # ── Tier 0: pre-check (target reachable, focus context sane) ──
             pre = await verification.pre_check(verify_step, active_window=active_window)
-            if not pre.ok and pre.confidence >= config.VERIFY_MIN_CONFIDENCE:
+            if pre.outcome is Outcome.FAILED and pre.confidence >= config.VERIFY_MIN_CONFIDENCE:
                 msg = f"verify_failed (pre): step {i+1} {action} — {pre.observation}"
                 logger.warning(f"[APP] {msg}")
                 results.append(msg)
@@ -1007,7 +1008,20 @@ async def run_app_steps(steps: List[Dict]) -> str:
             if post.tier == "ambiguous" and config.VERIFY_VISION_FALLBACK:
                 # Vision escalation. Currently a no-op pass-through.
                 post = await verification.vision_verify(verify_step, post, active_window=active_window)
-            if not post.ok and post.confidence >= config.VERIFY_MIN_CONFIDENCE and not post.skipped:
+            # Ran and could not decide, even after the vision tier. Not a
+            # failure -- there is no evidence either way -- so the loop
+            # continues. But it is not success either, and the old code read it
+            # as one because `ambiguous()` carried `ok=True`.
+            #
+            # Disclosed rather than swallowed, copying the shape the vision
+            # agent already uses (`_append_abandoned_suffix`): the caller's
+            # summary carries the doubt, so the spoken answer can say what was
+            # not confirmed instead of implying it was.
+            if post.outcome is Outcome.UNCERTAIN:
+                results.append(
+                    f"unconfirmed: step {i+1} {action} — {post.observation}"
+                )
+            if post.outcome is Outcome.FAILED and post.confidence >= config.VERIFY_MIN_CONFIDENCE:
                 msg = f"verify_failed (post): step {i+1} {action} — {post.observation}"
                 logger.warning(f"[APP] {msg}")
                 results.append(msg)

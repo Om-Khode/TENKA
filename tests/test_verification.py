@@ -14,6 +14,17 @@ Covers:
 Run: python test_verification.py
 """
 
+# P6: `VerifyResult.ok` was removed. It was True for confident success,
+# `ambiguous()` and `skip()` alike, so six call sites each decided what it meant
+# and `recovery.py` decided wrong (KI-31). Assertions here are rewritten against
+# `.outcome` / `.confirmed`, which say which of the three a result actually is.
+#
+#   assert r.ok          ->  assert r.confirmed        (success OR unverified)
+#   assert not r.ok      ->  assert not r.confirmed    (failed OR uncertain)
+#
+# Where a test means specifically "succeeded" or "failed" it says so with
+# `Outcome`, because that is the distinction the boolean could not carry.
+
 from __future__ import annotations
 
 import asyncio
@@ -26,6 +37,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent))
 
 import assistant.automation.verification as ver
+from assistant.brain.task import Outcome
 from assistant.automation.verification import VerifyResult
 from assistant import config as _config_stub
 
@@ -52,27 +64,34 @@ def _reset_config():
 class TestVerifyResult(unittest.TestCase):
     def test_ok_(self):
         r = VerifyResult.ok_()
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
         self.assertEqual(r.tier, "code")
         self.assertEqual(r.confidence, 1.0)
         self.assertFalse(r.skipped)
 
     def test_fail(self):
         r = VerifyResult.fail("URL mismatch")
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
         self.assertEqual(r.observation, "URL mismatch")
         self.assertEqual(r.tier, "code")
 
     def test_ambiguous_marks_for_escalation(self):
         r = VerifyResult.ambiguous("click outcome unknown")
-        self.assertTrue(r.ok)  # ok=True so callers don't fail-stop
+        # Was `assertTrue(r.ok)  # ok=True so callers don't fail-stop`. That
+        # comment names the defect precisely: not failing-stop and *being
+        # confirmed* were the same flag, so "the code tier cannot decide"
+        # arrived at every caller wearing success. A caller still must not
+        # fail-stop on this -- the tier is `ambiguous` and vision may resolve
+        # it -- but it is UNCERTAIN, and nothing may report it as done.
+        self.assertIs(r.outcome, Outcome.UNCERTAIN)
+        self.assertFalse(r.confirmed)
         self.assertEqual(r.tier, "ambiguous")
         self.assertEqual(r.confidence, 0.5)
 
     def test_skip(self):
         r = VerifyResult.skip("non-verifiable")
         self.assertTrue(r.skipped)
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
         self.assertEqual(r.tier, "skipped")
 
 
@@ -93,7 +112,7 @@ class TestGate(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(r.skipped)
         # App still runs
         r2 = await ver.post_verify({"type": "app", "action": "open", "params": {"name": "Notepad"}})
-        self.assertFalse(r2.skipped or r2.ok and r2.tier == "skipped",
+        self.assertFalse(r2.skipped or r2.confirmed and r2.tier == "skipped",
                          "app gate shouldn't skip when only browser is off")
 
     async def test_app_toggle(self):
@@ -187,7 +206,7 @@ class TestBrowserPreCheck(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "fill", "params": {"selector": "#email", "value": "x"}},
             page=page,
         )
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
         self.assertEqual(r.tier, "pre_check")
 
     async def test_fill_pre_fails_when_invisible(self):
@@ -196,7 +215,7 @@ class TestBrowserPreCheck(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "fill", "params": {"selector": "#email", "value": "x"}},
             page=page,
         )
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
         self.assertIn("not visible", r.observation)
 
     async def test_fill_pre_fails_when_disabled(self):
@@ -205,7 +224,7 @@ class TestBrowserPreCheck(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "fill", "params": {"selector": "#email", "value": "x"}},
             page=page,
         )
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
         self.assertIn("disabled", r.observation)
 
     async def test_navigate_no_pre_check(self):
@@ -225,7 +244,7 @@ class TestBrowserPostVerify(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "navigate", "params": {"url": "example.com"}},
             page=page,
         )
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
 
     async def test_navigate_url_mismatch(self):
         page = _make_page(url="https://other.com/")
@@ -233,7 +252,7 @@ class TestBrowserPostVerify(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "navigate", "params": {"url": "https://example.com"}},
             page=page,
         )
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
         self.assertIn("other.com", r.observation)
 
     async def test_navigate_same_host_redirect_is_ambiguous(self):
@@ -244,7 +263,11 @@ class TestBrowserPostVerify(unittest.IsolatedAsyncioTestCase):
              "params": {"url": "https://in.bookmyshow.com/movies/berlin/spiderman-brand-new-day/ET00447840"}},
             page=page,
         )
-        self.assertTrue(r.ok)
+        # "ambiguous, not fail" is still the property -- a slug redirect on the
+        # same host is not evidence the navigation failed. What changed is that
+        # it is not evidence it succeeded either: UNCERTAIN, so the vision tier
+        # gets a chance and no caller reports it as done.
+        self.assertIs(r.outcome, Outcome.UNCERTAIN)
         self.assertEqual(r.tier, "ambiguous")
         self.assertIn("same host", r.observation)
 
@@ -256,7 +279,7 @@ class TestBrowserPostVerify(unittest.IsolatedAsyncioTestCase):
              "params": {"url": "https://www.example.com/page"}},
             page=page,
         )
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
         self.assertIn("help.example.com", r.observation)
 
     async def test_fill_ok_loose(self):
@@ -265,7 +288,7 @@ class TestBrowserPostVerify(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "fill", "params": {"selector": "#e", "value": "john"}},
             page=page,
         )
-        self.assertTrue(r.ok, f"loose match should pass autocomplete; got {r.observation}")
+        self.assertTrue(r.confirmed, f"loose match should pass autocomplete; got {r.observation}")
 
     async def test_fill_fail_strict(self):
         _config_stub.VERIFY_STRICT_TEXT_MATCH = True
@@ -274,7 +297,7 @@ class TestBrowserPostVerify(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "fill", "params": {"selector": "#e", "value": "john"}},
             page=page,
         )
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
 
     async def test_fill_password_non_empty_ok(self):
         page = _make_page(locators={"#pwd": _make_locator(value="********")})
@@ -282,7 +305,7 @@ class TestBrowserPostVerify(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "fill", "params": {"selector": "#pwd", "value": "secret"}},
             page=page,
         )
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
 
     async def test_fill_password_empty_fails(self):
         page = _make_page(locators={"#pwd": _make_locator(value="")})
@@ -290,7 +313,7 @@ class TestBrowserPostVerify(unittest.IsolatedAsyncioTestCase):
             {"type": "browser", "action": "fill", "params": {"selector": "#pwd", "value": "secret"}},
             page=page,
         )
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
 
     async def test_click_is_ambiguous(self):
         r = await ver.post_verify(
@@ -298,7 +321,10 @@ class TestBrowserPostVerify(unittest.IsolatedAsyncioTestCase):
             page=_make_page(),
         )
         self.assertEqual(r.tier, "ambiguous")
-        self.assertTrue(r.ok)  # ambiguous == pass at code tier; vision can override
+        # Was `assertTrue(r.ok)  # ambiguous == pass at code tier`. It is not a
+        # pass; it is the absence of an answer, and the vision tier is what may
+        # turn it into one.
+        self.assertIs(r.outcome, Outcome.UNCERTAIN)
 
     async def test_press_is_ambiguous(self):
         r = await ver.post_verify(
@@ -319,33 +345,33 @@ class TestAppPostVerify(unittest.IsolatedAsyncioTestCase):
     async def test_open_window_appears(self):
         with patch("pygetwindow.getAllWindows", return_value=[_FakeWindow("Notepad - Untitled")]):
             r = await ver.post_verify({"type": "app", "action": "open", "params": {"name": "Notepad"}})
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
 
     async def test_open_window_missing_fails(self):
         with patch("pygetwindow.getAllWindows", return_value=[_FakeWindow("Calculator")]):
             r = await ver.post_verify({"type": "app", "action": "open", "params": {"name": "Notepad"}})
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
         self.assertIn("Notepad", r.observation)
 
     async def test_close_window_gone(self):
         with patch("pygetwindow.getAllWindows", return_value=[_FakeWindow("Calculator")]):
             r = await ver.post_verify({"type": "app", "action": "close", "params": {"name": "Notepad"}})
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
 
     async def test_close_window_still_present_fails(self):
         with patch("pygetwindow.getAllWindows", return_value=[_FakeWindow("Notepad - Untitled")]):
             r = await ver.post_verify({"type": "app", "action": "close", "params": {"name": "Notepad"}})
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
 
     async def test_focus_active_matches(self):
         with patch("pygetwindow.getActiveWindow", return_value=_FakeWindow("Notepad - Untitled")):
             r = await ver.post_verify({"type": "app", "action": "focus", "params": {"name": "Notepad"}})
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
 
     async def test_focus_active_mismatches(self):
         with patch("pygetwindow.getActiveWindow", return_value=_FakeWindow("Calculator")):
             r = await ver.post_verify({"type": "app", "action": "focus", "params": {"name": "Notepad"}})
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
 
     async def test_type_readback_ok(self):
         fake_aa = MagicMock()
@@ -355,7 +381,7 @@ class TestAppPostVerify(unittest.IsolatedAsyncioTestCase):
                 "type": "app", "action": "type",
                 "params": {"text": "hello", "selector": "name:Edit", "window": "Notepad"},
             })
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
 
     async def test_type_readback_mismatch(self):
         fake_aa = MagicMock()
@@ -365,7 +391,7 @@ class TestAppPostVerify(unittest.IsolatedAsyncioTestCase):
                 "type": "app", "action": "type",
                 "params": {"text": "hello", "selector": "name:Edit", "window": "Notepad"},
             })
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
         self.assertIn("hello", r.observation)
         self.assertIn("goodbye", r.observation)
 
@@ -402,7 +428,7 @@ class TestAppPreCheck(unittest.IsolatedAsyncioTestCase):
                 "type": "app", "action": "type",
                 "params": {"text": "x", "selector": "name:Edit", "window": "Notepad"},
             })
-        self.assertTrue(r.ok)
+        self.assertTrue(r.confirmed)
         self.assertEqual(r.tier, "pre_check")
 
     async def test_type_pre_focus_drift_caught(self):
@@ -413,7 +439,7 @@ class TestAppPreCheck(unittest.IsolatedAsyncioTestCase):
                 "type": "app", "action": "type",
                 "params": {"text": "x", "selector": "name:Edit", "window": "Notepad"},
             })
-        self.assertFalse(r.ok)
+        self.assertFalse(r.confirmed)
         self.assertIn("focus drift", r.observation)
 
     async def test_type_pre_at_focus_ambiguous(self):

@@ -13,11 +13,19 @@ Public surface:
     post_verify(step, *, page=None, active_window=None) -> VerifyResult
 
 Both return a VerifyResult. Callers (step loops, procedure_executor) decide
-whether to short-circuit, retry, or escalate based on .ok / .tier / .confidence.
+whether to short-circuit, retry, or escalate based on .outcome / .tier /
+.confidence. There is no `.ok` -- see VerifyResult.
 
-Failure-open policy: any internal exception (locator timeout, missing accessibility
-backend, JSON parse) returns skipped=True so verification never blocks execution
-on infrastructure problems. We surface the exception in observation for diagnosis.
+Failure-open policy: any internal exception (locator timeout, missing
+accessibility backend, JSON parse) still never blocks execution -- but it now
+returns `UNCERTAIN`, not the old `skipped=True` that a caller read as success.
+
+The behaviour is unchanged; the label is corrected. An exception means something
+was attempted and the answer is unknown, which is a fact about the world.
+Choosing not to verify (`VERIFY_ENABLED=False`, or an action with nothing to
+check) is a fact about the configuration, and that is `UNVERIFIED`. The old code
+used one value for both, so an infrastructure fault read as an operator
+decision.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .. import config
+from ..brain.task import Outcome
 
 logger = logging.getLogger("verification")
 
@@ -37,28 +46,99 @@ logger = logging.getLogger("verification")
 
 @dataclass
 class VerifyResult:
-    ok: bool = True
+    """What a verification tier concluded.
+
+    **There is no `ok` field, deliberately.** There was, and it was `True` for
+    three different things: confident success, `ambiguous()` (the code tier
+    could not decide) and `skip()` (nothing was checked). Six call sites each
+    decided for themselves what that meant, and `recovery.py` decided wrong --
+    it reported a recovery as succeeded when nothing had confirmed it (KI-31).
+
+    Removed rather than kept as a derived property: a reader that has not been
+    updated should raise `AttributeError` loudly, not quietly get a boolean
+    whose meaning changed underneath it.
+
+    The four constructors are unchanged, so the ~60 sites that *produce* a
+    result are untouched. What changed is what they mean:
+
+        ok_()        -> SUCCEEDED    positive evidence
+        fail()       -> FAILED       positive evidence against
+        ambiguous()  -> UNCERTAIN    ran, could not decide
+        skip()       -> UNVERIFIED   did not run: policy, or nothing to verify
+        crashed()    -> UNCERTAIN    ran and broke, which is not the same as
+                                     choosing not to look
+
+    `UNVERIFIED` is the member that earns its place. Folding it into
+    `UNCERTAIN` would make `VERIFY_ENABLED=False` -- a setting that exists so
+    the operator can skip verification -- turn every task uncertain, so TENKA
+    would answer "I could not confirm that" to everything. A rule that makes an
+    existing setting unusable is a rule that gets reverted, taking the honesty
+    property with it.
+    """
+
+    outcome: Outcome = Outcome.SUCCEEDED
     observation: str = ""           # planner-actionable failure detail
     confidence: float = 1.0         # 1.0 = code-deterministic, <1.0 = vision/heuristic
-    skipped: bool = False           # non-verifiable step (wait, extract, etc.)
     tier: str = "code"              # "pre_check" | "code" | "vision" | "skipped" | "ambiguous"
+
+    @property
+    def skipped(self) -> bool:
+        """Kept as a property because `UNVERIFIED` is exactly what the old
+        `skipped` flag meant, and several loops read it to mean "do not treat
+        this as a failure". Unlike `ok`, its meaning did not change."""
+        return self.outcome is Outcome.UNVERIFIED
+
+    @property
+    def confirmed(self) -> bool:
+        """The replacement for the bare `.ok` read.
+
+        One place answers "may a caller treat this as done", so no call site has
+        to decide again. `UNVERIFIED` counts: the operator turned verification
+        off, or the action has nothing to verify, and neither is a reason to
+        halt a step loop. `UNCERTAIN` does not: something was checked and could
+        not be established.
+        """
+        return self.outcome in (Outcome.SUCCEEDED, Outcome.UNVERIFIED)
 
     @classmethod
     def ok_(cls, tier: str = "code", observation: str = "") -> "VerifyResult":
-        return cls(ok=True, observation=observation, confidence=1.0, tier=tier)
+        return cls(outcome=Outcome.SUCCEEDED, observation=observation,
+                   confidence=1.0, tier=tier)
 
     @classmethod
     def fail(cls, observation: str, *, tier: str = "code", confidence: float = 1.0) -> "VerifyResult":
-        return cls(ok=False, observation=observation, confidence=confidence, tier=tier)
+        return cls(outcome=Outcome.FAILED, observation=observation,
+                   confidence=confidence, tier=tier)
 
     @classmethod
     def ambiguous(cls, observation: str = "") -> "VerifyResult":
-        # Code can't decide — escalate to vision tier.
-        return cls(ok=True, observation=observation, confidence=0.5, tier="ambiguous")
+        # Ran, could not decide. A caller may escalate to the vision tier; what
+        # it may not do is read this as success.
+        return cls(outcome=Outcome.UNCERTAIN, observation=observation,
+                   confidence=0.5, tier="ambiguous")
 
     @classmethod
     def skip(cls, reason: str = "") -> "VerifyResult":
-        return cls(ok=True, observation=reason, confidence=1.0, skipped=True, tier="skipped")
+        # Nothing was checked, by policy or because the action has nothing to
+        # check. Not a failure of knowledge -- a decision not to acquire it.
+        return cls(outcome=Outcome.UNVERIFIED, observation=reason,
+                   confidence=1.0, tier="skipped")
+
+    @classmethod
+    def crashed(cls, reason: str = "") -> "VerifyResult":
+        """Verification ran and broke. `UNCERTAIN`, not `UNVERIFIED`.
+
+        The distinction matters: an exception means something was attempted and
+        we do not know the answer, which is a fact about the world. Choosing not
+        to look is a fact about the configuration. The old code used `skip()`
+        for both, so an infrastructure fault read as an operator decision.
+
+        Still fails *open* at the step level -- verification must not block
+        execution on a locator timeout or a missing accessibility backend. The
+        fail-open behaviour is kept; only its label is corrected.
+        """
+        return cls(outcome=Outcome.UNCERTAIN, observation=reason,
+                   confidence=0.0, tier="skipped")
 
 
 # ─── Action classification ────────────────────────────────────────────────────
@@ -387,7 +467,7 @@ async def pre_check(step: dict, *, page=None, active_window: Optional[str] = Non
 
     except Exception as e:
         logger.warning(f"[verify] pre-check crashed for {stype}/{action}: {e}")
-        return VerifyResult.skip(f"pre-check crash: {e}")
+        return VerifyResult.crashed(f"pre-check crash: {e}")
 
 
 async def post_verify(step: dict, *, page=None, active_window: Optional[str] = None) -> VerifyResult:
@@ -432,7 +512,7 @@ async def post_verify(step: dict, *, page=None, active_window: Optional[str] = N
 
     except Exception as e:
         logger.warning(f"[verify] post-verify crashed for {stype}/{action}: {e}")
-        return VerifyResult.skip(f"post-verify crash: {e}")
+        return VerifyResult.crashed(f"post-verify crash: {e}")
 
 
 # ─── Vision tier ──────────────────────────────────────────────────────────────
@@ -474,9 +554,16 @@ async def vision_verify(step: dict, code_result: VerifyResult, *,
     """Tier 2: escalate to Gemini Flash vision when code tier is ambiguous.
 
     Captures the primary monitor, asks Flash to judge whether the step's
-    expected effect is visible, and returns a VerifyResult. Fail-open: any
-    capture/LLM/parse error returns the original code_result unchanged so
-    verification never blocks execution on infra issues.
+    expected effect is visible, and returns a VerifyResult.
+
+    Fail-open: any capture / LLM / parse error returns the original
+    `code_result` unchanged, so verification never blocks execution on infra
+    issues. That is safe now in a way it was not before: the thing being
+    handed back is whatever the code tier concluded, and an ambiguous code
+    verdict is `UNCERTAIN`. Previously it carried `ok=True`, so every
+    degraded path here -- no screenshot, LLM down, exhausted free tier, bad
+    JSON -- returned something a caller read as confirmation. On a free tier
+    that is not a corner case; it is the normal path.
     """
     if not getattr(config, "VERIFY_VISION_FALLBACK", True):
         return code_result
@@ -536,8 +623,24 @@ async def vision_verify(step: dict, code_result: VerifyResult, *,
     cleaned = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
     try:
         data = json.loads(cleaned)
+        # `data.get("ok", True)` used to default a MISSING verdict field to
+        # success -- a model that answered without the field, or answered in a
+        # shape the prompt did not ask for, was read as confirmation. Now the
+        # absence of a verdict is the absence of one.
+        raw_ok = data.get("ok")
+        if raw_ok is None:
+            logger.warning(
+                "[verify-vision] response carried no 'ok' field; treating as "
+                "unconfirmed rather than confirmed"
+            )
+            return VerifyResult(
+                outcome=Outcome.UNCERTAIN,
+                observation=str(data.get("observation", "")) or "vision gave no verdict",
+                confidence=float(data.get("confidence", 0.0)),
+                tier="vision",
+            )
         return VerifyResult(
-            ok=bool(data.get("ok", True)),
+            outcome=Outcome.SUCCEEDED if bool(raw_ok) else Outcome.FAILED,
             observation=str(data.get("observation", "")),
             confidence=float(data.get("confidence", 0.5)),
             tier="vision",

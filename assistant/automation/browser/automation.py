@@ -434,6 +434,7 @@ async def run_browser_steps(steps: List[Dict], *, _from_planner: bool = False, h
         return "Error: Playwright is not available."
 
     from .. import verification
+    from ...brain.task import Outcome
 
     global _planner_page, _planner_context, _pages
     page = None
@@ -468,7 +469,7 @@ async def run_browser_steps(steps: List[Dict], *, _from_planner: bool = False, h
 
             # ── Tier 0: pre-check (target visible/enabled, no occluding modal) ──
             pre = await verification.pre_check(verify_step, page=page)
-            if not pre.ok and pre.confidence >= config.VERIFY_MIN_CONFIDENCE:
+            if pre.outcome is Outcome.FAILED and pre.confidence >= config.VERIFY_MIN_CONFIDENCE:
                 # After a click, new UI (overlay/modal) may still be rendering.
                 # Wait briefly and retry before giving up.
                 _prev_action = steps[i - 1].get("action") if i > 0 else None
@@ -477,7 +478,7 @@ async def run_browser_steps(steps: List[Dict], *, _from_planner: bool = False, h
                     await page.wait_for_timeout(800)
                     pre = await verification.pre_check(verify_step, page=page)
 
-            if not pre.ok and pre.confidence >= config.VERIFY_MIN_CONFIDENCE:
+            if pre.outcome is Outcome.FAILED and pre.confidence >= config.VERIFY_MIN_CONFIDENCE:
                 msg = f"verify_failed (pre): step {i+1} {action} — {pre.observation}"
                 logger.warning(f"[BROWSER] {msg}")
                 results.append(msg)
@@ -586,7 +587,20 @@ async def run_browser_steps(steps: List[Dict], *, _from_planner: bool = False, h
             post = await verification.post_verify(verify_step, page=page)
             if post.tier == "ambiguous" and config.VERIFY_VISION_FALLBACK:
                 post = await verification.vision_verify(verify_step, post, page=page)
-            if not post.ok and post.confidence >= config.VERIFY_MIN_CONFIDENCE and not post.skipped:
+            # Ran and could not decide, even after the vision tier. Not a
+            # failure -- there is no evidence either way -- so the loop
+            # continues. But it is not success either, and the old code read it
+            # as one because `ambiguous()` carried `ok=True`.
+            #
+            # Disclosed rather than swallowed, copying the shape the vision
+            # agent already uses (`_append_abandoned_suffix`): the caller's
+            # summary carries the doubt, so the spoken answer can say what was
+            # not confirmed instead of implying it was.
+            if post.outcome is Outcome.UNCERTAIN:
+                results.append(
+                    f"unconfirmed: step {i+1} {action} — {post.observation}"
+                )
+            if post.outcome is Outcome.FAILED and post.confidence >= config.VERIFY_MIN_CONFIDENCE:
                 msg = f"verify_failed (post): step {i+1} {action} — {post.observation}"
                 logger.warning(f"[BROWSER] {msg}")
 

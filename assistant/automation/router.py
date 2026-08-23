@@ -22,6 +22,7 @@ from typing import Optional, Tuple, Dict, Any
 from urllib.parse import urlparse
 
 from .. import config
+from ..brain.task import Outcome
 from ..core.known_apps import get_apps_by_category
 
 logger = logging.getLogger("desktop_automation")
@@ -1464,7 +1465,10 @@ async def _execute_native_task(goal: str, llm_func) -> str:
                 )
             except Exception as e:
                 logger.warning(f"[DA] vision verification crashed: {e}")
-        if (not vr.ok and not vr.skipped
+        # `not vr.ok and not vr.skipped` used to mean this, back when `ok` was
+        # True for success, ambiguity and skip alike -- the `not skipped` half
+        # was redundant and the ambiguous case fell through as success.
+        if (vr.outcome is Outcome.FAILED
                 and vr.confidence >= getattr(config, "VERIFY_MIN_CONFIDENCE", 0.5)):
             logger.warning(f"[DA] verify_failed (single-step {action}): {vr.observation}")
             return f"VERIFY_FAILED|step=1|tier={vr.tier}|obs={vr.observation}\n{res}"
