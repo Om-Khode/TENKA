@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 
 from croniter import croniter
@@ -36,6 +37,57 @@ async def handle_manage_schedule(
     return "I'm not sure what to do with that schedule command."
 
 
+_EXPLICIT_MINUTE_CADENCE = re.compile(
+    r"\bevery\s+(?:(\d+)\s*)?(?:minute|min)s?\b", re.IGNORECASE,
+)
+""""every minute" / "every 5 minutes" / "every 15 mins", stated plainly.
+
+Deterministic because the model is *inconsistent* here, not incapable. Two
+schedules created minutes apart in the same session, both saying "every
+minute": one got `* * * * *` and fired on the minute as asked, the other got
+`0 * * * *` -- hourly -- and the operator was told "Got it, I scheduled ..."
+either way. Nothing in the parse prompt pinned the mapping, so the same words
+landed on two different cadences.
+
+That is the shape `.claude/rules/llm-and-intents.md` names outright: skip the
+LLM whenever a deterministic path exists. An explicit interval in the
+utterance is not a judgement call.
+
+Deliberately narrow: it wants a number or nothing between "every" and
+"minute(s)". "every few minutes" and "every couple of minutes" are left to the
+model, because a word is a judgement and the point here is to pin what is not.
+
+"every minute or so" **is** claimed -- the phrase "every minute" is in it, and
+roughly-every-minute is what `* * * * *` does. Noted because the first draft of
+this docstring said the opposite about that case and the regex was right.
+"""
+
+
+def _explicit_minute_cron(text: str) -> "str | None":
+    """The cron a plainly-stated minute cadence demands, or None.
+
+    Returns `* * * * *` for "every minute" and `*/N * * * *` for "every N
+    minutes". `N >= 60` is rejected rather than clamped: `*/60` is not a valid
+    minute field, and a request that large means something the caller should
+    phrase as hours.
+    """
+    match = _EXPLICIT_MINUTE_CADENCE.search(text or "")
+    if match is None:
+        return None
+    raw = match.group(1)
+    if raw is None:
+        return "* * * * *"
+    try:
+        n = int(raw)
+    except ValueError:            # pragma: no cover - the group is \d+
+        return None
+    if n <= 0 or n >= 60:
+        return None
+    if n == 1:
+        return "* * * * *"
+    return f"*/{n} * * * *"
+
+
 async def _create_schedule(goal: str) -> str:
     from assistant.llm.contracts import ask_for_schedule_parse
 
@@ -44,6 +96,19 @@ async def _create_schedule(goal: str) -> str:
         return "Sorry, I couldn't understand that schedule request."
 
     cron_expr = parsed.get("cron_expr")
+
+    # A plainly-stated minute cadence overrides the model. Not a fallback for
+    # when it fails -- an override for when it answers something else, which is
+    # what actually happened. Silently turning a one-minute check into an hourly
+    # one is the kind of wrong that reads as working software.
+    _explicit = _explicit_minute_cron(goal)
+    if _explicit and _explicit != cron_expr:
+        logger.info(
+            f"[SCHEDULE] Cadence stated explicitly in the request: using "
+            f"{_explicit!r} instead of the parsed {cron_expr!r}"
+        )
+        cron_expr = _explicit
+
     if not cron_expr or not croniter.is_valid(cron_expr):
         return "Sorry, I couldn't figure out the timing for that schedule."
 
