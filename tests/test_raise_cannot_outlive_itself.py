@@ -421,3 +421,50 @@ def test_an_upsert_reassigns_the_shortcut_to_whoever_overwrote_it(tmp_path):
     finally:
         set_principal(None)
         db._conn.close()
+
+
+def test_the_gate_covers_management_not_only_creation(turn, monkeypatch):
+    """A DECISION, pinned so it is not quietly undone.
+
+    `manage_monitor` covers create, list, pause, resume and delete, and the
+    gate keys on the intent -- so a raised device cannot list or delete its own
+    monitors either. Seen live on 2026-08-23 (`Delete firefox monitor` refused)
+    and kept deliberately.
+
+    It reads as a bug because deleting *reduces* authority. The precise version
+    costs the property: only the handler knows which calls create (its own goal
+    parse), so moving the check there makes every handler responsible for
+    remembering it -- the shape that left five doors unguarded in 6a.5 -- and
+    duplicating the parse at the choke point is a second source of truth about
+    what "create" means.
+
+    Whoever narrows this gets this test and KI-30's paragraph. The way to
+    revisit it is splitting the intents, not relocating the check.
+    """
+    import assistant.actions as actions
+
+    turn(grants=TUNNEL_CEILING | {Capability.EXECUTE},
+         issued=TUNNEL_CEILING | {Capability.EXECUTE},
+         raisable=frozenset({Capability.EXECUTE, Capability.SYSTEM_CONTROL}),
+         ceiling=TUNNEL_CEILING)
+
+    monkeypatch.setattr(actions.tool_registry, "get",
+                        lambda _i: (lambda *a, **k: "should not run"))
+
+    # Every shape the intent carries, not just the one that installs.
+    for goal in ("delete the firefox monitor", "list my monitors",
+                 "pause the song monitor", "resume the song monitor"):
+        result = await_sync(actions.execute("manage_monitor", {"goal": goal}))
+        assert "keyboard" in result.lower(), (
+            f"{goal!r} was allowed under a raise. The gate is on the intent by "
+            f"design -- if this was narrowed to the create action, read KI-30 "
+            f"before keeping the change."
+        )
+
+
+def await_sync(coro):
+    """Run one coroutine to completion. These four calls are refused before any
+    I/O, so there is nothing to await concurrently and a fresh loop is cheaper
+    than making the whole test async for it."""
+    import asyncio
+    return asyncio.run(coro)
