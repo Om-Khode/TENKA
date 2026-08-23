@@ -16,6 +16,8 @@ import time
 from datetime import datetime
 from typing import Any
 
+from .event_sources.base import normalize_process_name
+
 logger = logging.getLogger("event_bus")
 
 
@@ -66,9 +68,18 @@ def check_dispatch(monitor: dict, event: dict, *, now: float) -> bool:
     if monitor["event_type"] != event.get("event_type"):
         return False
 
+    # Both sides normalised through one function. This compared the raw strings,
+    # and `window.py` builds `source_app` with `.exe` already stripped -- so a
+    # monitor whose filter said "notepad.exe" asked whether
+    # 'notepad.exe' in 'notepad', got False, and could never fire. Created,
+    # loaded, reported active, silent forever: a filter matching nothing is
+    # indistinguishable from an event that never happened.
     src_filter = monitor.get("source_filter")
-    if src_filter and src_filter.lower() not in event.get("source_app", "").lower():
-        return False
+    if src_filter:
+        wanted = normalize_process_name(src_filter)
+        actual = normalize_process_name(event.get("source_app", ""))
+        if wanted and wanted not in actual:
+            return False
 
     dedup_key = make_dedup_key(event)
     if dedup_key == monitor.get("_last_dedup_key"):

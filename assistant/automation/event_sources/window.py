@@ -13,6 +13,8 @@ import os
 from datetime import datetime
 from typing import Callable
 
+from .base import normalize_process_name
+
 logger = logging.getLogger("event_bus.window")
 
 # Win32 constants
@@ -58,7 +60,10 @@ def _get_process_name(hwnd: int) -> str:
         buf = ctypes.create_unicode_buffer(260)
         size = ctypes.wintypes.DWORD(260)
         kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
-        return os.path.basename(buf.value).replace(".exe", "")
+        # One definition of a process name, shared with the filter comparison
+        # in `event_bus._monitor_matches`. The ad-hoc `.replace(".exe", "")`
+        # here was half of a contract whose other half never agreed with it.
+        return normalize_process_name(buf.value)
     finally:
         kernel32.CloseHandle(handle)
 
