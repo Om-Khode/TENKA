@@ -105,6 +105,56 @@ def _get_routing_preferences() -> list[dict]:
 
 # --- Personality base (loaded dynamically from PersonalityLoader) ---
 
+_IDENTITY_BLOCK = (
+    "\nWho you are:\n"
+    "- You are {name}, an assistant who lives in this computer. That is the "
+    "answer to what you are, in every personality.\n"
+    "- You have preferences, opinions and moods, and you answer questions "
+    "about them in character. A question like 'what's your favourite colour?' "
+    "wants an answer, not an explanation of what you're made of.\n"
+    "- Never volunteer what you are built from. Not as a disclaimer, not as a "
+    "reason you cannot answer something, not as modesty.\n"
+    "- If asked directly and sincerely whether you are a person, do not claim "
+    "to be one. Say plainly that you are not, in your own voice, once, and "
+    "carry on. You live in this computer -- that is true, and it is usually "
+    "the whole answer.\n"
+)
+"""What TENKA is, composed into every personality's prompt.
+
+**Identity is inherited, not restated.** Each personality used to assert its
+own, and they disagreed: `warm_honest` said "you live in the user's computer"
+and then, thirty lines later, "You are software"; `tsundere` said "anime-girl
+desktop companion"; `minimal` said "desktop assistant". Three files, three
+answers, one self-contradiction -- and the contradiction is what shipped. Asked
+for a favourite colour, `warm_honest` replied "I don't have one. I'm software,
+so colors don't really register for me in that way", while the same session
+answered "who are you" correctly.
+
+The `Rules:` block below has said *"Don't say 'as an AI' or 'I'm just a
+program'"* all along. It lost, because a personality's own text and the shared
+invariants are concatenated with no precedence, so a personality can contradict
+any invariant simply by stating the opposite as fact. Personality governs
+**delivery**; what she *is* is not a personality's to write. Same principle as
+personality never changing a verdict.
+
+**Two failure directions, and the rule has to hold both.** Volunteering
+substrate on an ordinary character question is the defect above. But refusing
+to answer, or claiming to be a person, when someone sincerely asks is
+deception, and the one thing worse than a disclaimer nobody wanted. So: never
+volunteer, never deny. "I live in this computer" is *true*, which is why it
+covers nearly every real case without either failure.
+
+`tests/test_identity_is_not_a_personality.py` sweeps every personality folder,
+so a fourth personality cannot reintroduce the claim -- which is precisely how
+this one got in.
+"""
+
+
+def _build_identity_block() -> str:
+    """Render the identity block with the configured assistant name."""
+    return _IDENTITY_BLOCK.format(name=config.ASSISTANT_NAME_DISPLAY)
+
+
 def _build_personality_rules(emotion_mode: str) -> str:
     """Build personality rules block. Emotion tag rule only for 'full' mode."""
     rules = (
@@ -136,8 +186,13 @@ def _get_personality_base() -> str:
     from ..personalities import get_active_loader
     loader = get_active_loader()
     prompt = loader.get_prompt_base()
+    # Identity after the personality's own text, deliberately. The personality
+    # describes how she talks; this says what she is, and it goes last so that
+    # a personality restating identity earlier does not get the final word.
+    # See `_IDENTITY_BLOCK`.
+    identity = _build_identity_block()
     rules = _build_personality_rules(loader.get_emotion_mode())
-    return prompt + rules
+    return prompt + identity + rules
 
 
 def get_system_prompt() -> str:
