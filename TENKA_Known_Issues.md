@@ -666,17 +666,22 @@ Tests: `tests/test_6b_principal.py::test_the_tier2_rearm_carries_the_searchers_p
 
 ---
 
-## KI-27: `planner/executor.py`'s auth-failure clear is invisible to the arm/clear AST sweeps
+## KI-27: ~~`planner/executor.py`'s auth-failure clear is invisible to the arm/clear AST sweeps~~ FIXED
 
-**Priority:** Low (reasoned safe today; a promise gap, not a live defect)
-**Effort:** Low once someone decides how to widen the sweep past name-matching
+**Priority:** was Low (reasoned safe at the time; a promise gap, not a live defect)
 **Discovered:** 2026-08-20, milestone 6b (Ruling 84, live-test wrap-up)
+**Fixed:** 2026-08-23, TENKA-v2 P8
 
-**Symptom:** `planner/executor.py:182` clears a pending state through a **loop-local variable** (`state = pending_registry.get(name); ...; state.clear()`), so it is invisible to both AST sweeps that cover every other arm and clear site in the tree ([KI-13](#ki-13)'s `test_every_pending_arm_outside_the_two_reasoned_exceptions_uses_try_arm` and `test_every_pending_clear_outside_the_reasoned_exceptions_is_gated`). Reasoned safe today — it is same-request teardown of a state that the same call armed — but the sweeps' whole promise is that a new unguarded site cannot ship silently, and this is the one shape where that promise does not hold: the sweeps are name-based, and a variable named `state` rather than `pending_*` sits outside what they can see.
+**Symptom:** `planner/executor.py` cleared a pending state through a **loop-local variable** (`state = pending_registry.get(name); ...; state.clear()`), so it was invisible to both AST sweeps that cover every other arm and clear site in the tree ([KI-13](#ki-13)'s `test_every_pending_arm_outside_the_two_reasoned_exceptions_uses_try_arm` and `test_every_pending_clear_outside_the_reasoned_exceptions_is_gated`). Reasoned safe — same-request teardown of a state the same call armed — but the sweeps' whole promise is that a new unguarded site cannot ship silently, and this was the one shape where that promise did not hold: the sweeps were name-based, and a variable called `state` rather than `pending_*` sat outside what they could see.
 
-**How you would know:** a refactor that lets this clear reach a state armed by a *different* principal than the one clearing it would not turn any sweep red — nothing today produces that shape, which is exactly why it is unguarded rather than closed.
+**What shipped, both halves — because either alone leaves the other open:**
 
-**What to check first:** whether the sweep has grown a way to follow a variable back to its `pending_registry.get(...)` origin rather than matching on the receiver's name, or whether this one site has been moved onto `try_clear` directly despite the loop-local binding.
+- **The site** goes through `pending.try_clear`, so a state owned by another principal survives the attempt and the attempt is parked via `note_foreign_attempt` for the owner to read. The loop was extracted into `_clear_auth_pending_states(pending_before)`, which made the refusal branch reachable by a test without standing up a whole plan run — it had no functional test before, only a check on the sentinel *strings*.
+- **The sweep** now follows a name back to `pending_registry.get(...)` instead of matching on the receiver's name, so the next clear written this way is visible whatever it is called. One level, same function, per-function scoping — enough for the shape this tree produces, and readable.
+
+**The bit worth remembering:** the sweep's widening finds nothing under `assistant/` once the site is fixed, so it would have been a walk over nothing — green forever while measuring the one shape it exists to catch. It is pinned against synthetic source instead, in both directions: a loop-local pending clear is detected, an ordinary `cache.clear()` is not.
+
+Tests: `tests/test_auth_clear_respects_ownership.py` (the site, five behavioural cases), `tests/test_6b_principal.py` (the widened sweep, plus its two self-tests).
 
 ---
 

@@ -15,20 +15,30 @@ from __future__ import annotations
 
 import asyncio
 import sys
-import types
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-# Stub heavy modules
-for mod_name in (
-    "assistant.io.audio.tts", "assistant.io.audio.stt",
-    "assistant.io.audio.speaker_verify",
-    "assistant.io.audio.wake_word",
-):
-    if mod_name not in sys.modules:
-        sys.modules[mod_name] = types.ModuleType(mod_name)
+# No audio stubs, deliberately, and this is a removal rather than a gap.
+#
+# This block used to install EMPTY `ModuleType` objects for
+# `assistant.io.audio.{tts,stt,speaker_verify,wake_word}` at import time, into
+# `sys.modules`, permanently -- nothing ever restored them. `main.py` does
+# `from .io.audio.stt import recorder`, so every later test file in the same
+# process that touched `assistant.main` died with
+# `ImportError: cannot import name 'recorder' ... (unknown location)`.
+#
+# What that cost: `test_6b_principal.py`'s `_pending_state_attribute_names()`
+# imports `assistant.main`, so all of KI-13/KI-18/KI-24's pending arm/clear
+# sweeps -- the guards that a new unguarded arming site cannot ship -- errored
+# out in any multi-file run. Five tests plus ten errors, and green whenever
+# that file happened to run alone.
+#
+# The stubs were also unnecessary. Importing these four for real costs a
+# `logging.getLogger` each and one `Recorder()`, whose `__init__` sets
+# `self._stream = None`; the `sounddevice.InputStream` is opened in a method,
+# not at construction. Nothing here touches a microphone.
 
 
 def _run(coro):

@@ -38,6 +38,56 @@ def _pending_state_changed(before: dict, after: dict) -> bool:
     return False
 
 
+def _clear_auth_pending_states(pending_before: dict) -> "list[str]":
+    """Tear down pending states this step armed while asking for credentials.
+
+    A step that returns an auth sentinel has parked an OAuth or device-auth
+    prompt that the planner is not going to answer, so it is cleared rather
+    than left armed for the next unrelated utterance to collide with. Only
+    states that were inactive *before* this step are touched -- anything
+    already armed belonged to someone else's conversation.
+
+    **KI-27.** This was a bare `state.clear()`, and the variable name is why it
+    was a known hole: both pending arm/clear AST sweeps match on the
+    *receiver's name*, so a clear reached through a loop-local called `state`
+    was invisible to them while every other clear in the tree was covered.
+    Reasoned safe at the time -- same-request teardown of a state this same
+    call armed -- but the sweeps' whole promise is that a new unguarded site
+    cannot ship silently, and this was the one shape where that promise did not
+    hold.
+
+    Two changes close it. `try_clear` is the mechanism built for exactly this
+    position: a clear in an ordinary flow rather than inside a
+    `handle_pending_*` that the dispatch loop already gates by ownership. For
+    the owner it behaves identically to the bare clear; for anyone else it
+    refuses and parks the attempt via `note_foreign_attempt`, so the owner is
+    told rather than finding her open question silently gone. And the sweep now
+    follows a name back to `pending_registry.get(...)`, so the next clear
+    written this way is visible whatever it is called.
+
+    Extracted from `execute_step` so the refusal branch is reachable by a test
+    without standing up a whole plan run. Returns the names actually cleared.
+    """
+    from assistant.pending import pending_registry, try_clear
+
+    cleared: "list[str]" = []
+    for name, was_active in pending_before.items():
+        if was_active:
+            continue
+        state = pending_registry.get(name)
+        if not (state and state.active):
+            continue
+        if try_clear(state):
+            cleared.append(name)
+            logger.info(f"[PLANNER] Cleared auth pending state: {name}")
+        else:
+            logger.warning(
+                f"[PLANNER] Auth pending state {name} is owned by another "
+                f"principal — left armed"
+            )
+    return cleared
+
+
 # --- Step execution ---
 
 async def execute_step(
@@ -174,16 +224,7 @@ async def execute_step(
                 "I need to set up",
             )
             if result and any(s in result for s in _AUTH_SENTINELS):
-                from assistant.pending import pending_registry
-                for name, was_active in pending_before.items():
-                    if not was_active:
-                        state = pending_registry.get(name)
-                        if state and state.active:
-                            state.clear()
-                            logger.info(
-                                f"[PLANNER] Cleared auth pending state: "
-                                f"{name}"
-                            )
+                _clear_auth_pending_states(pending_before)
                 step.status = "failed"
                 step.error = (
                     f"Authentication required — set up the service "

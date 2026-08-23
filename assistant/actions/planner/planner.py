@@ -770,6 +770,75 @@ _UNRECOVERABLE_PATTERNS = [
 ]
 
 
+def _plan_incoherence(steps: "list[PlanStep]") -> "str | None":
+    """Why this plan cannot be executed, or `None` if it can.
+
+    Run on the whole plan **before the first step**, which is the point: every
+    other check here is per-step and per-step is too late. A plan whose step 4
+    depends on a step that does not exist still runs steps 1 to 3 first, and
+    those steps send messages, write files and click things. Discovering the
+    incoherence afterwards is discovering it after the side effects.
+
+    Four ways a model-written plan can be structurally broken. All four are
+    cheap to check and none of them needs a model to decide:
+
+    - **duplicate `step_id`.** The ids come straight from the model
+      (`sd.get("step_id", ...)`), and `$step_N` and `depends_on` both address
+      steps by id -- with two steps sharing one, a reference means whichever
+      the resolver happens to reach first.
+    - **a dependency on a step that does not exist.** Especially likely because
+      a step naming an unknown tool is *skipped* above while the surviving
+      steps keep their model-assigned ids, so `depends_on: [2]` can outlive
+      step 2.
+    - **a forward or self dependency.** `_PLAN_SYSTEM_PROMPT` rule 3 says
+      depends_on names an *earlier* step, and execution is sequential, so a
+      dependency on a later step can never be satisfied -- it resolves to
+      nothing and the step runs on an empty substitution rather than failing.
+    - **a `$step_N` or `condition` reference to an unknown or later step**, for
+      the same reason. This is the one that actually bites: the reference
+      silently becomes empty text, so a search step searches for nothing and
+      reports success.
+
+    Returns a sentence naming the problem, for the log. Deliberately not an
+    exception: an unusable plan is a normal outcome of asking a model for one,
+    and the caller already treats `None` as "no plan".
+    """
+    ids = [s.step_id for s in steps]
+    duplicates = {i for i in ids if ids.count(i) > 1}
+    if duplicates:
+        return (f"duplicate step_id {sorted(duplicates)} -- $step_N and "
+                f"depends_on address steps by id")
+
+    seen: set[int] = set()
+    for step in steps:
+        for dep in step.depends_on or []:
+            if dep == step.step_id:
+                return f"step {step.step_id} depends on itself"
+            if dep not in ids:
+                return (f"step {step.step_id} depends on step {dep}, which is "
+                        f"not in the plan")
+            if dep not in seen:
+                return (f"step {step.step_id} depends on step {dep}, which "
+                        f"runs later -- dependencies must be earlier steps")
+
+        referenced = set()
+        for text in (step.goal or "", step.condition or ""):
+            referenced.update(int(m) for m in _STEP_REF_RE.findall(text))
+        for ref in sorted(referenced):
+            if ref == step.step_id:
+                return f"step {step.step_id} references its own output"
+            if ref not in ids:
+                return (f"step {step.step_id} references $step_{ref}, which "
+                        f"is not in the plan")
+            if ref not in seen:
+                return (f"step {step.step_id} references $step_{ref}, which "
+                        f"runs later -- it would resolve to nothing")
+
+        seen.add(step.step_id)
+
+    return None
+
+
 def _plan_capability_footprint(plan: Plan) -> "frozenset":
     """What the plan, as originally written, already asks permission for.
 
@@ -1507,6 +1576,11 @@ async def _generate_plan(goal: str, llm_func,
             ))
 
         if not steps:
+            return None
+
+        incoherent = _plan_incoherence(steps)
+        if incoherent is not None:
+            logger.warning(f"[PLANNER] Rejecting incoherent plan: {incoherent}")
             return None
 
         plan = Plan(original_goal=goal, steps=steps)

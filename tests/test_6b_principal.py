@@ -1595,6 +1595,89 @@ _CLEAR_ALLOWLIST = (_CLEAR_GATED_BY_DISPATCH_LOOP
                     | _CLEAR_GATED_BY_TEACHING_ANSWER_SITE)
 
 
+def _clear_calls_in_tree(tree, path, names):
+    """(path, enclosing function or None, lineno) for every pending-state
+    `.clear()` in ONE parsed module.
+
+    Split out of the tree-wide walk below so the same detection can be pointed
+    at a source string. Not tidiness: the loop-local branch this grew for KI-27
+    finds nothing under `assistant/` once that site is fixed, so without a
+    synthetic case the widening would be a walk over nothing -- green forever
+    while measuring the single shape it exists to catch.
+    """
+    found = []
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self, path):
+            self.path = path
+            self.stack: list[str] = []
+            # Names bound from `pending_registry.get(...)`, saved and restored
+            # around each function body so a local in one cannot colour the
+            # judgement of the next.
+            self.registry_bound: set[str] = set()
+
+        def _enclosing(self):
+            return self.stack[-1] if self.stack else None
+
+        def visit_FunctionDef(self, node):
+            self.stack.append(node.name)
+            outer = self.registry_bound
+            self.registry_bound = set(outer)
+            self.generic_visit(node)
+            self.registry_bound = outer
+            self.stack.pop()
+
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Assign(self, node):
+            """Remember names bound from `pending_registry.get(...)`.
+
+            KI-27's shape, and this sweep's one blind spot until now.
+            `planner/executor.py` had `state = pending_registry.get(name)`
+            followed by `state.clear()`, and matching on the receiver's *name*
+            could never see it -- `state` is not a registered pending-state
+            attribute name, so that clear was invisible while every other clear
+            in the tree was covered. A promise that "a new unguarded clear
+            cannot ship silently" has to hold for the spelling nobody chose on
+            purpose.
+
+            Deliberately not general data-flow: one level, same function, a
+            direct `pending_registry.get(...)` on the right-hand side. That is
+            the shape this tree produces, and a per-function name set stays
+            checkable by reading. Rebinding is not tracked -- once a name has
+            held a pending state in a function, a `.clear()` on it is worth a
+            look.
+            """
+            value = node.value
+            if (isinstance(value, ast.Call)
+                    and isinstance(value.func, ast.Attribute)
+                    and value.func.attr == "get"
+                    and isinstance(value.func.value, ast.Name)
+                    and value.func.value.id == "pending_registry"):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        self.registry_bound.add(target.id)
+            self.generic_visit(node)
+
+        def visit_Call(self, node):
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr == "clear":
+                target = func.value
+                owner = (target.attr if isinstance(target, ast.Attribute)
+                          else target.id if isinstance(target, ast.Name)
+                          else None)
+                if owner in names or owner in self.registry_bound:
+                    try:
+                        where = self.path.relative_to(_ROOT)
+                    except ValueError:
+                        where = self.path     # a synthetic path in a self-test
+                    found.append((where, self._enclosing(), node.lineno))
+            self.generic_visit(node)
+
+    _Visitor(path).visit(tree)
+    return found
+
+
 def _all_pending_clear_calls():
     """(relative path, enclosing function or None, lineno) for every
     `<pending-state>.clear()` call anywhere under `assistant/`, tree-wide.
@@ -1604,34 +1687,6 @@ def _all_pending_clear_calls():
     assistant_root = _ROOT / "assistant"
     pending_py = assistant_root / "pending.py"
     found = []
-
-    class _Visitor(ast.NodeVisitor):
-        def __init__(self, path):
-            self.path = path
-            self.stack: list[str] = []
-
-        def _enclosing(self):
-            return self.stack[-1] if self.stack else None
-
-        def visit_FunctionDef(self, node):
-            self.stack.append(node.name)
-            self.generic_visit(node)
-            self.stack.pop()
-
-        visit_AsyncFunctionDef = visit_FunctionDef
-
-        def visit_Call(self, node):
-            func = node.func
-            if isinstance(func, ast.Attribute) and func.attr == "clear":
-                target = func.value
-                owner = (target.attr if isinstance(target, ast.Attribute)
-                          else target.id if isinstance(target, ast.Name)
-                          else None)
-                if owner in names:
-                    found.append((self.path.relative_to(_ROOT), self._enclosing(),
-                                   node.lineno))
-            self.generic_visit(node)
-
     for path in sorted(assistant_root.rglob("*.py")):
         if path == pending_py:
             continue
@@ -1639,8 +1694,71 @@ def _all_pending_clear_calls():
             tree = ast.parse(path.read_text(encoding="utf-8"))
         except SyntaxError:  # pragma: no cover - not expected in this tree
             continue
-        _Visitor(path).visit(tree)
+        found.extend(_clear_calls_in_tree(tree, path, names))
     return found
+
+
+def test_the_clear_sweep_can_see_a_clear_through_a_loop_local():
+    """KI-27's shape, asserted against synthetic source.
+
+    The sweep matched on the receiver's NAME, so
+    `state = pending_registry.get(n); state.clear()` was invisible while every
+    other clear in the tree was covered -- and `planner/executor.py` had exactly
+    that. The site now uses `try_clear`, so the tree holds no example of the
+    shape any more, which is precisely why walking only `assistant/` would
+    prove nothing about the widening. The shape is fed in directly instead.
+
+    Both directions. A detector that flagged every `.clear()` would satisfy the
+    first half while turning the tree-wide sweep into noise nobody reads.
+    """
+    names = _pending_state_attribute_names()
+    assert names, "no registered pending-state names -- the sweep walks nothing"
+
+    # Joined rather than escaped: a "\\n" inside a nested quoted string is how
+    # three regex edits in this project ended up with a literal backspace in
+    # them. A list of lines has nothing to mangle.
+    src = "\n".join([
+        "def f():",
+        "    state = pending_registry.get(name)",
+        "    if state and state.active:",
+        "        state.clear()",
+    ])
+    found = _clear_calls_in_tree(ast.parse(src), pathlib.Path("synthetic.py"), names)
+    assert found, (
+        "a clear reached through a loop-local bound from pending_registry.get "
+        "is still invisible to the sweep -- the one shape KI-27 was filed for"
+    )
+    assert found[0][1] == "f", f"wrong enclosing function recorded: {found}"
+
+    other = "\n".join([
+        "def g():",
+        "    cache = {}",
+        "    cache.clear()",
+    ])
+    assert not _clear_calls_in_tree(
+        ast.parse(other), pathlib.Path("synthetic.py"), names), (
+        "an ordinary container .clear() was flagged as a pending-state clear"
+    )
+
+
+def test_the_loop_local_binding_does_not_leak_between_functions():
+    """Scoped per function. Without the save/restore around a function body, a
+    name bound in one function would make an unrelated `.clear()` in the next
+    one look like a pending clear -- a false positive of the kind that gets a
+    whole sweep allowlisted into uselessness."""
+    names = _pending_state_attribute_names()
+    src = "\n".join([
+        "def f():",
+        "    state = pending_registry.get(name)",
+        "    state.clear()",
+        "def g():",
+        "    state = {}",
+        "    state.clear()",
+    ])
+    found = _clear_calls_in_tree(ast.parse(src), pathlib.Path("synthetic.py"), names)
+    assert [f[1] for f in found] == ["f"], (
+        f"the binding leaked across function scopes: {found}"
+    )
 
 
 def test_every_pending_clear_outside_the_reasoned_exceptions_is_gated():
