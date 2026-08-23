@@ -341,7 +341,11 @@ Rules:
 - "every evening" = "0 18 * * *"
 - "every day at Xam/pm" = "0 X * * *"
 - "every Monday" = "0 9 * * 1"
+- "every minute" = "* * * * *"
+- "every N minutes" = "*/N * * * *" (e.g. every 5 minutes = "*/5 * * * *")
+- "every few minutes" / "every couple of minutes" = "*/5 * * * *"
 - "every hour" = "0 * * * *"
+- "every N hours" = "0 */N * * *"
 - Default notify_mode is "on_match_only" unless user says "always" or "if anything changes"
 - If user says "only tell me if..." or "only when...", extract that as condition_text
 - task_type is "http_check" if goal is a URL (http:// or https://)
