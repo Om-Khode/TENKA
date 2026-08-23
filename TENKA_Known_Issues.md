@@ -965,3 +965,69 @@ escalation reds one.
 this fixed the one caller that had fallen into it. Replacing the boolean with an explicit
 outcome (`SUCCEEDED` / `FAILED` / `UNCERTAIN` / `UNVERIFIED` / `UNSUPPORTED`) is specified
 in `TENKA-v2.md` §11 and is a larger change touching seven call sites.
+
+---
+
+## KI-32: ~~A model's own confidence estimate steered routing~~ FIXED
+
+**Priority:** Medium (an inference acted as a decision, silently, at routing priority 1)
+**Effort:** Low — a ceiling at one boundary and a provenance check at the other
+**Discovered:** 2026-08-22, tracing the preference store while writing `TENKA-v2.md`
+**Fixed:** 2026-08-23
+
+**Symptom:** two things met badly.
+
+`reflection.py` passes the **model's own** `confidence` straight into
+`set_preference`, and its prompt offers `0.8` for "the user explicitly stated a
+preference". `CONFIDENCE_SILENT` is `0.7`. So one nightly cycle could write a preference
+above the apply-silently bar on the model's assessment of its own evidence.
+
+`automation/router.py:_check_routing_preference` then accepted a bare `>= 0.4` and never
+read `source`. That function is routing **priority 1** — ahead of URL detection, the running
+process, everything — so it decides how a goal executes before anything else votes. `0.4` is
+`CONFIDENCE_ASK`, the bar for "apply but mention it". Routing is silent.
+
+**The design was already right; it was unenforced.** The ladder in
+`storage/repos/preference.py` says: discover at `CONFIDENCE_FIRST_OBSERVATION` (0.4),
+`+CONFIDENCE_REOBSERVED` (0.15) per re-observation, `CONFIDENCE_SILENT` (0.7) to act
+silently. Repetition earns trust. Reflection walked around the ladder rather than climbing
+it, and the prompt's "minimum 3 occurrences" rule was text a model could ignore — nothing
+counted.
+
+**What shipped.**
+
+*Write side.* `preferences.set_preference` caps a non-user writer at
+`CONFIDENCE_FIRST_OBSERVATION`. `not in USER_STATED_SOURCES`, not
+`in _MODEL_PROPOSED_SOURCES` — an unrecognised writer is capped rather than trusted, the
+same direction `DEFAULT_REQUIRED` takes.
+
+At the **facade**, not the repo. Every production writer goes through it (`reflection.py`
+×2, `router.teach_routing`, `check_for_corrections`), while a repo that silently rewrites
+the value it was handed cannot be used to restore or migrate one. This was got wrong first:
+the clamp went in the repo, ten `test_repo_preference.py` cases failed, and they were right
+— they pass `source="reflection"` as filler while testing bump, decay and threshold
+arithmetic. The test churn was the signal that the layer was wrong.
+
+*Read side.* Routing accepts a user-stated preference at `CONFIDENCE_ASK` (they said it) and
+anything else only at `CONFIDENCE_SILENT` — which the ladder grants only after repetition
+TENKA counted itself. A rejected preference is logged with its source and confidence, so an
+ignored preference is visible rather than mysterious.
+
+*`USER_STATED_SOURCES` was incomplete on the first pass* — `explicit` was missing, and
+`test_repo_preference.py` found it by failing on eleven cases that use that spelling to mean
+exactly "the user said so". The set was wrong, not the tests.
+
+**Found while fixing this, and fixed with it:** `router.teach_routing` — the one path where
+the user explicitly teaches a routing preference — called `set_preference` **without the
+required `source` and `reason`**, so it raised `TypeError` on every call, the bare `except`
+swallowed it, and the user was told "I couldn't save that". It had never once worked. It
+mattered more after this change, because a user-stated routing preference is precisely what
+the lower bar exists to admit, and nothing could produce one.
+
+**Tests:** `tests/test_preference_provenance.py` — 15 cases, both boundaries, both
+directions. Four mutations: removing the clamp reds four; clamping the user too reds four;
+keying the clamp on the permissive set reds three; making routing ignore provenance reds two.
+
+**Not closed:** the prompt still asks the model for a confidence number, which is now
+ignored above the ceiling. Removing the field would be clearer than capping it, and belongs
+with the wider memory-provenance work in `TENKA-v2.md` §10.
