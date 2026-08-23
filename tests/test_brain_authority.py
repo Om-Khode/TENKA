@@ -231,26 +231,82 @@ def test_a_local_task_is_always_live():
 
 def test_the_background_runners_cannot_reach_the_resume_path():
     """**Structural, and the real control.** Nothing can reliably detect its own
-    caller, so the rule is enforced by nobody importing it: `scheduler.py` and
-    `automation/event_bus.py` install `LOCAL_GRANTS` on the argument that
-    whoever installed the trigger held `EXECUTE`, and a resumable Task would
-    launder a remote caller's banked work into full local privilege through
-    exactly that argument.
+    caller, so the rule is enforced by what the background runners cannot
+    reach: `scheduler.py` and `automation/event_bus.py` install `LOCAL_GRANTS`
+    on the argument that whoever installed the trigger held `EXECUTE`, and a
+    resumable Task would launder a remote caller's banked work into full local
+    privilege through exactly that argument.
 
-    A hand-maintained promise is what the next edit forgets; this fails the
-    moment either file grows the import.
+    **This check was narrowed, and here is the accounting.** It used to forbid
+    importing *anything* from `brain` -- blunt, and effective precisely because
+    it needed no judgement. P4a moved authority installation into
+    `brain/turn.py` so that one implementation of the install order exists
+    instead of two that disagreed, which means `scheduler.py` now imports from
+    `brain` and the blunt version is no longer available.
+
+    What the blunt version was incidentally holding up, enumerated rather than
+    waved at (`CLAUDE.md` process rule 10):
+
+    1. no reach to `authority.may_resume` -- **still held**, forbidden below by
+       name;
+    2. no reach to `Task` construction, so a background runner could not create
+       something that later resumes -- **still held**: `brain/task.py` is
+       forbidden below too, and `brain/__init__.py` imports neither module, so
+       `from .brain.turn import run_turn` binds no path to either;
+    3. no reach to anything else in `brain` -- **given up**. `brain/turn.py` is
+       reachable, by design. It installs contextvars and awaits a callable; it
+       decides nothing and imports neither of the two modules above.
+
+    So the property is unchanged and its enforcement is one step less blunt. A
+    new module in `brain/` that can construct or resume a Task has to be added
+    to `_FORBIDDEN` here, and the test's own docstring is the reminder.
     """
+    _FORBIDDEN = ("authority", "task")
+    _ALLOWED = ("turn",)
+
     for name in ("scheduler.py", "automation/event_bus.py"):
         src = (_ROOT / "assistant" / name).read_text(encoding="utf-8")
         hits = [
             line.strip() for line in src.splitlines()
-            if re.search(r"brain[.\s]*(?:import|\.)\s*authority|"
-                         r"from\s+\.?\.?brain", line)
+            if re.search(
+                r"brain[.\s]*(?:import\s+|\.)\s*(?:" + "|".join(_FORBIDDEN) + r")\b|"
+                r"from\s+\.*brain\s+import\s+(?:" + "|".join(_FORBIDDEN) + r")\b",
+                line)
         ]
         assert not hits, (
-            f"{name} reaches brain/authority: {hits}. A background runner may "
-            f"enqueue a turn; it may not resume a Task."
+            f"{name} reaches brain/{{{','.join(_FORBIDDEN)}}}: {hits}. A "
+            f"background runner may enqueue a turn; it may not construct or "
+            f"resume a Task."
         )
+
+    # The narrowing is only sound while the two reachable modules stay inert.
+    # If either imports the machinery it is allowed past, the distinction above
+    # is decorative -- so both are checked by AST rather than by reading the
+    # text. The first version of this grepped the source and failed on
+    # `turn.py`'s own docstring, which says the words "resume a Task" while
+    # importing neither.
+    import ast
+
+    def _imported_names(rel: str) -> "set[str]":
+        src = (_ROOT / "assistant" / rel).read_text(encoding="utf-8")
+        names: set[str] = set()
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Import):
+                names.update(a.name.split(".")[-1] for a in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    names.add(node.module.split(".")[-1])
+                names.update(a.name for a in node.names)
+        return names
+
+    for rel in ("brain/turn.py", "brain/__init__.py"):
+        reached = _imported_names(rel) & set(_FORBIDDEN)
+        assert not reached, (
+            f"{rel} imports brain/{reached}, which hands the background "
+            f"runners the path this test just narrowed"
+        )
+
+    assert _ALLOWED, "the allow-list is empty -- nothing is being permitted"
 
 
 def test_an_unresumable_task_becomes_suspended_rather_than_failing(turn):
