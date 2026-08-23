@@ -57,6 +57,7 @@ class ChatDispatch(Protocol):
                      principal: str,
                      issued: "frozenset[Capability] | None" = None,
                      raisable: "frozenset[Capability] | None" = None,
+                     ceiling: "frozenset[Capability] | None" = None,
                      ) -> tuple[str, str, bool, str]: ...
     async def abort(self) -> bool: ...
     # Whether a submitted turn is currently in flight -- read by
@@ -102,20 +103,30 @@ class LiveChatRuntime:
                    principal: str,
                    issued: "frozenset[Capability] | None" = None,
                    raisable: "frozenset[Capability] | None" = None,
+                   ceiling: "frozenset[Capability] | None" = None,
                    ) -> TurnRef:
         # `grants` and `principal` travel with the text rather than being read
         # from anywhere here: the route is the only place that knows *which
         # device* asked, and the turn runs later, on the queue consumer's
-        # task, where the request is long gone. `issued`/`raisable` ride the
-        # same way, for the same reason, and only when the caller actually
-        # has them: a `ChatDispatch` that predates this milestone's refusal
-        # fix (a test double, say) does not have to grow the two new keyword
-        # arguments just to keep working, so they are passed on only when at
-        # least one is not `None`.
+        # task, where the request is long gone. `issued`/`raisable`/`ceiling`
+        # ride the same way, for the same reason, and only when the caller
+        # actually has them: a `ChatDispatch` that predates this milestone's
+        # refusal fix (a test double, say) does not have to grow the new
+        # keyword arguments just to keep working, so they are passed on only
+        # when at least one is not `None`.
+        #
+        # `ceiling` is the third leg of `RaiseContext` and is what the
+        # durability gate reads (`actions.durable_capability_refusal`). This
+        # method is the reason KI-30's first attempt broke `POST /v1/chat`
+        # outright: the protocol in `io/api/runtime.py` and the test fake both
+        # grew the argument and this implementation did not, so every request
+        # 500'd on `unexpected keyword argument 'ceiling'`. The fake and the
+        # real diverged, and nothing but a live run composed them.
         kwargs = {}
-        if issued is not None or raisable is not None:
+        if issued is not None or raisable is not None or ceiling is not None:
             kwargs["issued"] = issued
             kwargs["raisable"] = raisable
+            kwargs["ceiling"] = ceiling
         turn_id, conversation_id, accepted, reason = await self._dispatch.submit(
             text, grants, principal, **kwargs)
         return TurnRef(turn_id, conversation_id, accepted, reason)
