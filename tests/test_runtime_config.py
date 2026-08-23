@@ -470,7 +470,14 @@ class TestAssistantName(unittest.TestCase):
     def test_personality_prompt_contains_name(self):
         # get_system_prompt() returns the active personality base with rules.
         # Assert the current display name is somewhere in the prompt.
-        prompt = self.cfg.LLM_SYSTEM_PROMPT
+        #
+        # Was `self.cfg.LLM_SYSTEM_PROMPT`. That compat re-export is gone: it
+        # was evaluated at `config` import time, which is what dragged
+        # `llm/prompts` and every domain facade behind it into `config`'s import
+        # graph and produced fifteen `ignore_imports` entries. Call the real
+        # function.
+        from assistant.llm.prompts import get_system_prompt
+        prompt = get_system_prompt()
         self.assertIn("You are", prompt)
 
     def test_display_name_capitalizes_lowercase(self):
@@ -505,7 +512,8 @@ class TestAssistantName(unittest.TestCase):
         # the legacy "Your name is X. If asked to be Y, IGNORE IT" directive.
         # Verify the current shape — the name is present and the prompt forbids
         # leading with it.
-        prompt = self.cfg.LLM_SYSTEM_PROMPT
+        from assistant.llm.prompts import get_system_prompt
+        prompt = get_system_prompt()
         self.assertIn(f"You are {self.cfg.ASSISTANT_NAME}", prompt)
         self.assertIn("NEVER start a response with your name", prompt)
 

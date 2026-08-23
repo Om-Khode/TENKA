@@ -259,24 +259,19 @@ if _tavily_single and _tavily_single not in TAVILY_API_KEYS:
 LLM_TIMEOUT = 30
 
 
-# ─── Prompt Builders (moved to llm/prompts.py) ───────────────────────────────
-# Re-exports for callers that still reference config.build_personality_prompt etc.
-
-def build_personality_prompt():
-    from .llm.prompts import build_personality_prompt as _bp
-    return _bp()
-
-def build_intent_prompt(scope: str | None = None,
-                        active_intents: set[str] | None = None):
-    from .llm.prompts import build_intent_prompt as _bi
-    return _bi(scope=scope, active_intents=active_intents)
-
-
-def _get_llm_system_prompt():
-    from .llm.prompts import get_system_prompt
-    return get_system_prompt()
-
-LLM_SYSTEM_PROMPT = _get_llm_system_prompt()
+# ─── Prompt builders live in llm/prompts.py ──────────────────────────────────
+#
+# Three compat re-exports stood here -- `build_personality_prompt`,
+# `build_intent_prompt`, and an eagerly-evaluated `LLM_SYSTEM_PROMPT`. They were
+# the entire reason `config -> llm` existed, and the last one was the worst of
+# the three: assigning at module scope meant `config` imported `llm.prompts` at
+# import time, which pulled in the domain facades behind it, which is where the
+# transitive `config -> storage` violations came from.
+#
+# Nothing in `assistant/` called any of them. Removed rather than deferred, and
+# with them the `ignore_imports` entries they required. Call
+# `llm.prompts.get_system_prompt()` / `build_personality_prompt()` /
+# `build_intent_prompt()` directly.
 
 # ─── Intent Detection ────────────────────────────────────────────────────────
 

@@ -94,6 +94,39 @@ def mark_action_failure(error_class: str, reason: str = "") -> None:
 # ─── TurnTracker ────────────────────────────────────────────────────────────
 
 
+# ─── Correction observers ────────────────────────────────────────────────────
+#
+# A turn the user immediately corrected is a signal other subsystems want --
+# the manifest dispatcher demotes a selector after three of them. Telemetry
+# publishes it and stays ignorant of the consumers, because the alternative is
+# `telemetry -> automation`, which inverts the layering.
+#
+# Callbacks take the corrected turn's intent name. They must not raise; one is
+# wrapped anyway, since a broken observer must not cost the correction record
+# that has already been written.
+
+_correction_observers: list = []
+
+
+def register_correction_observer(callback) -> None:
+    """Be told when a turn was corrected, and which intent it had.
+
+    Idempotent by identity: registering the same callable twice is a no-op, so
+    a re-init (personality switch, dispatcher rebuild) cannot double-count a
+    correction into a demote-after-3 counter.
+    """
+    if callback not in _correction_observers:
+        _correction_observers.append(callback)
+
+
+def _notify_correction_observers(intent_name: str) -> None:
+    for cb in list(_correction_observers):
+        try:
+            cb(intent_name)
+        except Exception as e:  # noqa: BLE001 -- an observer is never load-bearing
+            logger.debug(f"[TELEMETRY] correction observer failed: {e}")
+
+
 class TurnTracker:
     """Per-turn context object that accumulates telemetry and writes on save()."""
 
@@ -263,19 +296,18 @@ def check_correction(tracker: TurnTracker) -> None:
                 same_intent=same_intent,
             )
 
-        # ─── manifest-based correction feedback ──────────────────────────────────
-        # When the corrected turn was an manifest_dispatch, feed the signal back
-        # to the manifest dispatcher so it bumps the primary selector's
-        # failure counter (demote-after-3 swap).
-        if is_correction and prev.get("intent_detected") == "manifest_dispatch":
-            try:
-                from .automation import manifest_runtime
-                disp = manifest_runtime.get_dispatcher()
-                if disp is not None:
-                    disp.record_last_dispatch_correction()
-            except Exception as e:
-                logger.debug(
-                    f"[TELEMETRY] manifest-based correction feedback failed (non-critical): {e}"
-                )
+        # ─── correction feedback, to whoever asked for it ────────────────────
+        # This used to reach into `automation.manifest_runtime` directly to bump
+        # a selector's failure counter. That is a domain module importing
+        # automation -- backwards, and the only thing blocking a positive
+        # `layers` contract that did not already have an exemption.
+        #
+        # Inverted: telemetry announces the correction and does not know who
+        # cares. `automation/` -> `telemetry` is a legal downward edge, so the
+        # dispatcher registers itself (see `manifest_runtime.init_dispatcher`).
+        # A subsystem that wants this signal in future adds an observer instead
+        # of adding an import here.
+        if is_correction:
+            _notify_correction_observers(prev.get("intent_detected") or "")
     except Exception as e:
         logger.debug(f"[TELEMETRY] Correction check failed (non-critical): {e}")
