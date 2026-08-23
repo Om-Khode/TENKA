@@ -239,13 +239,33 @@ class ProcedureRepo:
         """
         Match input text against all stored (enabled) procedure triggers.
 
-        Priority:
-          1. Exact match (after normalization)
-          2. Text starts with the trigger (trigger is a prefix)
-          3. Trigger is contained in text as a substring
-          4. Trigger words appear in order within input (subsequence, 2+ words)
+        Priority, strongest first:
+          1. `exact`       -- the whole utterance is the trigger
+          2. `prefix`      -- the utterance starts with the trigger
+          3. `contained`   -- the trigger appears somewhere in the utterance
+          4. `subsequence` -- the trigger's words appear in order (2+ words)
 
-        Returns the best-matching procedure dict, or None if no match.
+        Returns the best-matching procedure dict with a `match_tier` key naming
+        which of the four it was, or None if no match.
+
+        **`match_tier` is not diagnostic; a caller is expected to act on it.**
+        This runs before shortcuts and before intent routing, deliberately, so
+        that a taught trigger beats the classifier. That is right for a strong
+        match and wrong for a weak one: a one-word trigger under `contained`
+        claims *any* utterance containing that word.
+
+        Observed: a procedure taught with the trigger `scratchpad`, and
+        "schedule the scratchpad procedure every minute" ran the procedure
+        instead of scheduling it -- the word appeared, so the tier matched, and
+        nothing asked whether the sentence was a request to run anything. A
+        procedure named for a common word ("notes", "email", "work") would
+        shadow a large share of ordinary speech the same way.
+
+        The tier is reported rather than the weak tiers being deleted, because
+        they earn their place: "run scratchpad" and "do the scratchpad thing"
+        are neither exact nor prefix matches, and they are how anyone actually
+        invokes one. What they are not is stronger evidence than a deterministic
+        intent fast-path. `main.py` weighs the two; see its call site.
         """
         if not text or len(text.strip()) < 3:
             return None
@@ -288,14 +308,21 @@ class ProcedureRepo:
                 if subsequence is None:
                     subsequence = row
 
-        best = exact or prefix or contained or subsequence
+        best, tier = next(
+            ((row, name) for row, name in (
+                (exact, "exact"), (prefix, "prefix"),
+                (contained, "contained"), (subsequence, "subsequence"),
+            ) if row is not None),
+            (None, None),
+        )
         if best is None:
             return None
 
         result = self._row_to_dict(best)
+        result["match_tier"] = tier
         logger.info(
             f"[PROCEDURES] Matched trigger='{best['trigger']}' → id={best['id']} "
-            f"name='{best['name']}'"
+            f"name='{best['name']}' (tier={tier})"
         )
         return result
 
