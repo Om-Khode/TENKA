@@ -292,8 +292,47 @@ def test_the_turn_loop_reads_the_ledger():
         "main.py never reads the refusal ledger, so a refusal inside a "
         "planner step still cannot reach security_skip"
     )
-    save = src.index("security_skip=_security_skip_this_turn")
     fold = src.index("_refused_anywhere")
+    save = src.index("security_skip=_skip_this_turn")
     assert fold < save, (
         "the ledger is folded in after the conversation row is written"
     )
+
+
+def test_the_ledger_fold_does_not_shadow_the_outer_skip_flag():
+    """The bug this pins cost every turn that reached `_save_turn`.
+
+    The fold lives in the nested `_save_turn`, and the first version wrote
+    `_security_skip_this_turn = _security_skip_this_turn or _refused_anywhere`.
+    Python decides local-vs-closure at compile time from the presence of an
+    assignment, so that line made the name a local of `_save_turn` and reading
+    it on the same line raised `UnboundLocalError` -- killing the turn after the
+    work was done and before the conversation row was written.
+
+    Checked structurally because the failure is invisible to reasoning about the
+    line in isolation: it looks like an ordinary read-modify-write, and it is
+    one, of a name that belongs to another scope. `tests/
+    test_reply_cannot_contradict_the_machine.py` catches the behaviour; this
+    catches the shape, and names it.
+    """
+    import ast
+
+    src = (_ROOT / "assistant" / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    inner = [n for n in ast.walk(tree)
+             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+             and n.name == "_save_turn"]
+    assert inner, "_save_turn no longer exists -- move this check with it"
+
+    for fn in inner:
+        declared = {name for node in ast.walk(fn)
+                    if isinstance(node, ast.Nonlocal) for name in node.names}
+        assigned = {t.id for node in ast.walk(fn)
+                    if isinstance(node, ast.Assign)
+                    for t in node.targets if isinstance(t, ast.Name)}
+        assert "_security_skip_this_turn" not in (assigned - declared), (
+            "_save_turn assigns the enclosing turn's `_security_skip_this_turn` "
+            "without `nonlocal`, which makes it a local and raises "
+            "UnboundLocalError on the read. Compute a new name instead."
+        )

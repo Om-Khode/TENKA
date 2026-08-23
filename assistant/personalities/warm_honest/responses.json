@@ -135,7 +135,9 @@
     "Noted: {desc}. What comes after?"
   ],
   "teach_got_it_warn": [
-    "Got it — {desc}. {warn}"
+    "Got it — {desc}. {warn}",
+    "Okay, {desc}. {warn}",
+    "Noted: {desc}. {warn}"
   ],
   "teach_need_step": [
     "I need at least one step. What should I do first?",
