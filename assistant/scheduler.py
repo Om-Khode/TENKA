@@ -84,39 +84,69 @@ def _poll_loop() -> None:
 def _fire_task(task: dict, now: datetime) -> None:
     logger.info(f"[scheduler] Firing task #{task['id']} '{task['name']}'")
 
-    result = _run_handler(task)
+    ran, result = _run_handler(task)
 
-    notify, summary = _evaluate_condition(task, result)
+    if ran:
+        notify, summary = _evaluate_condition(task, result)
+    else:
+        # Did not run at all. `_should_notify_sync` used to turn an empty
+        # result into the literal string "Task completed", so a schedule
+        # pointing at a procedure that no longer exists announced success once
+        # a minute -- the log said `Procedure not found` on the line above and
+        # `Notified: Task completed` on the line below. Reporting a state change
+        # that did not happen is KI-28's shape, arriving through the scheduler.
+        #
+        # Routed through the same notify_mode logic rather than always speaking:
+        # `on_change` then dedupes a repeating failure by hash, which is what
+        # stops a broken minute-schedule talking sixty times an hour.
+        notify, summary = _should_notify_sync(task, result)
 
     if notify:
         _push_notification(task["name"], summary)
 
     next_fire = _compute_next_fire(task["cron_expr"], now)
+    # The failure text is hashed too, deliberately: under `on_change` a task
+    # that starts failing says so once, and a task that starts working again
+    # says that once as well.
     result_hash = _compute_result_hash(result) if result else None
     _repo.update_after_fire(task["id"], next_fire, result_hash)
 
     logger.info(
-        f"[scheduler] Task #{task['id']} done — notify={notify}, next={next_fire}"
+        f"[scheduler] Task #{task['id']} "
+        f"{'done' if ran else 'DID NOT RUN'} — notify={notify}, "
+        f"next={next_fire}"
     )
 
 
 # ─── Handler Dispatch ────────────────────────────────────────────
 
-def _run_handler(task: dict) -> str:
+def _run_handler(task: dict) -> "tuple[bool, str]":
+    """`(ran, text)`. `ran=False` means the work never happened.
+
+    The distinction exists because every not-run path used to return `""`, and
+    an empty string was then reported as "Task completed". A caller cannot tell
+    "ran and had nothing to say" from "never ran" out of one empty string, so it
+    is two values now.
+    """
     if _loop is None:
-        return ""
+        logger.warning(f"[scheduler] No event loop for '{task['name']}'")
+        return False, "the assistant was not running"
 
     future = asyncio.run_coroutine_threadsafe(
         _async_run_handler(task), _loop
     )
     try:
-        return future.result(timeout=120)
+        out = future.result(timeout=120)
     except Exception as e:
         logger.warning(f"[scheduler] Handler error for '{task['name']}': {e}")
-        return ""
+        return False, f"it failed with {type(e).__name__}"
+
+    if out is None:
+        return False, "there was nothing to run"
+    return True, out
 
 
-async def _async_run_handler(task: dict) -> str:
+async def _async_run_handler(task: dict) -> "str | None":
     from assistant.actions import (
         LOCAL_GRANTS, LOCAL_PRINCIPAL, LOCAL_RAISE_CONTEXT, execute,
     )
@@ -165,7 +195,9 @@ async def _async_run_handler(task: dict) -> str:
         proc = procedures.find_by_name_or_trigger(goal)
         if proc is None:
             logger.warning(f"[scheduler] Procedure not found: {goal}")
-            return ""
+            # None, not "" -- see `_run_handler`. A missing procedure is a task
+            # that did not run, and it must not be reported as one that did.
+            return None
         from assistant.procedure_executor import run_procedure
         # Same reasoning as the web_search branch above, and now load-bearing
         # rather than tidy: `run_procedure` checks EXECUTE itself, so without
@@ -183,7 +215,7 @@ async def _async_run_handler(task: dict) -> str:
         )
     else:
         logger.warning(f"[scheduler] Unknown task_type: {task_type}")
-        return ""
+        return None
 
 
 async def _http_check(url: str) -> str:
@@ -220,8 +252,14 @@ def _should_notify_sync(task: dict, result: str) -> tuple[bool, str]:
             return True, result or "Results changed"
         return False, ""
 
-    # "always" and "on_match_only" without condition_text both notify
-    return True, result or "Task completed"
+    # "always" and "on_match_only" without condition_text both notify.
+    #
+    # No `or "Task completed"`. That fallback is where a not-run task acquired
+    # a success message: every failure path returned `""`, and this line turned
+    # it into an announcement that the work was done. `_fire_task` now passes a
+    # reason in for the not-run case, and a task that genuinely ran with nothing
+    # to say gets a sentence that claims nothing.
+    return True, result or "it ran and returned nothing"
 
 
 def _evaluate_condition_llm(result: str, condition_text: str) -> tuple[bool, str]:

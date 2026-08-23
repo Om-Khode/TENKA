@@ -524,13 +524,36 @@ def pre_route(text: str) -> IntentResult | None:
                 query_words & config.BROWSER_NAMES):
             return IntentResult(intent="web_search", response=t, params={"query": query})
 
-    # ── Event monitor CRUD must precede _FORGET_MEMORY_RE ──────────────────
-    # "delete all monitors" / "remove the song monitor" would otherwise
-    # match the forget-fact pattern's leading verb and route to forget_memory.
+    # ── Durable-state CRUD must precede _FORGET_MEMORY_RE ─────────────────
+    # "delete all monitors", "remove the song monitor", "delete that schedule"
+    # all begin with a verb that pattern claims, so whichever block is tested
+    # first wins. That is not a judgement about English; it is line order.
+    #
+    # The monitor half was hoisted here when someone hit it. The schedule half
+    # was left below and hit the same wall: `delete that schedule` routed to
+    # `forget_memory` and answered "I don't have anything about that", while
+    # `delete scratchpad schedule` worked -- the difference being only whether
+    # the words after the verb happened to satisfy the forget pattern's
+    # qualifier. Both halves live here now, for one reason rather than two.
+    #
+    # `_SCHEDULE_CREATE_RE` comes along even though `^schedule ...` cannot
+    # collide with a forget pattern: splitting a block across two places in a
+    # long function is how the second half gets forgotten, which is exactly
+    # what happened.
     if _MONITOR_LIST_RE.match(t):
         return IntentResult(intent="manage_monitor", response=t, params={"goal": t})
     if _MONITOR_CRUD_RE.match(t):
         return IntentResult(intent="manage_monitor", response=t, params={"goal": t})
+    if _SCHEDULE_LIST_RE.match(t):
+        return IntentResult(intent="manage_schedule", response=t, params={"action": "list"})
+    if _SCHEDULE_CANCEL_RE.match(t):
+        return IntentResult(intent="manage_schedule", response=t, params={"goal": t, "action": "cancel"})
+    if _SCHEDULE_PAUSE_RE.match(t):
+        return IntentResult(intent="manage_schedule", response=t, params={"goal": t, "action": "toggle"})
+    if _SCHEDULE_RESUME_RE.match(t):
+        return IntentResult(intent="manage_schedule", response=t, params={"goal": t, "action": "toggle"})
+    if _SCHEDULE_CREATE_RE.match(t):
+        return IntentResult(intent="manage_schedule", response=t, params={"goal": t, "action": "create"})
 
     # ── Forget / delete a stored fact ──────────────────────────────────────
     m = _FORGET_MEMORY_RE.match(t)
@@ -602,18 +625,6 @@ def pre_route(text: str) -> IntentResult | None:
     # commitment shape (it greps for the verb, not the captured tail).
     if _COMMITMENT_RECALL_RE.match(t):
         return IntentResult(intent="memory_query", response=t, params={"query": t})
-
-    # ── Scheduled tasks ──
-    if _SCHEDULE_LIST_RE.match(t):
-        return IntentResult(intent="manage_schedule", response=t, params={"action": "list"})
-    if _SCHEDULE_CANCEL_RE.match(t):
-        return IntentResult(intent="manage_schedule", response=t, params={"goal": t, "action": "cancel"})
-    if _SCHEDULE_PAUSE_RE.match(t):
-        return IntentResult(intent="manage_schedule", response=t, params={"goal": t, "action": "toggle"})
-    if _SCHEDULE_RESUME_RE.match(t):
-        return IntentResult(intent="manage_schedule", response=t, params={"goal": t, "action": "toggle"})
-    if _SCHEDULE_CREATE_RE.match(t):
-        return IntentResult(intent="manage_schedule", response=t, params={"goal": t, "action": "create"})
 
     # ── Preference statements — not action requests ──────────────────────
     if _PREFERENCE_STMT_RE.match(tl):
