@@ -212,6 +212,15 @@ def _check_routing_preference(goal: str) -> Optional[str]:
     """
     try:
         from .. import preferences
+        # Folded into the same guard rather than imported below: this whole
+        # function's contract is "return None on any problem" -- it is a
+        # preference lookup, not a requirement -- and an unguarded import here
+        # would raise out of `detect_backend`, which every automation goal
+        # passes through. The thresholds come from the repo module because that
+        # is where the ladder is defined; `automation/ -> storage/` is legal.
+        from ..storage.repos.preference import (
+            CONFIDENCE_ASK, CONFIDENCE_SILENT, USER_STATED_SOURCES,
+        )
     except ImportError:
         return None
     
@@ -239,9 +248,6 @@ def _check_routing_preference(goal: str) -> Optional[str]:
     # classified -- has to reach `CONFIDENCE_SILENT`, which the ladder only
     # grants after repetition TENKA counted itself (`bump_confidence`,
     # +0.15 each) or an explicit confirmation. A proposal is not evidence.
-    from ..storage.repos.preference import (
-        CONFIDENCE_ASK, CONFIDENCE_SILENT, USER_STATED_SOURCES,
-    )
     for word in candidates:
         try:
             pref = preferences.get_preference(f"automation_{word}")
