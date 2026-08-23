@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import assistant.automation.recovery as rec
 from assistant.automation.recovery import RecoveryAttempt, RecoveryOutcome
+from assistant.brain.task import Outcome
 from assistant.automation.verification import VerifyResult
 from assistant import config as _config_stub
 
@@ -80,15 +81,28 @@ def _stub_screen_llm(*, screenshot="fake-b64", vision_response='{"class":"overla
 
 
 def _stub_verification(verify_results):
-    """Patch assistant.verification.post_verify with a sequence of return values
-    (or a single value). Returns the patcher so callers can stop()."""
+    """Patch `verification.post_verify` with a sequence of return values (or a
+    single value). Returns the patcher so callers can stop().
+
+    **AsyncMock, not MagicMock.** `attempt_recovery` awaits `post_verify`, and
+    awaiting a MagicMock raises `TypeError: object VerifyResult can't be used
+    in 'await' expression` -- which `attempt_recovery` catches as "the verifier
+    crashed". So every test built on this helper took the crash branch instead
+    of the branch it named, and six of them had been red on `main` for exactly
+    that reason: the stub never returned the verdict it was handed.
+
+    A textbook case of a hang-adjacent vacuity -- the tests were not passing
+    for the wrong reason, they were failing for one, which is luckier than it
+    sounds. Had `attempt_recovery` reported success on a crash, all six would
+    have gone green while measuring nothing.
+    """
     import assistant.automation.verification as ver
     if isinstance(verify_results, list):
-        mock = MagicMock(side_effect=verify_results)
+        mock = AsyncMock(side_effect=verify_results)
     elif isinstance(verify_results, Exception):
-        mock = MagicMock(side_effect=verify_results)
+        mock = AsyncMock(side_effect=verify_results)
     else:
-        mock = MagicMock(return_value=verify_results)
+        mock = AsyncMock(return_value=verify_results)
     return patch.object(ver, "post_verify", mock)
 
 
@@ -182,7 +196,11 @@ class TestRecoveryEscalation(unittest.IsolatedAsyncioTestCase):
             verify_result=vr_in,
         )
         self.assertFalse(outcome.succeeded)
-        self.assertTrue(outcome.escalated)
+        # UNCERTAIN, not FAILED. `_diagnose` fails open to `unknown` on a
+        # missing screenshot, an LLM crash or a parse failure, and none of
+        # those is evidence about the step -- reporting failure there would
+        # claim the world unchanged whenever the free tier ran out.
+        self.assertIs(outcome.outcome, Outcome.UNCERTAIN)
         self.assertEqual(len(outcome.attempts), 1)
         self.assertEqual(outcome.attempts[0].action_taken, "escalated")
         self.assertIn("captcha", outcome.final_observation)
@@ -206,7 +224,10 @@ class TestRecoveryEscalation(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertFalse(outcome.succeeded)
-        self.assertTrue(outcome.escalated)
+        # FAILED, and the loop guard is the branch that earns it: an action ran
+        # and re-perception describes the same world it described before. That
+        # is evidence about the step, not an absence of evidence.
+        self.assertIs(outcome.outcome, Outcome.FAILED)
         # 2 attempts: first was bbox_click (failed), second was loop-guard escalate
         self.assertEqual(len(outcome.attempts), 2)
         self.assertEqual(outcome.attempts[0].action_taken, "bbox_click")
@@ -231,11 +252,14 @@ class TestRecoveryEscalation(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertFalse(outcome.succeeded)
-        self.assertTrue(outcome.escalated)
+        # Exhaustion reports what the LAST verification concluded rather than a
+        # blanket failure. Here every check said FAILED, so it does too; a run
+        # of inconclusive checks would report UNCERTAIN instead.
+        self.assertIs(outcome.outcome, Outcome.FAILED)
         self.assertEqual(len(outcome.attempts), 3)
         for a in outcome.attempts:
             self.assertEqual(a.action_taken, "bbox_click")
-            self.assertFalse(a.succeeded)
+            self.assertIs(a.outcome, Outcome.FAILED)
         self.assertEqual(outcome.final_observation, "nope")
 
 
@@ -254,23 +278,27 @@ class TestRecoverySuccess(unittest.IsolatedAsyncioTestCase):
                     verify_result=VerifyResult.fail("focus drift"),
                 )
 
+        self.assertIs(outcome.outcome, Outcome.SUCCEEDED)
         self.assertTrue(outcome.succeeded)
-        self.assertFalse(outcome.escalated)
         self.assertEqual(len(outcome.attempts), 1)
         self.assertEqual(outcome.attempts[0].action_taken, "bbox_click")
-        self.assertTrue(outcome.attempts[0].succeeded)
+        self.assertIs(outcome.attempts[0].outcome, Outcome.SUCCEEDED)
         self.assertEqual(outcome.final_observation, "DOB filled")
 
     async def test_recovery_succeeds_on_second_attempt(self):
-        # First attempt fails (different detail), second succeeds.
+        # Both attempts are `overlay_appeared` with DIFFERENT details -- the
+        # same detail twice would trip the loop guard, and the second class can
+        # no longer be `error_shown` because that one has no strategy and now
+        # stops the loop on the diagnosis. What this test is actually about is
+        # that a later attempt can still succeed after an earlier one did not.
         responses = iter([
             '{"class":"overlay_appeared","detail":"first state"}',
-            '{"class":"error_shown","detail":"format invalid"}',
+            '{"class":"overlay_appeared","detail":"second state"}',
         ])
         _stub_screen_llm(vision_response=lambda *a, **kw: next(responses))
 
-        with patch.object(rec, "_recover_overlay", AsyncMock(return_value=(False, 1))), \
-             patch.object(rec, "_recover_error", AsyncMock(return_value=(True, 0))):
+        overlay = AsyncMock(side_effect=[(False, 1), (True, 0)])
+        with patch.object(rec, "_recover_overlay", overlay):
             verify_results = [
                 VerifyResult.fail("still bad"),       # after attempt 1
                 VerifyResult.ok_(observation="done"), # after attempt 2
@@ -283,13 +311,11 @@ class TestRecoverySuccess(unittest.IsolatedAsyncioTestCase):
                     max_attempts=3,
                 )
 
-        self.assertTrue(outcome.succeeded)
-        self.assertFalse(outcome.escalated)
+        self.assertIs(outcome.outcome, Outcome.SUCCEEDED)
         self.assertEqual(len(outcome.attempts), 2)
-        self.assertEqual(outcome.attempts[0].action_taken, "bbox_click")
-        self.assertFalse(outcome.attempts[0].succeeded)
-        self.assertEqual(outcome.attempts[1].action_taken, "replan_input")
-        self.assertTrue(outcome.attempts[1].succeeded)
+        self.assertIs(outcome.attempts[0].outcome, Outcome.FAILED)
+        self.assertIs(outcome.attempts[1].outcome, Outcome.SUCCEEDED)
+        self.assertEqual(outcome.final_observation, "done")
 
 
 # ─── attempt_recovery: dispatch matrix (1:1 strategy↔class) ───────────────────
@@ -309,33 +335,71 @@ class TestRecoveryDispatch(unittest.IsolatedAsyncioTestCase):
         me.assert_not_awaited()
         mn.assert_not_awaited()
 
-    async def test_error_routes_to_recover_error(self):
-        _stub_screen_llm(vision_response='{"class":"error_shown","detail":"x"}')
-        with patch.object(rec, "_recover_overlay", AsyncMock(return_value=(False, 0))) as mo, \
-             patch.object(rec, "_recover_error", AsyncMock(return_value=(False, 0))) as me, \
-             patch.object(rec, "_recover_no_change", AsyncMock(return_value=(False, 0))) as mn:
-            with _stub_verification(VerifyResult.fail("no")):
-                await rec.attempt_recovery(
-                    step={"type": "browser", "action": "fill", "params": {}},
-                    goal="g", verify_result=VerifyResult.fail("i"), max_attempts=1,
-                )
-        me.assert_awaited_once()
-        mo.assert_not_awaited()
-        mn.assert_not_awaited()
+    async def test_error_shown_dispatches_nothing_and_spends_nothing(self):
+        """`error_shown` and `no_change` have no strategy, so the loop stops on
+        the diagnosis rather than paying to discover that a stub did nothing.
 
-    async def test_no_change_routes_to_recover_no_change(self):
-        _stub_screen_llm(vision_response='{"class":"no_change","detail":"x"}')
-        with patch.object(rec, "_recover_overlay", AsyncMock(return_value=(False, 0))) as mo, \
-             patch.object(rec, "_recover_error", AsyncMock(return_value=(False, 0))) as me, \
-             patch.object(rec, "_recover_no_change", AsyncMock(return_value=(False, 0))) as mn:
+        What this replaces: a classification of either dispatched into a stub
+        returning `(False, 0)`, paid for a post-verification (plus a vision
+        escalation when that came back ambiguous), found nothing changed, and
+        went round again -- about four model calls to reach a conclusion that
+        was free after the first diagnosis.
+        """
+        _stub_screen_llm(vision_response='{"class":"error_shown","detail":"x"}')
+        with patch.object(rec, "_recover_overlay", AsyncMock(return_value=(False, 0))) as mo,              patch.object(rec, "_recover_error", AsyncMock(return_value=(False, 0))) as me,              patch.object(rec, "_recover_no_change", AsyncMock(return_value=(False, 0))) as mn:
             with _stub_verification(VerifyResult.fail("no")):
-                await rec.attempt_recovery(
+                # No WARNING, and that is the assertion with teeth here.
+                #
+                # Deleting the `_UNIMPLEMENTED_STRATEGIES` guard is a GREEN
+                # mutant on outcome alone: the class then falls through to the
+                # `else` branch, which returns the identical UNSUPPORTED with
+                # the identical attempt. The branches differ in exactly one
+                # observable way -- the `else` is documented unreachable and
+                # says so loudly when it is reached, because getting there
+                # means a class was added to `_VALID_CLASSES` with neither a
+                # strategy nor a listing. That distinction is the guard's whole
+                # value, so it is what the test measures.
+                with self.assertNoLogs("recovery", level="WARNING"):
+                    outcome = await rec.attempt_recovery(
+                        step={"type": "browser", "action": "fill", "params": {}},
+                        goal="g", verify_result=VerifyResult.fail("i"),
+                        max_attempts=3,
+                    )
+        for m in (mo, me, mn):
+            m.assert_not_awaited()
+        self.assertIs(outcome.outcome, Outcome.UNSUPPORTED)
+        self.assertEqual(len(outcome.attempts), 1, "went round again")
+        self.assertEqual(outcome.attempts[0].action_taken, "no_strategy")
+        self.assertEqual(outcome.attempts[0].cost_calls, 1, "spent more than the diagnosis")
+
+    async def test_no_change_dispatches_nothing_and_spends_nothing(self):
+        _stub_screen_llm(vision_response='{"class":"no_change","detail":"x"}')
+        with patch.object(rec, "_recover_overlay", AsyncMock(return_value=(False, 0))) as mo,              patch.object(rec, "_recover_error", AsyncMock(return_value=(False, 0))) as me,              patch.object(rec, "_recover_no_change", AsyncMock(return_value=(False, 0))) as mn:
+            with _stub_verification(VerifyResult.fail("no")):
+                outcome = await rec.attempt_recovery(
                     step={"type": "browser", "action": "click", "params": {}},
-                    goal="g", verify_result=VerifyResult.fail("i"), max_attempts=1,
+                    goal="g", verify_result=VerifyResult.fail("i"), max_attempts=3,
                 )
-        mn.assert_awaited_once()
-        mo.assert_not_awaited()
-        me.assert_not_awaited()
+        for m in (mo, me, mn):
+            m.assert_not_awaited()
+        self.assertIs(outcome.outcome, Outcome.UNSUPPORTED)
+        self.assertEqual(len(outcome.attempts), 1)
+
+    async def test_every_diagnose_class_has_a_strategy_or_is_listed(self):
+        """The set is closed, and both halves of it are accounted for.
+
+        Without this, removing a name from `_UNIMPLEMENTED_STRATEGIES` without
+        writing the strategy silently re-opens the burn above, and adding a
+        class to `_VALID_CLASSES` with neither reaches an unreachable branch.
+        """
+        handled = {"success", "unknown", "overlay_appeared"}
+        self.assertTrue(rec._VALID_CLASSES, "walked nothing")
+        self.assertEqual(
+            rec._VALID_CLASSES - handled - rec._UNIMPLEMENTED_STRATEGIES, set(),
+            "a diagnose class has neither a strategy nor a listing")
+        self.assertEqual(
+            rec._UNIMPLEMENTED_STRATEGIES & handled, set(),
+            "a class is listed as unimplemented AND dispatched")
 
 
 # ─── attempt_recovery: infra failure during re-verify ─────────────────────────
@@ -351,7 +415,9 @@ class TestRecoveryReVerifyCrash(unittest.IsolatedAsyncioTestCase):
                 verify_result=VerifyResult.fail("i"),
             )
         self.assertFalse(outcome.succeeded)
-        self.assertTrue(outcome.escalated)
+        # The recovery action already ran; what broke is the check on it. Same
+        # distinction `VerifyResult.crashed()` draws.
+        self.assertIs(outcome.outcome, Outcome.UNCERTAIN)
         self.assertIn("crashed", outcome.final_observation)
 
 
@@ -363,17 +429,28 @@ class TestResultTypes(unittest.TestCase):
             diagnose_class="overlay_appeared",
             detail="d",
             action_taken="bbox_click",
-            succeeded=True,
+            outcome=Outcome.SUCCEEDED,
             cost_calls=2,
         )
         self.assertEqual(a.diagnose_class, "overlay_appeared")
-        self.assertTrue(a.succeeded)
+        self.assertIs(a.outcome, Outcome.SUCCEEDED)
 
     def test_recovery_outcome_defaults(self):
-        o = RecoveryOutcome(succeeded=False)
+        o = RecoveryOutcome(outcome=Outcome.FAILED)
         self.assertEqual(o.attempts, [])
         self.assertEqual(o.final_observation, "")
-        self.assertFalse(o.escalated)
+        self.assertFalse(o.succeeded)
+
+    def test_only_succeeded_reads_as_success(self):
+        """`succeeded` survives as a property because its meaning did not
+        change. `escalated` does not: it meant "not succeeded", and reading it
+        that way is what let uncertainty be reported as failure."""
+        for o in Outcome:
+            self.assertEqual(
+                RecoveryOutcome(outcome=o).succeeded, o is Outcome.SUCCEEDED,
+                f"{o.value} reads as a successful recovery")
+        self.assertFalse(hasattr(RecoveryOutcome(outcome=Outcome.FAILED),
+                                 "escalated"))
 
 
 # ─── _overlay_goal_text helper (AR-1b) ────────────────────────────────────────
@@ -589,8 +666,7 @@ class TestAttemptRecoveryWithRealOverlay(unittest.IsolatedAsyncioTestCase):
                 verify_result=VerifyResult.fail("focus drifted to calendar"),
             )
 
-        self.assertTrue(outcome.succeeded)
-        self.assertFalse(outcome.escalated)
+        self.assertIs(outcome.outcome, Outcome.SUCCEEDED)
         self.assertEqual(outcome.attempts[-1].diagnose_class, "overlay_appeared")
         self.assertEqual(outcome.attempts[-1].action_taken, "bbox_click")
         self._pyauto.click.assert_called_once_with(640, 400)
@@ -994,12 +1070,11 @@ class TestRecoverySuccessClass(unittest.IsolatedAsyncioTestCase):
             goal="open movie page",
             verify_result=vr_in,
         )
-        self.assertTrue(outcome.succeeded)
-        self.assertFalse(outcome.escalated)
+        self.assertIs(outcome.outcome, Outcome.SUCCEEDED)
         self.assertEqual(len(outcome.attempts), 1)
         self.assertEqual(outcome.attempts[0].diagnose_class, "success")
         self.assertEqual(outcome.attempts[0].action_taken, "false_alarm")
-        self.assertTrue(outcome.attempts[0].succeeded)
+        self.assertIs(outcome.attempts[0].outcome, Outcome.SUCCEEDED)
 
     async def test_success_class_no_strategy_dispatched(self):
         _stub_screen_llm(vision_response='{"class":"success","detail":"navigated ok"}')

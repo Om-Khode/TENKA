@@ -305,13 +305,137 @@ def _refuse(required: Capability) -> str:
     """
     context = current_raise_context.get()
     if context is None or required not in context.issued:
-        return (f"That needs the {required.value} permission, "
-                f"which this device doesn't have.")
+        return _REFUSAL_NOT_HELD.format(cap=required.value)
     if required in context.raisable:
-        return (f"This device holds {required.value}; raise it from the "
-                f"keyboard to use it here.")
-    return (f"This device holds {required.value}, but this connection "
-            f"can never carry it.")
+        return _REFUSAL_RAISABLE.format(cap=required.value)
+    return _REFUSAL_NEVER_CARRIED.format(cap=required.value)
+
+
+# ─── Recognising a refusal we wrote ──────────────────────────────────────
+
+_REFUSAL_NOT_HELD = (
+    "That needs the {cap} permission, which this device doesn't have.")
+_REFUSAL_RAISABLE = (
+    "This device holds {cap}; raise it from the keyboard to use it here.")
+_REFUSAL_NEVER_CARRIED = (
+    "This device holds {cap}, but this connection can never carry it.")
+_REFUSAL_NO_RAISE_CONTEXT = (
+    "That needs the {cap} permission on this connection, and I can't confirm "
+    "it here.")
+_REFUSAL_NOT_DURABLE = (
+    "A raised {cap} can't install something that keeps running after the "
+    "raise ends. Do it from the keyboard.")
+
+_REFUSAL_TEMPLATES: "tuple[str, ...]" = (
+    _REFUSAL_NOT_HELD,
+    _REFUSAL_RAISABLE,
+    _REFUSAL_NEVER_CARRIED,
+    _REFUSAL_NO_RAISE_CONTEXT,
+    _REFUSAL_NOT_DURABLE,
+)
+"""Every sentence this module returns to say no, as data.
+
+Templates rather than f-strings inline, for one reason:
+`is_capability_refusal` below has to recognise every one of them, and a second
+hand-maintained copy would drift. Both predicates render from these names and
+the recogniser matches against them, so there is one source and drift is not
+expressible. `{cap}` is the only substitution; nothing else in a refusal
+varies.
+
+**Five, not three.** The first draft of this tuple held only the three
+`_refuse` writes and missed the two `durable_capability_refusal` writes
+directly -- so a durable refusal inside a planner step would have stayed
+unrecognised and gone on being recorded as a success, which is the whole
+defect this exists to close. Enumerating the sentences a boundary can produce
+is the same discipline as enumerating the paths around it, and it failed the
+same way the first time.
+
+The wording has already moved once -- 6b's live test found the single original
+sentence wrong for two of its three cases and split it into three -- so "the
+wording is stable enough to copy elsewhere" is not an assumption this tree has
+earned. `tests/test_refusal_is_a_failure.py` drives both predicates through
+every reachable branch and asserts each result is recognised, so a sixth
+sentence written inline reds a test instead of quietly escaping.
+"""
+
+_REFUSAL_SENTENCES: "frozenset[str]" = frozenset(
+    template.format(cap=capability.value)
+    for template in _REFUSAL_TEMPLATES
+    for capability in Capability
+)
+"""Every string `_refuse` can return: three templates x seven capabilities.
+
+Materialised once at import rather than matched by pattern. Twenty-one exact
+strings cannot false-positive on a handler's own output the way
+`"permission"` or a regex over the sentence shape could, and a user saying one
+of these sentences verbatim is not a case worth designing for.
+"""
+
+
+def _note_refusal(required: Capability) -> None:
+    """Record on the turn's tracker that a capability decision said no.
+
+    **Why a ledger and not just the return value.** A refusal that happens at
+    the top of a turn is visible to the turn loop, which sets
+    `_security_skip_this_turn` and keeps the reply honest. A refusal that
+    happens *inside* a planner step is not: `execute()` returns the sentence to
+    `planner/executor.py`, six frames down, and the turn loop never learns it
+    happened. The turn is then summarised into `session_snapshots` and replayed
+    verbatim as fact next session -- which is the failure
+    `session._exclude_security_skips` was written for, reached through a door
+    it does not cover.
+
+    The tracker is the right home rather than a new contextvar: it already
+    exists per turn, `main.py` already installs and resets it around exactly
+    the region that decides `security_skip`, and a set on it is mutable, so the
+    note is visible to the turn loop even from a nested task that copied the
+    context.
+
+    Best-effort by construction. `get_current_tracker()` is `None` for the
+    scheduler and the event bus, which install grants but no tracker -- and
+    neither writes a `conversations` row, so there is nothing there for this to
+    protect. It must never raise: a refusal is already the safe answer, and a
+    bookkeeping failure must not turn one into an exception at a security
+    boundary.
+    """
+    try:
+        from .. import telemetry as _telemetry
+        tracker = _telemetry.get_current_tracker()
+        if tracker is not None:
+            tracker.refused_capabilities.add(required.value)
+    except Exception:      # pragma: no cover - bookkeeping is never fatal
+        pass
+
+
+def is_capability_refusal(text: "str | None") -> bool:
+    """Did `_refuse` write this string?
+
+    The question a caller needs when it is holding a result and has to decide
+    whether the work happened. `execute()` returns the refusal as its entire
+    return value, so an exact match is the right test and a substring match
+    would be the wrong one -- a handler that legitimately *reports* a
+    permission problem in a longer sentence has not been refused by this
+    module and must not be treated as though it had.
+
+    **Why this exists.** `planner/executor.py` records a step's result and asks
+    `_step_failed()` whether it went wrong, and that predicate matches some
+    sixty failure phrases and eleven prefixes -- none of which any refusal
+    sentence contains. So a refused step was recorded `status="success"` with
+    the refusal as its output: the plan continued, a dependent step got the
+    refusal text as its `$step_N` input, and `_synthesize_result` composed the
+    spoken answer out of steps marked successful. The gate held and the report
+    about it lied, which is the shape this project has already paid for once
+    (KI-28).
+
+    Text-matching a security decision is not the design anyone would choose;
+    the alternative -- a flag threaded back through `execute()`'s return --
+    means changing what every handler returns. Single-sourcing the sentences is
+    what makes the text-match safe, and
+    `tests/test_refusal_is_a_failure.py` pins that `execute()` returns
+    `_refuse`'s output unwrapped, so a future path that wraps it reds a test
+    rather than silently stopping this from matching.
+    """
+    return bool(text) and text.strip() in _REFUSAL_SENTENCES
 
 
 def capability_refusal(required: Capability) -> "str | None":
@@ -334,8 +458,9 @@ def capability_refusal(required: Capability) -> "str | None":
     the absence of a decision is not a decision to allow -- and any caller that
     wants a capability the turn does not hold is refused rather than warned.
 
-    Deliberately synchronous and side-effect free apart from a log line, so a
-    branch can consult it in an `if` condition without restructuring itself.
+    Deliberately synchronous, and its only side effects are a log line and the
+    turn-ledger note below -- so a branch can consult it in an `if` condition
+    without restructuring itself.
     """
     granted = current_grants.get()
     if granted is not None and required in granted:
@@ -344,6 +469,7 @@ def capability_refusal(required: Capability) -> "str | None":
         f"Refused: needs {required.value}, caller holds "
         f"{'nothing (grants unset)' if granted is None else sorted(c.value for c in granted)}"
     )
+    _note_refusal(required)
     return _refuse(required)
 
 
@@ -387,8 +513,8 @@ def durable_capability_refusal(required: Capability) -> "str | None":
             f"Refused durable action needing {required.value}: no raise "
             f"context installed, so durable authority cannot be established"
         )
-        return (f"That needs the {required.value} permission on this "
-                f"connection, and I can't confirm it here.")
+        _note_refusal(required)
+        return _REFUSAL_NO_RAISE_CONTEXT.format(cap=required.value)
 
     durable = context.issued & context.ceiling
     if required in durable:
@@ -402,13 +528,14 @@ def durable_capability_refusal(required: Capability) -> "str | None":
             f"Refused durable action needing {required.value}: held only "
             f"under a live raise, which would expire while the effect lasted"
         )
-        return (f"A raised {required.value} can't install something that "
-                f"keeps running after the raise ends. Do it from the keyboard.")
+        _note_refusal(required)
+        return _REFUSAL_NOT_DURABLE.format(cap=required.value)
 
     logger.info(
         f"Refused durable action needing {required.value}: not in the "
         f"caller's durable set"
     )
+    _note_refusal(required)
     return _refuse(required)
 
 

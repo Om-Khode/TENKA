@@ -35,7 +35,12 @@ class TestSchemaV4Migration:
     def test_fresh_db_at_version_4(self, tmp_path):
         db = Database(tmp_path / "test.db")
         row = db.fetchone("SELECT version FROM _schema_version")
-        assert row["version"] == 4
+        # >=, not ==. This pinned an absolute version number and went red the
+        # moment the schema moved past v4 -- which it has, repeatedly, for
+        # reasons that have nothing to do with session snapshots. What this
+        # test is about is that opening an older database migrates it far
+        # enough to have `session_snapshots`, and that is what it now says.
+        assert row["version"] >= 4
 
     def test_session_snapshots_columns(self, tmp_path):
         db = Database(tmp_path / "test.db")
@@ -74,7 +79,12 @@ class TestSchemaV4Migration:
         )]
         assert "session_snapshots" in tables
         row = db.fetchone("SELECT version FROM _schema_version")
-        assert row["version"] == 4
+        # >=, not ==. This pinned an absolute version number and went red the
+        # moment the schema moved past v4 -- which it has, repeatedly, for
+        # reasons that have nothing to do with session snapshots. What this
+        # test is about is that opening an older database migrates it far
+        # enough to have `session_snapshots`, and that is what it now says.
+        assert row["version"] >= 4
 
 
 from assistant.storage.repos.session import SessionRepo

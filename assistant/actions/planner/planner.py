@@ -559,6 +559,25 @@ def _step_failed(output: str) -> bool:
     if not output or output.strip() == "(no output)":
         return True
 
+    # A capability refusal, first and by identity rather than by phrase.
+    #
+    # This predicate matched sixty-odd failure phrases and eleven prefixes, and
+    # not one of the five refusal sentences contains any of them -- verified
+    # across every sentence x capability pair. So a step the choke point
+    # refused was recorded `status="success"` with the refusal as its output:
+    # the plan carried on, a dependent step took the refusal text as its
+    # `$step_N` input, and `_synthesize_result` composed the spoken answer out
+    # of steps marked successful. The gate held and the report about it lied,
+    # which is KI-28's shape through a door `main.py`'s two skip sites do not
+    # cover.
+    #
+    # Asked of `actions` rather than answered here: that module writes the
+    # sentences, so it is the only place that can recognise them without a
+    # copy to drift from.
+    from .. import is_capability_refusal
+    if is_capability_refusal(output):
+        return True
+
     if any(output.startswith(p) for p in _FAILURE_PREFIXES):
         return True
 
@@ -751,6 +770,66 @@ _UNRECOVERABLE_PATTERNS = [
 ]
 
 
+def _plan_capability_footprint(plan: Plan) -> "frozenset":
+    """What the plan, as originally written, already asks permission for.
+
+    The union of every step's required capability. Read from
+    `REQUIRED_CAPABILITY` rather than stored, so a reclassified intent cannot
+    leave a stale footprint behind, and an unlisted tool contributes
+    `DEFAULT_REQUIRED` -- the same fail-closed default dispatch uses, which
+    here means an unclassified tool widens the footprint to EXECUTE and is
+    therefore never the thing that quietly *narrows* it.
+    """
+    from ...core.intent_capabilities import DEFAULT_REQUIRED, REQUIRED_CAPABILITY
+    return frozenset(
+        REQUIRED_CAPABILITY.get(s.tool, DEFAULT_REQUIRED) for s in plan.steps
+    )
+
+
+def _recovery_tool_in_scope(tool: str, footprint: "frozenset") -> bool:
+    """May a recovery step use `tool`?
+
+    Two independent narrowings, both deterministic, neither asking a model.
+
+    **One: recovery may not enlarge the plan's capability footprint.**
+    `Capability` is a set, not a lattice -- there is no "more" to compare
+    against -- so "does not widen" has to mean something checkable, and this is
+    it: the plan was written and dispatched asking for a particular set of
+    permissions, and a recovery that introduces a *new* one is doing something
+    the original plan never asked for. A `web_search` step (CHAT_SEND) that
+    fails may be recovered by `browse_url` (CHAT_SEND) freely, and by
+    `code_executor` (EXECUTE) only in a plan that already had a step costing
+    EXECUTE. That is the difference between recovering the goal and taking a
+    wider route to it.
+
+    **Two: it must be something this caller could actually run.** Asked of the
+    one predicate that answers it, so a step nobody may dispatch never enters
+    the plan at all -- honest about what is queued, and it means a refusal
+    cannot be laundered into a "failed" step that then gets its own recovery
+    round.
+
+    Order matters only for the log line: the footprint check is free and the
+    refusal check notes the turn's ledger, so a scope rejection should not look
+    like a security refusal in the telemetry.
+    """
+    from .. import capability_refusal
+    from ...core.intent_capabilities import DEFAULT_REQUIRED, REQUIRED_CAPABILITY
+
+    required = REQUIRED_CAPABILITY.get(tool, DEFAULT_REQUIRED)
+    if required not in footprint:
+        logger.info(
+            f"[PLANNER] Recovery step dropped: {tool} needs "
+            f"{required.value}, which this plan never asked for"
+        )
+        return False
+    if capability_refusal(required) is not None:
+        logger.info(
+            f"[PLANNER] Recovery step dropped: this caller cannot run {tool}"
+        )
+        return False
+    return True
+
+
 async def _attempt_recovery(
     failed_step: PlanStep,
     plan: Plan,
@@ -764,6 +843,31 @@ async def _attempt_recovery(
 
     Only called ONCE per failed step — no recursive recovery.
     """
+    # A security decision is not a failure to route around.
+    #
+    # Checked before `_UNRECOVERABLE_PATTERNS` and separately from it, because
+    # the reason is different in kind. Those patterns say "no alternative
+    # exists" -- no camera, no package, the LLM is down. This says an
+    # alternative must not be looked for: the answer to "may this caller do
+    # that" will be the same for every step in this turn, so replanning can
+    # only ever produce a differently-worded no while paying a plan-generating
+    # model to find it.
+    #
+    # And asking is worse than futile. The prompt hands a model the failed
+    # goal and the whole tool manifest, so the shape of the request is "this
+    # was refused; propose another way to accomplish it". Every proposal is
+    # still checked at dispatch, so this is not the thing standing between a
+    # refusal and an effect -- but building a step whose entire purpose is to
+    # get around a capability decision is not a mechanism worth having, and
+    # the plan it lands in is what gets summarised into the spoken answer.
+    from .. import is_capability_refusal
+    if is_capability_refusal(failed_step.error):
+        logger.info(
+            "[PLANNER] Skipping recovery — the step was refused, and a "
+            "refusal is not a failure to route around"
+        )
+        return []
+
     error_lower = failed_step.error.lower()
     for pattern in _UNRECOVERABLE_PATTERNS:
         if pattern in error_lower:
@@ -833,10 +937,13 @@ async def _attempt_recovery(
             logger.info("[PLANNER] No recovery steps suggested")
             return []
 
+        footprint = _plan_capability_footprint(plan)
         recovery_steps = []
         for sd in steps_data:
             tool = sd.get("tool", "")
             if tool not in TOOL_MANIFEST:
+                continue
+            if not _recovery_tool_in_scope(tool, footprint):
                 continue
             max_step_id += 1
             recovery_steps.append(PlanStep(

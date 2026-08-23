@@ -632,10 +632,24 @@ async def run_browser_steps(steps: List[Dict], *, _from_planner: bool = False, h
                     # Escalated — surface the diagnose-enriched observation
                     # so the user hears WHAT we got stuck on, not just the
                     # original verify failure.
+                    #
+                    # All three non-success outcomes halt, exactly as before;
+                    # what changed is what the observation says about why. The
+                    # `VERIFY_FAILED|step=|tier=|obs=` envelope is left alone
+                    # deliberately -- `verification._VERIFY_FAILED_RE` parses
+                    # it by that exact shape and `router.py` tests six places
+                    # for the literal, so a new prefix would be a change to
+                    # five modules to carry one distinction. The distinction
+                    # rides in `obs=`, which is the field that reaches the
+                    # user.
                     enriched = outcome.final_observation or post.observation
+                    if outcome.outcome is Outcome.UNSUPPORTED:
+                        enriched = f"no recovery route: {enriched}"
+                    elif outcome.outcome is not Outcome.FAILED:
+                        enriched = f"could not confirm recovery: {enriched}"
                     logger.warning(
                         f"[BROWSER] recovery escalated step {i+1} after {len(outcome.attempts)} "
-                        f"attempt(s): {enriched}"
+                        f"attempt(s) ({outcome.outcome.value}): {enriched}"
                     )
                     results.append(msg)
                     return (

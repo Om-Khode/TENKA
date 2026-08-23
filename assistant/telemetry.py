@@ -148,6 +148,22 @@ class TurnTracker:
         self.action_outcome: str = "skipped"
         self.error_class: str | None = None
 
+        # Capabilities a refusal named during this turn, wherever it happened.
+        # Written by `actions._note_refusal`, read by the turn loop to decide
+        # `security_skip` on the conversation row.
+        #
+        # A set, and mutated in place rather than reassigned, deliberately: a
+        # refusal inside a planner step is six frames below the turn loop and
+        # may be inside a task that copied the context, and mutating a shared
+        # object is visible across a context copy where rebinding a contextvar
+        # is not.
+        #
+        # Not persisted -- `telemetry_turns` has no column for it and the
+        # question it answers is asked before the turn ends. Naming *which*
+        # capability rather than a bare flag costs nothing and makes a debug
+        # log say which grant was missing.
+        self.refused_capabilities: set[str] = set()
+
         self.latency_stt_ms: int | None = None
         self.latency_intent_ms: int | None = None
         self.latency_action_ms: int | None = None
