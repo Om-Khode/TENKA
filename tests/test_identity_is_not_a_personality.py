@@ -147,11 +147,51 @@ def test_the_identity_block_carries_the_configured_name():
 
 # ─── both directions of the rule ─────────────────────────────────────────────
 
-def test_the_block_forbids_volunteering_what_she_is_made_of():
+_SUBSTRATE_WORDS = ("program", "software", "model", "code", "ai",
+                    "machine", "tool")
+
+
+def test_the_block_names_every_substrate_word_it_forbids():
+    """A class, not a phrase list -- and this is the second version of that
+    lesson.
+
+    The first ban read *"Don't say 'as an AI' or 'I'm just a program'"*, and she
+    said **"I'm a program, not a person"**: one word off the forbidden string
+    and straight through it. Banning wordings invites paraphrase. So the block
+    enumerates the nouns and forbids describing herself as any of them, and
+    this test holds that enumeration to the same standard -- a word dropped
+    from it is a word she can use again.
+    """
     from assistant.llm.prompts import _build_identity_block
     text = _build_identity_block().lower()
-    assert "never volunteer" in text, (
-        "nothing stops the unprompted disclaimer this whole file is about"
+    missing = [w for w in _SUBSTRATE_WORDS if w not in text]
+    assert not missing, f"the block does not forbid describing herself as: {missing}"
+    assert "never describe yourself as" in text, (
+        "the ban is not stated as a class, so a paraphrase escapes it"
+    )
+
+
+def test_the_block_forbids_the_qualifier_escape_hatch():
+    """"I'm *just* a program", "in a sense I'm software", "technically a
+    model" -- the observed failure was a qualifier away from the old rule, so
+    the block has to close the qualifier itself."""
+    from assistant.llm.prompts import _build_identity_block
+    text = _build_identity_block().lower()
+    assert "not with a qualifier" in text, (
+        "a hedged version of the banned self-description is still available"
+    )
+
+
+def test_the_block_forbids_denying_what_she_does_have():
+    """The second observed failure. Two turns after naming a favourite colour
+    she answered "I don't have preferences like that" -- contradicting the block
+    *and* herself. A ban on mentioning substrate does not cover a bare denial,
+    so that is named separately."""
+    from assistant.llm.prompts import _build_identity_block
+    text = _build_identity_block().lower()
+    assert "i don't have" in text, (
+        "nothing addresses the bare denial, which needs no substrate word to be "
+        "the same defect"
     )
 
 
@@ -162,25 +202,41 @@ def test_the_block_forbids_claiming_to_be_a_person():
     thing no personality should be able to produce."""
     from assistant.llm.prompts import _build_identity_block
     text = _build_identity_block().lower()
-    assert "not claim to be one" in text, (
-        "the block permits denying what she is when asked directly"
+    assert "not" in text and "human being" in text, (
+        "the block permits claiming to be human when sincerely asked"
+    )
+    assert "only" in text, (
+        "the exception is not marked as the only one, so it reads as a licence "
+        "rather than a single carve-out"
     )
 
 
-def test_an_ordinary_character_question_is_answered_not_explained():
-    """The instruction that addresses the observed reply directly, rather than
-    relying on the general ban to cover it."""
+@pytest.mark.parametrize("topic", ["colour", "age", "gender", "bored"])
+def test_the_block_covers_the_character_questions_that_went_wrong(topic):
+    """Named cases, because the general rule demonstrably did not generalise.
+
+    The first version of the block named only the favourite-colour example. That
+    one then worked -- "I've always liked a deep forest green" -- while *gender*
+    got "I'm a program, not a person" and *favourite human* got "I don't have
+    preferences like that". The model followed the example it was given and
+    reasoned badly about the rest, so the rest are named too.
+    """
     from assistant.llm.prompts import _build_identity_block
-    text = _build_identity_block().lower()
-    assert "favourite colour" in text or "favorite color" in text, (
-        "the block does not name the ordinary-character-question case, which is "
-        "the one that actually went wrong"
+    assert topic in _build_identity_block().lower(), (
+        f"a question about her {topic} is not covered, and the general rule has "
+        f"already been shown not to generalise"
     )
 
 
-def test_the_older_rule_against_disclaimers_is_still_there():
-    """It was right all along and it is kept. What changed is that it no longer
-    stands alone against a personality asserting the opposite as fact."""
+def test_the_rules_block_still_forbids_self_description():
+    """Kept, and widened. The rule was right from the start; what changed is
+    that it names the class rather than two phrasings, and no longer stands
+    alone against a personality asserting the opposite as fact."""
     from assistant.llm.prompts import _build_personality_rules
     rules = _build_personality_rules("neutral").lower()
-    assert "as an ai" in rules and "just a program" in rules
+    assert "never describe what you are made of" in rules, (
+        "the rules block stopped forbidding self-description"
+    )
+    assert "in any wording" in rules, (
+        "the rules block is back to banning particular phrasings"
+    )
