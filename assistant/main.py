@@ -1575,9 +1575,16 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                 outcome = "success"
             if source == "chat":
                 print(response)
-            elif source != "studio":
+            elif source in _LOCAL_SOURCES:
                 # Speak a short confirmation only (full help text would be a
                 # wall of speech). Truncate and keep the first line.
+                #
+                # The allow-list, not `!= "studio"`. That spelling was correct
+                # about the only remote source that existed and fails open on
+                # the next one -- which is the argument
+                # `test_local_sources_is_an_allow_list_not_a_studio_denylist`
+                # already makes about `_finish_turn`, and this site was not
+                # covered by it.
                 #
                 # Studio is excluded here for the same reason "chat" is:
                 # both are text-native channels with their own rendered
@@ -2122,7 +2129,7 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
             # gate stays deliberately independent of all of them.
             logger.warning(f"Policy DENIED: {policy.reason}")
             await bridge.send_command("set_expression", value="worried")
-            if source == "studio":
+            if source not in _LOCAL_SOURCES:
                 # Studio settles a turn by re-reading the transcript
                 # (LiveChatRuntime.conversation() -> memory.get_recent),
                 # never from this function's return value -- POST /v1/chat is
@@ -2131,15 +2138,19 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                 # showing the user's own message and no answer at all: the
                 # turn looked lost rather than refused. Same fix, same
                 # reason, as the slash-command refusal above.
+                #
+                # Keyed on the allow-list rather than `== "studio"`, so a
+                # transport added later records its refusals instead of
+                # silently dropping them and speaking them here.
                 memory.save_turn(transcription, intent_result.intent,
                                  policy.safe_response,
                                  session_mod.get_current_session_id())
             else:
-                # Not spoken for "studio", for the reason the slash-command
-                # branch spells out: a remote device that can make the local
-                # speaker talk on demand is a standing way to interrupt the
-                # owner's room from off the machine. The refusal is fully
-                # visible where it was asked, via the save above.
+                # Spoken only to the person at this machine: a remote device
+                # that can make the local speaker talk on demand is a standing
+                # way to interrupt the owner's room from off the machine. The
+                # refusal is fully visible where it was asked, via the save
+                # above.
                 await tts.speak(policy.safe_response, bridge, emotion="calm")
             await bridge.send_command("set_expression", value="neutral")
             _tracker.action_outcome = "skipped"
@@ -2485,14 +2496,28 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                 unity_expression = config.UNITY_EXPRESSION_MAP.get(emotion, "neutral")
                 await bridge.send_command("set_expression", value=unity_expression)
 
-                _t0_tts = _time.monotonic()
-                success, response_text = await speak_streaming(
-                    _resumed_stream(), bridge, emotion=emotion
-                )
-                _tracker.latency_tts_ms = int((_time.monotonic() - _t0_tts) * 1000)
+                if source in _LOCAL_SOURCES:
+                    _t0_tts = _time.monotonic()
+                    success, response_text = await speak_streaming(
+                        _resumed_stream(), bridge, emotion=emotion
+                    )
+                    _tracker.latency_tts_ms = int(
+                        (_time.monotonic() - _t0_tts) * 1000)
 
-                if not success and not response_text:
-                    await tts.speak("Sorry, something went wrong.", bridge)
+                    if not success and not response_text:
+                        await tts.speak("Sorry, something went wrong.", bridge)
+                else:
+                    # A remote turn is drained, not played. `speak_streaming`
+                    # both synthesises the audio and assembles the reply text,
+                    # and the text is still needed -- Studio settles a turn by
+                    # re-reading the transcript, so skipping the call outright
+                    # would turn every remote answer into a lost turn. This
+                    # collects the same tokens and never enters the audio
+                    # pipeline.
+                    _parts: list[str] = []
+                    async for _chunk in _resumed_stream():
+                        _parts.append(_chunk)
+                    response_text = "".join(_parts)
 
                 # The streaming pipeline already kept these sentences out of the
                 # audio. This is the same filter over the *assembled* reply,
@@ -2540,9 +2565,18 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                 unity_expression = config.UNITY_EXPRESSION_MAP.get(emotion, "neutral")
 
                 await bridge.send_command("set_expression", value=unity_expression)
-                _t0_tts = _time.monotonic()
-                await tts.speak(response_text, bridge, emotion=emotion)
-                _tracker.latency_tts_ms = int((_time.monotonic() - _t0_tts) * 1000)
+                # Speech is for the person at this machine. A remote caller's
+                # answer is delivered by re-reading the transcript, and a
+                # device that can make the local speaker talk on demand has a
+                # standing way to interrupt the owner's room -- the reason the
+                # pre-dispatch branches and both pending paths have guarded
+                # this since 6a.5. This path did not, so every Studio answer
+                # and every refusal `execute()` produced was played aloud.
+                if source in _LOCAL_SOURCES:
+                    _t0_tts = _time.monotonic()
+                    await tts.speak(response_text, bridge, emotion=emotion)
+                    _tracker.latency_tts_ms = int(
+                        (_time.monotonic() - _t0_tts) * 1000)
                 await bridge.send_command("set_expression", value="neutral")
                 await _finish_turn(bridge, source)
 

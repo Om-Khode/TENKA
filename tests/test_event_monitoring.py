@@ -396,6 +396,98 @@ class TestNamelessCommands:
         assert repo.get_by_id(2) is not None, "an arbitrary monitor was deleted"
 
 
+class TestAllMonitors:
+    """"all" names every monitor -- and only when it is the word "all"."""
+
+    def _one(self, repo, name):
+        repo.create(
+            name=name, event_type="media_changed",
+            source_filter=None, condition_mode="code",
+            condition_expr="True", condition_prompt=None,
+            action_type="tts_notify", action_payload="hi",
+            cooldown_secs=5, user_goal="test",
+        )
+
+    def test_pause_all_monitors(self, repo):
+        """Live-test finding. `delete_monitor` has had an "all" branch since it
+        was written; pause and resume never did, so "pause all monitors" fell
+        through to the name matcher with "all" as its only non-noise word,
+        matched nothing, and answered "I couldn't find a monitor matching that
+        name" with every monitor sitting right there."""
+        from assistant.event_monitoring import pause_monitor
+
+        self._one(repo, "Alpha Monitor")
+        self._one(repo, "Beta Monitor")
+
+        result = pause_monitor("pause all monitors")
+        assert "all 2" in result, result
+        assert repo.get_by_id(1)["enabled"] == 0
+        assert repo.get_by_id(2)["enabled"] == 0
+
+    def test_resume_all_monitors(self, repo):
+        from assistant.event_monitoring import pause_monitor, resume_monitor
+
+        self._one(repo, "Alpha Monitor")
+        self._one(repo, "Beta Monitor")
+        pause_monitor("pause all monitors")
+
+        result = resume_monitor("resume all monitors")
+        assert "all 2" in result, result
+        assert repo.get_by_id(1)["enabled"] == 1
+        assert repo.get_by_id(2)["enabled"] == 1
+
+    @pytest.mark.parametrize("phrase", [
+        "delete the call monitor",
+        "pause the install monitor",
+        "delete my recall monitor",
+        "pause the wall monitor",
+    ])
+    def test_a_word_containing_all_does_not_mean_all(self, repo, phrase):
+        """**The direction that cannot be undone.** The old test was
+        `"all" in goal.lower()`, and "call", "install", "recall" and "wall" all
+        satisfy it -- so `delete the call monitor` deleted every monitor the
+        operator had. A word-boundary match is the whole fix."""
+        from assistant.event_monitoring import _means_all
+
+        assert not _means_all(phrase), (
+            f"{phrase!r} was read as naming every monitor")
+
+    @pytest.mark.parametrize("phrase", [
+        "delete all monitors",
+        "pause ALL the monitors",
+        "resume all",
+    ])
+    def test_the_word_all_still_means_all(self, phrase):
+        from assistant.event_monitoring import _means_all
+
+        assert _means_all(phrase)
+
+    def test_delete_all_still_deletes_all(self, repo):
+        from assistant.event_monitoring import delete_monitor
+
+        self._one(repo, "Alpha Monitor")
+        self._one(repo, "Beta Monitor")
+
+        result = delete_monitor("delete all monitors")
+        assert "all 2" in result, result
+        assert repo.get_by_id(1) is None
+        assert repo.get_by_id(2) is None
+
+    def test_a_call_monitor_is_deleted_by_name_not_wholesale(self, repo):
+        """Both halves of the boundary fix, end to end: the substring version
+        wiped the other monitor too."""
+        from assistant.event_monitoring import delete_monitor
+
+        self._one(repo, "Call Monitor")
+        self._one(repo, "Beta Monitor")
+
+        result = delete_monitor("delete the call monitor")
+        assert "Call Monitor" in result
+        assert repo.get_by_id(1) is None
+        assert repo.get_by_id(2) is not None, (
+            "deleting one monitor by name took the others with it")
+
+
 class TestDebounce:
     """Debounce: only tts_notify on media_changed is debounced."""
 

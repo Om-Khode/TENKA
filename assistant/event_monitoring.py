@@ -7,6 +7,7 @@ and automation layers.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 
 logger = logging.getLogger("event_monitoring")
@@ -156,6 +157,18 @@ _NOISE_WORDS = frozenset({
 })
 
 
+def _means_all(goal: str) -> bool:
+    """Does this command name every monitor?
+
+    A word-boundary match, not a substring one. `"all" in goal.lower()` was
+    what `delete_monitor` used, and "call", "install", "recall" and "wall" all
+    contain it -- so `delete the call monitor` deleted every monitor the
+    operator had. The substring test is cheap in exactly the direction that
+    cannot be undone.
+    """
+    return re.search(r"\ball\b", goal or "", re.IGNORECASE) is not None
+
+
 def _fuzzy_match(
     monitors: list[dict],
     goal: str,
@@ -222,6 +235,18 @@ def pause_monitor(goal: str) -> str:
     if not monitors:
         return "You don't have any monitors to pause."
 
+    # `delete_monitor` has had this branch since it was written; these two
+    # never did, so "pause all monitors" fell through to the name matcher with
+    # "all" as its only non-noise word, matched nothing, and answered "I
+    # couldn't find a monitor matching that name" -- with every monitor sitting
+    # right there.
+    if _means_all(goal):
+        count = len(monitors)
+        for m in monitors:
+            repo.toggle(m["id"], enabled=False)
+        event_bus.reload_monitors()
+        return f"Paused all {count} monitors."
+
     matches = _fuzzy_match(monitors, goal, nameless_matches_all=True)
     if not matches:
         return "I couldn't find a monitor matching that name."
@@ -240,6 +265,18 @@ def resume_monitor(goal: str) -> str:
     monitors = repo.get_all()
     if not monitors:
         return "You don't have any monitors to resume."
+
+    # `delete_monitor` has had this branch since it was written; these two
+    # never did, so "resume all monitors" fell through to the name matcher with
+    # "all" as its only non-noise word, matched nothing, and answered "I
+    # couldn't find a monitor matching that name" -- with every monitor sitting
+    # right there.
+    if _means_all(goal):
+        count = len(monitors)
+        for m in monitors:
+            repo.toggle(m["id"], enabled=True)
+        event_bus.reload_monitors()
+        return f"Resumed all {count} monitors."
 
     matches = _fuzzy_match(monitors, goal, nameless_matches_all=True)
     if not matches:
@@ -260,8 +297,7 @@ def delete_monitor(goal: str) -> str:
     if not monitors:
         return "You don't have any monitors to delete."
 
-    goal_lower = goal.lower()
-    if "all" in goal_lower:
+    if _means_all(goal):
         count = len(monitors)
         for m in monitors:
             repo.delete(m["id"])

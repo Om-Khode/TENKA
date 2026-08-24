@@ -275,7 +275,20 @@ async def test_foreign_answer_skip_does_not_claim_a_state_change(
         "the skipped turn reached the LLM canary instead of short-circuiting")
     assert _saved_security_skip(out) is True, (
         "the turn was not flagged for the session-snapshot backstop")
-    assert out.spoken == [main_mod._SECURITY_SKIP_FALLBACK], out.spoken
+
+    # Recorded, not spoken. This line used to assert the opposite --
+    # `out.spoken == [_SECURITY_SKIP_FALLBACK]` -- and it was pinning a defect
+    # rather than a decision: `source` here is "studio", and the response path
+    # asked about the source nowhere, so every remote answer came out of the
+    # speakers on the operator's machine. Live testing caught it, this
+    # assertion had been holding it in place, and the control for the other
+    # direction (a local turn still speaks) is in
+    # `tests/test_remote_turns_are_not_spoken.py`, both response paths.
+    assert out.spoken == [], (
+        f"a foreign caller's skipped turn was spoken aloud: {out.spoken}")
+    assert _saved_response(out) == main_mod._SECURITY_SKIP_FALLBACK, (
+        "the fallback stopped being recorded -- Studio settles a turn by "
+        "re-reading the transcript, so unspoken and unsaved is a lost turn")
 
 
 @pytest.mark.asyncio
