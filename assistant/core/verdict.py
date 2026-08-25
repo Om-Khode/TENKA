@@ -56,6 +56,14 @@ class ObservationKind(str, enum.Enum):
     EXPECTED_ABSENT = "expected_absent"
     NOTHING_CHANGED = "nothing_changed"
     ERROR = "error"
+    # P5. Every member above reports something that was *seen*, and
+    # `NOTHING_CHANGED` is a claim as strong as any of them -- someone looked,
+    # and the state was the same. There was no way to say the weaker and much
+    # more common thing: nobody looked, so there is nothing to report. An
+    # `UNVERIFIED` outcome needs exactly that, and forcing it into
+    # `NOTHING_CHANGED` would turn "no evidence" into "evidence of no effect",
+    # which is the inversion §6 exists to prevent.
+    NOT_OBSERVED = "not_observed"
 
 
 @dataclass(frozen=True)

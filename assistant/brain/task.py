@@ -178,6 +178,12 @@ class TaskStep:
     affordance: str = ""
     operation: str = ""
     parameters: dict = field(default_factory=dict)
+    # Mirrors `Task.constraints`, and separate from `parameters` for the same
+    # reason: a value the user pinned must not be widened by whatever fills in
+    # the rest. The Executor lays these over `parameters` last and verbatim, so
+    # "mobile as 99999" reaches the adapter as 99999 whatever a planner or an
+    # adapter thought would be more plausible.
+    constraints: dict = field(default_factory=dict)
     depends_on: tuple[int, ...] = ()
     condition: str | None = None
     status: TaskStatus = TaskStatus.PENDING
@@ -190,8 +196,18 @@ class TaskStep:
 class Task:
     """What TENKA has committed to accomplishing, and on whose authority.
 
-    Build with `Task.create()` — the bare constructor cannot check anything,
-    and every field that must be checked is checked there.
+    Build with `brain.authority.create_task()` — the bare constructor cannot
+    check anything, and the two fields that must be checked are checked there:
+    it refuses when no grants are installed for the turn and when no principal
+    is, because a Task with no owner can be resumed by nobody and reads as a
+    timeout rather than as the bug it is.
+
+    This said `Task.create()` for three phases and no such method ever
+    existed, which is worth more than a correction: the docstring was the only
+    thing pointing at the factory, so anyone following it fell back to the bare
+    constructor it warns against. The two remaining direct constructions are
+    deliberate -- `authority.create_task` itself, and `storage/repos/task.py`
+    rehydrating a row that was already checked when it was first built.
     """
 
     task_id: str

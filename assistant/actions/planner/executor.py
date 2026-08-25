@@ -9,6 +9,8 @@ snapshotting for suspension detection.
 import logging
 import re
 
+from ...core.step_params import build_step_params
+
 logger = logging.getLogger("planner")
 
 _STEP_REF_RE = re.compile(r'\$step_(\d+)')
@@ -179,7 +181,25 @@ async def execute_step(
 
             _entry = TOOL_MANIFEST.get(step.tool, {})
             param_key = _entry.get("param_key", "goal")
-            params = {param_key: resolved_goal}
+
+            # P5. Built through the shared merge rather than as a bare dict, so
+            # the rule about pinned values has one implementation. `brain`'s
+            # Executor calls the same function -- it cannot be called from
+            # there, or this from it, because `brain` sits above `actions` and
+            # an import either way would be the fifth layer inversion.
+            #
+            # Behaviour is unchanged today: a `PlanStep` carries no structured
+            # parameters and no constraints, so this reduces to
+            # `{param_key: resolved_goal}` exactly as before. What it buys is
+            # that the moment a step *does* carry either, the pin wins and the
+            # sentence stops being the meaning -- without a second merge
+            # written here by someone who did not read the first one.
+            params = build_step_params(
+                getattr(step, "parameters", None),
+                getattr(step, "constraints", None),
+                resolved_goal,
+                goal_key=param_key,
+            )
 
             # Prior-step output travels in its own param, never merged back
             # into the instruction. Omitted entirely when there is none, so a
@@ -201,7 +221,24 @@ async def execute_step(
                 params["_planner_goal"] = _pg[:_MAX_PLANNER_GOAL_CHARS]
 
             if step.tool == "create_note":
-                params = _extract_note_params(resolved_goal)
+                # Re-parses the sentence into `title` and `content`, which is
+                # the re-interpretation P5 is aimed at -- and it *replaced* the
+                # merged dict, so a value the user pinned for this step was
+                # discarded without a word. Layered under the merge instead:
+                # the derived fields are a base, and anything the step states
+                # or the user pinned still wins.
+                #
+                # The re-parse itself stays until the planner emits `title` and
+                # `content` as structured fields at plan time. That is planner
+                # work with a live test attached, not something to fold into
+                # the phase that built the seam.
+                params = build_step_params(
+                    {**_extract_note_params(resolved_goal),
+                     **(getattr(step, "parameters", None) or {})},
+                    getattr(step, "constraints", None),
+                    goal="",
+                    goal_key=param_key,
+                )
 
             # Snapshot pending states BEFORE the step runs
             pending_before = _snapshot_pending_states()
