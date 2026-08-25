@@ -173,3 +173,86 @@ def test_a_declined_utterance_returns_none_not_unknown():
             f"{text!r} produced {r.intent!r} instead of None. A decline must be "
             "an absence of a result, not a result meaning 'nothing'."
         )
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# `create_note` — the fast path had the structure and threw it away
+#
+# Live test, 2026-08-25. "make a note called groceries saying milk and eggs"
+# hit `_NOTE_RE`, whose single capture group took everything after the opener,
+# so the note was written to `untitled.txt` with the contents:
+#
+#     called groceries saying milk and eggs
+#
+# The title was in the sentence. The words describing it became the body. Both
+# halves of this section matter: the titled form must be parsed, and the
+# title-with-no-body form must be *declined* -- a fast path never asks a second
+# opinion, so an over-claim there is final.
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestNoteTitleExtraction:
+
+    @pytest.mark.parametrize("text,title,content", [
+        ("make a note called groceries saying milk and eggs",
+         "groceries", "milk and eggs"),
+        ("make a note titled shopping with bread and jam",
+         "shopping", "bread and jam"),
+        ("create a note named ideas containing build a robot",
+         "ideas", "build a robot"),
+        ("make a note called wifi that says the password is hunter2",
+         "wifi", "the password is hunter2"),
+    ])
+    def test_a_named_note_keeps_its_name(self, text, title, content):
+        from assistant.regex_router import pre_route
+
+        result = pre_route(text)
+        assert result is not None, f"the fast path stopped claiming {text!r}"
+        assert result.intent == "create_note"
+        assert result.params.get("title") == title
+        assert result.params.get("content") == content
+        assert "called" not in result.params["content"]
+        assert "saying" not in result.params["content"]
+
+    @pytest.mark.parametrize("text", [
+        "make a note called groceries",
+        "create a note titled shopping",
+        "make a note named ideas",
+    ])
+    def test_a_name_with_no_body_is_left_to_the_classifier(self, text):
+        """**The over-claim half.** The old pattern matched these too and
+        stored "called groceries" as the note's contents. Declining costs one
+        LLM call; claiming costs a wrong file that persists."""
+        from assistant.regex_router import pre_route
+
+        assert pre_route(text) is None, (
+            f"{text!r} names a note but gives it nothing to hold -- the fast "
+            "path must not guess what the body was")
+
+    @pytest.mark.parametrize("text,content", [
+        ("note that the wifi password is hunter2",
+         "the wifi password is hunter2"),
+        ("write down that I owe Sam 20 quid", "I owe Sam 20 quid"),
+        ("make a note that milk and eggs are needed",
+         "milk and eggs are needed"),
+    ])
+    def test_an_untitled_note_still_works(self, text, content):
+        """The control. A pattern that only handled the titled form would
+        break every note anyone has ever dictated to her."""
+        from assistant.regex_router import pre_route
+
+        result = pre_route(text)
+        assert result is not None, f"the fast path stopped claiming {text!r}"
+        assert result.intent == "create_note"
+        assert result.params["content"] == content
+        assert "title" not in result.params, (
+            "an untitled note was given an invented title")
+
+    def test_the_title_stops_at_the_first_body_marker(self):
+        """Non-greedy on purpose: a title is short and a body is not. Greedy
+        matching puts most of the body in the filename."""
+        from assistant.regex_router import pre_route
+
+        result = pre_route("make a note called plan saying call Sam about the "
+                           "thing he was saying yesterday")
+        assert result.params["title"] == "plan"
+        assert result.params["content"].startswith("call Sam")
