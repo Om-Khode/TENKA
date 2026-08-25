@@ -113,15 +113,95 @@ _FALLBACK = (
 )
 
 
-def claims_an_effect(text: str) -> bool:
-    """Does `text` assert, in the perfect or past tense, that TENKA changed
-    something outside the conversation?"""
+# ─── what each intent can actually produce ───────────────────────────────────
+#
+# The first version of this gate asked "did any handler run", and that was the
+# wrong question. It caught the `unknown` turn and missed this one:
+#
+#     22:01:02  Intent: web_search      <- a handler ran
+#     22:01:05  "It's currently 19.3C ... I've made a note for you called
+#                'groceries' with milk in it."
+#
+# `web_search` ran, searched, and answered. It cannot write a note, and there
+# was no note -- `groceries.txt` was zero bytes at that moment. A handler
+# running is not evidence for whatever the reply then claims; the right
+# question is whether *this* intent could have produced *this* artifact.
+#
+# An intent absent from the table produces nothing, so every effect claim in
+# its reply is stripped. That is the fail-closed direction and it covers the
+# large majority: `web_search`, `get_time`, `memory_query`, `read_screen`,
+# `camera_look`, `small_talk`, `unknown`.
+_INTENT_ARTIFACTS: "dict[str, frozenset[str]]" = {
+    "create_note": frozenset({"note", "notes", "file", "files"}),
+    "file_task": frozenset({
+        "file", "files", "folder", "directory", "document", "note", "notes"}),
+    "set_reminder": frozenset({"reminder", "reminders", "alarm"}),
+    "cancel_reminder": frozenset({"reminder", "reminders", "alarm"}),
+    "manage_schedule": frozenset({
+        "schedule", "schedules", "task", "tasks", "reminder", "reminders"}),
+    "manage_monitor": frozenset({"monitor", "monitors", "event"}),
+    "manage_shortcut": frozenset({"shortcut", "shortcuts"}),
+    "manage_procedure": frozenset({"procedure", "procedures", "task", "tasks"}),
+    "manage_backup": frozenset({"backup", "backups", "file", "files"}),
+    "store_memory": frozenset({"memory", "fact", "entry", "record"}),
+    "forget_memory": frozenset({"memory", "fact", "entry", "record"}),
+    "open_browser": frozenset({
+        "tab", "window", "browser", "app", "application", "program"}),
+    "browse_url": frozenset({"tab", "window", "browser", "page"}),
+    "create_shortcut": frozenset({"shortcut", "shortcuts"}),
+    "start_recording": frozenset({"recording", "record"}),
+    "stop_recording": frozenset({"recording", "record"}),
+    "meet_face": frozenset({"face", "record", "entry"}),
+    "forget_face": frozenset({"face", "record", "entry"}),
+    "enroll_voice": frozenset({"voiceprint", "record", "entry"}),
+    "forget_voice": frozenset({"voiceprint", "record", "entry"}),
+}
+
+# Intents whose whole job is "do the thing the user described", where the set
+# of possible artifacts is the desktop. Filtering these would muzzle real work
+# -- a `computer_task` that genuinely saved a file must be free to say so --
+# and there is no table that could enumerate what they might touch.
+_UNBOUNDED_INTENTS: frozenset[str] = frozenset({
+    "computer_task", "code_executor", "planner", "find_and_click",
+    "manifest_dispatch",
+})
+
+
+def artifacts_for(intent: str) -> "frozenset[str]":
+    """What `intent` can produce. Empty for anything unlisted."""
+    return _INTENT_ARTIFACTS.get(intent or "", frozenset())
+
+
+def claims_an_effect(text: str, intent: str = "") -> bool:
+    """Does `text` assert an effect this `intent` could not have produced?
+
+    With no `intent`, asks the weaker question -- does it claim an effect at
+    all -- which is what the tests for the pattern itself want.
+    """
     if not text:
         return False
-    return any(_CLAIM.search(s) for s in _SENTENCE.findall(text))
+    if intent in _UNBOUNDED_INTENTS:
+        return False
+    allowed = artifacts_for(intent)
+    return any(_unbacked(s, allowed) for s in _SENTENCE.findall(text))
 
 
-def strip_effect_claims(text: str) -> str:
+def _unbacked(sentence: str, allowed: "frozenset[str]") -> bool:
+    """Is this sentence an effect claim about an artifact `allowed` lacks?"""
+    match = _CLAIM.search(sentence)
+    if not match:
+        return False
+    if not allowed:
+        return True
+    # The artifact is the last group the pattern matched; re-read it from the
+    # matched text rather than adding a capture group, so the pattern stays one
+    # expression and there is no second place to keep the noun list in sync.
+    found = match.group(0).lower()
+    return not any(re.search(r"\b" + re.escape(a) + r"\b", found)
+                   for a in allowed)
+
+
+def strip_effect_claims(text: str, intent: str = "") -> str:
     """Remove sentences claiming an effect, and keep everything else.
 
     Called only for a turn that dispatched no handler, so there is no effect
@@ -130,14 +210,17 @@ def strip_effect_claims(text: str) -> str:
     """
     if not text or not text.strip():
         return text
+    if intent in _UNBOUNDED_INTENTS:
+        return text
 
+    allowed = artifacts_for(intent)
     kept: list[str] = []
     dropped: list[str] = []
     for match in _SENTENCE.finditer(text):
         sentence = match.group(0)
         if not sentence.strip():
             continue
-        if _CLAIM.search(sentence):
+        if _unbacked(sentence, allowed):
             dropped.append(sentence.strip())
         else:
             kept.append(sentence)

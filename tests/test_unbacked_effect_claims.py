@@ -196,35 +196,75 @@ def test_the_filter_is_applied_on_both_response_paths():
         f"expected the filter on both response paths, found {len(calls)}")
 
 
-def test_the_filter_only_runs_where_nothing_was_dispatched():
-    """**The gate that keeps it honest.** A real `create_note` turn wrote a
-    real file and must be free to say so. Applying this everywhere would make
-    her deny her own successful work, which is a worse failure than the one
-    being fixed."""
-    src = _MAIN_PY.read_text(encoding="utf-8")
-    tree = ast.parse(src)
+def test_the_filter_is_told_which_intent_ran():
+    """**The gate that got this wrong once.** The first version asked "did any
+    handler run" and passed no intent. That caught the `unknown` turn, which
+    ran nothing, and missed `web_search` -- which ran, searched, answered, and
+    then said it had written a note it has no way to write."""
+    tree = ast.parse(_MAIN_PY.read_text(encoding="utf-8"))
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "id", None) == "strip_effect_claims"]
+    assert len(calls) == 2, (
+        f"expected the filter on both response paths, found {len(calls)}")
+    for call in calls:
+        assert len(call.args) == 2, (
+            "the filter is called without an intent, so it cannot tell a "
+            "`create_note` turn's true report from a `web_search` turn's "
+            "invention")
+        assert "intent" in ast.unparse(call.args[1])
 
-    guarded = 0
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        if "_NO_DISPATCH_INTENTS" not in ast.unparse(node.test):
-            continue
-        if "strip_effect_claims" in ast.unparse(node):
-            guarded += 1
-    assert guarded == 2, (
-        f"{guarded} of the two filter sites are gated on _NO_DISPATCH_INTENTS")
+
+# ─── the gate: what this intent could have produced ──────────────────────────
+
+_WEB_SEARCH_CLAIM = ("It's currently 19.3C in Pune. I've made a note for you "
+                     "called \"groceries\" with milk in it.")
 
 
-def test_the_no_dispatch_set_matches_the_branch_that_skips_dispatch():
-    """The set and the conversational fork must name the same intents. If they
-    drift, the filter either misses a branch that composes claims or muzzles
-    one that ran a handler."""
-    from assistant import main as main_mod
+def test_a_handler_that_ran_may_still_not_claim_what_it_cannot_do():
+    """The live one. `web_search` ran and answered; the note it described did
+    not exist, and `groceries.txt` was zero bytes at that moment."""
+    out = strip_effect_claims(_WEB_SEARCH_CLAIM, "web_search")
+    assert "19.3C in Pune" in out, "the real answer was collateral"
+    assert "made a note" not in out
 
-    assert main_mod._NO_DISPATCH_INTENTS == frozenset({"small_talk", "unknown"})
 
-    src = _MAIN_PY.read_text(encoding="utf-8")
-    assert 'if intent_result.intent in ("small_talk", "unknown"):' in src, (
-        "the conversational fork changed shape; re-check _NO_DISPATCH_INTENTS "
-        "against it rather than assuming the two still agree")
+@pytest.mark.parametrize("intent,text", [
+    ("create_note", "I've created the note called groceries for you."),
+    ("manage_monitor", "I've paused the monitor."),
+    ("set_reminder", "I've set a reminder for 9pm."),
+    ("manage_backup", "I've made a backup."),
+    ("file_task", "I've deleted the file."),
+    ("store_memory", "I've saved that fact."),
+])
+def test_an_intent_may_claim_what_it_actually_produces(intent, text):
+    """**The direction that makes this useless if broken.** A handler that did
+    the work must be free to report it -- muzzling a real success is worse than
+    the invention being removed."""
+    assert not claims_an_effect(text, intent), text
+    assert strip_effect_claims(text, intent) == text
+
+
+@pytest.mark.parametrize("intent", ["web_search", "get_time", "memory_query",
+                                    "read_screen", "camera_look"])
+def test_an_intent_that_produces_nothing_may_claim_nothing(intent):
+    """Fail-closed by default: an intent absent from the table produces no
+    artifacts, so every effect claim in its reply goes."""
+    assert claims_an_effect("I've created the note.", intent)
+
+
+def test_the_wrong_artifact_is_still_caught():
+    """`manage_monitor` can pause a monitor. It cannot write a note, and the
+    table is per-artifact rather than per-intent-is-trusted."""
+    assert claims_an_effect("I've saved that note for you.", "manage_monitor")
+    assert not claims_an_effect("I've paused that monitor.", "manage_monitor")
+
+
+@pytest.mark.parametrize("intent", ["computer_task", "code_executor",
+                                    "planner", "find_and_click"])
+def test_an_unbounded_intent_is_left_alone(intent):
+    """These do whatever the user described, and no table could enumerate what
+    they might touch. A `computer_task` that really saved a file must say so."""
+    text = "I've saved the file to your desktop."
+    assert not claims_an_effect(text, intent)
+    assert strip_effect_claims(text, intent) is text

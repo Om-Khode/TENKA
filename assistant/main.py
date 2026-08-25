@@ -958,13 +958,6 @@ def _match_batch_teach(text: str) -> tuple[str, str] | None:
 
 _LOCAL_SOURCES: frozenset[str] = frozenset({"stt", "chat"})
 
-# Intents whose branch reaches the LLM and dispatches no handler. A reply from
-# one of them claiming a completed effect is false by construction: there is no
-# tool behind the branch for it to be true about. Kept beside the branch
-# condition at the conversational fork rather than derived from the capability
-# table, because what matters here is "did anything run", not "was it allowed
-# to" -- a permitted intent that never dispatched is exactly the case.
-_NO_DISPATCH_INTENTS: frozenset[str] = frozenset({"small_talk", "unknown"})
 """Sources that mean "someone is physically at this keyboard or microphone".
 
 Spelled as a literal allow-list, never as `!= "studio"`. Two things hang off
@@ -2332,22 +2325,20 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
             except Exception as e:      # never lose a reply to the filter
                 logger.debug(f"[IDENTITY] filter skipped: {e}")
 
-            # And the claim filter. `small_talk` and `unknown` dispatch no
-            # handler, by design -- so a sentence in this reply saying she
-            # created, saved, deleted or sent something is false by
-            # construction, not merely unlikely. Live testing caught two in one
-            # exchange, including "I've created a new note called 'Pune
-            # Weather'" on an `unknown` turn that ran nothing at all.
-            #
-            # Gated on the intent rather than applied everywhere: a real
-            # `create_note` turn that wrote a real file must be free to say so,
-            # and that turn never reaches this branch.
-            if intent_result.intent in _NO_DISPATCH_INTENTS:
-                try:
-                    from .core.claims import strip_effect_claims
-                    response_text = strip_effect_claims(response_text)
-                except Exception as e:  # never lose a reply to the filter
-                    logger.debug(f"[CLAIMS] filter skipped: {e}")
+            # And the claim filter. A reply may claim an effect only if a
+            # handler capable of it ran. Live testing caught three, and the
+            # second gate is the one that catches all three: asking "did any
+            # handler run" caught the `unknown` turn that ran nothing, and
+            # missed `web_search` inventing "I've made a note for you called
+            # 'groceries'" -- a handler ran, searched, answered, and cannot
+            # write a note. `strip_effect_claims` takes the intent and keeps
+            # only claims that intent could have produced.
+            try:
+                from .core.claims import strip_effect_claims
+                response_text = strip_effect_claims(
+                    response_text, intent_result.intent)
+            except Exception as e:  # never lose a reply to the filter
+                logger.debug(f"[CLAIMS] filter skipped: {e}")
 
             logger.info(f'Response: "{response_text}"')
 
@@ -2555,22 +2546,15 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                 except Exception as e:
                     logger.debug(f"[IDENTITY] filter skipped: {e}")
 
-                # And the claim filter. `small_talk` and `unknown` dispatch no
-                # handler, by design -- so a sentence in this reply saying she
-                # created, saved, deleted or sent something is false by
-                # construction, not merely unlikely. Live testing caught two in one
-                # exchange, including "I've created a new note called 'Pune
-                # Weather'" on an `unknown` turn that ran nothing at all.
-                #
-                # Gated on the intent rather than applied everywhere: a real
-                # `create_note` turn that wrote a real file must be free to say so,
-                # and that turn never reaches this branch.
-                if intent_result.intent in _NO_DISPATCH_INTENTS:
-                    try:
-                        from .core.claims import strip_effect_claims
-                        response_text = strip_effect_claims(response_text)
-                    except Exception as e:  # never lose a reply to the filter
-                        logger.debug(f"[CLAIMS] filter skipped: {e}")
+                # And the claim filter. A reply may claim an effect only if a
+                # handler capable of it ran -- see the non-streaming path
+                # above for the three live claims this closes.
+                try:
+                    from .core.claims import strip_effect_claims
+                    response_text = strip_effect_claims(
+                        response_text, intent_result.intent)
+                except Exception as e:  # never lose a reply to the filter
+                    logger.debug(f"[CLAIMS] filter skipped: {e}")
 
                 logger.info(f'Response: "{response_text}"')
                 _save_turn(response_text)
