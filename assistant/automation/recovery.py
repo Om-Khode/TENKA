@@ -456,6 +456,18 @@ async def attempt_recovery(
     and say which one, because "I could not tell" and "it did not work" are
     different things to tell someone.
     """
+    # Telemetry, best-effort and never load-bearing: an observability write
+    # must not be able to fail a turn. The tracker is a contextvar, so a call
+    # six frames below the turn loop reaches the right one without threading a
+    # parameter through every signature in between.
+    try:
+        from ..telemetry import get_current_tracker
+        _tracker = get_current_tracker()
+        if _tracker is not None:
+            _tracker.note_recovery()
+    except Exception:
+        pass
+
     attempts: list[RecoveryAttempt] = []
     last_observation = getattr(verify_result, "observation", "") or ""
     # What to report if the attempt budget runs out. FAILED until a

@@ -69,7 +69,7 @@ class Database:
 
     # --- Schema versioning ---
 
-    _LATEST_VERSION = 22
+    _LATEST_VERSION = 23
 
     def _get_version(self) -> int:
         row = self._conn.execute(
@@ -119,6 +119,7 @@ class Database:
             20: self._migrate_v20,
             21: self._migrate_v21,
             22: self._migrate_v22,
+            23: self._migrate_v23,
         }
 
         for v in range(current + 1, self._LATEST_VERSION + 1):
@@ -808,6 +809,50 @@ class Database:
             )
         self._conn.commit()
 
+
+    def _migrate_v23(self) -> None:
+        """V23: four telemetry columns that answer §15's O2 questions.
+
+        Added because the six questions O2 names have to be answerable *by
+        query*, without reading source. Three of them were not:
+
+            why did she call a model      -> `llm_purposes`
+            why did planning happen       -> `replan_count`
+            why did execution fail        -> `recovery_count`
+            why did she report success    -> `verification_tiers`
+
+        **Four columns, not the ten §15 lists**, and the omission is the
+        phase's own rule rather than an oversight: *a field that is always null
+        is not observability*. `task_id`, `step_id`, `affordance`, `operation`
+        and `final_task_status` all need a Task to exist per turn, and nothing
+        creates one -- `brain/authority.py:create_task` has no caller in
+        `assistant/` (P5). `context_bytes_by_profile` needs the Context Builder
+        of section 12, which is not built. Adding six columns that can only
+        ever be NULL would make the schema *look* like it answers questions it
+        cannot, which is worse than a schema that visibly does not.
+
+        Counters are stored as JSON objects rather than as separate columns for
+        the same reason `llm_providers_used` is: the key set is open. A new
+        verification tier or a new `task_type` must not need a migration.
+        """
+        for column, sql_type in (
+            ("llm_purposes", "TEXT"),
+            ("replan_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("recovery_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("verification_tiers", "TEXT"),
+        ):
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE interaction_events ADD COLUMN "
+                    f"{column} {sql_type}"
+                )
+            except Exception as e:
+                # An existing column is the expected outcome of a re-run, and a
+                # migration that cannot be re-run is a migration that cannot be
+                # recovered from a half-applied state.
+                if "duplicate column" not in str(e).lower():
+                    raise
+        self._conn.commit()
 
     def _migrate_v22(self) -> None:
         """V22: tasks and task_steps.

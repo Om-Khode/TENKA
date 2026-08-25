@@ -38,6 +38,12 @@ class LLMResult:
     tokens_out: int | None
     latency_ms: float
     fallback_depth: int
+    # Which task_type asked for this call. Already chosen by every caller and
+    # already used to pick the model (`TASK_MODEL_MAP`), it was simply never
+    # recorded -- so "why did she call a model" could be answered for the
+    # *count* and not for the *reason*. Defaulted so the ~60 construction sites
+    # that do not care stay untouched.
+    task_type: str = "default"
 
 
 class StreamingLLMResult:
@@ -230,7 +236,7 @@ async def get_llm_response(
                 text=result.text, provider=preferred_provider, model=preferred_model,
                 tokens_in=result.tokens_in, tokens_out=result.tokens_out,
                 latency_ms=(_time_mod.monotonic() - _call_start) * 1000,
-                fallback_depth=_depth,
+                fallback_depth=_depth, task_type=task_type,
             )
             try:
                 from ..telemetry import get_current_tracker
@@ -268,7 +274,7 @@ async def get_llm_response(
                 text=result.text, provider=name, model=prov_entry.get("model", "unknown"),
                 tokens_in=result.tokens_in, tokens_out=result.tokens_out,
                 latency_ms=(_time_mod.monotonic() - _call_start) * 1000,
-                fallback_depth=_depth,
+                fallback_depth=_depth, task_type=task_type,
             )
             try:
                 from ..telemetry import get_current_tracker
@@ -288,7 +294,7 @@ async def get_llm_response(
         text="__LLM_UNAVAILABLE__", provider="none", model="none",
         tokens_in=None, tokens_out=None,
         latency_ms=(_time_mod.monotonic() - _call_start) * 1000,
-        fallback_depth=_depth,
+        fallback_depth=_depth, task_type=task_type,
     )
 
 

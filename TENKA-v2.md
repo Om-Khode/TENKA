@@ -2009,6 +2009,15 @@ W4's demonstration: the *absence* handling is exercised by a real path, not by a
 deleted. A speculative abstraction with no consumer is forbidden by §23, and that applies
 to this document's own proposals.
 
+> **DOES NOT SHIP — decided 2026-08-25.** W4 asks for a real consumer of the
+> *absence*, and there is none. `brain/` holds `turn.py`, `task.py`,
+> `authority.py` and `executor.py`; not one of them consults world state,
+> optional or otherwise, and nothing anywhere degrades when it is missing.
+> Building the Protocol now would be exactly the speculative abstraction W4
+> was written to pre-empt — the phase asked the question honestly and the
+> answer came back no. Revisit when something actually wants a snapshot; the
+> argument in §14 is worth keeping for that day.
+
 ---
 
 ### P16 — Git development awareness (optional)

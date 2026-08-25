@@ -40,6 +40,10 @@ class TelemetryRepo:
         vision_calls_count: int,
         llm_providers_used: str | None = None,
         llm_models_used: str | None = None,
+        llm_purposes: str | None = None,
+        replan_count: int = 0,
+        recovery_count: int = 0,
+        verification_tiers: str | None = None,
     ) -> int:
         cursor = self._db.execute(
             "INSERT INTO interaction_events ("
@@ -50,8 +54,10 @@ class TelemetryRepo:
             "  latency_action_ms, latency_tts_ms,"
             "  llm_calls_count, llm_tokens_in, llm_tokens_out,"
             "  fallback_chain_depth, vision_calls_count,"
-            "  llm_providers_used, llm_models_used"
-            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  llm_providers_used, llm_models_used,"
+            "  llm_purposes, replan_count, recovery_count, verification_tiers"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            "          ?, ?, ?, ?, ?, ?)",
             (
                 # transcript is redacted at the write, not the read: it stores the
                 # raw utterance, and a credential pasted into the chat used to land
@@ -66,6 +72,7 @@ class TelemetryRepo:
                 llm_calls_count, llm_tokens_in, llm_tokens_out,
                 fallback_chain_depth, vision_calls_count,
                 llm_providers_used, llm_models_used,
+                llm_purposes, replan_count, recovery_count, verification_tiers,
             ),
         )
         self._db.commit()
