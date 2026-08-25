@@ -72,10 +72,17 @@ def init_tts() -> bool:
 
         return True
 
-    except ImportError:
+    except ImportError as e:
+        # Reported as an absence for as long as this handler existed, and on
+        # 2026-08-25 that was wrong: `kokoro` was installed and `torch\_C.pyd`
+        # had been blocked by Windows Smart App Control, so the log told the
+        # operator to install a package that was already there. Kokoro is the
+        # voice -- when this fires TENKA starts mute -- so the line has to name
+        # the real cause.
+        from ...core.import_diagnostics import describe_import_failure
         logger.error(
-            "[tts] Kokoro initialization failed: kokoro not installed "
-            "— pip install kokoro"
+            "[tts] Kokoro initialization failed: %s",
+            describe_import_failure(e, "kokoro", "torch"),
         )
         return False
     except Exception as e:

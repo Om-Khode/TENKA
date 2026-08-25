@@ -22,8 +22,16 @@ try:
     import faiss
     from sentence_transformers import SentenceTransformer
     HAS_VECTOR_DEPS = True
-except ImportError:
+    VECTOR_DEPS_ERROR = ""
+except ImportError as _e:
     HAS_VECTOR_DEPS = False
+    # Kept as text rather than re-raised: the degradation is deliberate and
+    # keyword search still works. What was not deliberate is the old message
+    # calling this "not found" -- a blocked native extension is not a missing
+    # package, and the two want different fixes from the operator.
+    from ..core.import_diagnostics import describe_import_failure as _describe
+    VECTOR_DEPS_ERROR = _describe(_e, "faiss-cpu", "sentence-transformers",
+                                  "torch")
 
 from ..db import Database
 
@@ -192,6 +200,8 @@ class MemoryRepo:
 
     def init_vector_store(self) -> None:
         if not HAS_VECTOR_DEPS:
+            logger.warning("[MEMORY] Vector search disabled: %s",
+                           VECTOR_DEPS_ERROR)
             logger.warning(
                 "[MEMORY] Vector search dependencies (faiss, sentence-transformers) "
                 "not found. Vector search disabled."
