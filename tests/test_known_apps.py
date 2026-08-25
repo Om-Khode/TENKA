@@ -151,7 +151,14 @@ class TestDataIntegrity:
                 seen[alias] = name
 
     def test_categories_are_valid(self):
-        valid = {"music_app", "messaging_default", "email_app", "browser", "text_editor"}
+        # `canvas_app` arrived when nine brand names moved out of
+        # `automation/router.py`'s `_CANVAS_APP_RE` -- THE rule forbids a regex
+        # that mentions a brand, and a fact about an app belongs in this table.
+        # The category is not "what the app is for" but "what it costs the
+        # automation stack": a canvas exposes no accessible tree, so a step
+        # aimed at one has to go to the vision tier.
+        valid = {"music_app", "messaging_default", "email_app", "browser",
+                 "text_editor", "canvas_app"}
         for name, entry in KNOWN_APPS.items():
             assert entry.category in valid, (
                 f"{name} has unknown category '{entry.category}'"
