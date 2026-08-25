@@ -19,6 +19,7 @@ storage. A vocabulary that drags a dependency behind it is not one.
 from __future__ import annotations
 
 import enum
+from typing import Iterable
 from dataclasses import dataclass
 
 
@@ -95,3 +96,61 @@ class Verdict:
     observation: Observation
     tier: str = "code"            # pre | code | vision | skipped
     escalated: bool = False
+
+
+# ─── V4: how a whole task's outcome follows from its steps ───────────────────
+
+def roll_up(outcomes: "Iterable[Outcome]") -> Outcome:
+    """The outcome of a task made of steps with these outcomes.
+
+    §11.2's V4, in one place. It was in none: every `Outcome` in the tree was a
+    *step's*, and nothing combined them, so a task's honesty depended on
+    whoever summarised it that day. The rule the members already imply:
+
+        any FAILED           -> FAILED       positive evidence against
+        any UNSUPPORTED      -> UNSUPPORTED  a step had no route at all
+        any UNCERTAIN        -> UNCERTAIN    something ran and nothing decided
+        otherwise            -> SUCCEEDED    every step succeeded or was a
+                                             recorded choice not to look
+
+    **The precedence is the argument, not the implementation.** `FAILED` beats
+    `UNCERTAIN` because positive evidence against outranks no evidence either
+    way; there is no need to hedge about a step that demonstrably did not work.
+    `UNCERTAIN` beats `SUCCEEDED` because that is the whole point -- one step
+    nobody could confirm makes the task unconfirmed, and the alternative is the
+    behaviour §11 exists to remove.
+
+    **`UNVERIFIED` never lowers a task**, and that is V6 rather than an
+    oversight. It is the operator's recorded choice not to verify, or a step
+    with nothing to verify; treating it as doubt would make
+    `VERIFY_ENABLED=False` report "I couldn't confirm that" about everything,
+    which is the reason the fifth member exists at all.
+
+    An empty task is `UNVERIFIED`: no step ran, so nothing was confirmed and
+    nothing failed. Reporting `SUCCEEDED` for doing nothing is the same false
+    claim in a smaller package.
+    """
+    seen = set(outcomes)
+    if not seen:
+        return Outcome.UNVERIFIED
+    for outcome in (Outcome.FAILED, Outcome.UNSUPPORTED, Outcome.UNCERTAIN):
+        if outcome in seen:
+            return outcome
+    return Outcome.SUCCEEDED
+
+
+# ─── V8: the two that must never share a sentence ────────────────────────────
+
+def speaks_as_done(outcome: Outcome) -> bool:
+    """May a reply about this outcome simply say it is done?
+
+    `SUCCEEDED` and `UNVERIFIED` may. The second is the operator's own choice
+    not to check, and hedging about it would turn a setting they deliberately
+    switched off into a permanent apology.
+
+    `UNCERTAIN` may not, ever, and that is the rule this module exists for. A
+    function rather than a comparison at each call site, because six call sites
+    deciding for themselves what `ok` meant is the defect being replaced -- and
+    the same shape would return the moment two of them wrote the check by hand.
+    """
+    return outcome in (Outcome.SUCCEEDED, Outcome.UNVERIFIED)

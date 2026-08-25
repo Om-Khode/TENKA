@@ -248,6 +248,40 @@ class Task:
             )
         return replace(self, status=target)
 
+    def outcome(self) -> "Outcome":
+        """This task's outcome, from its steps. §11.2 V4.
+
+        Computed rather than stored, for the reason `requires()` is: a stored
+        answer can go stale against the steps it was derived from, and the one
+        thing a task's outcome must never be is out of date with what actually
+        happened.
+
+        A step with no verdict yet counts as **`UNCERTAIN`**, not `UNVERIFIED`,
+        and the difference is the whole point of the five-member ladder applied
+        one level down. `UNVERIFIED` means *nobody looked, and that was the
+        plan* -- the operator's recorded choice. A step that has not run is not
+        a choice about verification; it is work that has not happened, and
+        nothing confirms it.
+
+        The first draft used `UNVERIFIED` here and a task with one finished
+        step and one unrun step reported `SUCCEEDED`. That is a task claiming
+        it is done while half of it has not started, which is the same false
+        claim this phase exists to remove, arriving through the door marked
+        "not applicable".
+
+        A task with **no steps at all** is still `UNVERIFIED`: there was
+        nothing to do, nothing ran, and nothing is outstanding.
+        """
+        from ..core.verdict import Outcome as _Outcome, roll_up
+
+        if not self.steps:
+            return _Outcome.UNVERIFIED
+        return roll_up(
+            step.verdict.outcome if step.verdict is not None
+            else _Outcome.UNCERTAIN
+            for step in self.steps
+        )
+
     def requires(self) -> Capability:
         """What this Task costs, from the intent table.
 

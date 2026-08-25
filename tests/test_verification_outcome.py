@@ -266,3 +266,170 @@ def test_the_other_result_types_keep_their_booleans():
 
     assert HealResult(ok=True, tier=1).ok is True
     assert DispatchResult(ok=False).ok is False
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# V4 — a task is only as confirmed as its least confirmed step
+#
+# The rule existed in §11.2 and in no code. Every `Outcome` in the tree was a
+# *step's*, and nothing combined them, so what a whole task reported depended
+# on whoever summarised it. `roll_up` is that one place.
+# ═════════════════════════════════════════════════════════════════════════
+
+from assistant.core.verdict import roll_up, speaks_as_done  # noqa: E402
+
+
+def _v(outcome):
+    from assistant.core.verdict import Observation, ObservationKind, Verdict
+    return Verdict(outcome=outcome,
+                   observation=Observation(kind=ObservationKind.STATE_CHANGED))
+
+
+def _task(*outcomes):
+    from assistant.brain.task import Task, TaskStep
+    return Task(
+        task_id="t", intent="planner", principal="local", granted=frozenset(),
+        steps=tuple(
+            TaskStep(step_id=i, intent="x",
+                     verdict=None if o is None else _v(o))
+            for i, o in enumerate(outcomes, 1)
+        ),
+    )
+
+
+class TestV4TaskRollUp:
+
+    def test_one_uncertain_step_makes_the_task_uncertain(self):
+        """**The headline.** A task that reports success while one of its steps
+        could not be confirmed is the behaviour §11 exists to remove."""
+        assert roll_up([Outcome.SUCCEEDED, Outcome.UNCERTAIN,
+                        Outcome.SUCCEEDED]) is Outcome.UNCERTAIN
+        assert _task(Outcome.SUCCEEDED, Outcome.UNCERTAIN).outcome() \
+            is Outcome.UNCERTAIN
+
+    def test_unverified_steps_do_not_lower_a_task(self):
+        """V6, and the reason `UNVERIFIED` is a member at all. Treating the
+        operator's own choice not to verify as doubt would make
+        `VERIFY_ENABLED=False` apologise about everything, forever."""
+        assert roll_up([Outcome.SUCCEEDED,
+                        Outcome.UNVERIFIED]) is Outcome.SUCCEEDED
+        assert _task(Outcome.SUCCEEDED, Outcome.UNVERIFIED).outcome() \
+            is Outcome.SUCCEEDED
+
+    def test_all_unverified_is_still_not_uncertain(self):
+        assert roll_up([Outcome.UNVERIFIED,
+                        Outcome.UNVERIFIED]) is Outcome.SUCCEEDED
+
+    def test_a_failed_step_outranks_an_uncertain_one(self):
+        """Positive evidence against beats no evidence either way. There is
+        nothing to hedge about a step that demonstrably did not work."""
+        assert roll_up([Outcome.UNCERTAIN,
+                        Outcome.FAILED]) is Outcome.FAILED
+
+    def test_an_unsupported_step_is_not_reported_as_failure(self):
+        """The distinction P5 built: no route existed, so nothing was
+        attempted. A planner reading FAILED retries; one reading UNSUPPORTED
+        picks another tool."""
+        assert roll_up([Outcome.SUCCEEDED,
+                        Outcome.UNSUPPORTED]) is Outcome.UNSUPPORTED
+
+    def test_every_step_succeeding_succeeds(self):
+        """The control. A rollup that never returns SUCCEEDED satisfies every
+        test above and makes her incapable of reporting a finished job."""
+        assert roll_up([Outcome.SUCCEEDED] * 3) is Outcome.SUCCEEDED
+        assert _task(Outcome.SUCCEEDED, Outcome.SUCCEEDED).outcome() \
+            is Outcome.SUCCEEDED
+
+    def test_a_task_with_no_steps_is_unverified_not_succeeded(self):
+        """Doing nothing is not success. Reporting it as such is the same false
+        claim in a smaller package."""
+        assert roll_up([]) is Outcome.UNVERIFIED
+        assert _task().outcome() is Outcome.UNVERIFIED
+
+    def test_a_step_that_has_not_run_does_not_count_as_success(self):
+        """A half-finished task must not report a finished one. `verdict=None`
+        means the step has no evidence yet, which is `UNVERIFIED` -- honest,
+        and it keeps `roll_up` from promoting."""
+        # **From a green mutant.** The two cases below hold whether an unrun
+        # step reads as UNVERIFIED or as SUCCEEDED, because another step
+        # decides the answer in both. The distinguishing case is a task where
+        # the unrun step is the only evidence there is.
+        assert _task(None).outcome() is Outcome.UNCERTAIN, (
+            "a task whose only step never ran reported success")
+        assert _task(None, None).outcome() is Outcome.UNCERTAIN
+
+        # **This assertion found a bug in the first draft of `outcome()`.** It
+        # mapped an unrun step to UNVERIFIED, so a task with one finished step
+        # and one that had not started reported SUCCEEDED -- done, while half
+        # of it had not begun. `UNVERIFIED` is "nobody looked, and that was the
+        # plan"; an unrun step is not a decision about verification.
+        assert _task(Outcome.SUCCEEDED, None).outcome() is Outcome.UNCERTAIN, (
+            "a half-finished task reported success")
+        assert _task(Outcome.UNCERTAIN, None).outcome() is Outcome.UNCERTAIN
+        assert _task(Outcome.FAILED, None).outcome() is Outcome.FAILED
+
+    def test_the_task_outcome_is_computed_not_stored(self):
+        """A stored answer goes stale against the steps it came from, and the
+        one thing a task's outcome must never be is out of date with what
+        happened."""
+        from assistant.brain.task import Task
+        assert callable(Task.outcome)
+        assert "outcome" not in {f.name for f in
+                                 __import__("dataclasses").fields(Task)}
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# V8 — "done" and "I couldn't confirm that" are different sentences
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestV8SpokenDistinction:
+
+    def test_uncertain_never_speaks_as_done(self):
+        """The whole point of the phase, at the last layer. Everything else is
+        bookkeeping if this sentence comes out wrong."""
+        assert not speaks_as_done(Outcome.UNCERTAIN)
+
+    def test_unverified_speaks_plainly(self):
+        """V6 again at the response layer: the operator switched verification
+        off, and being told "I couldn't confirm that" about every single turn
+        is how the setting gets switched back on and the honesty lost."""
+        assert speaks_as_done(Outcome.UNVERIFIED)
+
+    def test_succeeded_speaks_plainly(self):
+        assert speaks_as_done(Outcome.SUCCEEDED)
+
+    @pytest.mark.parametrize("outcome", [Outcome.FAILED, Outcome.UNSUPPORTED])
+    def test_nothing_else_speaks_as_done(self, outcome):
+        assert not speaks_as_done(outcome)
+
+    def test_the_two_quiet_outcomes_are_not_the_same_answer(self):
+        """`UNVERIFIED` and `UNCERTAIN` both mean "no confirmation", and they
+        must never produce the same sentence -- one is a choice, the other is a
+        failure to find out."""
+        assert speaks_as_done(Outcome.UNVERIFIED)
+        assert not speaks_as_done(Outcome.UNCERTAIN)
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# V3 — verification fails open at the step level, never upward
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestV3FailOpenNotUpward:
+
+    def test_a_crashed_verification_does_not_block_the_task(self):
+        """The behaviour is kept and only the label is corrected: an
+        infrastructure fault must not stop execution. It becomes UNCERTAIN --
+        never SUCCEEDED, and never FAILED either, because nothing observed the
+        step failing."""
+        crashed = VerifyResult.crashed("boom")
+        assert crashed.outcome is Outcome.UNCERTAIN
+        assert crashed.outcome is not Outcome.FAILED
+        assert crashed.outcome is not Outcome.SUCCEEDED
+
+    def test_a_crash_makes_the_whole_task_uncertain(self):
+        """Failing open at the step must not become failing open at the task.
+        The doubt has to survive the rollup or the fail-open is just the old
+        `ok=True` with more steps."""
+        assert _task(Outcome.SUCCEEDED,
+                     VerifyResult.crashed("boom").outcome).outcome() \
+            is Outcome.UNCERTAIN

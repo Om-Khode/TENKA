@@ -1043,3 +1043,68 @@ keying the clamp on the permissive set reds three; making routing ignore provena
 **Not closed:** the prompt still asks the model for a confidence number, which is now
 ignored above the ceiling. Removing the field would be clearer than capping it, and belongs
 with the wider memory-provenance work in `TENKA-v2.md` §10.
+
+---
+
+## KI-33: ~~An uncertain verification read as success at the task level~~ FIXED
+
+**Priority:** Medium (honesty — she reported a finished job she could not confirm)
+**Effort:** Low — one rollup function and one predicate
+**Discovered:** 2026-08-22, auditing `VerifyResult` while writing `TENKA-v2.md`
+**Fixed:** 2026-08-25, TENKA-v2 phase P6
+
+**The defect.** KI-31 removed `VerifyResult.ok` and gave every *step* an
+explicit `Outcome`. Nothing combined them. A task made of steps had no outcome
+of its own, so what TENKA said about a multi-step job depended on whichever
+code path happened to summarise it — and the summary had no way to know that
+one step in the middle had come back `UNCERTAIN`.
+
+The step-level work was real and is what makes this fixable at all. The gap was
+that §11.2's V4 — *a task reaches `SUCCEEDED` only if every step is `SUCCEEDED`
+or `UNVERIFIED`* — was written down and never implemented.
+
+**The fix.** `core/verdict.py:roll_up()` is the one place a task's outcome
+follows from its steps, and `Task.outcome()` calls it. Precedence, and the
+argument for each:
+
+- `FAILED` outranks `UNCERTAIN` — positive evidence against beats no evidence
+  either way, and there is nothing to hedge about a step that demonstrably did
+  not work.
+- `UNCERTAIN` outranks `SUCCEEDED` — one step nobody could confirm makes the
+  task unconfirmed. This is the rule the whole phase exists for.
+- `UNVERIFIED` never lowers a task. It is the operator's recorded choice not to
+  verify, and treating it as doubt would make `VERIFY_ENABLED=False` apologise
+  about every turn forever — which is how the setting gets switched back on and
+  the honesty lost with it.
+
+`speaks_as_done()` carries V8: `SUCCEEDED` and `UNVERIFIED` may say "done";
+`UNCERTAIN` may not, ever. A function rather than a comparison per call site,
+because six call sites each deciding what `ok` meant is the defect being
+replaced.
+
+**A step that has not run counts as `UNCERTAIN`, not `UNVERIFIED`,** and the
+first draft got this wrong in a way its own test caught: a task with one
+finished step and one unstarted step reported `SUCCEEDED` — done, while half of
+it had not begun. `UNVERIFIED` means *nobody looked and that was the plan*; an
+unrun step is not a decision about verification.
+
+**Mutations, all red** (`tests/test_verification_outcome.py`):
+
+| Mutation | Reds |
+| --- | --- |
+| `ambiguous()` returns `SUCCEEDED` again | 3 |
+| `data.get("ok", True)` restored | 1 |
+| `UNCERTAIN` stops lowering a task | 3 |
+| `UNVERIFIED` starts lowering a task | 3 |
+| an empty task reports `SUCCEEDED` | 1 |
+| `UNCERTAIN` outranks `FAILED` | 1 |
+| `UNCERTAIN` speaks as done | 3 |
+| `UNVERIFIED` hedges | 2 |
+| an unrun step counts as `UNVERIFIED` | 1 |
+
+Two went green first. One anchored on the *docstring* line
+`ambiguous()  -> UNCERTAIN` rather than the constructor forty lines below it,
+so it mutated documentation — the fifth time this tree has been fooled by a
+sweep or a mutation reading prose. The other was a test passing for the wrong
+reason: two of its three cases held whether an unrun step read as `UNVERIFIED`
+or `SUCCEEDED`, because another step decided the answer in both.
