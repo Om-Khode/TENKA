@@ -74,6 +74,7 @@ from .da_handlers import (
     handle_browser_action, handle_app_action,
 )
 from .manifest_dispatch import handle_manifest_dispatch  # noqa: F401  (registers via decorator)
+from .self_knowledge import handle_self_knowledge  # noqa: F401  (registers via decorator)
 
 # --- Pending states ---
 # Each replaces a (_pending_X, _pending_X_ts, _X_TIMEOUT) triplet.

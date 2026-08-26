@@ -350,8 +350,12 @@ def test_the_word_capability_means_only_the_security_enum_in_brain():
     both, and that collision is what made an earlier plan look implementable
     while it proposed re-keying the only working security control in the tree.
     """
+    # `selfknowledge.py` is on the list because K4 is *about* capabilities:
+    # each fact class names the one that already governs the same information
+    # elsewhere. That is the enum, used for what the enum is for -- not the
+    # collision this rule exists to prevent.
     allowed_files = {"authority.py", "task.py", "affordance.py", "turn.py",
-                     "executor.py", "__init__.py"}
+                     "executor.py", "selfknowledge.py", "__init__.py"}
     for path in sorted(_BRAIN.glob("*.py")):
         body = "\n".join(
             line for line in path.read_text(encoding="utf-8").splitlines()

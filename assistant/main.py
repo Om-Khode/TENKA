@@ -3496,6 +3496,26 @@ async def async_main():
     from . import scheduler
     scheduler.start(loop=asyncio.get_running_loop())
 
+    # Self-knowledge: the facts live in `brain/`, the handler in `actions/`,
+    # and `actions` sits below `brain` -- so the reader is injected here for
+    # the same reason the event bus's dispatcher is. `main.py` owns both sides.
+    #
+    # Seeded first: `seed_from_handlers()` mirrors the handler table into the
+    # affordance registry, so "what can you do" answers from what actually has
+    # a handler rather than from `config.INTENTS`, which lists what she can be
+    # *asked* for -- including anything with nothing behind it.
+    try:
+        from .brain.affordance import seed_from_handlers
+        from .brain.selfknowledge import self_knowledge as _self_knowledge
+        from .actions.self_knowledge import set_reader as _set_sk_reader
+        _seeded = seed_from_handlers()
+        _set_sk_reader(_self_knowledge.answer)
+        logger.info("[SELF] %d affordances seeded from handlers", _seeded)
+    except Exception as e:
+        # Never fatal. Without it she answers "I don't have reliable
+        # information about that", which is the honest degradation.
+        logger.warning("[SELF] self-knowledge unavailable: %s", e)
+
     # event-driven monitors
     from .automation.event_bus import event_bus as _event_bus
     # Injected here, not imported there. `main.py` owns both sides: the event

@@ -315,6 +315,7 @@ INTENTS = [
     "forget_memory",
     "shutdown",
     "manifest_dispatch",  # synthetic intent fired by regex_router
+    "self_knowledge",     # what TENKA knows about her own implementation
 ]
 
 # System prompt for the intent-detection LLM call
@@ -337,6 +338,7 @@ TOP PRIORITY RULES (read first — these settle the common edge cases):
 11. IMPORTANT: "remember my X is Y" / "remember the X is Y" / "remember that X" → store_memory for a SINGLE fact. If the sentence contains multiple facts joined by "and"/"also"/"plus" (e.g. "remember X and Y", "remember X, also Y"), use planner instead — it will split into separate store_memory steps. NOT create_note, NOT manage_shortcut, NOT meet_face. Only use meet_face when the user is introducing themselves face-to-face ("this is Sarah", "I'm Alex"), not for "remember my name is X".
 12. "forget X" / "delete the fact about X" / "remove the memory of X" → forget_memory. User wants to delete a previously stored fact. NOT forget_face/forget_voice (those delete biometric data).
 13. "schedule X" / "every N minutes check X" / "daily at X" → manage_schedule (time-based, cron). "remind me X" → set_reminder (one-time alert). "when X happens do Y" / "skip songs that..." / "notify me when..." / "watch for..." → manage_monitor (event-driven, reacts to OS events like media changes or window focus).
+16. Questions about **TENKA herself** — "what can you do", "which model are you using", "what are you working on", "what are your limits" → self_knowledge. NOT small_talk: those answers come from her running state, and small_talk would have the model invent them. Questions about the world, however phrased, are still web_search or small_talk.
 15. "shut down" / "exit" / "quit" / "close yourself" / "go to sleep" addressed to YOU → shutdown (you exit; the machine keeps running). "shut down the computer / PC / laptop" → code_executor (the machine powers off). Read who the object is — these are different actions and one of them is not undoable.
 14. "back up my data" / "enable cloud backup" / "unlock backup" / "when was my last backup" / "restore from backup" → manage_backup. Distinct from manage_schedule (time-based recurring tasks) and manage_monitor (event-driven) — this is specifically about TENKA's own data durability.
 
@@ -377,6 +379,7 @@ store_memory        | content         | "remember my/the X is Y" — storing a f
 forget_memory       | content         | "forget about X" / "delete memory of X" — removing a stored fact (NOT forget_face/forget_voice)
 browser_cdp_setup   | mode            | configure browser --remote-debugging-port (setup/undo/preview)
 shutdown            | {}              | YOU exit ("shut down", "exit", "quit", "close yourself") — not the machine
+self_knowledge      | query           | questions about TENKA HERSELF: what she can do, which model she is using, what she is doing now, her own limits
 unknown             | {}              | truly unintelligible/empty input ONLY
 
 Param rules:
@@ -405,6 +408,8 @@ Few-shot (ambiguous cases):
   "back up now" → {"intent":"manage_backup","params":{"goal":"back up now"}}
   "remind me in 5 minutes to drink water" → {"intent":"set_reminder","params":{"goal":"remind me in 5 minutes to drink water"}}
   "close yourself" → {"intent":"shutdown","params":{}}
+  "what models are you using" → {"intent":"self_knowledge","params":{"query":"what models are you using"}}
+  "what can you actually do" → {"intent":"self_knowledge","params":{"query":"what can you actually do"}}
   "shut down my laptop" → {"intent":"code_executor","params":{"goal":"shut down my laptop"}}
 
 Output the JSON object only. Empty params → {}."""

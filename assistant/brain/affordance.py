@@ -145,3 +145,43 @@ class AffordanceRegistry(RegistryBase[Affordance]):
 # The one registry. Components self-register into it; nothing else constructs
 # an `AffordanceRegistry`, for the same reason there is one `tool_registry`.
 affordance_registry: AffordanceRegistry = AffordanceRegistry()
+
+
+def seed_from_handlers() -> int:
+    """Register one affordance per intent that actually has a handler.
+
+    §17.P3 asks for self-registration by existing components, and this is the
+    honest first form of it: `tool_registry` already knows which intents have a
+    handler, because each one registered itself with a decorator. Mirroring
+    that is a *true* statement about what TENKA can do -- unlike reading
+    `config.INTENTS`, which lists what she can be asked for, including things
+    with no handler behind them.
+
+    It is a floor, not the finished shape. Several affordances will eventually
+    share one intent and differ by `operation`; this gives one per intent, so
+    "what can you do" answers from live state instead of from nothing. A
+    handler-less intent is deliberately absent: claiming it would be exactly
+    the invented capability §13's K1 exists to prevent.
+
+    Idempotent, because `main.py` may call it after a reload and a duplicate
+    registration would otherwise raise.
+    """
+    from ..config import INTENTS
+    from .. import actions  # noqa: F401  -- importing registers the handlers
+    from ..actions.registry import tool_registry
+
+    added = 0
+    for intent in sorted(INTENTS):
+        if not tool_registry.has(intent):
+            continue
+        key = f"intent:{intent}"
+        if affordance_registry.has(key):
+            continue
+        affordance_registry.register(key, Affordance(
+            affordance_id=key,
+            intent=intent,
+            operation=intent,
+            description=f"Carried out by the {intent} handler.",
+        ))
+        added += 1
+    return added
