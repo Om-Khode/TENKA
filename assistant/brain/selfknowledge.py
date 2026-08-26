@@ -96,7 +96,13 @@ class Fact:
     key: str
     fact_class: FactClass
     description: str
-    read: Callable[[], object]
+    read: Callable[..., object]
+    # Whether `read` wants the asker's words. Most facts do not -- "which model
+    # are you using" has one answer. "How do you do X" has one per X, and
+    # without this the only honest reply was the whole list, which is what
+    # live testing produced: asked how she searches files, she recited every
+    # intent she has.
+    takes_query: bool = False
 
     def requires(self) -> Optional[Capability]:
         return REQUIRED_CAPABILITY[self.fact_class]
@@ -130,7 +136,8 @@ class SelfKnowledge:
 
     # ── the read path ──
 
-    def answer(self, key: str, granted: "frozenset[Capability] | None" = None):
+    def answer(self, key: str, granted: "frozenset[Capability] | None" = None,
+               query: str = ""):
         """The fact, or `UNAVAILABLE`. Never a guess, never a raise.
 
         `granted` is the turn's grant set. `None` means "nobody said", and is
@@ -151,7 +158,7 @@ class SelfKnowledge:
                 return UNAVAILABLE
 
         try:
-            value = fact.read()
+            value = fact.read(query) if fact.takes_query else fact.read()
         except Exception:
             # K2. A read that fails is an unavailable fact, not an opportunity
             # to describe what it would have said.
@@ -199,7 +206,71 @@ def _personality() -> str:
     return get_active_personality_id()
 
 
+def _mechanism(query: str = "") -> str:
+    """How a named capability is actually carried out.
+
+    §13.1: "How do you do X?" is answered from the affordance's declared
+    mechanism and adapter metadata, never from inference. The mechanism here is
+    the handler that is really registered for the intent -- its module, and
+    whether a regex fast path reaches it without a model call. Both are read
+    from the running process.
+
+    Returns "" when the question names no intent she has, which `answer()`
+    turns into the admission. Guessing which intent someone meant would be the
+    same failure as a resolver returning the closest affordance, except the
+    subject is herself and the asker has no way to check.
+    """
+    import inspect
+
+    from ..actions.registry import tool_registry
+    from ..config import INTENTS
+
+    words = {w.strip(".,!?;:'\"").lower() for w in (query or "").split()}
+    named = [i for i in INTENTS if i in words or i.replace("_", " ") in (query or "").lower()]
+    if not named:
+        return ""
+
+    lines = []
+    for intent in sorted(named):
+        handler = tool_registry.get(intent)
+        if handler is None:
+            # In the vocabulary but with nothing behind it. Saying so is the
+            # point -- this is exactly the case a document would get wrong.
+            lines.append(f"{intent}: no handler is registered")
+            continue
+        summary = (inspect.getdoc(handler) or "").strip().split("\n")[0]
+        fast_path = _has_fast_path(intent)
+        lines.append(
+            f"{intent}: {handler.__module__}.{handler.__qualname__}"
+            + (f" -- {summary}" if summary else "")
+            + (" (regex fast path, no model call)" if fast_path
+               else " (classified by the model)")
+        )
+    return "\n".join(lines)
+
+
+def _has_fast_path(intent: str) -> bool:
+    """Does `regex_router` route to this intent without a model call?
+
+    Read from the router's source rather than by calling it, because calling
+    it needs an utterance and the question is about the intent, not about any
+    particular phrasing.
+    """
+    import pathlib
+
+    from .. import regex_router
+    try:
+        src = pathlib.Path(regex_router.__file__).read_text(encoding="utf-8")
+    except Exception:
+        return False
+    return f'intent="{intent}"' in src
+
+
 for _fact in (
+    Fact("mechanism", FactClass.ARCHITECTURE,
+         "How a named capability is carried out: the registered handler and "
+         "whether a regex fast path reaches it.",
+         _mechanism, takes_query=True),
     Fact("affordances", FactClass.ARCHITECTURE,
          "What TENKA can accomplish, from the affordance registry.",
          _affordances),

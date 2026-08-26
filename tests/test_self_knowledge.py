@@ -289,3 +289,192 @@ def test_seeding_twice_is_safe():
 
     seed_from_handlers()
     assert seed_from_handlers() == 0
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  The two gaps live testing found
+# ═════════════════════════════════════════════════════════════════════════
+
+class TestMechanismFact:
+    """Gap 1. Asked "what do you use for searching files in file_task intent?"
+    she recited **every intent she has**. §13.1's table has a row for
+    "How do you do X?" -> the affordance's declared mechanism; there was no
+    such fact, so the only intent-shaped answer was the whole list."""
+
+    def test_it_names_the_handler_that_actually_runs(self):
+        answer = self_knowledge.answer(
+            "mechanism", _ALL, "how does file_task work")
+
+        assert "file_task" in answer
+        assert "handle_file_task" in answer, (
+            "the mechanism is the handler that is really registered, read from "
+            "the running process")
+
+    def test_it_says_when_an_intent_has_no_handler(self):
+        """`shutdown` is a pre-dispatch branch in `main.py`, not a registry
+        handler. Saying so is the point -- this is exactly the case a
+        hand-written document gets wrong and never notices."""
+        answer = self_knowledge.answer("mechanism", _ALL, "how does shutdown work")
+        assert "no handler is registered" in answer
+
+    def test_a_question_naming_no_intent_is_unavailable(self):
+        """Guessing which capability someone meant would be a resolver
+        returning the closest affordance, except the subject is herself."""
+        assert self_knowledge.answer(
+            "mechanism", _ALL, "how do you work") == UNAVAILABLE
+
+    def test_the_query_reaches_the_fact(self):
+        """`Fact.takes_query` decides, not the caller -- a fact that ignores it
+        must keep working when one is passed."""
+        assert self_knowledge.get("mechanism").takes_query is True
+        assert self_knowledge.get("model_chain").takes_query is False
+        assert self_knowledge.answer("model_chain", _ALL, "irrelevant text") \
+            != UNAVAILABLE
+
+
+class TestFactSelection:
+    """Which fact answers a question. Word overlap alone could not do it."""
+
+    @pytest.mark.parametrize("query,expected", [
+        ("what do you use for searching files in file_task intent?", "mechanism"),
+        ("how does web_search work", "mechanism"),
+        ("which model do you use", "model_chain"),
+        ("which model are you using", "model_chain"),
+        ("what can you do", "affordances"),
+        ("what personality are you", "personality"),
+        ("what commands do you know", "intents"),
+    ])
+    def test_the_right_fact_is_selected(self, query, expected):
+        from assistant.actions.self_knowledge import _select
+        assert _select(query) == expected, query
+
+    def test_mechanism_needs_an_intent_named(self):
+        """**The distinction ordering could not make.** "what do you use for
+        file_task" and "which model do you use" both contain "use"; whichever
+        key came first in the dict won both. What separates them is that one
+        names a capability."""
+        from assistant.actions.self_knowledge import _select
+
+        assert _select("how does file_task work") == "mechanism"
+        assert _select("how does it work") != "mechanism"
+
+    def test_an_unrelated_question_selects_nothing(self):
+        from assistant.actions.self_knowledge import _select
+        assert _select("what is the weather") is None
+        assert _select("") is None
+
+
+class TestTheClassifierReachesSelfKnowledge:
+    """Gap 2, and the one that mattered. "is there any intent for recording?"
+    routed to **small_talk**, and she answered from the model's own idea of
+    what TENKA is -- correctly, that time, because the previous turn had put
+    the intent list in her context. Ask it cold and it invents just as
+    confidently, and the asker cannot tell the difference.
+
+    The gate held; the classifier never reached it. These pin the prompt's
+    coverage, which is what decides whether the handler is consulted at all.
+    """
+
+    @pytest.mark.parametrize("shape", [
+        "is there an intent for X",
+        "do you have a way to X",
+        "how do you do X",
+        "what do you use for X",
+        # Phrased as the trimmed rule phrases it. The rule was cut to fit the
+        # prompt's character budget rather than the budget being raised again,
+        # and "her limits" is what survived.
+        "her limits",
+    ])
+    def test_the_rule_names_the_shape(self, shape):
+        from assistant import config
+        assert shape in config.INTENT_SYSTEM_PROMPT, (
+            f"the classifier is not told that {shape!r} is a question about "
+            f"herself, so it will land in small_talk and be improvised")
+
+    def test_the_prompt_draws_the_line_against_commands(self):
+        """The other direction, and the one that would break her: "can you open
+        notepad" is an instruction politely phrased, not a question about her
+        abilities. A rule that captured it would turn every polite request into
+        a description."""
+        from assistant import config
+
+        prompt = config.INTENT_SYSTEM_PROMPT
+        assert '"can you open notepad"' in prompt
+        assert "computer_task" in prompt.split('"can you open notepad"')[1][:120]
+
+    def test_the_live_failure_is_a_few_shot(self):
+        """The exact utterance that went wrong, kept as an example."""
+        from assistant import config
+        assert "is there an intent for recording" in config.INTENT_SYSTEM_PROMPT
+
+    def test_small_talk_is_named_as_the_wrong_answer(self):
+        """Naming the trap is what stops the model falling into it: these
+        questions look conversational, and that is precisely the problem."""
+        from assistant import config
+
+        rule = config.INTENT_SYSTEM_PROMPT.split("16. Questions about")[1][:400]
+        assert "NOT small_talk" in rule
+        assert "invent" in rule
+
+
+class TestTheHandlerWiring:
+    """**From two green mutants.** Everything above calls
+    `self_knowledge.answer()` directly, so dropping the query at the handler --
+    `_reader(key, granted)` instead of `_reader(key, granted, query)` --
+    changed no result. The handler is the only thing a real turn goes through.
+    """
+
+    @pytest.fixture
+    def wired(self, monkeypatch):
+        import assistant.actions as A
+        from assistant.actions.self_knowledge import set_reader
+        from assistant.brain.affordance import seed_from_handlers
+
+        seed_from_handlers()
+        set_reader(self_knowledge.answer)
+        token = A.set_grants(_ALL)
+        yield A.tool_registry.get("self_knowledge")
+        A.current_grants.reset(token)
+
+    def test_a_mechanism_question_answers_through_the_handler(self, wired):
+        answer = wired({"query": "how does file_task work"}, "")
+
+        assert "handle_file_task" in answer, (
+            "the query did not reach the fact, so the mechanism could not know "
+            "which capability was being asked about")
+
+    def test_an_ungated_question_answers_through_the_handler(self, wired):
+        assert "small_talk" in wired({"query": "what commands do you know"}, "")
+
+    def test_the_handler_withholds_without_the_capability(self, monkeypatch):
+        """The gate, through the real door rather than the reader."""
+        import assistant.actions as A
+        from assistant.actions.self_knowledge import set_reader
+        from assistant.actions.self_knowledge import UNAVAILABLE as U
+
+        set_reader(self_knowledge.answer)
+        token = A.set_grants(frozenset())
+        try:
+            answer = A.tool_registry.get("self_knowledge")(
+                {"query": "which model are you using"}, "")
+        finally:
+            A.current_grants.reset(token)
+        assert answer == U
+
+
+def test_the_command_rule_is_stated_not_just_demonstrated():
+    """**From a green mutant.** Renaming rule 17 to something meaningless left
+    every assertion passing, because they all checked the few-shot beneath it.
+    A few-shot without the rule is one example the model may or may not
+    generalise from."""
+    from assistant import config
+
+    prompt = config.INTENT_SYSTEM_PROMPT
+    assert "Asking about a capability vs using it" in prompt
+    rule = prompt.split("Asking about a capability vs using it")[1][:400]
+    assert "instruction" in rule
+    assert "computer_task" in rule
+    assert "self_knowledge" in rule
+    assert "prefer the ordinary intent" in rule, (
+        "the tie-break is gone: doing what was asked and being wrong is "
+        "recoverable, describing herself when asked to act is not useful")

@@ -64,26 +64,67 @@ _VOCABULARY: "dict[str, tuple[str, ...]]" = {
     "affordances": ("can", "capable", "capabilities", "able", "affordance",
                     "abilities", "skills", "tasks"),
     "intents": ("intent", "intents", "commands", "vocabulary"),
+    # "How do you do X". Checked before the others in `_select` because these
+    # words are about *mechanism*, and a question naming both a mechanism word
+    # and an intent name ("what do you use for file_task") is asking how, not
+    # which. Without this the only intent-shaped answer was the whole list,
+    # which is what live testing produced.
+    "mechanism": ("how", "mechanism", "implemented", "implementation",
+                  "handler", "works", "uses", "use"),
 }
+
+
+def _names_an_intent(query: str) -> bool:
+    """Does the question name one of TENKA's intents?
+
+    The signal that separates "how do you do X" from every other question:
+    a mechanism question is *about a specific capability*, and the only way to
+    be about one is to name it.
+    """
+    from ..config import INTENTS
+
+    lowered = (query or "").lower()
+    words = {w.strip(".,!?;:'\"") for w in lowered.split()}
+    return any(i in words or i.replace("_", " ") in lowered for i in INTENTS)
 
 
 def _select(query: str) -> Optional[str]:
     """Which fact answers this question, or None.
+
+    **Mechanism first, but only when the question names an intent.** Word
+    overlap alone cannot separate these two:
+
+        "what do you use for file_task"     -> mechanism
+        "which model do you use"            -> model_chain
+
+    Both contain "use". Ordering the dict does not help -- whichever comes
+    first wins both. What actually distinguishes them is that the first names
+    a capability and the second does not, so that is the test. Live testing
+    produced exactly this confusion: asked how she searches files, she recited
+    every intent she has, because "intent" scored for `intents` and won the
+    tie.
 
     "can" is in the affordance vocabulary and "do" is not, which looks
     arbitrary until you count: "do" appears in "what do you do", "which model
     do you use" and "what commands do you know" alike, so it matched every
     question and the first key to score won. "can" carries capability in a way
     "do" does not -- and the risk is smaller here than in `pre_route` anyway,
-    because this runs only after the classifier has already decided the
-    question is about TENKA herself.
+    because this runs only after the classifier has decided the question is
+    about TENKA herself.
 
-    Ties go to the earlier key, which is why `model_chain` is first: "which
-    model can you use" scores one for each, and the model is the answer.
+    Ties otherwise go to the earlier key, which is why `model_chain` is first:
+    "which model can you use" scores one for each, and the model is the answer.
     """
     words = {w.strip(".,!?;:'\"").lower() for w in (query or "").split()}
+    if words & set(_VOCABULARY["mechanism"]) and _names_an_intent(query):
+        return "mechanism"
     best, score = None, 0
     for key, vocabulary in _VOCABULARY.items():
+        if key == "mechanism":
+            # Handled above, and deliberately not eligible here: its words
+            # ("how", "use", "works") are common enough to steal questions
+            # they do not answer.
+            continue
         hits = len(words & set(vocabulary))
         if hits > score:
             best, score = key, hits
@@ -108,7 +149,10 @@ def handle_self_knowledge(params: dict, llm_response: str) -> str:
     granted = current_grants.get()
 
     try:
-        value = _reader(key, granted)
+        # The query goes through so a mechanism question can name what it is
+        # about. Facts that do not want it ignore it -- `Fact.takes_query`
+        # decides, not the caller.
+        value = _reader(key, granted, query)
     except Exception as e:
         logger.debug(f"[SELF] read failed: {e}")
         return UNAVAILABLE
