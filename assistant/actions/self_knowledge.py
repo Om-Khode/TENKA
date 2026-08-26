@@ -64,6 +64,11 @@ _VOCABULARY: "dict[str, tuple[str, ...]]" = {
     "affordances": ("can", "capable", "capabilities", "able", "affordance",
                     "abilities", "skills", "tasks"),
     "intents": ("intent", "intents", "commands", "vocabulary"),
+    # "What changed recently" -- development history, never a capability
+    # claim. Placed before `mechanism` in the fallback loop's order so
+    # "what changed" is not read as "how does change work".
+    "development": ("changed", "recently", "commits", "commit", "updated",
+                    "changelog", "worked", "lately", "new"),
     # "How do you do X". Checked before the others in `_select` because these
     # words are about *mechanism*, and a question naming both a mechanism word
     # and an intent name ("what do you use for file_task") is asking how, not

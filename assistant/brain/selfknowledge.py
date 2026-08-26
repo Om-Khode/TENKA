@@ -345,7 +345,23 @@ def _has_fast_path(intent: str) -> bool:
     return f'intent="{intent}"' in src
 
 
+def _development(query: str = "") -> str:
+    """What was worked on recently, from git. §13.1's last row.
+
+    ARCHITECTURE class: the commit log of a public repository. Note what this
+    fact is *not* allowed to answer -- "what changed recently" is a question
+    about development, never about what she can do now. A capability question
+    is answered from the affordance registry, and `test_development_history.py`
+    asserts git cannot reach it.
+    """
+    from .development import recent_changes
+    return recent_changes(limit=5)
+
+
 for _fact in (
+    Fact("development", FactClass.ARCHITECTURE,
+         "What was worked on recently, from the commit log.",
+         _development, takes_query=True),
     Fact("mechanism", FactClass.ARCHITECTURE,
          "How a named capability is carried out: the registered handler and "
          "whether a regex fast path reaches it.",
