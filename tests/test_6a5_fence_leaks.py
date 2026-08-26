@@ -418,9 +418,16 @@ def test_HOLE_stored_facts_are_replayed_into_the_system_prompt_unfenced(
     monkeypatch.setattr(
         memory, "search_facts",
         lambda *a, **k: [{"key": "user_note", "value": PLANTED}])
-    block = main_mod._build_facts_context()
-    assert PLANTED in block
-    assert "KNOWN FACTS ABOUT THE USER" in block
+    raw = main_mod._build_facts_context()
+    assert PLANTED in raw, "the planted fact never reached the context at all"
+
+    # Through the boundary, which is where the fence now lives. It was inside
+    # `_build_facts_context` for one commit, until `core/context.py` gained its
+    # first caller and both fenced at once -- two notices around one block.
+    # C2 says fencing happens at the boundary, once.
+    from assistant.core.context import build
+
+    block = build("interpretation", stored_facts=raw).render()
 
     assert "<untrusted_" in block, (
         "the stored fact is back in the maximally-trusted position in the "

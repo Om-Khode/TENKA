@@ -48,7 +48,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
-from .fence import render_untrusted_block
 from .redact import redact_secrets_strict
 
 # ─── the profiles ────────────────────────────────────────────────────────────
@@ -57,8 +56,23 @@ from .redact import redact_secrets_strict
 # profile may carry; anything else handed to `build()` is dropped.
 
 PROFILES: dict[str, frozenset[str]] = {
+    # §12.1 named three fields here -- `current_message`,
+    # `recent_conversation`, `minimal_state` -- and the conversational turn
+    # assembles four different ones: a knowledge-graph block, a session
+    # resume, stored user facts and a compressed summary. The table was
+    # written top-down before the code was read.
+    #
+    # `CLAUDE.md`: when docs and code disagree, the code wins and then the docs
+    # get fixed. So the profile names what actually flows. `minimal_state` is
+    # gone rather than kept as an aspiration -- an unused whitelist entry is a
+    # field nobody can explain, and the next person adds to it.
     "interpretation": frozenset({
-        "current_message", "recent_conversation", "minimal_state",
+        "current_message",
+        "recent_conversation",
+        "knowledge_graph",
+        "session_resume",
+        "stored_facts",
+        "conversation_summary",
     }),
     "planning": frozenset({
         "task", "constraints", "resolved_affordances",
@@ -96,6 +110,14 @@ UNTRUSTED_FIELDS: frozenset[str] = frozenset({
     "relevant_observations",
     "observation",
     "environment_state",
+    # The four the conversational turn carries. Every one of them is content
+    # TENKA's own code did not author: the graph block is built from stored
+    # extractions, the session resume and the summary are model-written from
+    # past turns, and the facts are whatever anyone told her.
+    "knowledge_graph",
+    "session_resume",
+    "stored_facts",
+    "conversation_summary",
 })
 
 
@@ -119,19 +141,39 @@ class ContextBundle:
     dropped: tuple[str, ...] = ()
     fenced: tuple[str, ...] = ()
 
+    def render(self) -> str:
+        """The text a caller puts in front of a model.
+
+        Separate from `build()` deliberately. The bundle holds *data* -- the
+        whitelisted, redacted values -- and rendering decides how they are
+        presented. Keeping them apart is what allows one notice for the whole
+        bundle instead of one per field, and it means a caller can inspect what
+        got through without parsing a fence back out.
+
+        Trusted fields are written plainly. Everything untrusted goes into a
+        single labelled block: the label carries C1's provenance, the notice
+        states the rule once.
+        """
+        from .fence import render_untrusted_sections
+
+        trusted = [f"{k}: {v}" for k, v in sorted(self.fields.items())
+                   if k not in self.fenced]
+        untrusted = render_untrusted_sections(
+            {k: self.fields[k] for k in self.fenced if k in self.fields})
+
+        parts = [p for p in ("\n".join(trusted), untrusted) if p]
+        return "\n\n".join(parts)
+
     @property
     def size_bytes(self) -> int:
-        """UTF-8 bytes of everything this bundle would put in front of a model.
+        """UTF-8 bytes of what this bundle actually puts in front of a model.
 
         §15's `context_bytes_by_profile`, and §12's O3: without a number, "the
         context is minimized" is an assertion nobody can check. Measured on the
-        built object rather than on a rendered prompt so it stays honest about
-        what the Builder produced, not about what a caller did afterwards.
+        *rendered* form, because that is what is paid for -- an earlier version
+        summed the raw fields and undercounted the fence by two kilobytes.
         """
-        return sum(
-            len(str(k).encode("utf-8")) + len(str(v).encode("utf-8"))
-            for k, v in self.fields.items()
-        )
+        return len(self.render().encode("utf-8"))
 
 
 def build(profile: str, **fields: Any) -> ContextBundle:
@@ -159,13 +201,11 @@ def build(profile: str, **fields: Any) -> ContextBundle:
             continue
 
         if name in UNTRUSTED_FIELDS:
-            rendered = render_untrusted_block(_as_text(value), label=name)
             fenced.append(name)
-        else:
-            rendered = value
+            value = _as_text(value)
 
-        built[name] = (redact_secrets_strict(rendered)
-                       if isinstance(rendered, str) else rendered)
+        built[name] = (redact_secrets_strict(value)
+                       if isinstance(value, str) else value)
 
     return ContextBundle(
         profile=profile,
