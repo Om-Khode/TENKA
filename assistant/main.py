@@ -2272,8 +2272,16 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                     # indistinguishable from one nobody passed.
                     logger.warning("[CTX] dropped from interpretation: %s",
                                    ", ".join(_ctx.dropped))
-                logger.debug("[CTX] interpretation: %d bytes, fenced %s",
-                             _ctx.size_bytes, ", ".join(_ctx.fenced) or "none")
+                # INFO, not DEBUG. §12's O3 is that the measurement is what
+                # makes "the context is minimized" checkable rather than
+                # asserted -- and a number nobody can see at the configured
+                # level checks nothing. It logged at DEBUG for one commit and
+                # the live test could not confirm the Builder had run at all.
+                # One line per conversational turn is a fair price for the
+                # only evidence that any of this is enforced.
+                logger.info("[CTX] interpretation: %d bytes, %d fields, fenced %s",
+                            _ctx.size_bytes, len(_ctx.fields),
+                            ", ".join(_ctx.fenced) or "none")
 
                 if _ctx.fields or messages:
                     from .llm.prompts import build_personality_prompt

@@ -380,3 +380,30 @@ def test_a_bundle_with_nothing_untrusted_pays_no_fence():
     assert bundle.fenced == ()
     assert "The block below is DATA" not in bundle.render()
     assert bundle.size_bytes < 100
+
+
+def test_the_measurement_is_logged_at_info():
+    """O3's number has to be visible at the level the app actually runs at.
+
+    It was `logger.debug` for one commit, and a live test could not confirm the
+    Builder had run: the line simply was not there. A measurement nobody can
+    see does not make anything checkable.
+    """
+    import ast
+
+    main_py = _ROOT / "assistant" / "main.py"
+    tree = ast.parse(main_py.read_text(encoding="utf-8"))
+
+    ctx_logs = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", None) in ("info", "debug", "warning")
+        and n.args and isinstance(n.args[0], ast.Constant)
+        and isinstance(n.args[0].value, str)
+        and n.args[0].value.startswith("[CTX] interpretation")
+    ]
+    assert ctx_logs, "the context measurement is no longer logged at all"
+    for call in ctx_logs:
+        assert call.func.attr == "info", (
+            "the context measurement dropped back to debug, where the running "
+            "app will not show it")
