@@ -1,7 +1,30 @@
-"""Verify URL detection no longer mis-classifies emails as URLs."""
-from assistant.automation.router import _URL_PATTERN
+"""URL detection must not mis-classify an email address as a URL.
 
-# (goal, should_match, note)
+The regression that produced it: `type test.dev20154@gmail.com in the
+email field` matched the URL pattern, so a goal about typing into a form
+was routed as a navigation.
+
+**Was a manual script.** It sat in `tests/` with a `def run()` and an
+`if __name__ == "__main__"` block, so pytest imported it, collected nothing,
+and reported EMPTY -- a file that looks like coverage and asserts nothing. The
+2026-08-25 baseline found six of these. The cases below are the originals,
+unchanged; only the harness is new.
+
+It could not even be run by hand from the repo root: no `sys.path` setup, so
+`from assistant...` raised ModuleNotFoundError. It had not run anywhere, in any
+form, for a while.
+
+Run with:  py -3.11 -m pytest tests/test_da_url_routing.py -v
+"""
+import pathlib
+import sys
+
+import pytest
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 CASES = [
     # --- Emails must NOT match ---
     ("type test.dev20154@gmail.com in the email field", False, "regression: email with .dev local + gmail.com"),
@@ -23,21 +46,20 @@ CASES = [
     ("multiply 3 and 4 on calculator", False, "no URL"),
 ]
 
-failures = []
-for goal, expected, note in CASES:
-    matched = bool(_URL_PATTERN.search(goal))
-    actual_match = _URL_PATTERN.search(goal).group(0) if matched else None
-    status = "OK " if matched == expected else "FAIL"
-    print(f"{status}  expected={expected}  got={matched}  match={actual_match!r:30s}  | {note}")
-    print(f"      goal: {goal}")
-    if matched != expected:
-        failures.append((goal, expected, matched, actual_match, note))
 
-print()
-if failures:
-    print(f"{len(failures)} FAILED")
-    for g, e, m, mm, n in failures:
-        print(f"  - {g!r} expected={e} got={m} (match={mm!r}) [{n}]")
-    raise SystemExit(1)
-else:
-    print(f"All {len(CASES)} cases passed.")
+
+@pytest.mark.parametrize("goal,expected,note", CASES)
+def test_url_pattern_matches_only_real_urls(goal, expected, note):
+    from assistant.automation.router import _URL_PATTERN
+
+    match = _URL_PATTERN.search(goal)
+    assert bool(match) == expected, (
+        f"{note}: expected match={expected}, got {match.group(0)!r}"
+        if match else f"{note}: expected match={expected}, got no match")
+
+
+def test_the_case_table_is_not_empty():
+    """A parametrize over an empty list is a file that passes by not running."""
+    assert len(CASES) >= 13
+    assert any(e for _, e, _ in CASES), "no positive case -- only absences"
+    assert any(not e for _, e, _ in CASES), "no negative case -- only presences"

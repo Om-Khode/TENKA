@@ -1146,3 +1146,51 @@ so it mutated documentation — the fifth time this tree has been fooled by a
 sweep or a mutation reading prose. The other was a test passing for the wrong
 reason: two of its three cases held whether an unrun step read as `UNVERIFIED`
 or `SUCCEEDED`, because another step decided the answer in both.
+
+---
+
+## KI-34: A form action with a browser open routes to a second browser
+
+**Priority:** Medium (correctness — the action lands somewhere the user is not looking)
+**Effort:** Low, but behaviour-changing: needs a live test on the automation tier
+**Discovered:** 2026-08-25, converting `tests/test_routing_trace.py` out of the
+EMPTY state the first test baseline found it in
+**Status:** open, pinned by two `xfail(strict=True)` cases
+
+**The defect.** `_BROWSER_INTENT_PATTERNS` claims `fill (out) (the) form` and
+`submit form`. The branch that answers `"browser"` asks
+`_detect_running_app(goal)`, which reads the **goal text** for an app name and
+never consults the open windows. So a form action typed while Firefox sits in
+front of you routes to `browser` — Playwright opens its own window — instead of
+`vision`, which would act on the page you are actually looking at.
+
+Measured with a window list of `["Test Page - Mozilla Firefox", ...]`:
+
+| goal | routes to | should be |
+| --- | --- | --- |
+| `fill out the form with random test data` | `browser` | `vision` |
+| `submit form` | `browser` | `vision` |
+| `fill this form for testing` | `vision` | `vision` |
+| `submit the form` | `vision` | `vision` |
+
+Four phrasings of one intent, routing two ways. The two that reach `vision` do
+so by *missing* `_BROWSER_INTENT_PATTERNS` — `submit the form` does not match
+`submit\s+form` because of the article — which is luck rather than design.
+
+**How it stayed hidden.** `tests/test_routing_trace.py` asserted the correct
+behaviour and was a manual script: a `def _main()` and an
+`if __name__ == "__main__"` block, in `tests/`, so pytest imported it, collected
+nothing, and reported EMPTY. Run by hand it printed `1 FAILED`. Nothing ran it.
+
+**And the one case that did pass, passed by accident.** The fixture's window
+title was `"DummyForms - TENKA Testing — Mozilla Firefox"`, and
+`_detect_running_app` matches goal words against window titles — so
+`fill out the form ...` "found" Firefox through the substring **Form**s. With an
+honest title it fails like the others. The test now asserts its own fixture does
+not echo the goal.
+
+**Not fixed here** because it changes automation-tier routing, which
+`.claude/rules/testing.md` requires a live test for, and the fix wants a
+decision: either `_detect_running_app` consults open windows, or the
+browser-intent branch defers to vision when a browser is already open. Both are
+behaviour changes with a blast radius beyond this file.

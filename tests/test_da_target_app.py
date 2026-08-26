@@ -1,9 +1,29 @@
-"""Verify _extract_target_app correctly identifies target apps from
-'in/on/with/using <app>' suffixes and strips them from the planner goal.
-Regression test for the 'type X in notepad → typed into IDE' bug."""
+"""`_extract_target_app` finds the app in an `in/on/with/using <app>` suffix
+and strips it from the goal.
 
-from assistant.automation.router import _extract_target_app
+Regression test for the `type X in notepad -> typed into the IDE` bug: the
+target was not extracted, so the text went to whatever had focus.
 
+**Was a manual script.** It sat in `tests/` with a `def run()` and an
+`if __name__ == "__main__"` block, so pytest imported it, collected nothing,
+and reported EMPTY -- a file that looks like coverage and asserts nothing. The
+2026-08-25 baseline found six of these. The cases below are the originals,
+unchanged; only the harness is new.
+
+It could not even be run by hand from the repo root: no `sys.path` setup, so
+`from assistant...` raised ModuleNotFoundError. It had not run anywhere, in any
+form, for a while.
+
+Run with:  py -3.11 -m pytest tests/test_da_target_app.py -v
+"""
+import pathlib
+import sys
+
+import pytest
+
+_ROOT = pathlib.Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 CASES = [
     # (goal, expected_target, expected_stripped)
@@ -36,26 +56,21 @@ CASES = [
 ]
 
 
-def run():
-    failures = []
-    for goal, expected_target, expected_stripped in CASES:
-        target, stripped = _extract_target_app(goal)
-        ok = (target == expected_target) and (stripped == expected_stripped)
-        status = "OK  " if ok else "FAIL"
-        print(f"{status}  goal={goal!r}")
-        print(f"      target={target!r}  stripped={stripped!r}")
-        if not ok:
-            print(f"      EXPECTED target={expected_target!r}, stripped={expected_stripped!r}")
-            failures.append(goal)
-
-    print()
-    if failures:
-        print(f"{len(failures)} FAILED:")
-        for f in failures:
-            print(f"  - {f}")
-        raise SystemExit(1)
-    print(f"All {len(CASES)} cases passed.")
 
 
-if __name__ == "__main__":
-    run()
+@pytest.mark.parametrize("goal,expected_target,expected_stripped", CASES)
+def test_target_app_is_extracted_and_stripped(goal, expected_target,
+                                              expected_stripped):
+    from assistant.automation.router import _extract_target_app
+
+    target, stripped = _extract_target_app(goal)
+    assert target == expected_target, f"target for {goal!r}"
+    assert stripped == expected_stripped, f"stripped goal for {goal!r}"
+
+
+def test_the_case_table_covers_both_directions():
+    """Both halves matter: an extractor that found nothing would pass every
+    `None` case, and one that matched everything would pass every named one."""
+    assert len(CASES) >= 15
+    assert any(t for _, t, _ in CASES), "no case expects an app to be found"
+    assert any(t is None for _, t, _ in CASES), "no case expects no app"

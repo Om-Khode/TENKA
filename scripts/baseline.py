@@ -77,6 +77,9 @@ _COUNT_RE = re.compile(
     r"(?:^|\s)(\d+)\s+(passed|failed|error|errors|skipped|xfailed|xpassed|deselected)"
 )
 _NO_TESTS = re.compile(r"no tests ran", re.I)
+# All of a file's tests filtered out by `-m 'not live_automation'`.
+# Not a failure and not a mystery -- the marker working as intended.
+_DESELECTED = re.compile(r"\d+ deselected", re.I)
 
 
 def _run_one(path: pathlib.Path) -> dict:
@@ -119,6 +122,14 @@ def _run_one(path: pathlib.Path) -> dict:
         status = "GREEN"
     elif counts.get("skipped"):
         status = "SKIPPED"
+    # Everything deselected by `addopts`, which is the marker doing its job.
+    # `test_computer_task_integration.py` -- which opens apps and clicks
+    # buttons -- reported UNKNOWN for exactly this, and UNKNOWN is meant to
+    # mean "we could not tell". Here we can: the file is correctly excluded.
+    # A state that is permanently unknown for a benign reason is how a column
+    # stops being read.
+    elif _DESELECTED.search(out):
+        status = "DESELECTED"
     else:
         # No recognisable summary at all: a crash before collection, or an
         # output format change. Fail closed -- never read as green.
