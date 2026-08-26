@@ -388,18 +388,24 @@ def test_CLOSED_planted_data_cannot_reach_store_memory_at_all():
 
 def test_HOLE_stored_facts_are_replayed_into_the_system_prompt_unfenced(
         monkeypatch):
-    """STILL TRUE, AND OUT OF THIS PASS'S FILE BUDGET.
+    """FIXED 2026-08-25 (TENKA-v2 P10). This probe used to assert the defect.
 
-    Anything `store_memory` persists is re-rendered into every later turn's
-    SYSTEM prompt under "KNOWN FACTS ABOUT THE USER" (main.py:1852-1872) with
-    no delimiter and no untrusted label.
+    As written in 6a.5 it recorded a finding that pass did not own: anything
+    `store_memory` persists is re-rendered into every later turn's SYSTEM
+    prompt under "KNOWN FACTS ABOUT THE USER" with no delimiter and no
+    untrusted label. `main.py` belonged to another stream, so the assertion
+    was `"<untrusted_" not in block` -- a deliberate record that the fence was
+    absent, and it went red the moment the fence arrived. That is the probe
+    working, not breaking.
 
-    `main.py` is owned by another stream in this milestone, so this is
-    reported rather than reached for. What this pass DID do is cut the supply:
-    the two tests above mean a planted file can no longer become a stored
-    fact, so the unfenced replay has nothing planted to replay. The read side
-    still wants fixing — a fact is user-authored but arbitrary text, and it
-    sits in the maximally-trusted position in the prompt."""
+    What 6a.5 did do was cut the supply: the two tests above mean a planted
+    file can no longer become a stored fact. P10 closed the read side, so this
+    now asserts the label is present and the payload sits inside it.
+
+    **Mitigated, not closed** (§12.1 C3). A fence tells the model where the
+    data starts and ends; it does not make a persuasive payload safe. This
+    asserts the boundary and the label, and deliberately asserts nothing about
+    whether a model obeyed them."""
     # `assistant.main` pulls in the audio stack at import time, which earlier
     # test files in a combined run leave stubbed. Skipping beats asserting
     # against a half-imported module -- and this probe documents a finding
@@ -415,7 +421,12 @@ def test_HOLE_stored_facts_are_replayed_into_the_system_prompt_unfenced(
     block = main_mod._build_facts_context()
     assert PLANTED in block
     assert "KNOWN FACTS ABOUT THE USER" in block
-    assert "<untrusted_" not in block
+
+    assert "<untrusted_" in block, (
+        "the stored fact is back in the maximally-trusted position in the "
+        "prompt, with no delimiter and no label")
+    body = block.split("<untrusted_", 1)[1]
+    assert PLANTED in body, "the planted value sits outside the fence"
 
 
 # ═══════════════════════════════════════════════════════════════════════════

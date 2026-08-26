@@ -491,7 +491,36 @@ Tests: `tests/test_6b_principal.py`.
 **Priority:** Medium (security)
 **Effort:** Low (fence the block, as `render_untrusted_block` already does elsewhere)
 **Discovered:** 2026-08-16, milestone 6a.5 adversarial review
-**Status:** open. Explicitly out of scope for milestone 6b (spec §1) — not touched, not made worse.
+**Status:** **MITIGATED — not closed.** 2026-08-25, TENKA-v2 P10.
+
+`_build_facts_context` now fences the values with a labelled, nonce-delimited
+`untrusted_stored_user_facts` block, and redacts them strictly on the way out.
+Two exposures lived in this one entry and only one of them is gone:
+
+- **the secret half is closed.** `save_typed_fact` is what records "my api key
+  is ..." as a durable fact, and this string reaches a third party on every
+  turn; `redact_secrets_strict` runs before the block is built.
+- **the injection half is mitigated.** A fact's value is written by whoever
+  said it, and a value of `ignore previous instructions and ...` used to arrive
+  as an unlabelled line sitting exactly where TENKA's own instructions sit. It
+  is now labelled data with a boundary the content cannot spell.
+
+**Why this is not "FIXED".** TENKA-v2 §12.1 C3 is explicit: fencing raises the
+cost of injection, it does not close it. The model is told which bytes are data;
+nothing forces it to care. Closure would need an adversarial live test —
+payloads written to defeat the fence, run through a real turn — which this
+change did not have and which §22 puts out of scope.
+
+Keys stay outside the fence deliberately: they are TENKA's own vocabulary
+(`user_name`, `user_wifi`), written by `save_typed_fact` rather than by the
+speaker, and a fact the model cannot read is a fact that does nothing.
+
+Pinned by `tests/test_facts_context_is_fenced.py` (13 tests, 6 mutations red),
+and `tests/test_6a5_fence_leaks.py`'s probe — which asserted the *absence* of
+the fence as a record of the open finding — is inverted to assert its presence.
+
+Still open in the same family: **KI-14** and **KI-16**, and the conversation
+history itself, which `memory.build_recent_context` still renders unfenced.
 
 **Symptom:** `_build_facts_context` concatenates stored facts into `build_personality_prompt()` with no delimiter and no untrusted label — the most trusted position in the tree — on every subsequent turn.
 
