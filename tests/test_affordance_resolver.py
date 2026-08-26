@@ -356,27 +356,31 @@ def test_the_word_capability_means_only_the_security_enum_in_brain():
     # collision this rule exists to prevent.
     allowed_files = {"authority.py", "task.py", "affordance.py", "turn.py",
                      "executor.py", "selfknowledge.py", "__init__.py"}
+
+    # Code, not prose. This scan stripped `#` comments and read docstrings, so
+    # `development.py` failed it for a module docstring that says git must
+    # never affect "capability availability" -- which is the rule being
+    # explained, not a violation of it. Forbidding that would forbid writing
+    # the rule down. Seventh time a sweep in this project has matched its own
+    # commentary; the brand scan above already learned it.
     for path in sorted(_BRAIN.glob("*.py")):
-        body = "\n".join(
-            line for line in path.read_text(encoding="utf-8").splitlines()
-            if not line.lstrip().startswith("#")
-        )
-        if "capabilit" not in body.lower():
+        used = _code_strings(path) | _code_names(path)
+        if not any("capabilit" in u.lower() for u in used):
             continue
         assert path.name in allowed_files, (
-            f"{path.name} uses the word 'capability'; in this package it means "
-            f"`core/capabilities.py`'s enum and nothing else -- what TENKA can "
-            f"do is an affordance")
+            f"{path.name} uses the word 'capability' in code; in this package "
+            f"it means `core/capabilities.py`'s enum and nothing else -- what "
+            f"TENKA can do is an affordance")
 
 
 def test_the_resolver_never_mentions_capabilities_at_all():
     """The resolver answers "what could do this", never "may it". Mixing the
     two in one module is how the two words collapse back together."""
-    body = "\n".join(
-        line for line in _RESOLVER.read_text(encoding="utf-8").splitlines()
-        if not line.lstrip().startswith("#")
-    )
-    assert "capabilit" not in body.lower()
+    used = _code_strings(_RESOLVER) | _code_names(_RESOLVER)
+    assert not any("capabilit" in u.lower() for u in used), (
+        "the resolver answers \"what could do this\", never \"may it\" -- "
+        "mixing the two in one module is how the two words collapse back "
+        "together")
 
 
 def test_the_registry_extends_the_shared_primitive():
