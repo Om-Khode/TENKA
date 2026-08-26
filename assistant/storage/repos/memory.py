@@ -9,6 +9,7 @@ facade delegates here.
 import json
 import logging
 
+from ...core.fence import render_untrusted_block
 from ...core.redact import redact_secrets, redact_secrets_strict
 import os
 import warnings
@@ -475,12 +476,30 @@ class MemoryRepo:
             if not turns:
                 return ""
             lines: list[str] = []
-            if header:
-                lines.append(header)
             for t in turns:
                 lines.append(f"User: {redact_secrets_strict(t['user_input'])}")
                 lines.append(f"Assistant: {redact_secrets_strict(t['response'])}")
-            return "\n".join(lines)
+
+            # Fenced, because both callers put this into a *prompt* and neither
+            # of them can fence it as well as one place can. C1/C2.
+            #
+            # "It is the user's own words" is the objection, and it is wrong in
+            # the direction that matters. An `Assistant:` line is whatever
+            # TENKA last said, which routinely contains a summary of a web page,
+            # the contents of a file she read, or OCR of a screen -- and a
+            # `User:` line is whatever was dictated, including by a voice she
+            # cannot authenticate. Both callers already knew: each one passes a
+            # header ending "do NOT replay these tasks", which is a prompt-level
+            # plea. This is the code-level control CLAUDE.md rule 8 asks for,
+            # and the header stays as the framing that explains it.
+            #
+            # The header sits *outside* the fence deliberately -- it is the
+            # caller's own instruction about how to read the block, and a caller
+            # instruction inside an untrusted block is exactly the confusion
+            # being prevented.
+            block = render_untrusted_block(
+                "\n".join(lines), label="conversation_history")
+            return f"{header}\n{block}" if header else block
         except Exception:
             return ""
 

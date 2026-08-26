@@ -519,8 +519,17 @@ Pinned by `tests/test_facts_context_is_fenced.py` (13 tests, 6 mutations red),
 and `tests/test_6a5_fence_leaks.py`'s probe — which asserted the *absence* of
 the fence as a record of the open finding — is inverted to assert its presence.
 
-Still open in the same family: **KI-14** and **KI-16**, and the conversation
-history itself, which `memory.build_recent_context` still renders unfenced.
+`MemoryRepo.build_recent_context` is fenced too, as of the same day. It feeds
+the plan-generation and code-generation prompts, and both callers already knew
+the content was risky -- each passes a header ending "do NOT replay these
+tasks", which is a prompt-level plea where `CLAUDE.md` rule 8 asks for a
+code-level control. The objection that conversation history is "the user's own
+words" is wrong in the direction that matters: an `Assistant:` line is whatever
+TENKA last said, which routinely carries a summary of a web page, the contents
+of a file she read, or OCR of a screen. The header stays outside the block as
+the framing that explains it.
+
+Still open in the same family: **KI-14** and **KI-16**.
 
 **Symptom:** `_build_facts_context` concatenates stored facts into `build_personality_prompt()` with no delimiter and no untrusted label — the most trusted position in the tree — on every subsequent turn.
 
