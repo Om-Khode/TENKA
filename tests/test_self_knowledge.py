@@ -333,30 +333,75 @@ class TestMechanismFact:
 
 
 class TestFactSelection:
-    """Which fact answers a question. Word overlap alone could not do it."""
+    """Which fact answers a question, asserted through the handler.
+
+    Selection is not `_select`'s alone. Whether a question names a capability
+    depends on the intent table and the handler docstrings, which live in
+    `brain/` -- and `actions` sits below `brain` with no import between them.
+    Rather than duplicating that knowledge in the handler (two tables,
+    drifting), the handler *tries* `mechanism` and falls back when the fact
+    reports it recognised nothing. So the real answer is only visible end to
+    end, which is also what a turn does.
+    """
+
+    @pytest.fixture
+    def ask(self):
+        import assistant.actions as A
+        from assistant.actions.self_knowledge import set_reader
+        from assistant.brain.affordance import seed_from_handlers
+
+        seed_from_handlers()
+        set_reader(self_knowledge.answer)
+        handler = A.tool_registry.get("self_knowledge")
+        token = A.set_grants(_ALL)
+        yield lambda q: handler({"query": q}, "")
+        A.current_grants.reset(token)
 
     @pytest.mark.parametrize("query,expected", [
         ("what do you use for searching files in file_task intent?", "mechanism"),
         ("how does web_search work", "mechanism"),
+        ("how do you search files", "mechanism"),
         ("which model do you use", "model_chain"),
         ("which model are you using", "model_chain"),
         ("what can you do", "affordances"),
         ("what personality are you", "personality"),
         ("what commands do you know", "intents"),
     ])
-    def test_the_right_fact_is_selected(self, query, expected):
-        from assistant.actions.self_knowledge import _select
-        assert _select(query) == expected, query
+    def test_the_right_fact_answers(self, ask, query, expected):
+        assert ask(query).startswith(expected + ":"), query
 
-    def test_mechanism_needs_an_intent_named(self):
+    def test_a_question_naming_a_capability_gets_that_capability(self, ask):
         """**The distinction ordering could not make.** "what do you use for
         file_task" and "which model do you use" both contain "use"; whichever
         key came first in the dict won both. What separates them is that one
-        names a capability."""
-        from assistant.actions.self_knowledge import _select
+        names a capability -- and naming it does not require saying its
+        identifier."""
+        assert "handle_file_task" in ask("how do you search files")
+        assert ask("how does it work") != "mechanism"
 
-        assert _select("how does file_task work") == "mechanism"
-        assert _select("how does it work") != "mechanism"
+    def test_an_existence_question_names_the_capability_not_the_list(self, ask):
+        """Live testing: "is there an intent for recording" answered with all
+        thirty-eight intents. It is a question about one capability, and the
+        answer that lists everything is technically true and useless."""
+        answer = ask("is there an intent for recording")
+
+        assert answer.startswith("mechanism:")
+        assert "recording" in answer
+
+        # Counted by line, one per intent. The first version of this counted
+        # `"intent:"`, which the mechanism format never emits -- so it was
+        # vacuous, and a mutation returning every partial match stayed green.
+        # Counted by line, one per intent. The first version of this
+        # counted `"intent:"`, which the mechanism format never emits --
+        # so it was vacuous, and a mutation returning every partial match
+        # stayed green.
+        lines = [ln for ln in answer.splitlines() if ln.strip()]
+        assert len(lines) <= 4, (
+            f"{len(lines)} capabilities came back for a question about "
+            f"one thing:\n{answer}")
+        assert all("record" in ln for ln in lines), (
+            f"a capability unrelated to recording came back:\n{answer}")
+
 
     def test_an_unrelated_question_selects_nothing(self):
         from assistant.actions.self_knowledge import _select
@@ -478,3 +523,20 @@ def test_the_command_rule_is_stated_not_just_demonstrated():
     assert "prefer the ordinary intent" in rule, (
         "the tie-break is gone: doing what was asked and being wrong is "
         "recoverable, describing herself when asked to act is not useful")
+
+
+def test_only_the_best_matching_capabilities_are_returned():
+    """**From a green mutant.** Dropping the best-score filter changed nothing
+    for "is there an intent for recording", because nothing else scored at all
+    -- so the mutation was behaviourally identical there and the test could not
+    see it. This query discriminates: "open and read files" also brushes
+    `open_browser` and `read_screen` on one word each, while `file_task`
+    matches three.
+
+    Returning every partial match is the resolver failure in a different
+    costume: a list of plausible-looking capabilities, presented as the answer
+    to a question about one.
+    """
+    from assistant.brain.selfknowledge import _intents_named_by
+
+    assert _intents_named_by("how do you open and read files") == ["file_task"]

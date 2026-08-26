@@ -69,26 +69,19 @@ _VOCABULARY: "dict[str, tuple[str, ...]]" = {
     # and an intent name ("what do you use for file_task") is asking how, not
     # which. Without this the only intent-shaped answer was the whole list,
     # which is what live testing produced.
+    # "how", plus the existence question -- "is there an intent for
+    # recording", "do you have a way to X". Live testing routed that one to
+    # self_knowledge correctly and then answered with all thirty-eight
+    # intents, because nothing here recognised it as being *about* one
+    # capability. It is safe to be broad now: mechanism is tried first and
+    # hands back when the question names nothing it recognises.
     "mechanism": ("how", "mechanism", "implemented", "implementation",
-                  "handler", "works", "uses", "use"),
+                  "handler", "works", "uses", "use", "there", "have", "any",
+                  "support", "supports"),
 }
 
 
-def _names_an_intent(query: str) -> bool:
-    """Does the question name one of TENKA's intents?
-
-    The signal that separates "how do you do X" from every other question:
-    a mechanism question is *about a specific capability*, and the only way to
-    be about one is to name it.
-    """
-    from ..config import INTENTS
-
-    lowered = (query or "").lower()
-    words = {w.strip(".,!?;:'\"") for w in lowered.split()}
-    return any(i in words or i.replace("_", " ") in lowered for i in INTENTS)
-
-
-def _select(query: str) -> Optional[str]:
+def _select(query: str, skip: "tuple[str, ...]" = ()) -> Optional[str]:
     """Which fact answers this question, or None.
 
     **Mechanism first, but only when the question names an intent.** Word
@@ -116,14 +109,14 @@ def _select(query: str) -> Optional[str]:
     "which model can you use" scores one for each, and the model is the answer.
     """
     words = {w.strip(".,!?;:'\"").lower() for w in (query or "").split()}
-    if words & set(_VOCABULARY["mechanism"]) and _names_an_intent(query):
+    if not skip and words & set(_VOCABULARY["mechanism"]):
         return "mechanism"
     best, score = None, 0
     for key, vocabulary in _VOCABULARY.items():
-        if key == "mechanism":
-            # Handled above, and deliberately not eligible here: its words
-            # ("how", "use", "works") are common enough to steal questions
-            # they do not answer.
+        if key in skip or key == "mechanism":
+            # `mechanism` is handled above and deliberately not eligible in
+            # this loop: its words ("how", "use", "works") are common enough
+            # to steal questions they do not answer.
             continue
         hits = len(words & set(vocabulary))
         if hits > score:
@@ -148,14 +141,33 @@ def handle_self_knowledge(params: dict, llm_response: str) -> str:
     from . import current_grants
     granted = current_grants.get()
 
-    try:
-        # The query goes through so a mechanism question can name what it is
-        # about. Facts that do not want it ignore it -- `Fact.takes_query`
-        # decides, not the caller.
-        value = _reader(key, granted, query)
-    except Exception as e:
-        logger.debug(f"[SELF] read failed: {e}")
-        return UNAVAILABLE
+    def _read(fact_key: str):
+        try:
+            # The query goes through so a mechanism question can name what it
+            # is about. Facts that do not want it ignore it --
+            # `Fact.takes_query` decides, not the caller.
+            return _reader(fact_key, granted, query)
+        except Exception as e:
+            logger.debug(f"[SELF] read of {fact_key!r} failed: {e}")
+            return UNAVAILABLE
+
+    value = _read(key)
+
+    # **Mechanism is tried, not decided.** Whether a question names a
+    # capability is a question about the intent table and the handler
+    # docstrings, which live in `brain/` -- and `actions` sits below `brain`
+    # with no import between them. Rather than duplicating that knowledge here
+    # (two tables, drifting), the handler asks by trying: the fact answers
+    # UNAVAILABLE when the question named nothing it recognises, and the
+    # ordinary selection runs instead.
+    #
+    # This is why "which model do you use" still reaches `model_chain`. It
+    # contains "use", so mechanism is tried first, finds no capability named,
+    # and hands back.
+    if key == "mechanism" and value == UNAVAILABLE:
+        fallback = _select(query, skip=("mechanism",))
+        if fallback is not None:
+            key, value = fallback, _read(fallback)
 
     if value == UNAVAILABLE or value is None:
         return UNAVAILABLE

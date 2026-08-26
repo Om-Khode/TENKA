@@ -225,8 +225,7 @@ def _mechanism(query: str = "") -> str:
     from ..actions.registry import tool_registry
     from ..config import INTENTS
 
-    words = {w.strip(".,!?;:'\"").lower() for w in (query or "").split()}
-    named = [i for i in INTENTS if i in words or i.replace("_", " ") in (query or "").lower()]
+    named = _intents_named_by(query)
     if not named:
         return ""
 
@@ -247,6 +246,86 @@ def _mechanism(query: str = "") -> str:
                else " (classified by the model)")
         )
     return "\n".join(lines)
+
+
+def _intents_named_by(query: str) -> "list[str]":
+    """Which intents the question is about.
+
+    **Not only by identifier.** The first version matched `file_task` and
+    nothing else, so "how do you search files" -- which is how anyone actually
+    asks -- found nothing and she answered that she did not know. Nobody says
+    "file_task". The same flaw made "is there an intent for recording" return
+    all thirty-eight intents rather than the three about recording.
+
+    So an intent is also named by the words *it* uses about itself: its
+    identifier split on underscores, and the first line of its handler's
+    docstring. That is the same principle as `brain/resolver.py:_matches` --
+    a capability describes itself, and a table here of what things are called
+    would be the hardcoded-app rule broken one entry at a time.
+
+    Identifier matches are kept separate and preferred: asking about
+    `file_task` by name means that one intent, not every intent whose
+    description mentions files.
+    """
+    import inspect
+
+    from ..actions.registry import tool_registry
+    from ..config import INTENTS
+
+    lowered = (query or "").lower()
+    words = {w.strip(".,!?;:'\"") for w in lowered.split()}
+
+    exact = [i for i in INTENTS
+             if i in words or i.replace("_", " ") in lowered]
+    if exact:
+        return exact
+
+    # Words too common to identify anything. Without this, "how do you open
+    # files" matches every intent whose description contains "open".
+    noise = {"the", "a", "an", "of", "for", "to", "in", "on", "and", "or",
+             "do", "does", "you", "your", "how", "what", "is", "are", "it",
+             "use", "uses", "used", "work", "works", "can", "with", "that",
+             "this", "handle", "user", "from", "any", "there", "intent"}
+    asked = _stems(words - noise)
+    if not asked:
+        return []
+
+    scored: "list[tuple[int, str]]" = []
+    for intent in INTENTS:
+        handler = tool_registry.get(intent)
+        summary = (inspect.getdoc(handler) or "") if handler else ""
+        vocabulary = set(intent.split("_")) | {
+            w.strip(".,!?;:'\"()").lower()
+            for w in summary.split("\n")[0].split()
+        }
+        overlap = len(asked & _stems(vocabulary - noise))
+        if overlap:
+            scored.append((overlap, intent))
+
+    if not scored:
+        return []
+    best = max(n for n, _ in scored)
+    return sorted(i for n, i in scored if n == best)
+
+
+def _stems(words: "set[str]") -> "set[str]":
+    """Words with a trailing plural `s` removed, alongside the originals.
+
+    Live testing asked "how do you search files" and got `memory_query`:
+    `file_task`'s docstring says "Handle **file** operations", singular, so
+    "files" matched nothing there while "search" matched memory search. A word
+    list that cannot see a plural is a word list that answers the wrong
+    question confidently.
+
+    Deliberately not a stemmer. A real one would fold "recording" to "record"
+    and start matching things nobody asked about; this handles the one case
+    that actually bit and stops.
+    """
+    out = set(words)
+    for w in words:
+        if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+            out.add(w[:-1])
+    return out
 
 
 def _has_fast_path(intent: str) -> bool:
