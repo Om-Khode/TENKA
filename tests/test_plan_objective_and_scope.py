@@ -38,6 +38,15 @@ from assistant.core.capabilities import Capability  # noqa: E402
 _PLANNER_SRC = (_ROOT / "assistant" / "actions" / "planner" / "planner.py").read_text(
     encoding="utf-8")
 
+# The 3D continuation moved with the loop (§17.P8): it is `run()` calling
+# itself in `brain/plan_runner.py` now. The H3 guards below read *this* source,
+# and each asserts its anchor is present -- without that, a further move would
+# leave them scanning a string that does not contain the bug, which passes for
+# entirely the wrong reason.
+_RUNNER_SRC = (_ROOT / "assistant" / "brain" / "plan_runner.py").read_text(
+    encoding="utf-8")
+_CONTINUATION_CALL = "continuation = await run("
+
 
 @pytest.fixture()
 def clean_context():
@@ -88,8 +97,11 @@ def test_the_continuation_never_splices_a_step_output_into_the_goal():
     a successful synthesize, a live LLM and a depth-0 entry -- and the thing to
     catch is the *shape* of one expression.
     """
-    call = _PLANNER_SRC.index("continuation_result = await execute_plan(")
-    first_arg = _PLANNER_SRC[call:_PLANNER_SRC.index(")", call)]
+    assert _CONTINUATION_CALL in _RUNNER_SRC, (
+        "the 3D continuation call is gone or renamed -- this guard would be "
+        "reading a source that cannot contain the defect")
+    call = _RUNNER_SRC.index(_CONTINUATION_CALL)
+    first_arg = _RUNNER_SRC[call:_RUNNER_SRC.index(")", call)]
 
     assert "goal" in first_arg, "the continuation lost the user's goal entirely"
     assert ".output" not in first_arg.split("_prior_context")[0], (
@@ -107,8 +119,11 @@ def test_the_continuation_carries_the_users_words_verbatim():
     design (the continuation has to say what it is for); the property that
     matters is that nothing *variable* joins it.
     """
-    call = _PLANNER_SRC.index("continuation_result = await execute_plan(")
-    first_arg = _PLANNER_SRC[call:_PLANNER_SRC.index(")", call)]
+    assert _CONTINUATION_CALL in _RUNNER_SRC, (
+        "the 3D continuation call is gone or renamed -- this guard would be "
+        "reading a source that cannot contain the defect")
+    call = _RUNNER_SRC.index(_CONTINUATION_CALL)
+    first_arg = _RUNNER_SRC[call:_RUNNER_SRC.index(")", call)]
     fstring = re.search(r'f"([^"]*)"', first_arg)
     assert fstring, f"the continuation goal is no longer a literal: {first_arg!r}"
 

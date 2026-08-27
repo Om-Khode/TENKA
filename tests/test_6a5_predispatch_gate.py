@@ -82,7 +82,22 @@ class _FakeBridge:
 
 
 class _FakeTracker:
-    """`_telemetry.TurnTracker` writes to SQLite in the turn's `finally`."""
+    """`_telemetry.TurnTracker` writes to SQLite in the turn's `finally`.
+
+    `__getattr__` returning `None` is what makes the attribute reads work
+    (`action_outcome`, `latency_stt_ms` ...). It is also how this fake broke
+    three security tests in this file: `note_context` was added to the real
+    tracker and to the turn, nothing was added here, and `_tracker.note_context(...)`
+    became `None(...)` -- `TypeError: 'NoneType' object is not callable`,
+    swallowed by the pipeline's error handler and surfacing as "Sorry,
+    something went wrong" instead of an answer. The turn kept "working"; every
+    assertion about what it said failed for a reason that had nothing to do
+    with what was being tested.
+
+    So the recorders are declared, and
+    `test_the_fake_tracker_implements_what_the_turn_calls` walks `main.py` for
+    the next one rather than relying on someone noticing.
+    """
 
     def __init__(self, **kw):
         self.__dict__.update(kw)
@@ -91,6 +106,22 @@ class _FakeTracker:
         return None
 
     def save(self):
+        pass
+
+    # -- the recorders the turn calls; counted, not stored --
+    def note_context(self, *a, **k):
+        pass
+
+    def note_replan(self, *a, **k):
+        pass
+
+    def note_recovery(self, *a, **k):
+        pass
+
+    def note_verification(self, *a, **k):
+        pass
+
+    def record_llm_result(self, *a, **k):
         pass
 
 
@@ -1155,3 +1186,35 @@ def test_the_refusal_text_is_safe_to_speak():
         assert msg and len(msg) < 120, (len(msg), msg)
         assert "\\" not in msg and "/" not in msg, msg
         assert not any(ch.isdigit() for ch in msg), msg
+
+
+def test_the_fake_tracker_implements_what_the_turn_calls():
+    """The drift guard. `_FakeTracker.__getattr__` answers `None` to anything
+    it does not define, so a telemetry recorder added to the turn and not to
+    this fake does not fail here -- it fails as `'NoneType' object is not
+    callable` inside the pipeline, is caught by the error handler, and every
+    other test in this file starts asserting against an apology.
+
+    That is not hypothetical: it happened, to three of them, and went
+    unnoticed until an unrelated refactor made someone run the file.
+    """
+    import ast
+
+    tree = ast.parse(_MAIN_PY.read_text(encoding="utf-8"))
+    called = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and getattr(node.func.value, "id", None) == "_tracker"):
+            called.add(node.func.attr)
+
+    assert called, "walked nothing -- the turn no longer records telemetry"
+    missing = sorted(
+        name for name in called
+        if not callable(getattr(_FakeTracker(), name, None))
+    )
+    assert not missing, (
+        f"the turn calls {missing} on its tracker and _FakeTracker answers "
+        f"None to them, which raises inside the pipeline and turns every "
+        f"assertion in this file into an assertion about an error message"
+    )

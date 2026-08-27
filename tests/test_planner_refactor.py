@@ -28,21 +28,44 @@ class TestPlannerPackageStructure(unittest.TestCase):
 
     def test_package_importable(self):
         import assistant.actions.planner
-        self.assertTrue(hasattr(assistant.actions.planner, 'execute_plan'))
-        self.assertTrue(hasattr(assistant.actions.planner, 'resume_plan'))
         self.assertTrue(hasattr(assistant.actions.planner, 'needs_planning'))
-        self.assertTrue(hasattr(assistant.actions.planner, 'has_suspended_plan'))
-        self.assertTrue(hasattr(assistant.actions.planner, 'clear_suspended_plan'))
         self.assertTrue(hasattr(assistant.actions.planner, 'PlanStep'))
         self.assertTrue(hasattr(assistant.actions.planner, 'Plan'))
         self.assertTrue(hasattr(assistant.actions.planner, 'TOOL_MANIFEST'))
 
+    def test_the_package_no_longer_offers_a_way_to_run_a_plan(self):
+        """§17.P8's deliverable, stated as an absence.
+
+        These four were re-exported here and are gone deliberately. The
+        assertion is not tidiness: `actions` sits below `brain`, so a module
+        down here that reached for `execute_plan` would be reaching across a
+        layer, and the failure would be an ImportError somewhere unrelated
+        rather than a clear "that is not yours any more".
+        """
+        import assistant.actions.planner as pkg
+        for gone in ('execute_plan', 'resume_plan', 'has_suspended_plan',
+                     'clear_suspended_plan'):
+            self.assertFalse(
+                hasattr(pkg, gone),
+                f"{gone} is back in actions/planner -- running a plan belongs "
+                f"to brain/plan_runner.py",
+            )
+
+    def test_brain_is_where_a_plan_is_run(self):
+        """The other half. Asserting only the absence above would pass just as
+        well if the capability had been deleted rather than moved."""
+        from assistant.brain import plan_runner
+        for name in ('run', 'resume', 'run_steps', 'has_suspended_plan',
+                     'clear_suspended_plan'):
+            self.assertTrue(hasattr(plan_runner, name), f"missing {name}")
+
     def test_planner_module_importable(self):
         from assistant.actions.planner import planner
-        self.assertTrue(hasattr(planner, 'execute_plan'))
+        # What the planner still owns: deciding what should happen.
         self.assertTrue(hasattr(planner, '_generate_plan'))
         self.assertTrue(hasattr(planner, '_synthesize_result'))
         self.assertTrue(hasattr(planner, '_attempt_recovery'))
+        self.assertTrue(hasattr(planner, 'needs_planning'))
 
     def test_executor_module_importable(self):
         from assistant.actions.planner import executor
@@ -309,13 +332,16 @@ class TestSuspensionAPI(unittest.TestCase):
     """Verify plan suspension API works."""
 
     def test_no_suspended_plan_initially(self):
-        from assistant.actions.planner import has_suspended_plan, clear_suspended_plan
+        from assistant.brain.plan_runner import (
+            has_suspended_plan, clear_suspended_plan,
+        )
         clear_suspended_plan()
         self.assertFalse(has_suspended_plan())
 
     def test_suspend_and_clear(self):
-        from assistant.actions.planner.planner import (
-            _suspend_plan, has_suspended_plan, clear_suspended_plan, Plan,
+        from assistant.actions.planner.planner import Plan
+        from assistant.brain.plan_runner import (
+            _suspend_plan, has_suspended_plan, clear_suspended_plan,
         )
         plan = Plan(original_goal="test", steps=[])
         _suspend_plan(plan, 0, None, None, None)

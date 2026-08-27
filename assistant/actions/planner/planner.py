@@ -50,6 +50,12 @@ class PlanStep:
     status: str = "pending"         # pending | running | success | failed | skipped
     output: str = ""                # result from tool execution
     error: str = ""                 # error message if failed
+    # True when this step's `output` is an exchange with the user rather than
+    # a result. A suspended step resolves to `success` so the steps after it
+    # are not skipped -- but "the user answered" is not "the goal was met",
+    # and the synthesis must not read the reply as a product. See
+    # `_synthesize_result`.
+    answered: bool = False
 
 
 @dataclass
@@ -73,44 +79,10 @@ class Plan:
 #  works — no planner changes needed. Just register it via pending_registry.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_suspended_plan: Plan | None = None
-_suspended_step_index: int = 0
-_suspended_llm_func = None
-_suspended_tts_func = None
-_suspended_bridge = None
-
-
-def has_suspended_plan() -> bool:
-    """Check if there's a plan waiting to resume after user interaction."""
-    return _suspended_plan is not None
-
-
-def clear_suspended_plan() -> None:
-    """Clear any suspended plan (e.g., if user changes topic)."""
-    global _suspended_plan, _suspended_step_index
-    global _suspended_llm_func, _suspended_tts_func, _suspended_bridge
-    if _suspended_plan:
-        logger.info("[PLANNER] Clearing suspended plan")
-    _suspended_plan = None
-    _suspended_step_index = 0
-    _suspended_llm_func = None
-    _suspended_tts_func = None
-    _suspended_bridge = None
-
-
-def _suspend_plan(plan, resume_from_index, llm_func, tts_func, bridge):
-    """Save plan state for later resumption."""
-    global _suspended_plan, _suspended_step_index
-    global _suspended_llm_func, _suspended_tts_func, _suspended_bridge
-    _suspended_plan = plan
-    _suspended_step_index = resume_from_index
-    _suspended_llm_func = llm_func
-    _suspended_tts_func = tts_func
-    _suspended_bridge = bridge
-    logger.info(
-        f"[PLANNER] Plan SUSPENDED at step {resume_from_index + 1}/"
-        f"{len(plan.steps)} — waiting for user interaction"
-    )
+# The suspension state and the three functions that read it moved to
+# `brain/plan_runner.py` with the loop. `actions` cannot reach `brain`, which
+# is the point: a module that decides what the steps *are* has no business
+# holding the state of a run in progress.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1636,11 +1608,41 @@ async def _synthesize_result(plan: Plan, llm_func) -> str:
     parts = []
     for step in plan.steps:
         if step.status == "success" and step.output:
-            parts.append(
-                f"[{step.tool}] produced:\n"
-                + render_untrusted_block(step.output,
-                                         label=f"step_{step.step_id}_output")
-            )
+            if step.answered:
+                # The step never finished -- it stopped to ask the user
+                # something, and this is the exchange. Labelling it "produced"
+                # is how "I couldn't find model.vroid, fast or deep search?"
+                # came back as "I found the model.vroid file and opened it".
+                #
+                # The first fix said "the goal of this step was not
+                # achieved", which traded one false claim for its exact
+                # opposite: the model read it as failure and reported "I
+                # couldn't find the model.vroid file" -- about a search
+                # that had already found it twenty-two seconds earlier, on
+                # a background thread that reports separately.
+                #
+                # The outcome is not failed. It is *unknown*, and often
+                # still in flight. Both directions have to be forbidden out
+                # loud, because a summary asked to describe a step with no
+                # result will otherwise supply whichever one the
+                # surrounding text hints at.
+                parts.append(
+                    f"[{step.tool}] has NOT finished and its outcome is NOT "
+                    f"known. It paused to ask the user something; this is "
+                    f"the exchange and nothing more:\n"
+                    + render_untrusted_block(
+                        step.output, label=f"step_{step.step_id}_exchange")
+                    + f"\nDo NOT say this step succeeded. Do NOT say it "
+                      f"failed. If the exchange says something is still "
+                      f"running or will be reported later, say it is still "
+                      f"in progress and that you will report back."
+                )
+            else:
+                parts.append(
+                    f"[{step.tool}] produced:\n"
+                    + render_untrusted_block(
+                        step.output, label=f"step_{step.step_id}_output")
+                )
         elif step.status == "failed":
             parts.append(f"[{step.tool}] FAILED: {step.error[:150]}")
         elif step.status == "skipped":
@@ -1701,358 +1703,14 @@ async def _synthesize_result(plan: Plan, llm_func) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN ENTRY POINT
+#  WHERE EXECUTION WENT
+#
+#  This module used to end with `run_steps`, `execute_plan` and `resume_plan`.
+#  They are `brain/plan_runner.py` now. §17.P8: the planner emits steps and
+#  does not execute them, so what remains here answers only "what should
+#  happen" -- generation, validation, the tool manifest, reference and egress
+#  resolution, recovery planning and synthesis.
+#
+#  `brain` calls in; nothing here calls out to it, and nothing can: `actions`
+#  sits below `brain` and an import either way would invert the layer.
 # ═══════════════════════════════════════════════════════════════════════════════
-
-async def execute_plan(
-    goal: str,
-    llm_func,
-    tts_func=None,
-    bridge=None,
-    _depth: int = 0,
-    _prior_context: str = "",
-) -> str | None:
-    """
-    Main entry point for the planner.
-
-    1. Generate a plan from the goal
-    2. Execute each step sequentially
-    3. Verify each step's output
-    4. Synthesize a final response from all step outputs
-
-    Returns:
-        Final synthesized response string, or None if the planner decides
-        this is a single-step task (caller should fall back to normal routing).
-    """
-    from .executor import execute_step
-
-    try:
-        logger.info(f'[PLANNER] Goal: "{goal}"')
-
-        # ── Step 1: Generate plan ──────────────────────────────────────
-        plan = await _generate_plan(goal, llm_func, prior_context=_prior_context)
-
-        if not plan or not plan.steps:
-            logger.warning("[PLANNER] Plan generation failed — falling back")
-            return None
-
-        if len(plan.steps) == 1:
-            tool = plan.steps[0].tool
-            step_goal = plan.steps[0].goal
-            logger.info(
-                f"[PLANNER] Single-step plan → bypassing planner, "
-                f"direct to {tool}"
-            )
-            return {"bypass": tool, "goal": step_goal}
-
-        logger.info(f"[PLANNER] Plan: {len(plan.steps)} steps")
-        for s in plan.steps:
-            cond = f" [if: {s.condition}]" if s.condition else ""
-            deps = f" [needs: step {s.depends_on}]" if s.depends_on else ""
-            logger.info(
-                f"  Step {s.step_id}: [{s.tool}] {s.goal[:80]}{deps}{cond}"
-            )
-
-        # ── Step 2: Execute steps ──────────────────────────────────────
-        plan.status = "executing"
-        _step_idx = 0
-        while _step_idx < len(plan.steps):
-            from ...core.abort import abort, UserAborted
-            if abort.is_aborted():
-                raise UserAborted(abort.reason)
-            step = plan.steps[_step_idx]
-            from ...io.status_broadcaster import status, StatusPhase
-            _total = len(plan.steps)
-            # Detail uses the step intent (e.g. "browser_action") replacing
-            # underscores with spaces. Empty if missing — step chip carries N/M.
-            _intent = getattr(step, "intent", "") or ""
-            _detail = str(_intent).replace("_", " ")[:32]
-            status.set(StatusPhase.PLANNING,
-                       detail=_detail,
-                       step=(_step_idx + 1, _total))
-            if step.depends_on:
-                skip = False
-                for dep_id in step.depends_on:
-                    dep_step = next(
-                        (s for s in plan.steps if s.step_id == dep_id), None
-                    )
-                    if dep_step and dep_step.status in ("failed", "skipped"):
-                        step.status = "skipped"
-                        step.error = (
-                            f"dependency step {dep_id} "
-                            f"{dep_step.status}: {dep_step.error[:80]}"
-                        )
-                        logger.info(
-                            f"[PLANNER] Step {step.step_id} SKIPPED: "
-                            f"{step.error}"
-                        )
-                        skip = True
-                        break
-                if skip:
-                    _step_idx += 1
-                    continue
-
-            await execute_step(
-                step, plan,
-                llm_func=llm_func,
-                bridge=bridge,
-                tts_func=tts_func,
-            )
-
-            # ── Check if step is waiting for user interaction ─────────
-            if step.status == "waiting":
-                current_index = plan.steps.index(step)
-                resume_index = current_index + 1
-
-                if resume_index < len(plan.steps):
-                    _suspend_plan(plan, resume_index, llm_func, tts_func, bridge)
-                    return step.output
-                else:
-                    step.status = "success"
-                    logger.info(
-                        f"[PLANNER] Step {step.step_id} was last step, "
-                        f"no suspension needed"
-                    )
-
-            # ── Mark origin as recovered if all recovery steps done ──
-            if (step.status == "success"
-                    and hasattr(plan, '_recovery_step_ids')
-                    and step.step_id == plan._recovery_step_ids[-1]):
-                origin = next(
-                    (s for s in plan.steps if s.step_id == plan._recovery_origin),
-                    None,
-                )
-                if origin and origin.status == "failed":
-                    origin.status = "recovered"
-                    logger.info(
-                        f"[PLANNER] Step {plan._recovery_origin} marked "
-                        f"'recovered' — all recovery steps succeeded"
-                    )
-
-            # ── Attempt recovery on failure ──────────────────────────
-            if step.status == "failed":
-                if not hasattr(plan, '_recovery_attempted'):
-                    plan._recovery_attempted = False
-
-                if not plan._recovery_attempted:
-                    plan._recovery_attempted = True
-                    logger.info(
-                        f"[PLANNER] Attempting recovery for step "
-                        f"{step.step_id}"
-                    )
-
-                    if tts_func:
-                        from ...automation import verification as _ver
-                        parsed = _ver.parse_verify_failed(step.error or "")
-                        if parsed:
-                            await tts_func(
-                                f"{_ver.format_failure_for_user(parsed)} Trying again."
-                            )
-                        else:
-                            await tts_func("Hmm, that didn't work. Let me try a different approach.")
-
-                    recovery_steps = await _attempt_recovery(
-                        step, plan, llm_func
-                    )
-
-                    if recovery_steps:
-                        for i, rs in enumerate(recovery_steps):
-                            plan.steps.insert(_step_idx + 1 + i, rs)
-                        plan._recovery_origin = step.step_id
-                        plan._recovery_step_ids = [rs.step_id for rs in recovery_steps]
-                        logger.info(
-                            f"[PLANNER] Inserted {len(recovery_steps)} "
-                            f"recovery steps after step {step.step_id}"
-                        )
-                        _step_idx += 1
-                        continue
-                else:
-                    logger.info(
-                        f"[PLANNER] Recovery already attempted this plan "
-                        f"— skipping for step {step.step_id}"
-                    )
-
-                for later in plan.steps:
-                    if (later.status == "pending"
-                            and step.step_id in later.depends_on):
-                        later.status = "skipped"
-                        later.error = (
-                            f"dependency step {step.step_id} failed: "
-                            f"{step.error[:80]}"
-                        )
-                        logger.info(
-                            f"[PLANNER] Step {later.step_id} SKIPPED: "
-                            f"dependency failed"
-                        )
-
-            _step_idx += 1
-
-        # ── Step 3: 3D re-plan if step limit was hit ──────────────────
-        plan.status = "completed"
-        last_step = plan.steps[-1] if plan.steps else None
-        if (
-            _depth == 0
-            and last_step is not None
-            and last_step.tool == "synthesize"
-            and last_step.status == "success"
-            and len(plan.steps) >= 3
-        ):
-            # 6a.5 review H3. This used to be
-            #   f"{goal}\n\nProgress so far: {last_step.output}"
-            # which made a synthesize step's output -- laundered file content
-            # -- part of the continuation plan's `original_goal`, i.e. the one
-            # field the fence treats as the user's own words. From there it
-            # rode `_planner_goal` into `browser_action`, a tool declared to
-            # accept no prior-step output at all. The progress now travels
-            # beside the goal as fenced data and never joins it.
-            logger.info("[PLANNER] 3D: Step limit hit — re-planning continuation")
-            continuation_result = await execute_plan(
-                f"{goal}\n\nContinue completing the remaining work.",
-                llm_func, tts_func, bridge, _depth=1,
-                _prior_context=last_step.output,
-            )
-            if continuation_result:
-                return continuation_result
-
-        # ── Step 4: Synthesize final response ──────────────────────────
-        return await _synthesize_result(plan, llm_func)
-    finally:
-        pass
-
-
-async def resume_plan(interaction_result: str = "") -> str | None:
-    """
-    Resume a suspended plan after user interaction completes.
-
-    Called from main.py after a pending handler resolves. Continues
-    executing remaining steps from where the plan was suspended.
-    """
-    from .executor import execute_step
-
-    global _suspended_plan
-
-    if _suspended_plan is None:
-        return None
-
-    plan = _suspended_plan
-    resume_from = _suspended_step_index
-    llm_func = _suspended_llm_func
-    tts_func = _suspended_tts_func
-    bridge = _suspended_bridge
-
-    clear_suspended_plan()
-
-    if resume_from > 0:
-        waiting_step = plan.steps[resume_from - 1]
-        if waiting_step.status == "waiting":
-            if interaction_result and not _step_failed(interaction_result):
-                waiting_step.status = "success"
-                waiting_step.output = interaction_result
-                plan.context[f"step_{waiting_step.step_id}"] = interaction_result
-                logger.info(
-                    f"[PLANNER] Suspended step {waiting_step.step_id} "
-                    f"resolved: SUCCESS"
-                )
-            else:
-                waiting_step.status = "failed"
-                waiting_step.error = interaction_result[:300] if interaction_result else "cancelled"
-                waiting_step.output = interaction_result or ""
-                logger.info(
-                    f"[PLANNER] Suspended step {waiting_step.step_id} "
-                    f"resolved: FAILED"
-                )
-
-    logger.info(
-        f"[PLANNER] Resuming plan from step {resume_from + 1}/"
-        f"{len(plan.steps)}"
-    )
-
-    if tts_func:
-        remaining = len(plan.steps) - resume_from
-        await tts_func(
-            f"Alright, continuing. "
-            f"{remaining} step{'s' if remaining != 1 else ''} left."
-        )
-
-    # ── Continue executing remaining steps ─────────────────────────
-    try:
-        for i in range(resume_from, len(plan.steps)):
-            step = plan.steps[i]
-
-            if step.depends_on:
-                skip = False
-                for dep_id in step.depends_on:
-                    dep_step = next(
-                        (s for s in plan.steps if s.step_id == dep_id), None
-                    )
-                    if dep_step and dep_step.status in ("failed", "skipped"):
-                        step.status = "skipped"
-                        step.error = (
-                            f"dependency step {dep_id} "
-                            f"{dep_step.status}: {dep_step.error[:80]}"
-                        )
-                        skip = True
-                        break
-                if skip:
-                    continue
-
-            await execute_step(
-                step, plan,
-                llm_func=llm_func,
-                bridge=bridge,
-                tts_func=tts_func,
-            )
-
-            if step.status == "waiting":
-                current_index = plan.steps.index(step)
-                next_index = current_index + 1
-                if next_index < len(plan.steps):
-                    _suspend_plan(plan, next_index, llm_func, tts_func, bridge)
-                    return step.output
-                else:
-                    step.status = "success"
-
-            # Attempt recovery on failure in resumed plan too
-            if step.status == "failed":
-                if not hasattr(plan, '_recovery_attempted'):
-                    plan._recovery_attempted = False
-
-                if not plan._recovery_attempted:
-                    plan._recovery_attempted = True
-                    logger.info(
-                        f"[PLANNER] Attempting recovery for step "
-                        f"{step.step_id} (in resumed plan)"
-                    )
-                    recovery_steps = await _attempt_recovery(
-                        step, plan, llm_func
-                    )
-                    if recovery_steps:
-                        for rs in recovery_steps:
-                            await execute_step(
-                                rs, plan,
-                                llm_func=llm_func,
-                                bridge=bridge,
-                                tts_func=tts_func,
-                            )
-                            if rs.status == "waiting":
-                                next_rs_idx = plan.steps.index(rs) + 1
-                                if next_rs_idx < len(plan.steps):
-                                    _suspend_plan(plan, next_rs_idx, llm_func, tts_func, bridge)
-                                    return rs.output
-                            if rs.status == "failed":
-                                break
-                        continue
-
-                for later in plan.steps:
-                    if (later.status == "pending"
-                            and step.step_id in later.depends_on):
-                        later.status = "skipped"
-                        later.error = (
-                            f"dependency step {step.step_id} failed: "
-                            f"{step.error[:80]}"
-                        )
-
-        plan.status = "completed"
-        return await _synthesize_result(plan, llm_func)
-    finally:
-        pass

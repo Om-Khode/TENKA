@@ -958,6 +958,18 @@ def _match_batch_teach(text: str) -> tuple[str, str] | None:
 
 _LOCAL_SOURCES: frozenset[str] = frozenset({"stt", "chat"})
 
+
+async def _planner_llm_text(prompt, **kwargs) -> str:
+    """`llm_func` for the plan runner: plain text, not an `LLMResult`.
+
+    The same adapter `da_handlers._llm_text` is, defined here because `brain`
+    is called from this module and reaching into `actions` for a private
+    helper to hand back down would be a stranger arrangement than four lines.
+    """
+    from . import llm as _llm_module
+    result = await _llm_module.get_llm_response(prompt, **kwargs)
+    return result.text
+
 """Sources that mean "someone is physically at this keyboard or microphone".
 
 Spelled as a literal allow-list, never as `!= "studio"`. Two things hang off
@@ -2080,10 +2092,10 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
             _tracker.action_dispatched = f"pending_{label.lower()}"
             _tracker.action_outcome = "success"
             # If a planner plan is suspended, resume it now
-            from .actions.planner import planner as _planner_module
-            if _planner_module.has_suspended_plan():
+            from .brain import plan_runner as _plan_runner
+            if _plan_runner.has_suspended_plan():
                 logger.info("[PLANNER] Resuming suspended plan after interaction")
-                resume_result = await _planner_module.resume_plan(pending_response)
+                resume_result = await _plan_runner.resume(pending_response)
                 if resume_result:
                     parsed_emotion, clean_result = llm.parse_emotion_tag(resume_result)
                     if source in _LOCAL_SOURCES:
@@ -2161,9 +2173,10 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
         # If we reached here, no pending handler claimed the input.
         # Any suspended plan is stale — the user has moved on.
         from .actions.planner import planner as _planner_module
-        if _planner_module.has_suspended_plan():
+        from .brain import plan_runner as _plan_runner
+        if _plan_runner.has_suspended_plan():
             logger.info("[PLANNER] User moved on — clearing suspended plan")
-            _planner_module.clear_suspended_plan()
+            _plan_runner.clear_suspended_plan()
 
         # ── Planner pre-check on cleanest available goal ─────────────────
         # The 8b intent classifier truncates multi-step goals (e.g.
@@ -2306,6 +2319,88 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
 
                 _use_streaming = True
                 _tracker.action_dispatched = intent_result.intent
+                _tracker.action_outcome = "success"
+        elif intent_result.intent == "planner":
+            # ── §17.P8: plans are run by `brain`, not by `actions` ──────────
+            #
+            # A sibling of the ordinary dispatch rather than an early return,
+            # so the pre-dispatch region gains no new door and the AST sweep
+            # that guards it is unaffected. The `EXECUTE` check has not moved
+            # either: `plan_runner.run()` asks for the plan through
+            # `execute_action("planner", ...)`, which is the one site in the
+            # tree that resolves a handler, and every step re-enters the same
+            # way.
+            _t0_action = _time.monotonic()
+            from .brain import plan_runner as _plan_runner
+            from .io.status_broadcaster import status as _status
+            from .io.status_broadcaster import StatusPhase as _StatusPhase
+            from .core.abort import abort as _abort, UserAborted as _UserAborted
+            import uuid as _uuid
+
+            _plan_goal = (intent_result.params or {}).get("goal", "")
+
+            # The planner's own narration -- "let me try a different
+            # approach" -- spoken only for a local turn.
+            #
+            # `handle_planner` used to pass `tts.speak` whenever a bridge
+            # existed, with no source check, so a Studio or tailnet turn
+            # narrated its retries out loud in the owner's room. That is the
+            # same defect `_LOCAL_SOURCES` was introduced for on the reply
+            # path; the intermediate narration was simply never audited with
+            # it. `None` is not a degraded mode -- the loop runs without a
+            # voice by design.
+            #
+            # Defined *inside* the guard rather than beside a ternary at the
+            # call site. Both spellings are correct; only this one is legible
+            # to `test_no_speak_on_the_response_path_is_unguarded`, which
+            # walks for `tts.speak` calls under an `if` naming
+            # `_LOCAL_SOURCES`. A guard the enumeration cannot see protects
+            # this turn and none of the ones added later.
+            _plan_speak = None
+            if source in _LOCAL_SOURCES:
+                async def _plan_speak(text: str) -> None:
+                    await tts.speak(text, bridge, emotion="neutral")
+
+            def _plan_progress(detail: str, index: int, total: int) -> None:
+                _status.set(_StatusPhase.PLANNING, detail=detail,
+                            step=(index, total))
+
+            _plan_task_id = f"planner:{_uuid.uuid4().hex[:8]}"
+            _abort.reset()
+            _abort.register_task(_plan_task_id)
+            _status.set(_StatusPhase.THINKING, detail=str(_plan_goal)[:40])
+            try:
+                response_text = await _plan_runner.run(
+                    _plan_goal,
+                    llm_func=_planner_llm_text,
+                    speak=_plan_speak,
+                    progress=_plan_progress,
+                    bridge=bridge,
+                    params=intent_result.params,
+                    llm_response=transcription,
+                )
+                if response_text is None:
+                    # Not a multi-step goal after all. Fall back to the
+                    # ordinary route rather than inventing an answer.
+                    response_text = await execute_action(
+                        "code_executor",
+                        intent_result.params,
+                        llm_response=transcription,
+                        bridge=bridge,
+                    )
+            except _UserAborted:
+                from .actions.responses import personality_say as _say
+                try:
+                    response_text = _say("stopped", default="Stopped.")
+                except Exception:
+                    response_text = "Stopped."
+            finally:
+                _status.set(_StatusPhase.IDLE)
+                _abort.unregister_task(_plan_task_id)
+
+            _tracker.latency_action_ms = int((_time.monotonic() - _t0_action) * 1000)
+            _tracker.action_dispatched = "planner"
+            if _tracker.action_outcome != "failure":
                 _tracker.action_outcome = "success"
         else:
             # Tool execution — run the matched handler (async for computer agent)
