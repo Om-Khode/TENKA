@@ -1,30 +1,24 @@
 """
-planner/ — Multi-step goal orchestration package.
+planner/ — Multi-step goal planning.
 
-Public API re-exported here so callers can do:
-    from assistant.actions.planner import execute_plan, needs_planning, ...
-or:
-    from assistant.actions import planner
-    planner.execute_plan(...)
+**Planning, not running.** §17.P8 split the package: what a plan *is* is
+decided here, and running one is `brain/plan_runner.py`. `execute_plan`,
+`resume_plan` and the suspension helpers used to be re-exported from this line
+and are deliberately absent -- an `actions` module importing them would be
+reaching for a layer above it, and the import would not resolve.
+
+    from assistant.actions.planner import needs_planning, TOOL_MANIFEST
 """
 
 from .planner import (
-    execute_plan,
-    resume_plan,
     needs_planning,
-    has_suspended_plan,
-    clear_suspended_plan,
     PlanStep,
     Plan,
     TOOL_MANIFEST,
 )
 
 __all__ = [
-    "execute_plan",
-    "resume_plan",
     "needs_planning",
-    "has_suspended_plan",
-    "clear_suspended_plan",
     "PlanStep",
     "Plan",
     "TOOL_MANIFEST",
