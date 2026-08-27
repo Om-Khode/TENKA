@@ -288,74 +288,36 @@ async def handle_find_and_click(params: dict, llm_response: str, bridge=None,
 # --- Planner Handler ---
 
 @tool_registry.decorator("planner")
-async def handle_planner(params: dict, llm_response: str, bridge=None) -> str:
-    """Orchestrate a multi-step plan to accomplish a complex goal."""
-    import uuid as _uuid
-    from ..core.abort import abort, UserAborted
-    from ..io.status_broadcaster import status, StatusPhase
+async def handle_planner(params: dict, llm_response: str, bridge=None):
+    """Plan a multi-step goal. Does not execute it.
 
-    import assistant.actions as _act
-    from .planner import planner
-    from .. import llm as llm_module
-    from ..io.audio import tts as tts_module
+    §17.P8. This used to be the orchestrator -- it opened an abort task, set a
+    status phase, ran every step and synthesized the answer. All of that is
+    `brain/plan_runner.py` now, because running a plan is coordination and
+    coordination lives above `actions`.
+
+    What is left is the half `actions` can honestly own: turn a goal into a
+    `Plan`, or say it does not need one.
+
+    **The registration stays, and that is the point of doing it this way.**
+    `brain/affordance.py:seed_from_handlers` mirrors `tool_registry`, so
+    deleting this entry would remove `planner` from what she says she can do --
+    while she was still doing it. Denying a capability you have is the same
+    defect as claiming one you lack.
+
+    Returns a `Plan`, or `None` when the goal does not need planning and the
+    caller should fall back to ordinary routing. Unlike every other handler
+    this returns no sentence, because it does nothing a sentence could
+    describe -- `brain` turns the outcome into words.
+    """
+    from .planner.planner import _generate_plan
 
     goal = params.get("goal", "")
     if not goal:
-        return "What do you want me to do? Give me a goal, dummy."
+        return None
 
-    _task_id = f"planner:{_uuid.uuid4().hex[:8]}"
-    abort.reset()
-    abort.register_task(_task_id)
-    status.set(StatusPhase.THINKING, detail=str(goal)[:40])
-    try:
-        async def agent_tts(text):
-            if bridge:
-                await tts_module.speak(text, bridge, emotion="neutral")
-
-        result = await planner.execute_plan(
-            goal=goal,
-            llm_func=_llm_text,
-            tts_func=agent_tts,
-            bridge=bridge,
-        )
-
-        if result is None:
-            return await handle_code_executor(params, llm_response, bridge,
-                                              _from_planner=True)
-
-        if isinstance(result, dict) and "bypass" in result:
-            tool_name = result["bypass"]
-            bypass_params = {**params, "goal": result["goal"]}
-            bypass_result = await _act.execute(tool_name, bypass_params, llm_response,
-                                               bridge, _from_planner=True)
-            from ..automation import verification as _ver
-            parsed = _ver.parse_verify_failed(bypass_result or "")
-            if parsed:
-                return _ver.format_failure_for_user(parsed)
-            from ..llm.contracts import ask_for_synthesis
-            try:
-                synth = await ask_for_synthesis(
-                    f'User asked: "{goal}"\n'
-                    f'Result:\n{(bypass_result or "")[:1500]}\n\n'
-                    f'Concise spoken response (1-2 sentences). '
-                    f'Summarize what happened and the key information.',
-                    max_tokens=200,
-                )
-                if synth and synth != "__LLM_UNAVAILABLE__":
-                    return synth
-            except Exception:
-                pass
-            return bypass_result
-
-        return result
-    except UserAborted:
-        try:
-            return personality_say("stopped", default="Stopped.")
-        except Exception:
-            return "Stopped."
-    finally:
-        status.set(StatusPhase.IDLE)
-        abort.unregister_task(_task_id)
+    return await _generate_plan(goal, _llm_text,
+                                prior_context=params.get("prior_context", ""))
 
 
 # --- Code Executor Handler ---
