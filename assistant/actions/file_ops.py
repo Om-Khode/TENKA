@@ -787,20 +787,45 @@ async def handle_pending_file_search(text: str) -> str | None:
         elapsed = round(time.time() - start, 1)
 
         if not results:
+            # "I looked everywhere and it is not there" and "I ran out of time"
+            # are different answers, and only one of them was ever given. A
+            # result object that does not carry the fact is treated as the
+            # cautious case: never claim an exhaustive search without evidence
+            # that one happened.
+            searched_it_all = getattr(results, "exhaustive", False)
+            missed = ", ".join(getattr(results, "unsearched", ()) or ())
             if tier == 2:
                 try_arm(_act.pending_file_search, {"name": name, "tier": 2},
                         principal=searcher_principal)
-                msg = (
-                    f"I did a fast search and couldn't find '{name}' "
-                    f"in {elapsed}s. Want me to try a deep full-computer search? "
-                    f"That could take a minute or two."
-                )
+                if searched_it_all:
+                    msg = (
+                        f"I did a fast search and couldn't find '{name}' "
+                        f"in {elapsed}s. Want me to try a deep full-computer "
+                        f"search? That could take a minute or two."
+                    )
+                else:
+                    where = f" — I never got to {missed}" if missed else ""
+                    msg = (
+                        f"The fast search ran out of time after {elapsed}s"
+                        f"{where}, so '{name}' may well still be there. "
+                        f"Want me to run the deep search?"
+                    )
             else:
-                msg = (
-                    f"I did a thorough search of your entire computer "
-                    f"and couldn't find any file called '{name}'. "
-                    f"It may not exist or could be on an external drive."
-                )
+                if searched_it_all:
+                    msg = (
+                        f"I did a thorough search of your entire computer "
+                        f"and couldn't find any file called '{name}'. "
+                        f"It may not exist or could be on an external drive."
+                    )
+                else:
+                    where = f" before reaching {missed}" if missed else ""
+                    msg = (
+                        f"I searched for {elapsed}s and ran out of time"
+                        f"{where}. I can't tell you '{name}' isn't on your "
+                        f"computer — only that I didn't get to look "
+                        f"everywhere. If you know roughly where it is, point "
+                        f"me at the folder and I'll go straight there."
+                    )
         elif len(results) == 1:
             p = results[0]
             info = file_manager.get_file_info(p)

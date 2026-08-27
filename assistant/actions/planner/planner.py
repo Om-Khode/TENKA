@@ -50,6 +50,12 @@ class PlanStep:
     status: str = "pending"         # pending | running | success | failed | skipped
     output: str = ""                # result from tool execution
     error: str = ""                 # error message if failed
+    # True when this step's `output` is an exchange with the user rather than
+    # a result. A suspended step resolves to `success` so the steps after it
+    # are not skipped -- but "the user answered" is not "the goal was met",
+    # and the synthesis must not read the reply as a product. See
+    # `_synthesize_result`.
+    answered: bool = False
 
 
 @dataclass
@@ -1636,11 +1642,25 @@ async def _synthesize_result(plan: Plan, llm_func) -> str:
     parts = []
     for step in plan.steps:
         if step.status == "success" and step.output:
-            parts.append(
-                f"[{step.tool}] produced:\n"
-                + render_untrusted_block(step.output,
-                                         label=f"step_{step.step_id}_output")
-            )
+            if step.answered:
+                # The step never finished -- it stopped to ask the user
+                # something, and this is the exchange. Labelling it "produced"
+                # is how "I couldn't find model.vroid, fast or deep search?"
+                # came back as "I found the model.vroid file and opened it".
+                parts.append(
+                    f"[{step.tool}] did NOT finish. It paused to ask the user "
+                    f"something, and this is only what was said:\n"
+                    + render_untrusted_block(
+                        step.output, label=f"step_{step.step_id}_exchange")
+                    + f"\nDo not report this as a result. The goal of this "
+                      f"step was not achieved."
+                )
+            else:
+                parts.append(
+                    f"[{step.tool}] produced:\n"
+                    + render_untrusted_block(
+                        step.output, label=f"step_{step.step_id}_output")
+                )
         elif step.status == "failed":
             parts.append(f"[{step.tool}] FAILED: {step.error[:150]}")
         elif step.status == "skipped":
@@ -2035,6 +2055,7 @@ async def resume_plan(interaction_result: str = "") -> str | None:
         if waiting_step.status == "waiting":
             if interaction_result and not _step_failed(interaction_result):
                 waiting_step.status = "success"
+                waiting_step.answered = True
                 waiting_step.output = interaction_result
                 plan.context[f"step_{waiting_step.step_id}"] = interaction_result
                 logger.info(

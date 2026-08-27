@@ -427,6 +427,74 @@ async def test_the_loop_starts_where_it_is_told(planner):
     assert not result.suspended
 
 
+# ─── an answered step is not a finished step ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_an_answered_step_is_not_offered_as_a_result(planner):
+    """Found by live testing, and it made her state a falsehood.
+
+    A step that suspends is resolved to `success` so the steps behind it are
+    not skipped -- but what it carries is the *exchange*, not a result. Step 1
+    here said "I couldn't find model.vroid, fast search or deep?"; the
+    synthesis was handed it under the heading "[file_task] produced:" and
+    reported "I found the model.vroid file and opened it."
+
+    The user's answer is not evidence the step's goal was met.
+    """
+    seen = {}
+
+    async def _capture(prompt, **kw):
+        seen["prompt"] = prompt
+        return "summary"
+
+    async def _ok(step, plan, **kw):
+        step.status = "success"
+        step.output = "opened it"
+
+    plan = _plan(planner, _step(planner, 1, tool="file_task"),
+                 _step(planner, 2))
+    plan.steps[0].status = "waiting"
+    planner._suspend_plan(plan, 1, _capture, None, None)
+
+    with _executor_returning(_ok):
+        await planner.resume_plan(
+            "Starting a fast 3-level search. I'll let you know.")
+
+    prompt = seen["prompt"]
+    assert "Starting a fast 3-level search" in prompt, "the test set nothing up"
+    assert "[file_task] produced" not in prompt, (
+        "the interaction was offered to the synthesis as the step's product")
+    assert "did NOT finish" in prompt, (
+        "nothing told the synthesis this step never completed")
+
+
+@pytest.mark.asyncio
+async def test_a_step_that_really_ran_is_still_offered_as_a_result(planner):
+    """The control. A fix that labels every step "unfinished" would pass the
+    test above and make her unable to report anything she did do."""
+    seen = {}
+
+    async def _capture(prompt, **kw):
+        seen["prompt"] = prompt
+        return "summary"
+
+    async def _ok(step, plan, **kw):
+        step.status = "success"
+        step.output = "the deed is done"
+
+    plan = _plan(planner, _step(planner, 1), _step(planner, 2))
+    plan.steps[0].status = "success"
+    plan.steps[0].output = "already finished"
+    planner._suspend_plan(plan, 1, _capture, None, None)
+
+    with _executor_returning(_ok):
+        await planner.resume_plan("")
+
+    assert "produced" in seen["prompt"], (
+        "a step that genuinely ran was reported as unfinished")
+    assert "did NOT finish" not in seen["prompt"]
+
+
 # ─── what stays different, on purpose ────────────────────────────────────────
 
 def test_3d_replanning_stays_out_of_the_loop():

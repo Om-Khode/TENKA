@@ -90,6 +90,40 @@ def _get_tier1_folders() -> list[Path]:
     return folders
 
 
+def _get_drives() -> "list[Path]":
+    """Every mounted drive root, in walk order.
+
+    Its own function so a test can hand `find_files` a set of ordinary
+    directories: the alphabetical, first-is-largest shape of real drive
+    letters is exactly what the fair-share budget exists to survive, and it
+    cannot be reproduced from a temp folder otherwise.
+    """
+    import string
+    return [Path(f"{d}:\\") for d in string.ascii_uppercase
+            if Path(f"{d}:\\").exists()]
+
+
+class SearchResult(list):
+    """The matches, plus whether the search actually finished.
+
+    A plain list cannot tell "looked everywhere, it is not there" from "gave up
+    after fifteen seconds", so the caller reported the first while meaning the
+    second -- "I did a thorough search of your entire computer and couldn't find
+    any file called X" after covering part of one drive out of three.
+
+    Subclasses `list` because three of the four callers only ever ask for tier
+    1, which has no deadline and cannot be cut short. They keep working
+    untouched, and the one caller that reports to the user gains the fact it
+    was missing.
+    """
+
+    def __init__(self, matches=(), *, exhaustive: bool = True,
+                 unsearched=()) -> None:
+        super().__init__(matches)
+        self.exhaustive = bool(exhaustive)
+        self.unsearched = tuple(str(u) for u in unsearched)
+
+
 def find_files(
     name: str,
     tier: int = 1,
@@ -122,6 +156,7 @@ def find_files(
     """
     import time
     import string
+    from collections import deque
 
     name_lower = name.lower().strip()
     matches = []
@@ -139,70 +174,105 @@ def find_files(
                 try:
                     if p.is_file() and name_lower in p.name.lower():
                         if _add(p):
-                            return matches
+                            return SearchResult(matches)
                 except (PermissionError, OSError):
                     continue
         except (PermissionError, OSError):
             continue
 
     if tier == 1 or matches:
-        return matches
+        # Tier 1 has no deadline and always finishes, so "not found" here
+        # really does mean not found in those folders.
+        return SearchResult(matches)
 
-    # ── Tier 2: all drives, 3 levels deep ────────────────────────────────
-    drives = [
-        Path(f"{d}:\\")
-        for d in string.ascii_uppercase
-        if Path(f"{d}:\\").exists()
-    ]
+    # ── Tier 2/3: every drive, each with a fair share of the clock ────────
+    #
+    # This used to be one deadline for the whole walk, with the drives taken
+    # in alphabetical order. On a machine where the system drive is both first
+    # and by far the largest, that is a starvation bug wearing a timeout's
+    # clothing: C:\ takes ~37s at tier 2's depth here and the tier-2 budget is
+    # 15s, so C:\ consumed all of it and D:\ was never opened. A file two
+    # directories below D:\ was reported as "not on your computer" by a search
+    # that never looked at the drive it was on -- twice, once per tier.
+    #
+    # Each drive now gets an equal share of whatever time remains, and a drive
+    # that finishes early hands its remainder to the ones behind it. Nothing
+    # here knows which drive is the system drive; that is a fact about one
+    # machine, and the rule is about fairness, not about C:.
+    drives = _get_drives()
 
-    # Skip drives already covered by Tier 1 (avoid re-scanning home drive root)
-    tier1_roots = {p.anchor for p in _get_tier1_folders()}
+    max_depth = 3 if tier == 2 else 999  # 999 = effectively unlimited (tier 3)
 
-    def _scan_dir(folder: Path, current_depth: int, max_depth: int) -> bool:
-        """Recursively scan up to max_depth. Returns True if limit reached."""
-        if time.time() > deadline:
-            return False
-        try:
-            for item in folder.iterdir():
-                if time.time() > deadline:
-                    return False
-                try:
-                    if item.is_file() and name_lower in item.name.lower():
-                        if _add(item):
-                            return True
-                    elif item.is_dir() and current_depth < max_depth:
-                        if _scan_dir(item, current_depth + 1, max_depth):
-                            return True
-                except (PermissionError, OSError):
-                    continue
-        except (PermissionError, OSError):
-            pass
+    # The per-drive deadline, in a cell so `_scan_dir` reads the current one
+    # rather than closing over a value fixed before the loop starts.
+    budget = {"until": deadline}
+    unsearched: list[str] = []
+
+    def _scan_drive(root: Path, max_depth: int) -> bool:
+        """Breadth-first walk of one drive. True if the result limit was hit.
+
+        Depth-first is how tier 3 managed to find *less* than tier 2: with
+        `max_depth` effectively unlimited, the first large subtree in
+        alphabetical order consumed the drive's whole share before the sibling
+        holding the file was ever opened. `D:\Code` before `D:\VR Model`, and
+        the file sat two directories down the whole time.
+
+        Breadth-first makes a shallow file cheap to find regardless of what
+        else is on the drive, and makes each tier a superset of the one below
+        it by construction rather than by hope -- which is the property a
+        "deeper search" is supposed to have.
+        """
+        queue = deque([(root, 0)])
+        while queue:
+            if time.time() > budget["until"]:
+                return False
+            folder, depth = queue.popleft()
+            try:
+                for item in folder.iterdir():
+                    if time.time() > budget["until"]:
+                        return False
+                    try:
+                        if item.is_file():
+                            if name_lower in item.name.lower() and _add(item):
+                                return True
+                        elif item.is_dir() and depth < max_depth:
+                            queue.append((item, depth + 1))
+                    except (PermissionError, OSError):
+                        continue
+            except (PermissionError, OSError):
+                continue
         return False
 
-    max_depth = 3 if tier == 2 else 999  # 999 = effectively unlimited for Tier 3
-
-    for drive in drives:
-        if time.time() > deadline:
-            logger.info(f"[FILE] Tier {tier} search timed out after {timeout_seconds}s")
+    for position, drive in enumerate(drives):
+        now = time.time()
+        if now >= deadline:
+            unsearched.extend(str(d) for d in drives[position:])
+            logger.info(
+                f"[FILE] Tier {tier} search out of time — never opened "
+                f"{', '.join(str(d) for d in drives[position:])}"
+            )
             break
-        try:
-            for item in drive.iterdir():
-                if time.time() > deadline:
-                    break
-                try:
-                    if item.is_file() and name_lower in item.name.lower():
-                        if _add(item):
-                            return matches
-                    elif item.is_dir():
-                        if _scan_dir(item, 1, max_depth):
-                            return matches
-                except (PermissionError, OSError):
-                    continue
-        except (PermissionError, OSError):
-            continue
 
-    return matches
+        remaining_drives = len(drives) - position
+        budget["until"] = min(
+            deadline, now + (deadline - now) / remaining_drives
+        )
 
+        if _scan_drive(drive, max_depth):
+            # Stopped on the result limit, not on the clock: there may be more.
+            return SearchResult(
+                matches, exhaustive=False,
+                unsearched=[str(d) for d in drives[position + 1:]],
+            )
+
+        if time.time() > budget["until"]:
+            unsearched.append(str(drive))
+            logger.info(
+                f"[FILE] Tier {tier} search ran out of its share on {drive}"
+            )
+
+    return SearchResult(matches, exhaustive=not unsearched,
+                        unsearched=unsearched)
 
 # ─── Rich document extraction ────────────────────────────────────────────────
 # Each entry maps an extension to (pip package name, lazy extractor). Adding a
