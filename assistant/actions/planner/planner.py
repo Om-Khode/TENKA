@@ -1704,6 +1704,224 @@ async def _synthesize_result(plan: Plan, llm_func) -> str:
 #  MAIN ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ─── The step loop ───────────────────────────────────────────────────────────
+#
+# One loop, called from two places. It used to be two loops -- `execute_plan`
+# walked the steps with a `while` and an index, `resume_plan` walked them again
+# with a `for` over a range -- and they had drifted apart in seven ways, every
+# one of them a defect rather than a deliberate difference:
+#
+#   * `resume_plan` never checked `abort`, so a resumed plan could not be
+#     cancelled. The stop word worked before the interaction and not after it.
+#   * It never touched the status broadcaster, so the overlay went blank for
+#     the whole second half of a plan.
+#   * It never marked a recovery origin `recovered`, so a step that failed,
+#     recovered and finished stayed `failed` in the synthesis.
+#   * It said nothing to the user before retrying.
+#   * It ran recovery steps in a nested inline loop instead of inserting them,
+#     which is the reason it needed a third `execute_step` call site -- and
+#     that loop called `plan.steps.index(rs)` on a step nothing had inserted,
+#     so a recovery step that ended `waiting` raised `ValueError` instead of
+#     suspending.
+#   * The `for i in range(...)` is why it could not insert: inserting into the
+#     list it was indexing would have shifted every later step.
+#
+# The `while` form is the one that survives, because inserting recovery steps
+# into the plan and letting the ordinary loop pick them up is what makes
+# recovery, dependencies and suspension compose. A nested executor has to
+# re-implement all three, and did not.
+#
+# 3D re-planning stays in `execute_plan` and is deliberately not here: it needs
+# the original goal to write a continuation, and a resumed plan is a
+# continuation already.
+
+
+@dataclass
+class StepLoopResult:
+    """Why the loop stopped.
+
+    `suspended` is not "did it fail" -- a suspended plan is healthy and waiting
+    on a person. The caller must return `output` to the user untouched and
+    must not synthesize, because the plan is not finished.
+    """
+
+    suspended: bool
+    output: str | None = None
+
+
+def _blocked_by_dependency(step: PlanStep, plan: Plan) -> bool:
+    """Mark `step` skipped if anything it depends on failed or was skipped."""
+    if not step.depends_on:
+        return False
+    for dep_id in step.depends_on:
+        dep_step = next(
+            (s for s in plan.steps if s.step_id == dep_id), None
+        )
+        if dep_step and dep_step.status in ("failed", "skipped"):
+            step.status = "skipped"
+            step.error = (
+                f"dependency step {dep_id} "
+                f"{dep_step.status}: {dep_step.error[:80]}"
+            )
+            logger.info(
+                f"[PLANNER] Step {step.step_id} SKIPPED: {step.error}"
+            )
+            return True
+    return False
+
+
+def _skip_dependents(step: PlanStep, plan: Plan) -> None:
+    """Cascade a failure to every pending step waiting on it."""
+    for later in plan.steps:
+        if later.status == "pending" and step.step_id in later.depends_on:
+            later.status = "skipped"
+            later.error = (
+                f"dependency step {step.step_id} failed: {step.error[:80]}"
+            )
+            logger.info(
+                f"[PLANNER] Step {later.step_id} SKIPPED: dependency failed"
+            )
+
+
+def _mark_origin_recovered(step: PlanStep, plan: Plan) -> None:
+    """A step whose recovery steps all succeeded is `recovered`, not `failed`.
+
+    Without this the synthesis reports a failure that was repaired, which is
+    the same lie in the other direction from claiming a success.
+    """
+    if step.status != "success":
+        return
+    if not hasattr(plan, "_recovery_step_ids"):
+        return
+    if step.step_id != plan._recovery_step_ids[-1]:
+        return
+    origin = next(
+        (s for s in plan.steps if s.step_id == plan._recovery_origin), None
+    )
+    if origin and origin.status == "failed":
+        origin.status = "recovered"
+        logger.info(
+            f"[PLANNER] Step {plan._recovery_origin} marked 'recovered' "
+            f"— all recovery steps succeeded"
+        )
+
+
+async def _insert_recovery(
+    step: PlanStep, plan: Plan, index: int, llm_func, tts_func,
+) -> bool:
+    """Try once per plan to plan around a failed step.
+
+    Returns True when recovery steps were inserted, which means the caller
+    should advance past the failure and let the ordinary loop run them --
+    they are ordinary steps now, and get dependency handling, abort checks and
+    suspension for free.
+    """
+    if not hasattr(plan, "_recovery_attempted"):
+        plan._recovery_attempted = False
+
+    if plan._recovery_attempted:
+        logger.info(
+            f"[PLANNER] Recovery already attempted this plan — skipping for "
+            f"step {step.step_id}"
+        )
+        return False
+
+    plan._recovery_attempted = True
+    logger.info(f"[PLANNER] Attempting recovery for step {step.step_id}")
+
+    if tts_func:
+        from ...automation import verification as _ver
+        parsed = _ver.parse_verify_failed(step.error or "")
+        if parsed:
+            await tts_func(
+                f"{_ver.format_failure_for_user(parsed)} Trying again."
+            )
+        else:
+            await tts_func(
+                "Hmm, that didn't work. Let me try a different approach."
+            )
+
+    recovery_steps = await _attempt_recovery(step, plan, llm_func)
+    if not recovery_steps:
+        return False
+
+    for i, rs in enumerate(recovery_steps):
+        plan.steps.insert(index + 1 + i, rs)
+    plan._recovery_origin = step.step_id
+    plan._recovery_step_ids = [rs.step_id for rs in recovery_steps]
+    logger.info(
+        f"[PLANNER] Inserted {len(recovery_steps)} recovery steps after "
+        f"step {step.step_id}"
+    )
+    return True
+
+
+async def run_steps(
+    plan: Plan,
+    start_index: int,
+    *,
+    llm_func,
+    tts_func=None,
+    bridge=None,
+) -> StepLoopResult:
+    """Walk `plan.steps` from `start_index`, executing each.
+
+    The single place a plan step is executed. `execute_plan` starts it at 0 and
+    `resume_plan` starts it wherever the interaction left off; nothing else
+    differs, which is the point.
+    """
+    from .executor import execute_step
+    from ...core.abort import abort, UserAborted
+    from ...io.status_broadcaster import status, StatusPhase
+
+    index = start_index
+    while index < len(plan.steps):
+        if abort.is_aborted():
+            raise UserAborted(abort.reason)
+
+        step = plan.steps[index]
+
+        # Detail uses the step intent (e.g. "browser_action") replacing
+        # underscores with spaces. Empty if missing — step chip carries N/M.
+        _intent = getattr(step, "intent", "") or ""
+        status.set(
+            StatusPhase.PLANNING,
+            detail=str(_intent).replace("_", " ")[:32],
+            step=(index + 1, len(plan.steps)),
+        )
+
+        if _blocked_by_dependency(step, plan):
+            index += 1
+            continue
+
+        await execute_step(
+            step, plan, llm_func=llm_func, bridge=bridge, tts_func=tts_func,
+        )
+
+        if step.status == "waiting":
+            resume_index = plan.steps.index(step) + 1
+            if resume_index < len(plan.steps):
+                _suspend_plan(plan, resume_index, llm_func, tts_func, bridge)
+                return StepLoopResult(suspended=True, output=step.output)
+            step.status = "success"
+            logger.info(
+                f"[PLANNER] Step {step.step_id} was last step, "
+                f"no suspension needed"
+            )
+
+        _mark_origin_recovered(step, plan)
+
+        if step.status == "failed":
+            if await _insert_recovery(step, plan, index, llm_func, tts_func):
+                index += 1
+                continue
+            _skip_dependents(step, plan)
+
+        index += 1
+
+    return StepLoopResult(suspended=False)
+
+
 async def execute_plan(
     goal: str,
     llm_func,
@@ -1724,8 +1942,6 @@ async def execute_plan(
         Final synthesized response string, or None if the planner decides
         this is a single-step task (caller should fall back to normal routing).
     """
-    from .executor import execute_step
-
     try:
         logger.info(f'[PLANNER] Goal: "{goal}"')
 
@@ -1755,137 +1971,11 @@ async def execute_plan(
 
         # ── Step 2: Execute steps ──────────────────────────────────────
         plan.status = "executing"
-        _step_idx = 0
-        while _step_idx < len(plan.steps):
-            from ...core.abort import abort, UserAborted
-            if abort.is_aborted():
-                raise UserAborted(abort.reason)
-            step = plan.steps[_step_idx]
-            from ...io.status_broadcaster import status, StatusPhase
-            _total = len(plan.steps)
-            # Detail uses the step intent (e.g. "browser_action") replacing
-            # underscores with spaces. Empty if missing — step chip carries N/M.
-            _intent = getattr(step, "intent", "") or ""
-            _detail = str(_intent).replace("_", " ")[:32]
-            status.set(StatusPhase.PLANNING,
-                       detail=_detail,
-                       step=(_step_idx + 1, _total))
-            if step.depends_on:
-                skip = False
-                for dep_id in step.depends_on:
-                    dep_step = next(
-                        (s for s in plan.steps if s.step_id == dep_id), None
-                    )
-                    if dep_step and dep_step.status in ("failed", "skipped"):
-                        step.status = "skipped"
-                        step.error = (
-                            f"dependency step {dep_id} "
-                            f"{dep_step.status}: {dep_step.error[:80]}"
-                        )
-                        logger.info(
-                            f"[PLANNER] Step {step.step_id} SKIPPED: "
-                            f"{step.error}"
-                        )
-                        skip = True
-                        break
-                if skip:
-                    _step_idx += 1
-                    continue
-
-            await execute_step(
-                step, plan,
-                llm_func=llm_func,
-                bridge=bridge,
-                tts_func=tts_func,
-            )
-
-            # ── Check if step is waiting for user interaction ─────────
-            if step.status == "waiting":
-                current_index = plan.steps.index(step)
-                resume_index = current_index + 1
-
-                if resume_index < len(plan.steps):
-                    _suspend_plan(plan, resume_index, llm_func, tts_func, bridge)
-                    return step.output
-                else:
-                    step.status = "success"
-                    logger.info(
-                        f"[PLANNER] Step {step.step_id} was last step, "
-                        f"no suspension needed"
-                    )
-
-            # ── Mark origin as recovered if all recovery steps done ──
-            if (step.status == "success"
-                    and hasattr(plan, '_recovery_step_ids')
-                    and step.step_id == plan._recovery_step_ids[-1]):
-                origin = next(
-                    (s for s in plan.steps if s.step_id == plan._recovery_origin),
-                    None,
-                )
-                if origin and origin.status == "failed":
-                    origin.status = "recovered"
-                    logger.info(
-                        f"[PLANNER] Step {plan._recovery_origin} marked "
-                        f"'recovered' — all recovery steps succeeded"
-                    )
-
-            # ── Attempt recovery on failure ──────────────────────────
-            if step.status == "failed":
-                if not hasattr(plan, '_recovery_attempted'):
-                    plan._recovery_attempted = False
-
-                if not plan._recovery_attempted:
-                    plan._recovery_attempted = True
-                    logger.info(
-                        f"[PLANNER] Attempting recovery for step "
-                        f"{step.step_id}"
-                    )
-
-                    if tts_func:
-                        from ...automation import verification as _ver
-                        parsed = _ver.parse_verify_failed(step.error or "")
-                        if parsed:
-                            await tts_func(
-                                f"{_ver.format_failure_for_user(parsed)} Trying again."
-                            )
-                        else:
-                            await tts_func("Hmm, that didn't work. Let me try a different approach.")
-
-                    recovery_steps = await _attempt_recovery(
-                        step, plan, llm_func
-                    )
-
-                    if recovery_steps:
-                        for i, rs in enumerate(recovery_steps):
-                            plan.steps.insert(_step_idx + 1 + i, rs)
-                        plan._recovery_origin = step.step_id
-                        plan._recovery_step_ids = [rs.step_id for rs in recovery_steps]
-                        logger.info(
-                            f"[PLANNER] Inserted {len(recovery_steps)} "
-                            f"recovery steps after step {step.step_id}"
-                        )
-                        _step_idx += 1
-                        continue
-                else:
-                    logger.info(
-                        f"[PLANNER] Recovery already attempted this plan "
-                        f"— skipping for step {step.step_id}"
-                    )
-
-                for later in plan.steps:
-                    if (later.status == "pending"
-                            and step.step_id in later.depends_on):
-                        later.status = "skipped"
-                        later.error = (
-                            f"dependency step {step.step_id} failed: "
-                            f"{step.error[:80]}"
-                        )
-                        logger.info(
-                            f"[PLANNER] Step {later.step_id} SKIPPED: "
-                            f"dependency failed"
-                        )
-
-            _step_idx += 1
+        _loop = await run_steps(
+            plan, 0, llm_func=llm_func, tts_func=tts_func, bridge=bridge,
+        )
+        if _loop.suspended:
+            return _loop.output
 
         # ── Step 3: 3D re-plan if step limit was hit ──────────────────
         plan.status = "completed"
@@ -1927,8 +2017,6 @@ async def resume_plan(interaction_result: str = "") -> str | None:
     Called from main.py after a pending handler resolves. Continues
     executing remaining steps from where the plan was suspended.
     """
-    from .executor import execute_step
-
     global _suspended_plan
 
     if _suspended_plan is None:
@@ -1976,81 +2064,13 @@ async def resume_plan(interaction_result: str = "") -> str | None:
 
     # ── Continue executing remaining steps ─────────────────────────
     try:
-        for i in range(resume_from, len(plan.steps)):
-            step = plan.steps[i]
-
-            if step.depends_on:
-                skip = False
-                for dep_id in step.depends_on:
-                    dep_step = next(
-                        (s for s in plan.steps if s.step_id == dep_id), None
-                    )
-                    if dep_step and dep_step.status in ("failed", "skipped"):
-                        step.status = "skipped"
-                        step.error = (
-                            f"dependency step {dep_id} "
-                            f"{dep_step.status}: {dep_step.error[:80]}"
-                        )
-                        skip = True
-                        break
-                if skip:
-                    continue
-
-            await execute_step(
-                step, plan,
-                llm_func=llm_func,
-                bridge=bridge,
-                tts_func=tts_func,
-            )
-
-            if step.status == "waiting":
-                current_index = plan.steps.index(step)
-                next_index = current_index + 1
-                if next_index < len(plan.steps):
-                    _suspend_plan(plan, next_index, llm_func, tts_func, bridge)
-                    return step.output
-                else:
-                    step.status = "success"
-
-            # Attempt recovery on failure in resumed plan too
-            if step.status == "failed":
-                if not hasattr(plan, '_recovery_attempted'):
-                    plan._recovery_attempted = False
-
-                if not plan._recovery_attempted:
-                    plan._recovery_attempted = True
-                    logger.info(
-                        f"[PLANNER] Attempting recovery for step "
-                        f"{step.step_id} (in resumed plan)"
-                    )
-                    recovery_steps = await _attempt_recovery(
-                        step, plan, llm_func
-                    )
-                    if recovery_steps:
-                        for rs in recovery_steps:
-                            await execute_step(
-                                rs, plan,
-                                llm_func=llm_func,
-                                bridge=bridge,
-                                tts_func=tts_func,
-                            )
-                            if rs.status == "waiting":
-                                next_rs_idx = plan.steps.index(rs) + 1
-                                if next_rs_idx < len(plan.steps):
-                                    _suspend_plan(plan, next_rs_idx, llm_func, tts_func, bridge)
-                                    return rs.output
-                            if rs.status == "failed":
-                                break
-                        continue
-
-                for later in plan.steps:
-                    if (later.status == "pending"
-                            and step.step_id in later.depends_on):
-                        later.status = "skipped"
-                        later.error = (
-                            f"dependency step {step.step_id} failed: "
-                            f"{step.error[:80]}"
-                        )
+        plan.status = "executing"
+        _loop = await run_steps(
+            plan, resume_from,
+            llm_func=llm_func, tts_func=tts_func, bridge=bridge,
+        )
+        if _loop.suspended:
+            return _loop.output
 
         plan.status = "completed"
         return await _synthesize_result(plan, llm_func)
