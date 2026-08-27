@@ -201,6 +201,17 @@ class TurnTracker:
         self.recovery_count: int = 0
         self.verification_tiers: Counter = Counter()
 
+        # §15's `context_bytes_by_profile`, and §12's O3. Summed rather than
+        # replaced: a turn can build the same profile twice -- a planner that
+        # replans builds `planning` again -- and the cost asked about is the
+        # total.
+        self.context_bytes: Counter = Counter()
+
+    def note_context(self, profile: str, size_bytes: int) -> None:
+        """Record what one built context bundle costs."""
+        if profile and size_bytes:
+            self.context_bytes[profile] += int(size_bytes)
+
     def note_replan(self) -> None:
         """A loop generated a fresh plan rather than continuing the old one."""
         self.replan_count += 1
@@ -258,6 +269,10 @@ class TurnTracker:
             json.dumps(dict(self.verification_tiers))
             if self.verification_tiers else None
         )
+        context_json = (
+            json.dumps(dict(self.context_bytes))
+            if self.context_bytes else None
+        )
         try:
             _get_repo().create(
                 session_id=self.session_id,
@@ -285,6 +300,7 @@ class TurnTracker:
                 replan_count=self.replan_count,
                 recovery_count=self.recovery_count,
                 verification_tiers=tiers_json,
+                context_bytes_by_profile=context_json,
             )
         except Exception as e:
             logger.warning(f"[TELEMETRY] Failed to save event: {e}")

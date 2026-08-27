@@ -11,14 +11,18 @@ tier decided.
     recovery_count      why did execution fail
     verification_tiers  why did she report success
 
-**Four columns, not the ten §15 lists**, and that is the phase's own rule
-rather than a shortcut: *a field that is always null is not observability*.
-`task_id`, `step_id`, `affordance`, `operation` and `final_task_status` all
-need a Task to exist per turn, and nothing creates one --
-`brain/authority.py:create_task` has no caller in `assistant/`.
-`context_bytes_by_profile` needs the Context Builder of section 12, which is
-not built. Six columns that could only ever be NULL would make the schema look
-like it answers questions it cannot.
+**Five columns, not the ten §15 lists**, and the count is the phase's own rule
+at work rather than a shortcut: *a field that is always null is not
+observability*. `task_id`, `step_id`, `affordance`, `operation` and
+`final_task_status` all need a Task to exist per turn, and nothing creates one
+-- `brain/authority.py:create_task` has no caller in `assistant/`.
+
+    context_bytes_by_profile   what the context actually cost
+
+was the sixth deferral and is the fifth column now. It arrived when the Context
+Builder gained its first caller: the conversational turn assembles through
+`core/context.py`, so the number exists. A deferred field is due the moment
+something can fill it, and no sooner.
 
 Run with:  py -3.11 -m pytest tests/test_observability_o2.py -v
 """
@@ -33,7 +37,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 _NEW_COLUMNS = ("llm_purposes", "replan_count", "recovery_count",
-                "verification_tiers")
+                "verification_tiers", "context_bytes_by_profile")
 
 # The five §15 fields deliberately not added, and why. Named so the omission is
 # a decision on the record rather than something that looks forgotten.
@@ -43,8 +47,12 @@ _DEFERRED = {
     "affordance": "same",
     "operation": "same",
     "final_task_status": "same",
-    "context_bytes_by_profile": "the Context Builder does not exist",
 }
+
+# `context_bytes_by_profile` was here. It left when the Context Builder gained
+# its first caller: the conversational turn assembles through
+# `core/context.py` now, so the number exists and the column stops being
+# permanently NULL. That is the whole test for whether a deferred field is due.
 
 
 @pytest.fixture
@@ -71,11 +79,57 @@ def tracker():
 def test_the_column_exists_after_migration(db, column):
     cols = {r[1] for r in db.fetchall(
         "PRAGMA table_info(interaction_events)")}
-    assert column in cols, f"v23 did not add {column}"
+    assert column in cols, f"the migration did not add {column}"
 
 
 def test_the_schema_version_moved(db):
-    assert db._get_version() == 23
+    assert db._get_version() == 24
+
+
+def test_context_bytes_are_recorded_by_the_real_builder(tracker):
+    """Not by calling the counter directly -- the question is whether a real
+    bundle's size reaches telemetry, and a test that calls `note_context()`
+    itself answers a different one."""
+    from assistant.core.context import build
+
+    bundle = build("interpretation", stored_facts="user_name: Om")
+    tracker.note_context(bundle.profile, bundle.size_bytes)
+
+    assert dict(tracker.context_bytes) == {"interpretation": bundle.size_bytes}
+    assert bundle.size_bytes > 300, "the fence is not being counted"
+
+
+def test_repeat_builds_of_one_profile_are_summed(tracker):
+    """A planner that replans builds `planning` twice, and the cost asked about
+    is the total."""
+    tracker.note_context("planning", 100)
+    tracker.note_context("planning", 250)
+    assert dict(tracker.context_bytes) == {"planning": 350}
+
+
+def test_an_empty_bundle_is_not_recorded(tracker):
+    """Zero bytes is not a measurement, and a profile that carried nothing
+    should not appear as though it did."""
+    tracker.note_context("execution", 0)
+    tracker.note_context("", 500)
+    assert not tracker.context_bytes
+
+
+def test_the_turn_records_the_context_it_built():
+    """**The wiring, structurally.** Everything above exercises the tracker; a
+    turn that measures and never records would pass all of it."""
+    import ast
+
+    tree = ast.parse((_ROOT / "assistant" / "main.py").read_text(
+        encoding="utf-8"))
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "attr", None) == "note_context"]
+    assert calls, "main.py builds a context bundle and never records its size"
+    for call in calls:
+        rendered = ast.unparse(call)
+        assert "size_bytes" in rendered, (
+            f"the recorded number is not the bundle's size: {rendered}")
 
 
 def test_the_migration_is_safe_to_rerun(db):
@@ -83,6 +137,7 @@ def test_the_migration_is_safe_to_rerun(db):
     half-applied state, and an already-present column is the expected outcome
     of a re-run rather than an error."""
     db._migrate_v23()
+    db._migrate_v24()
     cols = {r[1] for r in db.fetchall("PRAGMA table_info(interaction_events)")}
     assert set(_NEW_COLUMNS) <= cols
 

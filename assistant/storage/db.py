@@ -69,7 +69,7 @@ class Database:
 
     # --- Schema versioning ---
 
-    _LATEST_VERSION = 23
+    _LATEST_VERSION = 24
 
     def _get_version(self) -> int:
         row = self._conn.execute(
@@ -120,6 +120,7 @@ class Database:
             21: self._migrate_v21,
             22: self._migrate_v22,
             23: self._migrate_v23,
+            24: self._migrate_v24,
         }
 
         for v in range(current + 1, self._LATEST_VERSION + 1):
@@ -809,6 +810,30 @@ class Database:
             )
         self._conn.commit()
 
+
+    def _migrate_v24(self) -> None:
+        """V24: `context_bytes_by_profile`.
+
+        §15 lists this field and P14 deliberately left it out, because P14's own
+        rule is that *a field that is always null is not observability* -- there
+        was no Context Builder then, so nothing could have filled it. The
+        Builder now assembles the conversational turn's context, so the number
+        exists and the column earns its place.
+
+        §12's O3 is what it is for: without a measurement, "the context is
+        minimized" is an assertion nobody can check. JSON rather than a column
+        per profile, for the same reason `llm_purposes` is -- six profiles today
+        and a seventh must not need a migration.
+        """
+        try:
+            self._conn.execute(
+                "ALTER TABLE interaction_events "
+                "ADD COLUMN context_bytes_by_profile TEXT"
+            )
+        except Exception as e:
+            if "duplicate column" not in str(e).lower():
+                raise
+        self._conn.commit()
 
     def _migrate_v23(self) -> None:
         """V23: four telemetry columns that answer §15's O2 questions.

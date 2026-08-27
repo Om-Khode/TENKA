@@ -2282,6 +2282,7 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                 logger.info("[CTX] interpretation: %d bytes, %d fields, fenced %s",
                             _ctx.size_bytes, len(_ctx.fields),
                             ", ".join(_ctx.fenced) or "none")
+                _tracker.note_context(_ctx.profile, _ctx.size_bytes)
 
                 if _ctx.fields or messages:
                     from .llm.prompts import build_personality_prompt
