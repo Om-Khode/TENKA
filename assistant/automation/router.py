@@ -22,7 +22,7 @@ from typing import Optional, Tuple, Dict, Any
 from urllib.parse import urlparse
 
 from .. import config
-from ..brain.task import Outcome
+from ..core.verdict import Outcome
 from ..core.known_apps import get_apps_by_category
 
 logger = logging.getLogger("desktop_automation")
@@ -98,12 +98,42 @@ _EXTRACTION_RE = re.compile(
 
 # Canvas / WebGL / Flutter Web heavy apps where DOM perception is opaque.
 # These ALWAYS route to vision regardless of CDP availability.
-_CANVAS_APP_RE = re.compile(
-    r'\b(figma|miro|whiteboard|canvas|excalidraw|flutter|tldraw|'
-    r'google\s+slides|google\s+docs|google\s+drawings|sketch|'
-    r'draw|paint)\b',
+# Generic words that describe a drawing surface. These are not brand names and
+# belong in an expression: "whiteboard", "canvas" and "draw" mean the same
+# thing whoever makes the app. The nine product names that used to sit beside
+# them moved to `core/known_apps.py` as `canvas_app` rows -- `CLAUDE.md` forbids
+# a regex that mentions a brand outright, and the tenth such app should be a row
+# of data rather than an edit to this line.
+_CANVAS_INTENT_RE = re.compile(
+    r'\b(whiteboard|canvas|draw|drawing|paint|sketching)\b',
     re.IGNORECASE,
 )
+
+
+def _names_a_canvas_app(goal: str) -> bool:
+    """Does `goal` mention **any** app whose document is a canvas?
+
+    Asked of the app table, so an app taught at runtime is found the same way a
+    built-in one is.
+
+    **Any, not the first.** The first version stopped at the longest name it
+    found and answered about that one, which got "open figma in chrome"
+    exactly backwards: `chrome` is longer, so the answer was "not a canvas" and
+    the step went to a tier that cannot see a canvas. A goal naming two apps
+    needs the tier that can handle the harder of them, and the ordering that
+    bug made necessary disappears with it -- there is nothing left for
+    longest-first to disambiguate.
+    """
+    from ..core.known_apps import KNOWN_APPS
+
+    lowered = (goal or "").lower()
+    for canonical, entry in KNOWN_APPS.items():
+        if entry.category != "canvas_app":
+            continue
+        for name in (canonical, *entry.aliases):
+            if re.search(r"\b" + re.escape(name) + r"\b", lowered):
+                return True
+    return False
 
 _BROWSER_PLAN_PROMPT = """\
 Convert this browser task into a sequence of steps.
@@ -583,7 +613,7 @@ def _choose_browser_mode(
     # 2. Canvas / WebGL apps — DOM is opaque, vision is the only path.
     #    This wins even when CDP is up because the DOM tree won't have
     #    actionable content (the canvas element is a single <canvas>).
-    if _CANVAS_APP_RE.search(goal):
+    if _CANVAS_INTENT_RE.search(goal) or _names_a_canvas_app(goal):
         return "vision", {"reason": "canvas_intent"}
 
     # 3. CDP availability is necessary for DOM-mode (it's how we get to

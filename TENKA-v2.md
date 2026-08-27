@@ -2009,6 +2009,15 @@ W4's demonstration: the *absence* handling is exercised by a real path, not by a
 deleted. A speculative abstraction with no consumer is forbidden by §23, and that applies
 to this document's own proposals.
 
+> **DOES NOT SHIP — decided 2026-08-25.** W4 asks for a real consumer of the
+> *absence*, and there is none. `brain/` holds `turn.py`, `task.py`,
+> `authority.py` and `executor.py`; not one of them consults world state,
+> optional or otherwise, and nothing anywhere degrades when it is missing.
+> Building the Protocol now would be exactly the speculative abstraction W4
+> was written to pre-empt — the phase asked the question honestly and the
+> answer came back no. Revisit when something actually wants a snapshot; the
+> argument in §14 is worth keeping for that day.
+
 ---
 
 ### P16 — Git development awareness (optional)
@@ -2240,9 +2249,45 @@ decision -- a decision with no recorded argument is one the next person re-opens
 | **D7** | P13 may leave a loop unmerged if merging would change behaviour. Confirm that "documented exception" is acceptable over "forced uniformity". | P13 | Accept. Forced uniformity here is the rewrite this project keeps refusing for good reason. |
 | **D8** | P3 must pick one of the two "exactly one router" resolutions (§7.3): move `detect_backend` into the resolver, or make the resolver a delegating adapter over it. | P3 | Move it. A delegating adapter leaves the decision in `automation/` while the Brain claims to own resolution, which is the ambiguity this document exists to remove. |
 | **D9** | §12.2 C3 states that fencing **mitigates** injection and does not close it, so KI-14/15/16 stay open after this plan. Confirm that an honest "mitigated" is acceptable over a claimed fix. | P10 | Accept. Claiming closure without an adversarial live test is how a check comes to point one step to the side of the property. |
-| **D10** | §10.5's reflection→routing key-namespace mismatch: reconcile the namespaces, or accept that the reflection cycle's routing proposals are unreadable and drop that category. **Needs the operator.** | P9 | **Open.** See below. |
+| **D10** | §10.5's reflection→routing key-namespace mismatch. | P9 | **Premise wrong; see the correction below.** Operator chose "reconcile"; reconciling turned out to be the wrong thing to do, and the salvageable half shipped instead. |
 
-### D10 — what the nightly reflection cycle is actually for
+### D10 — CORRECTED. The premise below is wrong.
+
+Written 2026-08-23, corrected the same day when it came time to implement it.
+Left in place rather than deleted, because a plan that quietly edits away its
+own mistakes teaches nobody anything.
+
+**Two claims in the write-up below are false, and both are mine.**
+
+1. *"a reflection proposal has never been readable by the router at all"* — the
+   router is not its consumer. `actions._build_goal_hints` reads these
+   preferences **by category** (`app_routing`, `contact_routing`,
+   `environment`), not by key, and always has. They were being read the whole
+   time — which is precisely why P9 had to gate that path to user-stated
+   provenance.
+2. *"Option A — reconcile the namespaces"* — doing that would have **broken
+   routing**. `automation_{word}` holds a *backend* (`browser` / `app` /
+   `vision`) for `detect_backend`, which returns `pref["value"]` directly.
+   Reflection's `music_app` holds an *application name*. Same-shaped keys,
+   different value domains; pointing one at the other puts "spotify" where a
+   backend is expected.
+
+So there was no mismatch to reconcile. The two key spaces are two preference
+systems with two consumers, and they were never meant to meet.
+
+**What was real underneath it, and what shipped.** The reflection prompt lets
+the model invent keys, and `get_preference` matches exactly. So `music_app` one
+night, `Music App` the next and `music-app` the third are three rows at
+`CONFIDENCE_FIRST_OBSERVATION`, none ever promoted — because promotion happens
+by finding the *same* key again and bumping it. That silently defeats the D3
+ladder built in P9: the mechanism exists and can never accumulate.
+`reflection._canonical_preference_key` now folds case, spacing and punctuation
+to one spelling. It deliberately does **not** try to unify `music_app` with
+`music_player`; that is a judgement, not a normalisation.
+
+The original write-up follows, unedited.
+
+### D10 (superseded) — what the nightly reflection cycle is actually for
 
 Recorded rather than decided, because either answer changes what a feature *is*
 and that is not a call to make quietly.

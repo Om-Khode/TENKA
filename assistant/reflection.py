@@ -21,6 +21,7 @@ Usage (called from proactive.py):
 
 import json
 import logging
+import re
 import threading
 import time
 from datetime import datetime
@@ -256,6 +257,35 @@ def _run_reflection_cycle() -> None:
 # ─── Preference Processing ──────────────────────────────────────────────────
 
 
+def _canonical_preference_key(key: str) -> str:
+    """One spelling per preference, so repetition can actually accumulate.
+
+    The reflection prompt lets the model invent keys, and `get_preference` /
+    `set_preference` look up by **exact** string. So the same observation
+    written `music_app` one night, `Music App` the next and `music-app` the
+    third is three rows sitting at `CONFIDENCE_FIRST_OBSERVATION`, none ever
+    promoted -- which silently defeats the D3 ladder, since promotion happens by
+    finding the *same* key again and bumping it.
+
+    Mechanical variance only: case, spacing, punctuation. `music_app` and
+    `music_player` stay separate rows, because telling those apart is a
+    judgement and this is not the place to make one.
+
+    Not validation. A key that normalises to nothing is passed through
+    unchanged -- losing a preference to a naming rule is worse than storing an
+    oddly-named one, and the confidence ladder decides whether it is ever acted
+    on anyway.
+
+    **This is the salvageable half of decision D10.** The other half -- pointing
+    reflection at the router's `automation_{word}` keys -- rested on a wrong
+    premise, mine: those hold a *backend* for `detect_backend`, not an app name,
+    and `actions._build_goal_hints` already reads these preferences by category
+    rather than by key, so they were never unreadable. See TENKA-v2 section 21.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", (key or "").strip().lower()).strip("_")
+    return slug or key
+
+
 def _process_discovered_preferences(discovered_prefs: list[dict]) -> None:
     """
     Process preferences discovered by the reflection cycle.
@@ -268,7 +298,9 @@ def _process_discovered_preferences(discovered_prefs: list[dict]) -> None:
     from . import preferences
 
     for pref in discovered_prefs:
-        key = pref["key"]
+        # Canonical, so a re-observation lands on the same row and the ladder
+        # can actually promote it. See `_canonical_preference_key`.
+        key = _canonical_preference_key(pref["key"])
         value = pref["value"]
         category = pref["category"]
         confidence = pref["confidence"]

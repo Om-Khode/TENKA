@@ -4,6 +4,14 @@ The full list of intents TENKA can dispatch on, grouped by what they're for. Eac
 
 If you find yourself wanting to add a new intent, read [Adding capabilities](#adding-capabilities) at the bottom first. Most "new intent" ideas are better expressed as preferences, taught procedures, or app manifests — TENKA is designed to grow as data, not as code.
 
+> **This file is documentation, not a source of truth.** `config.INTENTS` is,
+> and `tests/test_capabilities_doc.py` fails if the two disagree. It matters
+> more since `self_knowledge` landed: when TENKA is asked what she can do, she
+> answers from the affordance registry and the live handler table, *not* from
+> this page. A capability described here and absent from the code is a page
+> that lies about her; one present in the code and missing here is a page that
+> is merely incomplete. The test catches both.
+
 ---
 
 ## Voice & interaction
@@ -99,6 +107,7 @@ These are the three-tier automation system plus the supporting tools. Tier escal
 | Intent | What it does |
 | --- | --- |
 | `browser_cdp_setup` | One-time setup helper for connecting TENKA to your real Chrome over the DevTools Protocol (optional advanced feature). |
+| `self_knowledge` | Questions about TENKA herself — "what can you do", "which model are you using", "what personality are you". Answered from her **running state**: the affordance registry, `llm/router.py`'s resolved chain, the loaded personality. Never from this document, and never from the model's own idea of what TENKA is. When the fact is not available she says so rather than guessing. |
 | `unknown` | Sentinel — the classifier explicitly said "no idea what this is." Triggers a polite "I didn't catch that, can you rephrase?". |
 
 ---

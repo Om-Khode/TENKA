@@ -173,8 +173,47 @@ _FILE_KEYWORDS = frozenset({
 })
 
 # Create note (file)
+_NOTE_OPENER = (
+    r"(?:note\s+(?:that|down)?|write\s+down(?:\s+that)?|"
+    r"make\s+a\s+note(?:\s+that)?|create\s+a\s+note)"
+)
+
+# The words that introduce a name, and the words that introduce a body. Kept as
+# named pieces because both regexes below need them and the *absence* of the
+# second one is itself a decision -- see `_NOTE_TITLE_ONLY_RE`.
+_NOTE_TITLE_MARK = r"(?:called|titled|named|for)"
+_NOTE_BODY_MARK = r"(?:saying|that\s+says|which\s+says|with|containing|about|:)"
+
+# "make a note called groceries saying milk and eggs" -> title + content.
+#
+# Live test, 2026-08-25: this phrasing hit `_NOTE_RE` below, whose single
+# capture group took everything after the opener. The note was written to
+# `untitled.txt` containing "called groceries saying milk and eggs" -- the
+# structure was right there in the sentence and the fast path dropped it, then
+# stored the words that described it as though they were the body.
+#
+# Non-greedy on the title so "called a saying b saying c" takes the first body
+# marker rather than the last: a title is short and a body is not, and getting
+# that backwards puts half the body in the filename.
+_NOTE_TITLED_RE = re.compile(
+    r"^" + _NOTE_OPENER + r"\s+" + _NOTE_TITLE_MARK + r"\s+(.+?)\s+"
+    + _NOTE_BODY_MARK + r"\s+(.+)$",
+    re.I,
+)
+
+# A title marker with no body marker: "make a note called groceries". The old
+# pattern claimed this too and wrote a note whose *content* was "called
+# groceries", which is worse than not matching -- the fast path never asks a
+# second opinion, so an over-claim here is final. Detected so `pre_route` can
+# decline and let the classifier, which can read the whole sentence, decide
+# whether that means an empty note named groceries or something else entirely.
+_NOTE_TITLE_ONLY_RE = re.compile(
+    r"^" + _NOTE_OPENER + r"\s+" + _NOTE_TITLE_MARK + r"\s+\S+",
+    re.I,
+)
+
 _NOTE_RE = re.compile(
-    r"^(?:note\s+(?:that|down)?|write\s+down(?:\s+that)?|make\s+a\s+note(?:\s+that)?)\s+(.+)$",
+    r"^" + _NOTE_OPENER + r"\s+(.+)$",
     re.I,
 )
 
@@ -597,6 +636,22 @@ def pre_route(text: str) -> IntentResult | None:
             )
 
     # ── Create note ───────────────────────────────────────────────────────
+    # Titled form first: it is the more specific pattern, and the plain one
+    # below would otherwise swallow the title words into the body.
+    m = _NOTE_TITLED_RE.match(t)
+    if m:
+        return IntentResult(
+            intent="create_note",
+            response=t,
+            params={"title": m.group(1).strip(), "content": m.group(2).strip()},
+        )
+
+    # A name with nothing to put in it. Declining is the point: this fast path
+    # never asks a second opinion, so claiming the turn here means storing the
+    # words "called groceries" as the note's contents forever.
+    if _NOTE_TITLE_ONLY_RE.match(t):
+        return None
+
     m = _NOTE_RE.match(t)
     if m:
         return IntentResult(

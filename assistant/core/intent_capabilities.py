@@ -77,6 +77,13 @@ REQUIRED_CAPABILITY: dict[str, Capability] = {
     "open_browser": Capability.CHAT_SEND,
     "create_note": Capability.CHAT_SEND,
     "memory_query": Capability.CHAT_SEND,
+    # The intent itself costs no more than being able to talk. The
+    # *facts* are gated individually in `brain/selfknowledge.py`, per
+    # fact class, against the route that already publishes the same
+    # information -- putting the whole intent behind one capability
+    # would either hide the architecture (public in this repository)
+    # or expose the transport list (loopback-only, SYSTEM_CONTROL).
+    "self_knowledge": Capability.CHAT_SEND,
     "store_memory": Capability.CHAT_SEND,
     "forget_memory": Capability.CHAT_SEND,
     "set_reminder": Capability.CHAT_SEND,
@@ -143,5 +150,5 @@ TRANSIENT_AUTHORITY: frozenset[str] = frozenset({
     "set_reminder", "cancel_reminder", "hide_avatar", "show_avatar",
     "meet_face", "recognize_face", "forget_face", "camera_look", "planner",
     "enroll_voice", "forget_voice", "browser_cdp_setup", "store_memory",
-    "forget_memory", "shutdown", "manifest_dispatch",
+    "forget_memory", "shutdown", "manifest_dispatch", "self_knowledge",
 })

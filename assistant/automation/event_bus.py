@@ -14,7 +14,7 @@ import queue
 import threading
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from .event_sources.base import normalize_process_name
 
@@ -108,7 +108,27 @@ class EventBus:
         self._compiled_conditions: dict[int, Any] = {}
         self._stop_requested = False
         self._debounce_timers: dict[int, threading.Timer] = {}
+        # Injected by `main.py` at startup. See `set_turn_dispatcher`.
+        self._run_turn: Callable | None = None
         self._debounce_events: dict[int, tuple[dict, dict]] = {}
+
+    def set_turn_dispatcher(self, dispatcher) -> None:
+        """Install the callable that runs a fired monitor's action as a turn.
+
+        **Injected rather than imported, and that is the layering.** The event
+        bus is a *source* of turns; the thing that runs one sits above it
+        (`core -> ... -> automation -> actions -> brain -> main`). P4b removed
+        the `automation -> actions` edge by importing `brain.turn` instead,
+        which was the same inversion moved one layer further up -- honest to say
+        so. `main.py` owns both sides and hands the callable down, so
+        `automation` imports neither.
+
+        Unset means a fired monitor's action does not run. Fail closed: a
+        monitor that fires with no dispatcher installed would otherwise have to
+        invent its own authority, which is the whole thing this indirection
+        exists to prevent.
+        """
+        self._run_turn = dispatcher
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         from assistant.storage.db import get_db
@@ -131,13 +151,19 @@ class EventBus:
         logger.info("[event-monitor] EventBus started (%d active monitors)", len(self._active_monitors))
 
     def stop(self) -> None:
-        if self._thread is None or not self._thread.is_alive():
-            return
+        # Timers first, and unconditionally. A pending debounce timer is a real
+        # `threading.Timer` -- it fires `_fire_action` on a thread of its own and
+        # does not need the message pump to be alive. Returning early on a dead
+        # or never-started pump therefore left armed timers behind, free to
+        # dispatch a monitor action after the bus was told to stop.
         self._stop_requested = True
         for timer in self._debounce_timers.values():
             timer.cancel()
         self._debounce_timers.clear()
         self._debounce_events.clear()
+
+        if self._thread is None or not self._thread.is_alive():
+            return
         import ctypes
         WM_QUIT = 0x0012
         ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
@@ -321,8 +347,6 @@ class EventBus:
         installs them in one order, in one place, and its import is what removes
         the last `automation -> actions` edge in the tree.
         """
-        from ..brain.turn import run_local_intent
-
         # `installed_by` (schema v21, KI-30) recorded at fire rather than only at
         # install: the row says who paid for this, and the moment it matters is
         # the moment it runs. A monitor installed months ago by a device since
@@ -332,7 +356,15 @@ class EventBus:
             "[event-monitor] Firing code_executor on local authority "
             "(installed_by=%s): %s", installed_by or "unknown", goal[:80]
         )
-        return await run_local_intent(
+        if self._run_turn is None:
+            logger.error(
+                "[event-monitor] No turn dispatcher installed — refusing to "
+                "run '%s'. A fired monitor does not get to invent its own "
+                "authority.", goal[:60]
+            )
+            return "the monitor could not run: no dispatcher installed"
+
+        return await self._run_turn(
             intent="code_executor",
             params={"goal": goal},
             label="monitor:code_executor",

@@ -42,8 +42,19 @@ def reset_db():
 
 @pytest.fixture
 def repo(tmp_path):
-    db = Database(tmp_path / "test.db")
-    return MonitorRepo(db)
+    """The singleton, not a second connection.
+
+    This used to be a bare `Database(...)`, which gave the test its own
+    connection and left `get_db()` returning None -- so every test that went
+    through a real entry point (`delete_monitor`, `pause_monitor`, anything
+    calling `_get_repo()`) died on "DB not initialized" instead of exercising
+    the path it named. `init_db` is what the app calls, and the autouse
+    `reset_db` fixture tears it down after each test.
+    """
+    from assistant.storage.db import init_db
+
+    _reset_for_testing()
+    return MonitorRepo(init_db(tmp_path / "test.db"))
 
 
 class TestMonitorRepo:
@@ -332,6 +343,149 @@ class TestDisambiguation:
         result = resolve_disambig("cancel")
         assert result == "Okay, cancelled."
         assert not _act.pending_monitor_disambig.active
+
+
+class TestNamelessCommands:
+    """"pause monitor" names no monitor. Two answers are right -- act, or ask
+    which -- and "I couldn't find a monitor matching that name" is neither."""
+
+    def _one(self, repo, name):
+        repo.create(
+            name=name, event_type="media_changed",
+            source_filter=None, condition_mode="code",
+            condition_expr="True", condition_prompt=None,
+            action_type="tts_notify", action_payload="hi",
+            cooldown_secs=5, user_goal="test",
+        )
+
+    def test_a_nameless_command_acts_when_there_is_only_one(self, repo):
+        from assistant.event_monitoring import pause_monitor
+
+        self._one(repo, "Alpha Monitor")
+        result = pause_monitor("pause monitor")
+        assert "Paused" in result and "Alpha Monitor" in result
+        assert repo.get_by_id(1)["enabled"] == 0
+
+    def test_a_nameless_command_asks_when_there_are_several(self, repo):
+        import assistant.actions as _act
+        from assistant.event_monitoring import pause_monitor
+
+        self._one(repo, "Alpha Monitor")
+        self._one(repo, "Beta Monitor")
+        result = pause_monitor("pause monitor")
+        assert "multiple matches" in result.lower()
+        assert _act.pending_monitor_disambig.active
+        _act.pending_monitor_disambig.clear()
+
+    def test_a_nameless_answer_to_which_one_selects_nothing(self, repo):
+        """**The direction this must not generalise.** `resolve_disambig` picks
+        `picked[0]`, so letting a nameless reply match everything there would
+        turn "which one?" -- "the monitor" into an arbitrary choice, and for
+        `delete` into an arbitrary deletion. It has to stay a non-answer."""
+        import assistant.actions as _act
+        from assistant.event_monitoring import delete_monitor, resolve_disambig
+
+        self._one(repo, "Alpha Monitor")
+        self._one(repo, "Beta Monitor")
+        delete_monitor("delete monitor")
+        assert _act.pending_monitor_disambig.active
+
+        result = resolve_disambig("the monitor")
+        assert "couldn't match" in result.lower(), result
+        assert repo.get_by_id(1) is not None, "an arbitrary monitor was deleted"
+        assert repo.get_by_id(2) is not None, "an arbitrary monitor was deleted"
+
+
+class TestAllMonitors:
+    """"all" names every monitor -- and only when it is the word "all"."""
+
+    def _one(self, repo, name):
+        repo.create(
+            name=name, event_type="media_changed",
+            source_filter=None, condition_mode="code",
+            condition_expr="True", condition_prompt=None,
+            action_type="tts_notify", action_payload="hi",
+            cooldown_secs=5, user_goal="test",
+        )
+
+    def test_pause_all_monitors(self, repo):
+        """Live-test finding. `delete_monitor` has had an "all" branch since it
+        was written; pause and resume never did, so "pause all monitors" fell
+        through to the name matcher with "all" as its only non-noise word,
+        matched nothing, and answered "I couldn't find a monitor matching that
+        name" with every monitor sitting right there."""
+        from assistant.event_monitoring import pause_monitor
+
+        self._one(repo, "Alpha Monitor")
+        self._one(repo, "Beta Monitor")
+
+        result = pause_monitor("pause all monitors")
+        assert "all 2" in result, result
+        assert repo.get_by_id(1)["enabled"] == 0
+        assert repo.get_by_id(2)["enabled"] == 0
+
+    def test_resume_all_monitors(self, repo):
+        from assistant.event_monitoring import pause_monitor, resume_monitor
+
+        self._one(repo, "Alpha Monitor")
+        self._one(repo, "Beta Monitor")
+        pause_monitor("pause all monitors")
+
+        result = resume_monitor("resume all monitors")
+        assert "all 2" in result, result
+        assert repo.get_by_id(1)["enabled"] == 1
+        assert repo.get_by_id(2)["enabled"] == 1
+
+    @pytest.mark.parametrize("phrase", [
+        "delete the call monitor",
+        "pause the install monitor",
+        "delete my recall monitor",
+        "pause the wall monitor",
+    ])
+    def test_a_word_containing_all_does_not_mean_all(self, repo, phrase):
+        """**The direction that cannot be undone.** The old test was
+        `"all" in goal.lower()`, and "call", "install", "recall" and "wall" all
+        satisfy it -- so `delete the call monitor` deleted every monitor the
+        operator had. A word-boundary match is the whole fix."""
+        from assistant.event_monitoring import _means_all
+
+        assert not _means_all(phrase), (
+            f"{phrase!r} was read as naming every monitor")
+
+    @pytest.mark.parametrize("phrase", [
+        "delete all monitors",
+        "pause ALL the monitors",
+        "resume all",
+    ])
+    def test_the_word_all_still_means_all(self, phrase):
+        from assistant.event_monitoring import _means_all
+
+        assert _means_all(phrase)
+
+    def test_delete_all_still_deletes_all(self, repo):
+        from assistant.event_monitoring import delete_monitor
+
+        self._one(repo, "Alpha Monitor")
+        self._one(repo, "Beta Monitor")
+
+        result = delete_monitor("delete all monitors")
+        assert "all 2" in result, result
+        assert repo.get_by_id(1) is None
+        assert repo.get_by_id(2) is None
+
+    def test_a_call_monitor_is_deleted_by_name_not_wholesale(self, repo):
+        """Both halves of the boundary fix, end to end: the substring version
+        wiped the other monitor too."""
+        from assistant.event_monitoring import delete_monitor
+
+        self._one(repo, "Call Monitor")
+        self._one(repo, "Beta Monitor")
+
+        result = delete_monitor("delete the call monitor")
+        assert "Call Monitor" in result
+        assert repo.get_by_id(1) is None
+        assert repo.get_by_id(2) is not None, (
+            "deleting one monitor by name took the others with it")
 
 
 class TestDebounce:

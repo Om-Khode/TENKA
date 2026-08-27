@@ -37,7 +37,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .. import config
-from ..brain.task import Outcome
+from ..core.verdict import Outcome
 
 logger = logging.getLogger("verification")
 
@@ -470,7 +470,39 @@ async def pre_check(step: dict, *, page=None, active_window: Optional[str] = Non
         return VerifyResult.crashed(f"pre-check crash: {e}")
 
 
-async def post_verify(step: dict, *, page=None, active_window: Optional[str] = None) -> VerifyResult:
+def _note_tier(result: "VerifyResult") -> "VerifyResult":
+    """Record which tier decided, and pass the verdict straight through.
+
+    §15's O2 asks "why did she report success", and the answer is which tier
+    checked and whether it had to escalate. Returns its argument so a call site
+    reads `return _note_tier(...)` and cannot accidentally drop the result --
+    the shape a bare `_note_tier(result); return result` invites.
+    """
+    try:
+        from ..telemetry import get_current_tracker
+        tracker = get_current_tracker()
+        if tracker is not None:
+            tracker.note_verification(getattr(result, "tier", "") or "")
+    except Exception:
+        # Never load-bearing. An observability write must not fail a turn.
+        pass
+    return result
+
+
+async def post_verify(step: dict, *, page=None,
+                      active_window: Optional[str] = None) -> VerifyResult:
+    """Run a step's post-verification and record which tier decided.
+
+    A thin wrapper rather than a `_note_tier(...)` at each `return`: the body
+    below has eleven of them, and the one someone forgets is the tier that then
+    never appears in the telemetry -- a gap that looks like "that tier never
+    ran" rather than like a missing call.
+    """
+    return _note_tier(
+        await _post_verify_inner(step, page=page, active_window=active_window))
+
+
+async def _post_verify_inner(step: dict, *, page=None, active_window: Optional[str] = None) -> VerifyResult:
     """Run after executing a state-changing step. Returns:
        - ok=True, tier=code         → confident success
        - ok=False, tier=code        → confident failure (caller surfaces directly)

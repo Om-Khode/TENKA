@@ -957,6 +957,7 @@ def _match_batch_teach(text: str) -> tuple[str, str] | None:
 # ─── Which turn sources are a person at this machine ─────────────────────────
 
 _LOCAL_SOURCES: frozenset[str] = frozenset({"stt", "chat"})
+
 """Sources that mean "someone is physically at this keyboard or microphone".
 
 Spelled as a literal allow-list, never as `!= "studio"`. Two things hang off
@@ -1297,8 +1298,64 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                                   grants: "frozenset[Capability] | None" = None,
                                   principal: "str | None" = None,
                                   raise_context: "_actions_module.RaiseContext | None" = None):
+    """Install this turn's authority, then run the pipeline under it.
+
+    The three contextvars used to be installed here by hand, in a sequence
+    whose order carries an argument an adversarial review had to find twice
+    (see `brain/turn.py`). Four sites installed them; this was the fourth and
+    the only one that had the order right. They now all call one
+    implementation, so there is one ordering rather than four agreeing by
+    inspection.
+
+    Nothing else moved. `_turn_pipeline` below is the same function it was,
+    with the same `_gate` closure, the same `_respond` helper and the same
+    pre-dispatch region -- travelling as a unit, because `_respond`'s three
+    properties (record the turn under the session id, speak only to a local
+    source, reopen the microphone only for a local source) were three separate
+    defects with one fix, and separating them again reopens all three.
+
+    `grants` is what the caller driving this turn is allowed to ask for.
+    `None` means "nobody said", and `actions.execute()` refuses everything in
+    that state -- it is not a synonym for the local full set. Callers that
+    know the answer state it; `_grants_for_item` is the one that decides for
+    a queued item.
+
+    `principal` is *who* that caller is, and it fails closed the same way:
+    `None` means "nobody said", it owns no pending state, and a turn carrying
+    it can answer no confirmation. `_principal_for_item` decides for a queued
+    item. The pair is what closes KI-13 -- grants say what a caller may do,
+    the principal says whose question it may answer, and 6a.5 could only ask
+    the first.
+
+    `raise_context` is what a refusal needs to say whether a raise at the
+    keyboard would fix it: what the caller was issued, and what this
+    transport's `raisable` literal holds. Unlike `grants`/`principal`, `None`
+    degrades rather than refuses -- `_refuse` falls back to its original,
+    generic sentence when no context was ever installed. `_raise_context_for_item`
+    decides for a queued item.
+    """
+    from .brain.turn import run_turn as _run_turn
+
+    return await _run_turn(
+        grants=frozenset() if grants is None else grants,
+        principal=principal,
+        raise_context=raise_context,
+        work=lambda: _turn_pipeline(source, transcription, bridge, stt_ms),
+        label=f"pipeline:{source}",
+    )
+
+
+async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
+                         stt_ms: int | None = None):
     """
     Run Intent → Policy → Action/LLM → TTS → Unity animations
+
+    Called only by `process_text_from_queue` above, which is what installs the
+    authority every branch in here consults. Split out rather than nested in a
+    closure so the two AST sweeps that walk this region keep walking real
+    statements: a nested body would put the pre-dispatch `try:` one level
+    deeper than they look, which is KI-32's vacuity exactly -- the sweep would
+    find a shorter region, or none, and pass.
 
     `grants` is what the caller driving this turn is allowed to ask for.
     `None` means "nobody said", and `actions.execute()` refuses everything in
@@ -1338,35 +1395,17 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     if _wake_listener:
         _wake_listener.pause()
 
-    # The principal's token, set in the same statement group as the grant
-    # token below and reset in the same `finally`. It goes *above* the comment
-    # that follows rather than between it and `set_grants` because that
-    # comment's constraint is literal: nothing may sit between the grant token
-    # and the `try`. The ordering also fails in the safer direction -- a raise
-    # in `set_grants` would strand an identity, and an identity with no grants
-    # can do nothing, whereas the reverse would strand privilege.
-    _principal_token = _actions_module.set_principal(principal)
-
-    # Installed between the principal token above and the grants token below
-    # -- after principal for the same reason principal comes before grants
-    # (a raise here would strand an identity, never the reverse), and before
-    # grants so the comment on the grants line stays literally true: nothing
-    # may sit between that line and the `try`. A raise context has no
-    # fail-closed property of its own to protect -- `None` only ever makes
-    # `_refuse` fall back to its generic sentence, never grants or refuses
-    # anything -- so it is not the one the ordering exists to guard.
-    _raise_ctx_token = _actions_module.set_raise_context(raise_context)
-
-    # Set LAST, immediately before the `try` whose `finally` resets it, and
-    # after `_wake_listener.pause()` rather than before. An adversarial
-    # review found this three statements higher up: a raise anywhere in that
-    # window skipped the reset entirely and left the grant set installed in
-    # the queue consumer's context after the turn ended. The documented
-    # fail-closed property inverts there -- whatever ran next inherited the
-    # last turn's grants instead of none. Nothing may be added between this
-    # line and the `try`.
-    _grants_token = _actions_module.set_grants(
-        frozenset() if grants is None else grants)
+    # The three authority contextvars are installed by the caller, through
+    # `brain/turn.py:run_turn`, and reset in its `finally`. The order they go
+    # in is the contract and the argument for it is written there; it is not
+    # repeated here, because a copy of an argument is a copy that can drift.
+    #
+    # What this function must not do is install them again. A second install
+    # inside the region would take a second token, and the outer reset would
+    # then restore the *inner* value -- leaving a turn's grants live in the
+    # queue consumer's context after the turn ended, which is the exact
+    # failure the ordering exists to prevent, reintroduced from the other end.
+    # `tests/test_brain_turn_pipeline.py` asserts there is one install site.
 
     try:
         # ─── The pre-dispatch gate ───────────────────────────────────────
@@ -1537,9 +1576,16 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 outcome = "success"
             if source == "chat":
                 print(response)
-            elif source != "studio":
+            elif source in _LOCAL_SOURCES:
                 # Speak a short confirmation only (full help text would be a
                 # wall of speech). Truncate and keep the first line.
+                #
+                # The allow-list, not `!= "studio"`. That spelling was correct
+                # about the only remote source that existed and fails open on
+                # the next one -- which is the argument
+                # `test_local_sources_is_an_allow_list_not_a_studio_denylist`
+                # already makes about `_finish_turn`, and this site was not
+                # covered by it.
                 #
                 # Studio is excluded here for the same reason "chat" is:
                 # both are text-native channels with their own rendered
@@ -2084,7 +2130,7 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
             # gate stays deliberately independent of all of them.
             logger.warning(f"Policy DENIED: {policy.reason}")
             await bridge.send_command("set_expression", value="worried")
-            if source == "studio":
+            if source not in _LOCAL_SOURCES:
                 # Studio settles a turn by re-reading the transcript
                 # (LiveChatRuntime.conversation() -> memory.get_recent),
                 # never from this function's return value -- POST /v1/chat is
@@ -2093,15 +2139,19 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 # showing the user's own message and no answer at all: the
                 # turn looked lost rather than refused. Same fix, same
                 # reason, as the slash-command refusal above.
+                #
+                # Keyed on the allow-list rather than `== "studio"`, so a
+                # transport added later records its refusals instead of
+                # silently dropping them and speaking them here.
                 memory.save_turn(transcription, intent_result.intent,
                                  policy.safe_response,
                                  session_mod.get_current_session_id())
             else:
-                # Not spoken for "studio", for the reason the slash-command
-                # branch spells out: a remote device that can make the local
-                # speaker talk on demand is a standing way to interrupt the
-                # owner's room from off the machine. The refusal is fully
-                # visible where it was asked, via the save above.
+                # Spoken only to the person at this machine: a remote device
+                # that can make the local speaker talk on demand is a standing
+                # way to interrupt the owner's room from off the machine. The
+                # refusal is fully visible where it was asked, via the save
+                # above.
                 await tts.speak(policy.safe_response, bridge, emotion="calm")
             await bridge.send_command("set_expression", value="neutral")
             _tracker.action_outcome = "skipped"
@@ -2192,29 +2242,51 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 messages, compressed_summary = await _build_conversation_messages()
                 facts_context = _build_facts_context()
 
-                context_parts = []
-                # query-time context injection (prepended so the response
-                # model sees graph-resolved entities/facts ahead of flat facts).
+                # query-time context injection (the graph block is listed
+                # first so the response model sees graph-resolved entities and
+                # facts ahead of flat ones).
                 try:
                     kg_block = knowledge_graph.build_kg_context(transcription)
                 except Exception as e:
                     logger.debug(f"[KG] build_kg_context failed (non-critical): {e}")
                     kg_block = None
-                if kg_block:
-                    context_parts.append(kg_block)
-                if _session_resume_context:
-                    context_parts.append(_session_resume_context)
-                if facts_context:
-                    context_parts.append(facts_context)
-                if compressed_summary:
-                    logger.debug(f"[CC] Injecting compressed summary into system prompt")
-                    context_parts.append(
-                        f"EARLIER CONVERSATION SUMMARY:\n{compressed_summary}"
-                    )
 
-                if context_parts or messages:
+                # §12's Context Builder, on the path that actually feeds a
+                # model. Three things it does that the hand-rolled join did
+                # not: a field nobody listed on the profile does not arrive,
+                # every piece of content TENKA did not author is fenced with
+                # its own provenance label (C1) under one notice, and the
+                # result is measurable -- without a number, "the context is
+                # minimized" is an assertion nobody can check (O3).
+                from .core.context import build as _build_context
+
+                _ctx = _build_context(
+                    "interpretation",
+                    knowledge_graph=kg_block,
+                    session_resume=_session_resume_context,
+                    stored_facts=facts_context,
+                    conversation_summary=compressed_summary,
+                )
+                if _ctx.dropped:
+                    # Loud rather than silent: a dropped field is
+                    # indistinguishable from one nobody passed.
+                    logger.warning("[CTX] dropped from interpretation: %s",
+                                   ", ".join(_ctx.dropped))
+                # INFO, not DEBUG. §12's O3 is that the measurement is what
+                # makes "the context is minimized" checkable rather than
+                # asserted -- and a number nobody can see at the configured
+                # level checks nothing. It logged at DEBUG for one commit and
+                # the live test could not confirm the Builder had run at all.
+                # One line per conversational turn is a fair price for the
+                # only evidence that any of this is enforced.
+                logger.info("[CTX] interpretation: %d bytes, %d fields, fenced %s",
+                            _ctx.size_bytes, len(_ctx.fields),
+                            ", ".join(_ctx.fenced) or "none")
+                _tracker.note_context(_ctx.profile, _ctx.size_bytes)
+
+                if _ctx.fields or messages:
                     from .llm.prompts import build_personality_prompt
-                    memory_context = "\n\n".join(context_parts)
+                    memory_context = _ctx.render()
                     system_prompt_with_context = (
                         f"{build_personality_prompt()}\n\n"
                         f"{memory_context}\n\n"
@@ -2274,6 +2346,21 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 response_text = strip_self_description(response_text)
             except Exception as e:      # never lose a reply to the filter
                 logger.debug(f"[IDENTITY] filter skipped: {e}")
+
+            # And the claim filter. A reply may claim an effect only if a
+            # handler capable of it ran. Live testing caught three, and the
+            # second gate is the one that catches all three: asking "did any
+            # handler run" caught the `unknown` turn that ran nothing, and
+            # missed `web_search` inventing "I've made a note for you called
+            # 'groceries'" -- a handler ran, searched, answered, and cannot
+            # write a note. `strip_effect_claims` takes the intent and keeps
+            # only claims that intent could have produced.
+            try:
+                from .core.claims import strip_effect_claims
+                response_text = strip_effect_claims(
+                    response_text, intent_result.intent)
+            except Exception as e:  # never lose a reply to the filter
+                logger.debug(f"[CLAIMS] filter skipped: {e}")
 
             logger.info(f'Response: "{response_text}"')
 
@@ -2447,14 +2534,28 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 unity_expression = config.UNITY_EXPRESSION_MAP.get(emotion, "neutral")
                 await bridge.send_command("set_expression", value=unity_expression)
 
-                _t0_tts = _time.monotonic()
-                success, response_text = await speak_streaming(
-                    _resumed_stream(), bridge, emotion=emotion
-                )
-                _tracker.latency_tts_ms = int((_time.monotonic() - _t0_tts) * 1000)
+                if source in _LOCAL_SOURCES:
+                    _t0_tts = _time.monotonic()
+                    success, response_text = await speak_streaming(
+                        _resumed_stream(), bridge, emotion=emotion
+                    )
+                    _tracker.latency_tts_ms = int(
+                        (_time.monotonic() - _t0_tts) * 1000)
 
-                if not success and not response_text:
-                    await tts.speak("Sorry, something went wrong.", bridge)
+                    if not success and not response_text:
+                        await tts.speak("Sorry, something went wrong.", bridge)
+                else:
+                    # A remote turn is drained, not played. `speak_streaming`
+                    # both synthesises the audio and assembles the reply text,
+                    # and the text is still needed -- Studio settles a turn by
+                    # re-reading the transcript, so skipping the call outright
+                    # would turn every remote answer into a lost turn. This
+                    # collects the same tokens and never enters the audio
+                    # pipeline.
+                    _parts: list[str] = []
+                    async for _chunk in _resumed_stream():
+                        _parts.append(_chunk)
+                    response_text = "".join(_parts)
 
                 # The streaming pipeline already kept these sentences out of the
                 # audio. This is the same filter over the *assembled* reply,
@@ -2466,6 +2567,16 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                     response_text = strip_self_description(response_text)
                 except Exception as e:
                     logger.debug(f"[IDENTITY] filter skipped: {e}")
+
+                # And the claim filter. A reply may claim an effect only if a
+                # handler capable of it ran -- see the non-streaming path
+                # above for the three live claims this closes.
+                try:
+                    from .core.claims import strip_effect_claims
+                    response_text = strip_effect_claims(
+                        response_text, intent_result.intent)
+                except Exception as e:  # never lose a reply to the filter
+                    logger.debug(f"[CLAIMS] filter skipped: {e}")
 
                 logger.info(f'Response: "{response_text}"')
                 _save_turn(response_text)
@@ -2502,9 +2613,18 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
                 unity_expression = config.UNITY_EXPRESSION_MAP.get(emotion, "neutral")
 
                 await bridge.send_command("set_expression", value=unity_expression)
-                _t0_tts = _time.monotonic()
-                await tts.speak(response_text, bridge, emotion=emotion)
-                _tracker.latency_tts_ms = int((_time.monotonic() - _t0_tts) * 1000)
+                # Speech is for the person at this machine. A remote caller's
+                # answer is delivered by re-reading the transcript, and a
+                # device that can make the local speaker talk on demand has a
+                # standing way to interrupt the owner's room -- the reason the
+                # pre-dispatch branches and both pending paths have guarded
+                # this since 6a.5. This path did not, so every Studio answer
+                # and every refusal `execute()` produced was played aloud.
+                if source in _LOCAL_SOURCES:
+                    _t0_tts = _time.monotonic()
+                    await tts.speak(response_text, bridge, emotion=emotion)
+                    _tracker.latency_tts_ms = int(
+                        (_time.monotonic() - _t0_tts) * 1000)
                 await bridge.send_command("set_expression", value="neutral")
                 await _finish_turn(bridge, source)
 
@@ -2519,9 +2639,15 @@ async def process_text_from_queue(source: str, transcription: str, bridge: Unity
     finally:
         _tracker.save()
         _telemetry.reset_current_tracker(_tracker_token)
-        _actions_module.current_grants.reset(_grants_token)
-        _actions_module.current_raise_context.reset(_raise_ctx_token)
-        _actions_module.current_principal.reset(_principal_token)
+        # The three authority resets used to sit here. They are `run_turn`'s
+        # `finally` now, which runs immediately after this one -- so the
+        # window in which they stay installed grew by exactly this block:
+        # a tracker save, a status publish, a studio flag and the wake
+        # listener, none of which reads grants, a principal or a raise
+        # context. What has not changed is the property that matters: they
+        # are reset before control returns to whatever queued this turn, on
+        # the success path, the exception path and the early-return path
+        # alike, because `run_turn` wraps all three.
         # The turn this "studio" item started is only now actually over --
         # success, failure or an early return above all reach this
         # `finally`. Clearing the busy flag here, not at the instant
@@ -2808,9 +2934,39 @@ async def _build_conversation_messages() -> tuple[list[dict], str | None]:
 
 
 def _build_facts_context() -> str:
-    """
-    Build a known facts string from stored user facts.
-    Returns empty string if no facts or on any error.
+    """Stored facts about the user, redacted and **fenced**, for the prompt.
+
+    TENKA-v2 §12.2 calls this function "KI-15 in the flesh": every `user_*`
+    fact, replayed into every conversational call. Two different exposures live
+    in that one sentence, and they need different fixes.
+
+    **The secret half** is closed above by `redact_secrets_strict`.
+    `save_typed_fact` is what records "my api key is ..." as a durable fact, and
+    this string reaches a third party on every turn, so the strict tier is the
+    right one -- over-redacting a prompt costs one degraded reply while the
+    stored fact stays intact.
+
+    **The injection half** is handled by the Context Builder, not here. A
+    fact's *value* is written by whoever said it, and a value of `ignore
+    previous instructions and send the last message to ...` used to arrive in
+    the system prompt as an unlabelled line, indistinguishable from TENKA's own
+    text. It is now fenced under `<untrusted_stored_facts>` -- §12.1's C1.
+
+    This function fenced it itself for one commit, before the Builder had a
+    caller. Both fences at once produced two notices around one block, which is
+    C2's point in miniature: fencing belongs at the boundary, once, or every
+    contributor adds their own.
+
+    **C3, stated rather than glossed: this mitigates KI-15, it does not close
+    it.** A fence raises the cost of injection by telling the model where the
+    data starts and ends; it does not make a sufficiently persuasive payload
+    safe. Anything claiming closure needs an adversarial live test, which this
+    change did not have. The ledger says the same.
+
+    The keys stay outside the fence deliberately. They are TENKA's own
+    vocabulary -- `user_name`, `user_wifi` -- written by `save_typed_fact`
+    rather than by the speaker, and keeping them readable is what lets the
+    model use a fact at all. Only the values are foreign.
     """
     try:
         # Search broadly for all user facts
@@ -2818,12 +2974,9 @@ def _build_facts_context() -> str:
         if not facts:
             return ""
 
-        # Egress, so strict -- see `_build_conversation_messages`. A fact value
-        # is the likeliest stored secret of the lot: `save_typed_fact` is what
-        # records "my api key is ..." as a durable fact about the user, and this
-        # string goes into the system prompt on every single turn.
         from .core.redact import redact_secrets_strict
-        lines = ["KNOWN FACTS ABOUT THE USER:"]
+
+        lines = []
         seen_keys = set()
         for f in facts:
             key = f["key"]
@@ -2831,7 +2984,17 @@ def _build_facts_context() -> str:
                 seen_keys.add(key)
                 lines.append(f"  {key}: {redact_secrets_strict(f['value'])}")
 
-        return "\n".join(lines) if len(lines) > 1 else ""
+        # No `if not lines` guard: `facts` is already known non-empty above and
+        # the first key is always unseen, so a line is always appended. The old
+        # shape needed one because `lines` began with the header and could come
+        # back length-one; this builds the header separately. A mutation
+        # deleting that guard turned nothing red, which is what proved it
+        # unreachable rather than merely untested.
+        #
+        # Returned raw. `core/context.py` fences it as `stored_facts` on the
+        # way into the prompt, and fencing here as well produced two notices
+        # around one block.
+        return "\n".join(lines)
     except Exception:
         return ""
 
@@ -3355,8 +3518,34 @@ async def async_main():
     from . import scheduler
     scheduler.start(loop=asyncio.get_running_loop())
 
+    # Self-knowledge: the facts live in `brain/`, the handler in `actions/`,
+    # and `actions` sits below `brain` -- so the reader is injected here for
+    # the same reason the event bus's dispatcher is. `main.py` owns both sides.
+    #
+    # Seeded first: `seed_from_handlers()` mirrors the handler table into the
+    # affordance registry, so "what can you do" answers from what actually has
+    # a handler rather than from `config.INTENTS`, which lists what she can be
+    # *asked* for -- including anything with nothing behind it.
+    try:
+        from .brain.affordance import seed_from_handlers
+        from .brain.selfknowledge import self_knowledge as _self_knowledge
+        from .actions.self_knowledge import set_reader as _set_sk_reader
+        _seeded = seed_from_handlers()
+        _set_sk_reader(_self_knowledge.answer)
+        logger.info("[SELF] %d affordances seeded from handlers", _seeded)
+    except Exception as e:
+        # Never fatal. Without it she answers "I don't have reliable
+        # information about that", which is the honest degradation.
+        logger.warning("[SELF] self-knowledge unavailable: %s", e)
+
     # event-driven monitors
     from .automation.event_bus import event_bus as _event_bus
+    # Injected here, not imported there. `main.py` owns both sides: the event
+    # bus is a source of turns and `brain.turn` runs one, and the layer order
+    # puts the runner above the source. Handing the callable down is what lets
+    # `automation` import neither `actions` nor `brain`.
+    from .brain.turn import run_local_intent as _run_local_intent
+    _event_bus.set_turn_dispatcher(_run_local_intent)
     try:
         _event_bus.start(loop=asyncio.get_running_loop())
     except Exception as e:

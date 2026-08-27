@@ -132,7 +132,7 @@ def _list_schedules() -> str:
     repo = _get_repo()
     schedules = repo.list_all()
     if not schedules:
-        return "You don't have any scheduled monitors."
+        return "You don't have any schedules."
 
     names = []
     for s in schedules:
@@ -140,8 +140,8 @@ def _list_schedules() -> str:
         names.append(f"{s['name']}{status}")
 
     if len(names) == 1:
-        return f"You have 1 monitor: {names[0]}."
-    return f"You have {len(names)} monitors: {', '.join(names)}."
+        return f"You have 1 schedule: {names[0]}."
+    return f"You have {len(names)} schedules: {', '.join(names)}."
 
 
 _NOISE_WORDS = frozenset({
@@ -186,7 +186,7 @@ def _cancel_schedule(goal: str) -> str:
         return f"I found multiple matches: {names}. Which one?"
 
     repo.delete(matches[0]["id"])
-    return f"Cancelled the '{matches[0]['name']}' monitor."
+    return f"Cancelled the '{matches[0]['name']}' schedule."
 
 
 def _toggle_schedule(goal: str) -> str:
@@ -208,4 +208,4 @@ def _toggle_schedule(goal: str) -> str:
     repo.toggle(target["id"], enabled=new_state)
 
     verb = "Resumed" if new_state else "Paused"
-    return f"{verb} the '{target['name']}' monitor."
+    return f"{verb} the '{target['name']}' schedule."

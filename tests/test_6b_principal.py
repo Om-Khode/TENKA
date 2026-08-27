@@ -1330,6 +1330,63 @@ def test_every_pending_arm_outside_the_two_reasoned_exceptions_uses_try_arm():
         f"survives the arm attempt.")
 
 
+def test_the_arming_sweep_still_reaches_the_files_that_arm():
+    """P4c. A union non-empty assertion is not per-file coverage.
+
+    The sweep above walks `assistant/**/*.py` and refuses to be empty, which
+    stops it going quietly vacuous altogether. It does not stop it going
+    vacuous *for one file* -- and that is the realistic failure, because the
+    turn pipeline is exactly the file that gets restructured. When P4c split
+    `process_text_from_queue` in two, the other structural sweep in this tree
+    lost its region entirely; had this one been keyed the same way, its
+    main.py contribution would have gone to zero while the tree-wide total
+    stayed comfortably non-empty and green.
+
+    So: name the files that arm pending state, and require each of them to
+    still be represented. A file that legitimately stops arming is removed
+    from this list deliberately -- one line, in a commit that says why.
+    """
+    calls = _all_pending_set_calls()
+    seen = {pathlib.PurePath(path).name for path, _, _ in calls}
+
+    # Every file with an arming site today. `brain/` holds none yet: it
+    # installs authority and returns, and `brain/turn.py`'s docstring makes
+    # that a property rather than an accident. Listed all the same, with the
+    # count it must have, so the day the Brain does arm something the walk is
+    # already known to reach it.
+    expected = {"main.py", "pending_handlers.py", "pending.py"}
+    reaching = expected & seen
+    assert reaching, (
+        f"the walk reached none of {sorted(expected)} -- it found "
+        f"{sorted(seen)}, so whatever it is measuring is not the arming "
+        "sites this test exists for")
+    assert "main.py" in seen, (
+        "the walk no longer reaches an arming site in main.py. Either the "
+        "turn pipeline stopped arming pending state -- unlikely, and it would "
+        "be the headline of its own commit -- or the sweep lost the file to a "
+        "restructure, which is how a structural test goes green while "
+        "measuring nothing.")
+
+
+def test_the_arming_sweep_covers_the_brain_package():
+    """The Brain is above `actions/` and may arm state the moment it
+    coordinates anything. The sweep is tree-wide, so this asserts the *root*
+    it walks contains `brain/` rather than asserting a site that does not
+    exist yet -- an empty-set assertion about a real directory, which stays
+    true and starts biting the day the directory has arming code in it."""
+    brain = _ROOT / "assistant" / "brain"
+    assert brain.is_dir(), "assistant/brain/ is gone; this sweep needs re-aiming"
+    assert list(brain.rglob("*.py")), "assistant/brain/ holds no modules"
+
+    calls = _all_pending_set_calls()
+    in_brain = [c for c in calls
+                if "brain" in pathlib.PurePath(str(c[0])).parts]
+    assert not in_brain, (
+        f"the Brain arms pending state with a raw `.set(`: {in_brain}. It has "
+        "no principal of its own to own that state with -- route it through "
+        "`pending.try_arm` with the turn's principal.")
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # The third door: `.clear()`. The answer side (dispatch loop) and the arm
 # side (`try_arm`) both already refuse a foreign principal; a bare `.clear()`

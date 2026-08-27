@@ -912,6 +912,19 @@ async def _attempt_recovery(
 
     Only called ONCE per failed step — no recursive recovery.
     """
+    # §15's O2: "why did planning happen". A turn that replanned three times
+    # and one that ran straight through are indistinguishable in the store
+    # without this. Best-effort and never load-bearing -- an observability
+    # write must not be able to fail a turn -- and read off the contextvar so
+    # a call this far below the turn loop needs no new parameter.
+    try:
+        from ...telemetry import get_current_tracker
+        _tracker = get_current_tracker()
+        if _tracker is not None:
+            _tracker.note_replan()
+    except Exception:
+        pass
+
     # A security decision is not a failure to route around.
     #
     # Checked before `_UNRECOVERABLE_PATTERNS` and separately from it, because

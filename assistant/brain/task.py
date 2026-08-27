@@ -35,70 +35,19 @@ from ..core.capabilities import Capability
 
 
 # ─── What came of a step ─────────────────────────────────────────────────────
-
-class Outcome(str, enum.Enum):
-    """A step's verdict. Replaces the boolean that made three states look like
-    one (`VerifyResult.ok` is True for success, ambiguity and skip alike).
-
-    The distinction between `UNCERTAIN` and `UNVERIFIED` is the whole reason
-    this is an enum: one is a failure of knowledge, the other is a choice not
-    to acquire it, and only the first is a problem.
-    """
-
-    SUCCEEDED = "succeeded"      # positive evidence the effect happened
-    FAILED = "failed"            # positive evidence it did not
-    UNCERTAIN = "uncertain"      # verification ran and could not decide
-    UNVERIFIED = "unverified"    # verification did not run: policy, or nothing to verify
-    UNSUPPORTED = "unsupported"  # no route exists; never attempted at all
-
-    @property
-    def is_evidence_of_success(self) -> bool:
-        """Only `SUCCEEDED` is. Absence of an exception is not evidence.
-
-        A property rather than a bare comparison so there is one place that
-        answers it — the bug this type replaces was six call sites each
-        deciding for themselves what `ok` meant.
-        """
-        return self is Outcome.SUCCEEDED
-
-
-class ObservationKind(str, enum.Enum):
-    STATE_CHANGED = "state_changed"
-    EXPECTED_PRESENT = "expected_present"
-    EXPECTED_ABSENT = "expected_absent"
-    NOTHING_CHANGED = "nothing_changed"
-    ERROR = "error"
-
-
-@dataclass(frozen=True)
-class Observation:
-    """What was seen, by what, when, and how sure.
-
-    Freshness and provenance are fields rather than hopes: an observation of
-    the desktop is stale the moment it is taken, and a caller that cannot tell
-    a code-tier check from a vision guess cannot weigh them differently. The
-    thing this replaces is a bare string.
-    """
-
-    kind: ObservationKind
-    detail: str = ""
-    source: str = "code"          # code | dom | uia | vision | process | llm
-    confidence: float = 1.0
-    at: str = ""                  # ISO 8601; set by the observer, never inferred
-
-
-@dataclass(frozen=True)
-class Verdict:
-    """An outcome plus the evidence for it. **There is no `ok` field.**
-
-    `escalated` records that a cheaper tier was inconclusive and a dearer one
-    ran, which is what makes the cost of a verification legible after the fact.
-    """
-
-    outcome: Outcome
-    observation: Observation
-    tier: str = "code"            # pre | code | vision | skipped
-    escalated: bool = False
+#
+# Defined in `core/verdict.py` and re-exported here. These are vocabulary, not
+# coordination: `automation/` and `storage/` both need to say what a step
+# concluded, and both sit below `brain/` in the layer order -- so defining them
+# here put five wrong-way imports into the tree. What a Task *is*, who owns it
+# and whether it may resume are decisions, and those stay below.
+#
+# Re-exported rather than moved outright so that `from ..brain.task import
+# Outcome` keeps working; the point was to give the lower layers somewhere legal
+# to import from, not to rename anything.
+from ..core.verdict import (  # noqa: F401
+    Observation, ObservationKind, Outcome, Verdict,
+)
 
 
 # ─── Where a Task is in its life ─────────────────────────────────────────────
@@ -229,6 +178,12 @@ class TaskStep:
     affordance: str = ""
     operation: str = ""
     parameters: dict = field(default_factory=dict)
+    # Mirrors `Task.constraints`, and separate from `parameters` for the same
+    # reason: a value the user pinned must not be widened by whatever fills in
+    # the rest. The Executor lays these over `parameters` last and verbatim, so
+    # "mobile as 99999" reaches the adapter as 99999 whatever a planner or an
+    # adapter thought would be more plausible.
+    constraints: dict = field(default_factory=dict)
     depends_on: tuple[int, ...] = ()
     condition: str | None = None
     status: TaskStatus = TaskStatus.PENDING
@@ -241,8 +196,18 @@ class TaskStep:
 class Task:
     """What TENKA has committed to accomplishing, and on whose authority.
 
-    Build with `Task.create()` — the bare constructor cannot check anything,
-    and every field that must be checked is checked there.
+    Build with `brain.authority.create_task()` — the bare constructor cannot
+    check anything, and the two fields that must be checked are checked there:
+    it refuses when no grants are installed for the turn and when no principal
+    is, because a Task with no owner can be resumed by nobody and reads as a
+    timeout rather than as the bug it is.
+
+    This said `Task.create()` for three phases and no such method ever
+    existed, which is worth more than a correction: the docstring was the only
+    thing pointing at the factory, so anyone following it fell back to the bare
+    constructor it warns against. The two remaining direct constructions are
+    deliberate -- `authority.create_task` itself, and `storage/repos/task.py`
+    rehydrating a row that was already checked when it was first built.
     """
 
     task_id: str
@@ -282,6 +247,40 @@ class Task:
                 f"illegal task transition {self.status.value} -> {target.value}"
             )
         return replace(self, status=target)
+
+    def outcome(self) -> "Outcome":
+        """This task's outcome, from its steps. §11.2 V4.
+
+        Computed rather than stored, for the reason `requires()` is: a stored
+        answer can go stale against the steps it was derived from, and the one
+        thing a task's outcome must never be is out of date with what actually
+        happened.
+
+        A step with no verdict yet counts as **`UNCERTAIN`**, not `UNVERIFIED`,
+        and the difference is the whole point of the five-member ladder applied
+        one level down. `UNVERIFIED` means *nobody looked, and that was the
+        plan* -- the operator's recorded choice. A step that has not run is not
+        a choice about verification; it is work that has not happened, and
+        nothing confirms it.
+
+        The first draft used `UNVERIFIED` here and a task with one finished
+        step and one unrun step reported `SUCCEEDED`. That is a task claiming
+        it is done while half of it has not started, which is the same false
+        claim this phase exists to remove, arriving through the door marked
+        "not applicable".
+
+        A task with **no steps at all** is still `UNVERIFIED`: there was
+        nothing to do, nothing ran, and nothing is outstanding.
+        """
+        from ..core.verdict import Outcome as _Outcome, roll_up
+
+        if not self.steps:
+            return _Outcome.UNVERIFIED
+        return roll_up(
+            step.verdict.outcome if step.verdict is not None
+            else _Outcome.UNCERTAIN
+            for step in self.steps
+        )
 
     def requires(self) -> Capability:
         """What this Task costs, from the intent table.

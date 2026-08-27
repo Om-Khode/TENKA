@@ -23,19 +23,81 @@ def _sanitize_filename(name: str) -> str:
     return sanitized.strip() or "untitled"
 
 
+def _unused_note_path(base: "pathlib.Path") -> "pathlib.Path":
+    """`groceries.txt`, or `groceries (2).txt` if that is taken.
+
+    Bounded, and the bound is not decoration: a directory somebody has filled
+    with a thousand `groceries (n).txt` is a directory where the right answer
+    is to say so, not to spin.
+    """
+    if not base.exists():
+        return base
+    for n in range(2, 1000):
+        candidate = base.with_name(f"{base.stem} ({n}){base.suffix}")
+        if not candidate.exists():
+            return candidate
+    return base.with_name(f"{base.stem} (overflow){base.suffix}")
+
+
 @tool_registry.decorator("create_note")
 def handle_create_note(params: dict, llm_response: str) -> str:
-    """Create a text note in the sandbox Notes directory."""
+    """Create a text note in the sandbox Notes directory.
+
+    **Never truncates an existing note.** It did, and it cost one:
+
+        21:58:48  'make a note called groceries saying milk and vegetables'
+                  -> Notes\groceries.txt          (the contents)
+        22:00:28  'make a note called groceries'
+                  -> params {'title': 'groceries'}  (no content at all)
+                  -> Notes\groceries.txt           (zero bytes)
+                  -> "Done -- 'groceries' is saved."
+
+    A bare `write_text(content)` with `content=""` emptied a note written a
+    hundred seconds earlier, and the reply called it saving. Two separate
+    failures in one line: the write was destructive, and the sentence
+    describing it was false.
+
+    Both directions are handled here rather than by asking the classifier to
+    behave. It is doing nothing wrong -- "make a note called groceries" really
+    does name a note and give it no body, and deciding what to do about that
+    is this handler's job:
+
+    - **the name is taken and there is content** -- write beside it, under a
+      numbered name, and say which file it went to. Overwriting is the one
+      thing that cannot be undone from here; a second file can be deleted in a
+      breath.
+    - **the name is taken and there is no content** -- change nothing at all,
+      and say the note already exists. An empty request is not permission to
+      empty the note.
+    - **the name is free** -- create it, and if it is empty, say that it is
+      empty rather than implying something was written into it.
+    """
+    import pathlib
+
     title = params.get("title", "untitled")
-    content = params.get("content", "")
+    content = params.get("content", "") or ""
 
     safe_name = _sanitize_filename(title)
     file_path = config.NOTES_DIR / f"{safe_name}.txt"
 
     config.NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
+    if file_path.exists():
+        if not content.strip():
+            logger.info(f"Note left untouched (nothing to add): {file_path}")
+            return (f"'{title}' already exists and you didn't give me anything "
+                    f"to put in it, so I left it alone.")
+
+        target = _unused_note_path(file_path)
+        target.write_text(content, encoding="utf-8")
+        logger.info(f"Note created beside an existing one: {target}")
+        return (f"'{title}' already existed, so I saved this one as "
+                f"'{target.stem}' instead of overwriting it.")
+
     file_path.write_text(content, encoding="utf-8")
     logger.info(f"Note created: {file_path}")
+    if not content.strip():
+        return f"Created '{title}' — it's empty, so tell me what goes in it."
     return personality_say("note_created", title=title)
 
 

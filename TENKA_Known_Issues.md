@@ -491,7 +491,45 @@ Tests: `tests/test_6b_principal.py`.
 **Priority:** Medium (security)
 **Effort:** Low (fence the block, as `render_untrusted_block` already does elsewhere)
 **Discovered:** 2026-08-16, milestone 6a.5 adversarial review
-**Status:** open. Explicitly out of scope for milestone 6b (spec §1) — not touched, not made worse.
+**Status:** **MITIGATED — not closed.** 2026-08-25, TENKA-v2 P10.
+
+`_build_facts_context` now fences the values with a labelled, nonce-delimited
+`untrusted_stored_user_facts` block, and redacts them strictly on the way out.
+Two exposures lived in this one entry and only one of them is gone:
+
+- **the secret half is closed.** `save_typed_fact` is what records "my api key
+  is ..." as a durable fact, and this string reaches a third party on every
+  turn; `redact_secrets_strict` runs before the block is built.
+- **the injection half is mitigated.** A fact's value is written by whoever
+  said it, and a value of `ignore previous instructions and ...` used to arrive
+  as an unlabelled line sitting exactly where TENKA's own instructions sit. It
+  is now labelled data with a boundary the content cannot spell.
+
+**Why this is not "FIXED".** TENKA-v2 §12.1 C3 is explicit: fencing raises the
+cost of injection, it does not close it. The model is told which bytes are data;
+nothing forces it to care. Closure would need an adversarial live test —
+payloads written to defeat the fence, run through a real turn — which this
+change did not have and which §22 puts out of scope.
+
+Keys stay outside the fence deliberately: they are TENKA's own vocabulary
+(`user_name`, `user_wifi`), written by `save_typed_fact` rather than by the
+speaker, and a fact the model cannot read is a fact that does nothing.
+
+Pinned by `tests/test_facts_context_is_fenced.py` (13 tests, 6 mutations red),
+and `tests/test_6a5_fence_leaks.py`'s probe — which asserted the *absence* of
+the fence as a record of the open finding — is inverted to assert its presence.
+
+`MemoryRepo.build_recent_context` is fenced too, as of the same day. It feeds
+the plan-generation and code-generation prompts, and both callers already knew
+the content was risky -- each passes a header ending "do NOT replay these
+tasks", which is a prompt-level plea where `CLAUDE.md` rule 8 asks for a
+code-level control. The objection that conversation history is "the user's own
+words" is wrong in the direction that matters: an `Assistant:` line is whatever
+TENKA last said, which routinely carries a summary of a web page, the contents
+of a file she read, or OCR of a screen. The header stays outside the block as
+the framing that explains it.
+
+Still open in the same family: **KI-14** and **KI-16**.
 
 **Symptom:** `_build_facts_context` concatenates stored facts into `build_personality_prompt()` with no delimiter and no untrusted label — the most trusted position in the tree — on every subsequent turn.
 
@@ -1043,3 +1081,116 @@ keying the clamp on the permissive set reds three; making routing ignore provena
 **Not closed:** the prompt still asks the model for a confidence number, which is now
 ignored above the ceiling. Removing the field would be clearer than capping it, and belongs
 with the wider memory-provenance work in `TENKA-v2.md` §10.
+
+---
+
+## KI-33: ~~An uncertain verification read as success at the task level~~ FIXED
+
+**Priority:** Medium (honesty — she reported a finished job she could not confirm)
+**Effort:** Low — one rollup function and one predicate
+**Discovered:** 2026-08-22, auditing `VerifyResult` while writing `TENKA-v2.md`
+**Fixed:** 2026-08-25, TENKA-v2 phase P6
+
+**The defect.** KI-31 removed `VerifyResult.ok` and gave every *step* an
+explicit `Outcome`. Nothing combined them. A task made of steps had no outcome
+of its own, so what TENKA said about a multi-step job depended on whichever
+code path happened to summarise it — and the summary had no way to know that
+one step in the middle had come back `UNCERTAIN`.
+
+The step-level work was real and is what makes this fixable at all. The gap was
+that §11.2's V4 — *a task reaches `SUCCEEDED` only if every step is `SUCCEEDED`
+or `UNVERIFIED`* — was written down and never implemented.
+
+**The fix.** `core/verdict.py:roll_up()` is the one place a task's outcome
+follows from its steps, and `Task.outcome()` calls it. Precedence, and the
+argument for each:
+
+- `FAILED` outranks `UNCERTAIN` — positive evidence against beats no evidence
+  either way, and there is nothing to hedge about a step that demonstrably did
+  not work.
+- `UNCERTAIN` outranks `SUCCEEDED` — one step nobody could confirm makes the
+  task unconfirmed. This is the rule the whole phase exists for.
+- `UNVERIFIED` never lowers a task. It is the operator's recorded choice not to
+  verify, and treating it as doubt would make `VERIFY_ENABLED=False` apologise
+  about every turn forever — which is how the setting gets switched back on and
+  the honesty lost with it.
+
+`speaks_as_done()` carries V8: `SUCCEEDED` and `UNVERIFIED` may say "done";
+`UNCERTAIN` may not, ever. A function rather than a comparison per call site,
+because six call sites each deciding what `ok` meant is the defect being
+replaced.
+
+**A step that has not run counts as `UNCERTAIN`, not `UNVERIFIED`,** and the
+first draft got this wrong in a way its own test caught: a task with one
+finished step and one unstarted step reported `SUCCEEDED` — done, while half of
+it had not begun. `UNVERIFIED` means *nobody looked and that was the plan*; an
+unrun step is not a decision about verification.
+
+**Mutations, all red** (`tests/test_verification_outcome.py`):
+
+| Mutation | Reds |
+| --- | --- |
+| `ambiguous()` returns `SUCCEEDED` again | 3 |
+| `data.get("ok", True)` restored | 1 |
+| `UNCERTAIN` stops lowering a task | 3 |
+| `UNVERIFIED` starts lowering a task | 3 |
+| an empty task reports `SUCCEEDED` | 1 |
+| `UNCERTAIN` outranks `FAILED` | 1 |
+| `UNCERTAIN` speaks as done | 3 |
+| `UNVERIFIED` hedges | 2 |
+| an unrun step counts as `UNVERIFIED` | 1 |
+
+Two went green first. One anchored on the *docstring* line
+`ambiguous()  -> UNCERTAIN` rather than the constructor forty lines below it,
+so it mutated documentation — the fifth time this tree has been fooled by a
+sweep or a mutation reading prose. The other was a test passing for the wrong
+reason: two of its three cases held whether an unrun step read as `UNVERIFIED`
+or `SUCCEEDED`, because another step decided the answer in both.
+
+---
+
+## KI-34: A form action with a browser open routes to a second browser
+
+**Priority:** Medium (correctness — the action lands somewhere the user is not looking)
+**Effort:** Low, but behaviour-changing: needs a live test on the automation tier
+**Discovered:** 2026-08-25, converting `tests/test_routing_trace.py` out of the
+EMPTY state the first test baseline found it in
+**Status:** open, pinned by two `xfail(strict=True)` cases
+
+**The defect.** `_BROWSER_INTENT_PATTERNS` claims `fill (out) (the) form` and
+`submit form`. The branch that answers `"browser"` asks
+`_detect_running_app(goal)`, which reads the **goal text** for an app name and
+never consults the open windows. So a form action typed while Firefox sits in
+front of you routes to `browser` — Playwright opens its own window — instead of
+`vision`, which would act on the page you are actually looking at.
+
+Measured with a window list of `["Test Page - Mozilla Firefox", ...]`:
+
+| goal | routes to | should be |
+| --- | --- | --- |
+| `fill out the form with random test data` | `browser` | `vision` |
+| `submit form` | `browser` | `vision` |
+| `fill this form for testing` | `vision` | `vision` |
+| `submit the form` | `vision` | `vision` |
+
+Four phrasings of one intent, routing two ways. The two that reach `vision` do
+so by *missing* `_BROWSER_INTENT_PATTERNS` — `submit the form` does not match
+`submit\s+form` because of the article — which is luck rather than design.
+
+**How it stayed hidden.** `tests/test_routing_trace.py` asserted the correct
+behaviour and was a manual script: a `def _main()` and an
+`if __name__ == "__main__"` block, in `tests/`, so pytest imported it, collected
+nothing, and reported EMPTY. Run by hand it printed `1 FAILED`. Nothing ran it.
+
+**And the one case that did pass, passed by accident.** The fixture's window
+title was `"DummyForms - TENKA Testing — Mozilla Firefox"`, and
+`_detect_running_app` matches goal words against window titles — so
+`fill out the form ...` "found" Firefox through the substring **Form**s. With an
+honest title it fails like the others. The test now asserts its own fixture does
+not echo the goal.
+
+**Not fixed here** because it changes automation-tier routing, which
+`.claude/rules/testing.md` requires a live test for, and the fix wants a
+decision: either `_detect_running_app` consults open windows, or the
+browser-intent branch defers to vision when a browser is already open. Both are
+behaviour changes with a blast radius beyond this file.

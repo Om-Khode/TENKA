@@ -178,8 +178,59 @@ class TurnTracker:
         self.llm_providers_used: Counter = Counter()
         self.llm_models_used: Counter = Counter()
 
+        # §15's O2, the three questions the store could not answer.
+        #
+        # `llm_purposes` is *why* each model call happened -- the `task_type`
+        # every caller already chooses and `TASK_MODEL_MAP` already routes on,
+        # which was never recorded. Without it the store could say a turn made
+        # four model calls and not which were classification, which were
+        # code-generation and which were the reply.
+        #
+        # `replan_count` and `recovery_count` are why planning and recovery
+        # happened; a turn with three replans and one that ran straight through
+        # look identical without them.
+        #
+        # `verification_tiers` is why she reported success -- which tier
+        # decided, and how often it had to escalate. §11's whole argument is
+        # that "it worked" depends on who checked.
+        #
+        # Counters rather than columns per key: a new task_type or a new
+        # verification tier must not need a migration.
+        self.llm_purposes: Counter = Counter()
+        self.replan_count: int = 0
+        self.recovery_count: int = 0
+        self.verification_tiers: Counter = Counter()
+
+        # §15's `context_bytes_by_profile`, and §12's O3. Summed rather than
+        # replaced: a turn can build the same profile twice -- a planner that
+        # replans builds `planning` again -- and the cost asked about is the
+        # total.
+        self.context_bytes: Counter = Counter()
+
+    def note_context(self, profile: str, size_bytes: int) -> None:
+        """Record what one built context bundle costs."""
+        if profile and size_bytes:
+            self.context_bytes[profile] += int(size_bytes)
+
+    def note_replan(self) -> None:
+        """A loop generated a fresh plan rather than continuing the old one."""
+        self.replan_count += 1
+
+    def note_recovery(self) -> None:
+        """A recovery strategy was attempted after a step failed."""
+        self.recovery_count += 1
+
+    def note_verification(self, tier: str) -> None:
+        """A verification tier reached a verdict. `tier` is
+        `VerifyResult.tier` -- pre, code, vision, ambiguous or skipped."""
+        if tier:
+            self.verification_tiers[tier] += 1
+
     def record_llm_result(self, result) -> None:
         self.llm_calls_count += 1
+        purpose = getattr(result, "task_type", None)
+        if purpose:
+            self.llm_purposes[purpose] += 1
         self.llm_tokens_in += result.tokens_in or 0
         self.llm_tokens_out += result.tokens_out or 0
         self.fallback_chain_depth = max(
@@ -210,6 +261,18 @@ class TurnTracker:
             json.dumps(dict(self.llm_models_used))
             if self.llm_models_used else None
         )
+        purposes_json = (
+            json.dumps(dict(self.llm_purposes))
+            if self.llm_purposes else None
+        )
+        tiers_json = (
+            json.dumps(dict(self.verification_tiers))
+            if self.verification_tiers else None
+        )
+        context_json = (
+            json.dumps(dict(self.context_bytes))
+            if self.context_bytes else None
+        )
         try:
             _get_repo().create(
                 session_id=self.session_id,
@@ -233,6 +296,11 @@ class TurnTracker:
                 vision_calls_count=self.vision_calls_count,
                 llm_providers_used=providers_json,
                 llm_models_used=models_json,
+                llm_purposes=purposes_json,
+                replan_count=self.replan_count,
+                recovery_count=self.recovery_count,
+                verification_tiers=tiers_json,
+                context_bytes_by_profile=context_json,
             )
         except Exception as e:
             logger.warning(f"[TELEMETRY] Failed to save event: {e}")

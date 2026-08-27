@@ -129,8 +129,12 @@ class TaskRepo:
     def load(self, task_id: str):
         """Return the Task, or None. Raises `UnknownCapabilityStored` if its
         recorded authority cannot be reconstructed exactly."""
-        from ...brain.task import Observation, ObservationKind, Outcome
-        from ...brain.task import Task, TaskStatus, TaskStep, Verdict
+        # Vocabulary from `core`, coordination from `brain`. The repo is
+        # below both in the layer order, and only the second edge is
+        # unavoidable: a repository for an aggregate has to know the
+        # aggregate. The first was not.
+        from ...core.verdict import Observation, ObservationKind, Outcome, Verdict
+        from ...brain.task import Task, TaskStatus, TaskStep
 
         row = self._db.fetchone("SELECT * FROM tasks WHERE task_id = ?", (task_id,))
         if row is None:
