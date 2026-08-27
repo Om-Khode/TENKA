@@ -2063,6 +2063,8 @@ async def resume_plan(interaction_result: str = "") -> str | None:
         )
 
     # ── Continue executing remaining steps ─────────────────────────
+    from ...core.abort import UserAborted
+
     try:
         plan.status = "executing"
         _loop = await run_steps(
@@ -2074,5 +2076,29 @@ async def resume_plan(interaction_result: str = "") -> str | None:
 
         plan.status = "completed"
         return await _synthesize_result(plan, llm_func)
+    except UserAborted:
+        # `execute_plan` raises this too, and survives only because
+        # `da_handlers.handle_planner` wraps the whole call in `except
+        # UserAborted`. `resume_plan` has no such wrapper: `main.py` calls it
+        # straight from the pending epilogue and catches nothing, so the
+        # ESC-hold check the loop just gained would have left the turn on an
+        # unhandled exception instead of stopping it.
+        #
+        # The boundary was easy; the paths around it were not. Giving the
+        # resumed half an abort check without asking where the exception lands
+        # is the same mistake this project has now made four times.
+        plan.status = "failed"
+        logger.info("[PLANNER] Resumed plan aborted by user")
+        try:
+            from ..responses import personality_say
+            return personality_say("stopped", default="Stopped.")
+        except Exception:
+            return "Stopped."
     finally:
-        pass
+        # `run_steps` sets PLANNING on every step and nothing here put it back.
+        # `execute_plan` never needed this line because its caller has the
+        # `finally` -- `main.py` calls `resume_plan` directly and has none, so
+        # a resumed plan used to leave the overlay reading PLANNING forever.
+        # An eighth divergence, created by fixing the second one.
+        from ...io.status_broadcaster import status, StatusPhase
+        status.set(StatusPhase.IDLE)

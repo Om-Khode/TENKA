@@ -147,10 +147,10 @@ def test_both_entry_points_go_through_the_loop(entry):
 
 @pytest.mark.asyncio
 async def test_a_resumed_plan_can_be_aborted(planner):
-    """The worst of the seven. The stop word worked before the interaction and
-    silently did nothing after it, which is the half of a plan most likely to
-    be doing something the user just changed their mind about."""
-    from assistant.core.abort import abort, UserAborted
+    """The worst of the seven. Holding ESC worked before the interaction and
+    silently did nothing after it -- on the half of a plan a user is most
+    likely to have changed their mind about."""
+    from assistant.core.abort import abort
 
     ran = []
 
@@ -161,12 +161,78 @@ async def test_a_resumed_plan_can_be_aborted(planner):
     plan.steps[0].status = "success"
     planner._suspend_plan(plan, 1, _llm, None, None)
 
-    abort.request_abort("user said stop")
+    abort.request_abort("esc_hold")
     with _executor_returning(_never):
-        with pytest.raises(UserAborted):
-            await planner.resume_plan("done")
+        result = await planner.resume_plan("done")
 
     assert not ran, f"steps ran after abort: {ran}"
+    assert result, "an aborted resume said nothing at all"
+    assert plan.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_an_aborted_resume_does_not_escape_as_an_exception(planner):
+    """Where the exception lands, not whether it is raised.
+
+    `execute_plan` raises `UserAborted` and survives only because
+    `da_handlers.handle_planner` wraps the whole call. `resume_plan` has no
+    such wrapper -- `main.py` calls it straight from the pending epilogue and
+    catches nothing. Adding the abort check without asking that question would
+    have converted an ignored ESC into an unhandled exception, which is worse
+    than the bug it fixed.
+    """
+    from assistant.core.abort import abort, UserAborted
+
+    async def _never(step, plan, **kw):
+        raise AssertionError("should not run")
+
+    plan = _plan(planner, _step(planner, 1), _step(planner, 2))
+    plan.steps[0].status = "success"
+    planner._suspend_plan(plan, 1, _llm, None, None)
+
+    abort.request_abort("esc_hold")
+    with _executor_returning(_never):
+        try:
+            result = await planner.resume_plan("done")
+        except UserAborted:  # pragma: no cover - the regression
+            pytest.fail(
+                "UserAborted escaped resume_plan; main.py has no handler for "
+                "it and the turn would die on an unhandled exception")
+
+    assert isinstance(result, str) and result.strip(), (
+        f"expected something sayable, got {result!r}")
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_plan_puts_the_overlay_back(planner):
+    """The eighth divergence, created by fixing the second one.
+
+    `run_steps` sets PLANNING on every step. `execute_plan` never needed to
+    undo it because `da_handlers` has the `finally`; `main.py` calls
+    `resume_plan` directly and has none -- so adding progress reporting to the
+    resumed path would have left the overlay reading PLANNING forever.
+    """
+    from assistant.io.status_broadcaster import StatusPhase
+
+    seen = []
+
+    async def _ok(step, plan, **kw):
+        step.status = "success"
+
+    class _Status:
+        def set(self, phase, *, detail="", step=None, **kw):
+            seen.append(phase)
+
+    plan = _plan(planner, _step(planner, 1), _step(planner, 2))
+    plan.steps[0].status = "success"
+    planner._suspend_plan(plan, 1, _llm, None, None)
+
+    with _executor_returning(_ok), \
+            patch("assistant.io.status_broadcaster.status", new=_Status()):
+        await planner.resume_plan("done")
+
+    assert seen[-1] is StatusPhase.IDLE, (
+        f"the overlay was left on {seen[-1]}")
 
 
 @pytest.mark.asyncio
@@ -192,10 +258,12 @@ async def test_a_resumed_plan_reports_progress(planner):
             patch("assistant.io.status_broadcaster.status", new=_Status()):
         await planner.resume_plan("done")
 
-    assert seen, "a resumed plan reported no progress at all"
-    assert all(p is StatusPhase.PLANNING for p, _ in seen)
-    assert seen[0][1] == (2, 2), (
-        f"progress started at {seen[0][1]}, not at the resumed step")
+    # The last call is the `finally`'s IDLE — its own test below.
+    progress = [(p, s) for p, s in seen if s is not None]
+    assert progress, "a resumed plan reported no progress at all"
+    assert all(p is StatusPhase.PLANNING for p, _ in progress)
+    assert progress[0][1] == (2, 2), (
+        f"progress started at {progress[0][1]}, not at the resumed step")
 
 
 @pytest.mark.asyncio
