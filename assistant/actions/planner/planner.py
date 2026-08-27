@@ -1613,13 +1613,29 @@ async def _synthesize_result(plan: Plan, llm_func) -> str:
                 # something, and this is the exchange. Labelling it "produced"
                 # is how "I couldn't find model.vroid, fast or deep search?"
                 # came back as "I found the model.vroid file and opened it".
+                #
+                # The first fix said "the goal of this step was not
+                # achieved", which traded one false claim for its exact
+                # opposite: the model read it as failure and reported "I
+                # couldn't find the model.vroid file" -- about a search
+                # that had already found it twenty-two seconds earlier, on
+                # a background thread that reports separately.
+                #
+                # The outcome is not failed. It is *unknown*, and often
+                # still in flight. Both directions have to be forbidden out
+                # loud, because a summary asked to describe a step with no
+                # result will otherwise supply whichever one the
+                # surrounding text hints at.
                 parts.append(
-                    f"[{step.tool}] did NOT finish. It paused to ask the user "
-                    f"something, and this is only what was said:\n"
+                    f"[{step.tool}] has NOT finished and its outcome is NOT "
+                    f"known. It paused to ask the user something; this is "
+                    f"the exchange and nothing more:\n"
                     + render_untrusted_block(
                         step.output, label=f"step_{step.step_id}_exchange")
-                    + f"\nDo not report this as a result. The goal of this "
-                      f"step was not achieved."
+                    + f"\nDo NOT say this step succeeded. Do NOT say it "
+                      f"failed. If the exchange says something is still "
+                      f"running or will be reported later, say it is still "
+                      f"in progress and that you will report back."
                 )
             else:
                 parts.append(

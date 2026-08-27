@@ -490,8 +490,92 @@ async def test_an_answered_step_is_not_offered_as_a_result(runner):
     assert "Starting a fast 3-level search" in prompt, "the test set nothing up"
     assert "[file_task] produced" not in prompt, (
         "the interaction was offered to the synthesis as the step's product")
-    assert "did NOT finish" in prompt, (
+    assert "has NOT finished" in prompt, (
         "nothing told the synthesis this step never completed")
+
+
+@pytest.mark.asyncio
+async def test_an_unfinished_step_is_unknown_not_failed(runner):
+    """The second live-test finding, and the first fix caused it.
+
+    Saying "the goal of this step was not achieved" made the model report "I
+    couldn't find the model.vroid file" -- about a search that had already
+    found it, twenty-two seconds earlier, on a background thread that reports
+    separately. One false claim swapped for its exact opposite.
+
+    A step with no result has an *unknown* outcome. Both directions have to be
+    forbidden explicitly: asked to describe a step it has no result for, a
+    summary supplies whichever the surrounding text hints at.
+    """
+    seen = {}
+
+    async def _capture(prompt, **kw):
+        seen["prompt"] = prompt
+        return "summary"
+
+    async def _ok(step, plan, **kw):
+        step.status = "success"
+        step.output = "done"
+
+    plan = _plan(_step(1, tool="file_task"), _step(2))
+    plan.steps[0].status = "waiting"
+    runner._suspend_plan(plan, 1, _capture, None, None)
+
+    with _executor_returning(_ok):
+        await runner.resume(
+            "Starting a fast 3-level search. I'll let you know when I find "
+            "something.")
+
+    prompt = seen["prompt"]
+    assert "outcome is NOT known" in prompt, (
+        "the synthesis was not told the outcome is unknown")
+    assert "Do NOT say this step succeeded" in prompt, (
+        "nothing forbids claiming success")
+    assert "Do NOT say it failed" in prompt or "not say it failed" in prompt, (
+        "nothing forbids claiming failure -- which is the direction that "
+        "actually shipped")
+    assert "still in progress" in prompt, (
+        "the synthesis was not told it may report the work as ongoing")
+
+
+@pytest.mark.asyncio
+async def test_an_abort_before_resume_stops_before_it_says_it_is_continuing(
+        runner):
+    """The third live-test finding.
+
+    `run_steps` checks abort at the top of every iteration, which is right for
+    a step -- but everything before the first iteration ran regardless: the
+    suspended step was resolved and "Alright, continuing. 1 step left." was
+    spoken. Observed: ESC at 23:19:52, "Alright, continuing" at 23:19:58,
+    "Stopped" at 23:20:01. Obeying the user once should not look like ignoring
+    them twice.
+    """
+    from assistant.core.abort import abort
+
+    spoken = []
+    ran = []
+
+    async def _speak(text):
+        spoken.append(text)
+
+    async def _ok(step, plan, **kw):
+        ran.append(step.step_id)
+        step.status = "success"
+
+    plan = _plan(_step(1), _step(2))
+    plan.steps[0].status = "waiting"
+    runner._suspend_plan(plan, 1, _llm, _speak, None)
+
+    abort.request_abort("esc_hold")
+    with _executor_returning(_ok):
+        result = await runner.resume("done")
+
+    assert not ran, f"steps ran after an abort that preceded the resume: {ran}"
+    assert not any("continuing" in t.lower() for t in spoken), (
+        f"she announced she was carrying on after being told to stop: {spoken}")
+    assert result and "stop" in result.lower()
+    assert not runner.has_suspended_plan(), (
+        "the plan is still suspended -- the next turn would resume it")
 
 
 @pytest.mark.asyncio

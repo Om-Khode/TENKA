@@ -460,10 +460,35 @@ async def resume(interaction_result: str = "") -> Optional[str]:
     from ..actions.planner.planner import _step_failed, _synthesize_result
     from ..core.abort import UserAborted
 
+    from ..core.abort import abort
+
     global _suspended_plan
 
     if _suspended_plan is None:
         return None
+
+    # Before the bookkeeping and before the voice, not after.
+    #
+    # `run_steps` checks abort at the top of every iteration, which is the
+    # right place for a step -- but everything between here and the first
+    # iteration happens regardless: the suspended step is resolved, the plan is
+    # cleared, and "Alright, continuing. 1 step left." is spoken. Live test:
+    # ESC at 23:19:52, "Alright, continuing" at 23:19:58, "Stopped" at
+    # 23:20:01. She announced she was carrying on six seconds after being told
+    # to stop, and then stopped -- which reads as ignoring the user twice
+    # rather than obeying them once.
+    if abort.is_aborted():
+        logger.info("[PLANNER] Resume refused — aborted before it began")
+        # Marked before clearing, not after: a plan that stopped is `failed`,
+        # and leaving it `pending` would describe an abandoned run as one that
+        # never started.
+        _suspended_plan.status = "failed"
+        clear_suspended_plan()
+        try:
+            from ..actions.responses import personality_say
+            return personality_say("stopped", default="Stopped.")
+        except Exception:
+            return "Stopped."
 
     plan = _suspended_plan
     resume_from = _suspended_step_index
