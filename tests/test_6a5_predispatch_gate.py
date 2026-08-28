@@ -247,7 +247,16 @@ async def test_procedure_replay_is_refused_without_execute(turn, monkeypatch):
 @pytest.mark.asyncio
 async def test_procedure_replay_still_works_locally(turn, monkeypatch):
     """The other direction, and the one that must never regress: voice and
-    console carry LOCAL_GRANTS, so the same trigger still replays."""
+    console carry LOCAL_GRANTS, so the same trigger still replays.
+
+    Stubs `run_procedure_detailed`, which is what the branch calls as of
+    §17.P13. This test caught the migration: it stubbed `run_procedure`, the
+    branch moved to the detailed form, and `ran` came back empty -- the fake
+    was pinned to the function that changed, which is
+    `.claude/rules/testing.md`'s strongest live-test signal. The refusal test
+    above did *not* notice, because the gate refuses before the call and its
+    stub is never reached: a sibling refusal keeping a broken stub green.
+    """
     from assistant import main as main_mod
     from assistant import procedure_executor
 
@@ -255,9 +264,17 @@ async def test_procedure_replay_still_works_locally(turn, monkeypatch):
 
     async def _spy_run_procedure(proc, original_text):
         ran.append(proc["name"])
-        return "step 1: done"
+        # A real result object, not a bare string: the branch reads `.text` for
+        # the spoken summary and `.outcome` for the tracker, so a stub that
+        # returns prose would fail on the second and teach nothing about the
+        # first.
+        return procedure_executor.ProcedureResult(steps=(
+            procedure_executor.StepResult(
+                1, "done", procedure_executor.Outcome.SUCCEEDED),
+        ))
 
-    monkeypatch.setattr(procedure_executor, "run_procedure", _spy_run_procedure)
+    monkeypatch.setattr(procedure_executor, "run_procedure_detailed",
+                        _spy_run_procedure)
     monkeypatch.setattr(main_mod.procedures, "match_trigger", lambda t: {
         "id": 1, "name": "morning", "trigger": "deploy the thing", "steps": [],
     })
@@ -857,17 +874,49 @@ async def test_a_pre_dispatch_answer_is_saved_under_the_session_id(
 
 def test_no_pre_dispatch_branch_saves_under_a_date():
     """Structural: no `save_turn(...)` in the turn pipeline may pass a date as
-    its conversation id."""
+    its conversation id.
+
+    **This test was vacuous from P4c until 2026-08-28.** It found its region by
+    name -- `process_text_from_queue` -- and P4c split that function, leaving
+    the name on a fifty-line wrapper that installs the turn's authority and
+    delegates. The wrapper contains **zero** `save_turn` calls; all six live in
+    `_turn_pipeline`. So the walk returned nothing, `bad` was empty, and the
+    test passed on an empty collection for every commit in between. Exactly
+    KI-32's quiet shape, and exactly the failure `.claude/rules/testing.md`
+    describes as "a walk over nothing" -- in the same file whose *other* sweep
+    had already been hardened against it by anchoring on the dispatch call
+    rather than on a function name.
+
+    Found while writing an unrelated sweep in
+    `tests/test_procedure_executor.py` that made the identical mistake, and was
+    told so by its own `assert <collection>, "walked nothing"` line. That line
+    is why this one now has one.
+
+    The finder is now name-free: every `save_turn` call in the module,
+    wherever it lives. A rename or another split cannot shrink it, and there is
+    no function name to keep in sync.
+    """
     tree = ast.parse(_MAIN_PY.read_text(encoding="utf-8"))
-    fn = next(n for n in ast.walk(tree)
-              if isinstance(n, ast.AsyncFunctionDef)
-              and n.name == "process_text_from_queue")
+
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "attr", None) == "save_turn"]
+
+    assert calls, (
+        "walked nothing: no `save_turn(...)` call found anywhere in main.py. "
+        "Either it was renamed, or turn persistence moved out of this module "
+        "-- follow it and re-point this sweep. An empty walk is not a pass."
+    )
+    # A floor as well as a non-empty check: six today, and a split that moved
+    # five of them somewhere else would still satisfy `calls` being truthy.
+    assert len(calls) >= 6, (
+        f"only {len(calls)} `save_turn` call(s) in main.py, expected at least "
+        f"6. If persistence legitimately moved, extend this sweep to the file "
+        f"it moved to rather than lowering the floor."
+    )
 
     bad = []
-    for node in ast.walk(fn):
-        if not (isinstance(node, ast.Call)
-                and getattr(node.func, "attr", None) == "save_turn"):
-            continue
+    for node in calls:
         conv_id = node.args[3] if len(node.args) > 3 else None
         if conv_id is None:
             continue

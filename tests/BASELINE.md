@@ -87,7 +87,7 @@ has looked at, and it blocks the next phase.
 | `test_4c_app_not_running.py` | GREEN | 22 | 0 | 0 | 0 | 0.6 |
 | `test_6a5_api_fixes.py` | GREEN | 32 | 0 | 0 | 0 | 3.5 |
 | `test_6a5_fence_leaks.py` | GREEN | 54 | 0 | 0 | 0 | 9.8 |
-| `test_6a5_predispatch_gate.py` | GREEN | 36 | 0 | 0 | 0 | 13.2 |
+| `test_6a5_predispatch_gate.py` | GREEN | 37 | 0 | 0 | 0 | 12.3 |
 | `test_6b_host_scoping.py` | GREEN | 16 | 0 | 0 | 0 | 2.2 |
 | `test_6b_invalidate_frame.py` | GREEN | 14 | 0 | 0 | 0 | 2.3 |
 | `test_6b_ki17.py` | GREEN | 5 | 0 | 0 | 0 | 0.6 |
@@ -286,7 +286,7 @@ has looked at, and it blocks the next phase.
 | `test_preference_provenance.py` | GREEN | 15 | 0 | 0 | 0 | 1.5 |
 | `test_preferences_merge.py` | GREEN | 10 | 0 | 0 | 0 | 0.6 |
 | `test_proactive_reflection_split.py` | GREEN | 23 | 0 | 0 | 0 | 0.6 |
-| `test_procedure_executor.py` | GREEN | 59 | 0 | 0 | 0 | 11.6 |
+| `test_procedure_executor.py` | GREEN | 78 | 0 | 0 | 0 | 4.0 |
 | `test_procedure_store.py` | GREEN | 45 | 0 | 0 | 0 | 3.9 |
 | `test_promote_slash.py` | GREEN | 10 | 0 | 0 | 0 | 1.0 |
 | `test_promoter.py` | GREEN | 16 | 0 | 0 | 0 | 1.6 |
