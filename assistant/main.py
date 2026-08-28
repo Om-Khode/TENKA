@@ -767,6 +767,49 @@ async def _drain_and_announce_notifications(bridge: UnityBridge):
             msgs[-5:], principal=_actions.LOCAL_PRINCIPAL)
 
 
+# ─── Procedure replay: outcome -> telemetry vocabulary ──────────────────────
+#
+# TENKA-v2 §17.P13. `action_outcome` is a free TEXT column read by
+# `telemetry._maybe_mark_correction`, which treats `("failure", "skipped")` as
+# "the last turn did not work" when deciding whether this turn is a correction.
+# The replay branch used to hand it the literal `"success"` regardless of what
+# the procedure did, so a run that halted at step 1 was stored as a success and
+# the correction detector was told the previous turn had worked.
+#
+# A table rather than a chain of `if`s so the mapping is one readable thing, and
+# a dict rather than a function so a member added to `Outcome` raises `KeyError`
+# at the call site instead of quietly picking a default. There is no honest
+# default here: guessing "success" is the defect and guessing "failure" invents
+# evidence.
+#
+# `UNVERIFIED` maps to `"success"` on purpose -- V6. It means nothing needed
+# verifying (a deliberately skipped step), not that verification failed.
+# `UNCERTAIN` gets its own value rather than borrowing `"failure"`: collapsing
+# "we could not tell" into "it did not work" is the exact conflation this phase
+# removes, one field further out.
+#
+# Note what this does *not* change: `"uncertain"` is not in
+# `_maybe_mark_correction`'s failed set, and neither was `"success"`, so those
+# turns are treated exactly as they were before. Adding it there is a separate
+# behaviour change in a module this phase does not own.
+_PROC_OUTCOME_TO_TELEMETRY: dict = {}
+
+
+def _init_proc_outcome_map() -> None:
+    """Populated at import, in a function so the import stays local to it."""
+    from .core.verdict import Outcome
+    _PROC_OUTCOME_TO_TELEMETRY.update({
+        Outcome.SUCCEEDED: "success",
+        Outcome.UNVERIFIED: "success",
+        Outcome.UNCERTAIN: "uncertain",
+        Outcome.FAILED: "failure",
+        Outcome.UNSUPPORTED: "refused",
+    })
+
+
+_init_proc_outcome_map()
+
+
 # ─── Implicit procedure management (no "procedure" keyword) ─────────────────
 
 _IMPLICIT_PROC_EDIT_RE = re.compile(
@@ -1823,7 +1866,17 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                     return
                 from . import procedure_executor
                 logger.info(f"[PROC] Executing '{_proc_match['name']}' ({len(_proc_match['steps'])} steps)")
-                _proc_result = await procedure_executor.run_procedure(_proc_match, transcription)
+                # `_detailed` rather than `run_procedure`, for the tracker
+                # below. §17.P13: this branch recorded `action_outcome =
+                # "success"` unconditionally, whatever the procedure did --
+                # a run that halted at step 1 was stored as a success, and
+                # `telemetry._maybe_mark_correction` was reading that field to
+                # decide whether the user's next utterance was a correction.
+                # The spoken text is unchanged: `.text` is byte-identical to
+                # what `run_procedure` returns, and it is what gets summarised.
+                _proc = await procedure_executor.run_procedure_detailed(
+                    _proc_match, transcription)
+                _proc_result = _proc.text
                 _proc_spoken = await llm.chat(
                     f"Summarize in 1-2 short sentences for voice (friendly, no bullet points): {_proc_result}",
                     task_type="synthesis",
@@ -1833,7 +1886,7 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                 _tracker.intent_detected = "procedure"
                 _tracker.intent_source = "procedure"
                 _tracker.action_dispatched = _proc_match["name"]
-                _tracker.action_outcome = "success"
+                _tracker.action_outcome = _PROC_OUTCOME_TO_TELEMETRY[_proc.outcome]
                 _tracker.latency_intent_ms = int((_time.monotonic() - _t0_intent) * 1000)
                 return
 

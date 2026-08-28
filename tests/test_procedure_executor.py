@@ -58,6 +58,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 import assistant.procedures as ps
+from assistant.core.abort import UserAborted
+from assistant.core.verdict import Outcome, speaks_as_done
 import assistant.procedure_executor as pe
 from assistant import config as _config_stub
 
@@ -823,6 +825,320 @@ class TestClickWithWindowScope(unittest.TestCase):
             ))
         mock_aa.focus_window.assert_called_once_with("chrome")
         mock_aa.type_text.assert_called_once_with("hello", None, "chrome")
+
+
+# ─── P13: the state machine ──────────────────────────────────────────────────
+#
+# TENKA-v2 §17.P13, loop 2. This loop kept its step generation, its
+# retry-with-backoff, its self-heal escalation and its stop-on-error rule, and
+# gave up `_is_error` as its *status vocabulary* while keeping it as the
+# definition of the *halt decision*.
+
+
+# Every shape `run_procedure`'s step loop can put in a result, with the answer
+# the pre-P13 substring sniff gave. Written out rather than generated, because
+# the point is that a human can read the list and see rows 4, 5 and 7 are
+# wrong -- which is not visible in a comprehension.
+_SHAPES = [
+    # (text, _is_error today)
+    ("Opened chrome", False),
+    ("Pressed ctrl+s", False),
+    ("Waited 1.0s", False),
+    ("Navigated to https://example.invalid", False),
+    ("Typed: hello", False),
+    ("Skipped (browser navigate opens the browser)", False),
+    ("Skipped (already logged in)", False),
+    # The three the sniff gets wrong. Preserved, not fixed -- see the module
+    # note in procedure_executor.py.
+    ("Skipped (element not found)", True),
+    ("Skipped (page still loading, timeout)", True),
+    ("Typed: the file was not found on the server", True),
+    # Genuine failures.
+    ("Error pressing ctrl+s: boom", True),
+    ("Exception: something broke", True),
+    ("Unknown step type 'wat'", False),
+    ("get_text timed out", True),
+    # Self-heal's two verdicts.
+    ("click completed (screen-verified)", False),
+    ("", False),
+]
+
+
+class TestHaltParity(unittest.TestCase):
+    """`_classify` must not change any procedure's course.
+
+    This is P13's "identical externally observable behaviour" as a single
+    assertion. The migration's claim is that the halt decision is unchanged and
+    only the *recorded verdict* is new, so the two predicates are compared
+    directly over every shape rather than sampled.
+    """
+
+    def test_halt_decision_matches_is_error_for_every_shape(self):
+        for text, was_error in _SHAPES:
+            with self.subTest(text=text):
+                halts = pe._classify(text) in pe._HALTS
+                self.assertEqual(
+                    halts, pe._is_error(text),
+                    f"_classify disagrees with _is_error on {text!r}: "
+                    f"halts={halts}, _is_error={pe._is_error(text)}",
+                )
+
+    def test_the_shape_table_is_not_stale(self):
+        """The table's second column must match the real `_is_error`.
+
+        Without this the parity test above is comparing `_classify` against a
+        hand-written list that could have drifted -- a walk over the wrong
+        thing rather than over nothing, which is the same class of vacuous.
+        """
+        for text, was_error in _SHAPES:
+            with self.subTest(text=text):
+                self.assertEqual(pe._is_error(text), was_error)
+
+    def test_the_table_covers_every_shape_the_loop_can_produce(self):
+        """Anti-vacuity: a table that shrinks proves less every time.
+
+        Not a strong check -- it cannot know about a shape nobody added -- but
+        it fails loudly if someone deletes rows to make a failure go away.
+        """
+        self.assertGreaterEqual(len(_SHAPES), 16)
+        self.assertTrue(any(t.startswith("Skipped (") for t, _ in _SHAPES))
+        self.assertTrue(any(t.endswith(pe._SCREEN_VERIFIED) for t, _ in _SHAPES))
+
+
+class TestClassifyIsHonest(unittest.TestCase):
+    """The half that is new: what the run *records*, as opposed to what it does."""
+
+    def test_a_clean_result_is_evidence_of_success(self):
+        o = pe._classify("Opened chrome")
+        self.assertIs(o, Outcome.SUCCEEDED)
+        self.assertTrue(o.is_evidence_of_success)
+
+    def test_a_vision_confirmed_step_is_uncertain_not_succeeded(self):
+        # The retries all failed and a model looking at a screenshot said it
+        # had worked. That is not positive evidence, and the run continuing is
+        # a separate question from what it may later claim.
+        o = pe._classify(f"click completed {pe._SCREEN_VERIFIED}")
+        self.assertIs(o, Outcome.UNCERTAIN)
+        self.assertFalse(o.is_evidence_of_success)
+        self.assertFalse(speaks_as_done(o))
+        self.assertNotIn(o, pe._HALTS)      # but the run still continues
+
+    def test_a_deliberate_skip_is_unverified_and_still_speaks_as_done(self):
+        o = pe._classify("Skipped (browser navigate opens the browser)")
+        self.assertIs(o, Outcome.UNVERIFIED)
+        self.assertFalse(o.is_evidence_of_success)
+        self.assertTrue(speaks_as_done(o))   # V6
+        self.assertNotIn(o, pe._HALTS)
+
+    def test_an_empty_result_is_uncertain_not_succeeded(self):
+        # `_is_error("")` is False so it never halted, but nothing was
+        # observed either. This is the "absence of an exception is not
+        # evidence" rule at the smallest scale.
+        o = pe._classify("")
+        self.assertIs(o, Outcome.UNCERTAIN)
+        self.assertNotIn(o, pe._HALTS)
+
+    def test_a_skip_whose_reason_trips_the_sniff_is_recorded_as_failed(self):
+        """The preserved defect, asserted so it cannot be fixed by accident.
+
+        `_self_heal` spent a vision call to decide SKIP, and the substring
+        sniff reads its reason text and halts anyway. The honest answer is
+        UNVERIFIED. This test encodes the *old* behaviour on purpose: whoever
+        corrects it should have to change this test and read why.
+        """
+        o = pe._classify("Skipped (element not found)")
+        self.assertIs(o, Outcome.FAILED)
+        self.assertIn(o, pe._HALTS)
+
+
+class TestProcedureResult(unittest.TestCase):
+    def test_text_is_the_same_joined_string_as_before(self):
+        r = pe.ProcedureResult(steps=(
+            pe.StepResult(1, "Opened chrome", Outcome.SUCCEEDED),
+            pe.StepResult(2, "Typed: hello", Outcome.SUCCEEDED),
+        ))
+        self.assertEqual(r.text, "Step 1: Opened chrome\nStep 2: Typed: hello")
+
+    def test_outcome_rolls_up_and_uncertainty_wins_over_success(self):
+        r = pe.ProcedureResult(steps=(
+            pe.StepResult(1, "Opened chrome", Outcome.SUCCEEDED),
+            pe.StepResult(2, f"click completed {pe._SCREEN_VERIFIED}",
+                          Outcome.UNCERTAIN),
+        ))
+        self.assertIs(r.outcome, Outcome.UNCERTAIN)
+        self.assertFalse(speaks_as_done(r.outcome))
+
+    def test_a_skip_alone_does_not_lower_the_procedure(self):
+        r = pe.ProcedureResult(steps=(
+            pe.StepResult(1, "Skipped (already logged in)", Outcome.UNVERIFIED),
+            pe.StepResult(2, "Opened chrome", Outcome.SUCCEEDED),
+        ))
+        self.assertIs(r.outcome, Outcome.SUCCEEDED)
+
+    def test_a_message_only_result_is_unsupported(self):
+        # A refusal, or a procedure with no steps: nothing was attempted.
+        r = pe.ProcedureResult(message="Procedure has no steps.")
+        self.assertIs(r.outcome, Outcome.UNSUPPORTED)
+        self.assertEqual(r.text, "Procedure has no steps.")
+        self.assertFalse(speaks_as_done(r.outcome))
+
+    def test_halted_reports_whether_the_run_stopped_early(self):
+        ok = pe.ProcedureResult(steps=(
+            pe.StepResult(1, "Opened chrome", Outcome.SUCCEEDED),))
+        bad = pe.ProcedureResult(steps=(
+            pe.StepResult(1, "Error: boom", Outcome.FAILED),))
+        self.assertFalse(ok.halted)
+        self.assertTrue(bad.halted)
+
+
+class TestUserAbortedIsNotAStepFailure(unittest.TestCase):
+    """An abort must leave `run_procedure` as an exception.
+
+    `Exception: esc_hold` trips `_is_error`, so before P13 an abort raised
+    beneath a step would retry twice with backoff and then spend a vision call
+    on `_self_heal` asking the screen whether the thing the user had just
+    cancelled had worked. Nothing beneath this module raises `UserAborted`
+    today (KI-36 -- it has no abort boundary at all), so this guard is ahead of
+    a raiser rather than behind one.
+    """
+
+    def test_run_procedure_reraises_and_does_not_self_heal(self):
+        proc = {"id": 1, "name": "p", "trigger": "t", "steps": [
+            {"type": "app", "action": "open", "params": {"name": "chrome"}},
+        ]}
+        mock_aa = MagicMock()
+        mock_aa.open_app = AsyncMock(side_effect=UserAborted("esc_hold"))
+        heal = AsyncMock(return_value="open completed (screen-verified)")
+
+        with patch.dict(sys.modules, {"assistant.automation.native": mock_aa}), \
+             patch("assistant.automation.native", mock_aa, create=True), \
+             patch.object(pe, "_self_heal", new=heal), \
+             patch.object(pe.procedures, "record_usage", MagicMock()):
+            with pytest.raises(UserAborted):
+                run_granted(pe.run_procedure_detailed(proc, "t"))
+
+        heal.assert_not_awaited()
+        # One attempt, not three: the retry loop never saw a halting outcome
+        # because it never got to classify one.
+        self.assertEqual(mock_aa.open_app.await_count, 1)
+
+
+class TestTrackerRecordsTheTruth(unittest.TestCase):
+    """`main.py`'s replay branch must not hand telemetry a literal.
+
+    The mapping is asserted here rather than in a main.py test because the
+    branch it lives in needs a whole turn to reach; what matters is that the
+    table exists, is exhaustive, and never answers "success" for a halted run.
+    """
+
+    def test_the_map_is_exhaustive_over_outcome(self):
+        from assistant import main as main_mod
+        self.assertEqual(
+            set(main_mod._PROC_OUTCOME_TO_TELEMETRY), set(Outcome),
+            "an Outcome member with no row means a KeyError on a live turn",
+        )
+
+    def test_a_halted_run_is_never_recorded_as_success(self):
+        from assistant import main as main_mod
+        for outcome in (Outcome.FAILED, Outcome.UNSUPPORTED):
+            with self.subTest(outcome=outcome):
+                self.assertNotEqual(
+                    main_mod._PROC_OUTCOME_TO_TELEMETRY[outcome], "success")
+
+    def test_uncertain_is_not_collapsed_into_failure(self):
+        from assistant import main as main_mod
+        self.assertNotIn(
+            main_mod._PROC_OUTCOME_TO_TELEMETRY[Outcome.UNCERTAIN],
+            ("success", "failure"),
+        )
+
+    def test_the_replay_branch_asks_for_the_detailed_result(self):
+        """Structural: the replay branch must not go back to the string form.
+
+        `run_procedure` returns prose, and prose is what made the literal
+        `"success"` the only available answer. If a later edit swaps the call
+        back, the tracker silently loses its source and nothing else notices.
+
+        **Name-free on purpose.** The first draft of this test walked
+        `process_text_from_queue`, which P4c reduced to a fifty-line wrapper --
+        so it walked a body with no such call and failed on its own
+        `walked nothing` assertion. That is the same trap that had left
+        `test_6a5_predispatch_gate.test_no_pre_dispatch_branch_saves_under_a_date`
+        silently vacuous since P4c; finding it here is what led to fixing it
+        there. Anchor on the call, never on the function that happens to hold
+        it today.
+        """
+        import ast
+        from pathlib import Path
+
+        src = (Path(__file__).parent.parent / "assistant" / "main.py"
+               ).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        called = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and getattr(n.func, "attr", None) in (
+                "run_procedure", "run_procedure_detailed")
+        ]
+        assert called, (
+            "walked nothing: main.py no longer calls run_procedure in any "
+            "form. If replay moved, re-point this sweep at the module it "
+            "moved to. An empty walk is not a pass."
+        )
+        names = {n.func.attr for n in called}
+        self.assertEqual(
+            names, {"run_procedure_detailed"},
+            f"main.py calls {sorted(names)}. The replay branch must use the "
+            f"detailed form -- the string form gives the tracker nothing to "
+            f"branch on, which is how it came to record a literal 'success'.",
+        )
+
+    def test_the_tracker_assignment_reads_the_map_not_a_literal(self):
+        """The assignment itself, because asking for the detailed result and
+        then ignoring it is a passing test away from the original defect.
+
+        This test exists because of a green mutant. Reverting the assignment to
+        `_tracker.action_outcome = "success"` -- the exact line P13 removed --
+        left every other test in this class green: they assert the *map's*
+        properties, and a map nobody reads has whatever properties you like.
+        `.claude/rules/testing.md`: a green mutant is investigated, not
+        accepted.
+
+        Name-free like its neighbour: any `<x>.action_outcome = ...` in main.py
+        whose value subscripts the mapping. There are a dozen other
+        `action_outcome` assignments in the tree for other intents, and this
+        asserts one of them is the mapped kind rather than auditing all of them.
+        """
+        import ast
+        from pathlib import Path
+
+        src = (Path(__file__).parent.parent / "assistant" / "main.py"
+               ).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+
+        assigns = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Attribute) and t.attr == "action_outcome"
+                    for t in n.targets)
+        ]
+        assert assigns, (
+            "walked nothing: no `.action_outcome = ...` assignment in main.py"
+        )
+
+        mapped = [
+            n for n in assigns
+            if isinstance(n.value, ast.Subscript)
+            and getattr(n.value.value, "id", None) == "_PROC_OUTCOME_TO_TELEMETRY"
+        ]
+        self.assertTrue(
+            mapped,
+            "no `action_outcome` assignment in main.py reads "
+            "_PROC_OUTCOME_TO_TELEMETRY. The procedure-replay branch is back to "
+            "recording a literal, so a run that halted at step 1 is stored as "
+            "a success and telemetry._maybe_mark_correction is told the last "
+            "turn worked.",
+        )
 
 
 if __name__ == "__main__":
