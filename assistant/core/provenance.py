@@ -96,8 +96,18 @@ _KNOWN: dict[str, Provenance] = {
     "observation": Provenance.VERIFIED_OBSERVATION,
     "procedure": Provenance.VERIFIED_OBSERVATION,
     "shortcut": Provenance.VERIFIED_OBSERVATION,
-    # a model said so -- once, unless TENKA counted otherwise
+    # a model said so -- once, unless TENKA counted otherwise.
+    #
+    # `inference` and `assistant` come from `_MODEL_PROPOSED_SOURCES` in
+    # `storage/repos/preference.py`, which classified them before this module
+    # existed. They were missing here, so `classify("assistant")` returned
+    # `EXTERNAL_CONTENT` while the preference store called it model-proposed --
+    # two ladders quietly disagreeing about the same string, which is the
+    # reason the preference sets are derived from this one below rather than
+    # written out again.
     "reflection": Provenance.SINGLE_INFERENCE,
+    "inference": Provenance.SINGLE_INFERENCE,
+    "assistant": Provenance.SINGLE_INFERENCE,
     "llm": Provenance.SINGLE_INFERENCE,
     "code": Provenance.SINGLE_INFERENCE,
     "gemini_bbox": Provenance.SINGLE_INFERENCE,
@@ -164,6 +174,31 @@ def at_least(actual: "str | Provenance",
     if got is Provenance.SYSTEM or minimum is Provenance.SYSTEM:
         return got is minimum
     return _RANK[got] >= _RANK[minimum]
+
+
+def spellings_at_least(minimum: Provenance) -> "frozenset[str]":
+    """Every recorded spelling that satisfies `minimum`, enum values included.
+
+    Exists so a consumer that genuinely needs a *set of strings* -- a SQL
+    filter, an existing constant other modules import -- can derive it from
+    this ladder instead of maintaining a second copy. That second copy is not
+    hypothetical: `storage/repos/preference.py` had one, and the two disagreed
+    about `assistant` and `inference` until they were reconciled here.
+
+    Prefer `at_least()` where a single value is being judged. This is for the
+    places that must hand a collection to something else.
+    """
+    return frozenset(
+        {raw for raw in _KNOWN if at_least(raw, minimum)}
+        | {p.value for p in Provenance if at_least(p, minimum)}
+    )
+
+
+def spellings_for(tier: Provenance) -> "frozenset[str]":
+    """Every recorded spelling that classifies exactly as `tier`."""
+    return frozenset(
+        {raw for raw, got in _KNOWN.items() if got is tier} | {tier.value}
+    )
 
 
 # ─── Who may write a durable store ───────────────────────────────────────────

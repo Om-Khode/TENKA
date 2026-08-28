@@ -90,11 +90,16 @@ def set_preference(key: str, value: str, category: str,
     in `test_repo_preference.py` demonstrated the difference by failing when
     the clamp was briefly a layer lower.
 
-    `not in USER_STATED_SOURCES` rather than `in _MODEL_PROPOSED_SOURCES`: an
+    Keyed on the **restrictive** set -- `not in USER_STATED_SOURCES` -- so an
     unrecognised writer is capped rather than trusted, matching
     `DEFAULT_REQUIRED`'s direction in `core/intent_capabilities.py`. Keying on
-    the permissive set would let a source nobody has classified start wherever
-    it liked.
+    a permissive "these are model-proposed" set would let a source nobody has
+    classified start wherever it liked. There was such a set here; it is gone,
+    because nothing read it and a permissive list nobody consults is an
+    invitation to start consulting it.
+
+    `USER_STATED_SOURCES` is now derived from `core/provenance.py`, so the
+    spellings are classified in one table rather than restated per store.
 
     A model may propose. Only repetition TENKA counted itself
     (`bump_confidence`) or the user can raise it.

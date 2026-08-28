@@ -242,3 +242,49 @@ def test_fact_extraction_is_not_recorded_as_the_user_speaking():
     assert classify("conversation") is Provenance.SINGLE_INFERENCE
     assert not at_least("conversation", Provenance.REPEATED_INFERENCE)
     assert not at_least("conversation", Provenance.EXPLICIT_USER_STATEMENT)
+
+
+# ─── one ladder, not two ─────────────────────────────────────────────────────
+
+def test_the_preference_store_does_not_keep_its_own_ladder():
+    """The duplication this reconciles.
+
+    `storage/repos/preference.py` classified `source` before this module
+    existed -- `USER_STATED_SOURCES` and a `_MODEL_PROPOSED_SOURCES` written
+    out by hand. Two ladders answering the same question, and they had already
+    drifted: `assistant` and `inference` were model-proposed there and
+    unrecognised here, which resolves to `EXTERNAL_CONTENT`. One string, two
+    answers, nothing to notice it.
+
+    Asserted at source, because the failure is invisible at runtime: both sets
+    would keep working, separately, forever.
+    """
+    src = (_ROOT / "assistant" / "storage" / "repos"
+           / "preference.py").read_text(encoding="utf-8")
+    assert "spellings_at_least" in src, (
+        "the preference store no longer derives its provenance set from "
+        "core/provenance.py -- there are two ladders again")
+    assert 'frozenset({\n    "user"' not in src, (
+        "USER_STATED_SOURCES is a hand-written literal again")
+
+
+def test_the_derived_set_still_holds_every_spelling_it_used_to():
+    """A derived set that quietly narrowed would demote real user statements
+    to guesses, and the clamp would start capping deliberate corrections."""
+    from assistant.storage.repos.preference import USER_STATED_SOURCES
+
+    for spelling in ("user", "explicit", "correction", "confirmed"):
+        assert spelling in USER_STATED_SOURCES, (
+            f"{spelling!r} was user-stated before the sets were derived and "
+            f"is not now")
+
+
+def test_the_model_proposed_spellings_are_not_user_stated():
+    """The other direction. The nightly cycle's own spellings, and the two the
+    preference store knew about that this ladder did not."""
+    from assistant.storage.repos.preference import USER_STATED_SOURCES
+
+    for spelling in ("reflection", "inference", "assistant", "llm"):
+        assert spelling not in USER_STATED_SOURCES, (
+            f"{spelling!r} counts as the user speaking")
+        assert classify(spelling) is Provenance.SINGLE_INFERENCE
