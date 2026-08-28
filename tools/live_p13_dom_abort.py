@@ -19,23 +19,39 @@ Safety. It will click and type on whatever page it attaches to, so
 substring or nothing runs. Point it at a scratch page, never at anything
 logged in.
 
-    py -3.11 tools/live_p13_dom_abort.py --expect-url httpbin --abort \
-        --goal "click the submit button"
+Three modes, and the middle one is the one to reach for:
 
-    py -3.11 tools/live_p13_dom_abort.py --expect-url httpbin --control \
-        --goal "click the submit button"
+    --control          run the goal untouched; it must finish
+    --simulate-abort   fire `abort.request_abort()` from a timer; deterministic
+    --abort            hold ESC yourself; also tests the ESC monitor
 
-`--abort` expects you to hold ESC for >= 1s once it says GO. `--control` runs
-the same goal untouched and expects it to finish — the answer, not the
-refusal. Run both; a guard that aborts correctly while breaking the success
-path passes every red-green check there is.
+**`--simulate-abort` is what tests the guard.** The guard's job is: given a
+raised abort flag, propagate `UserAborted` instead of returning
+`"__FALLBACK__"`. Where the flag came from is not part of that, and putting a
+human's key-hold timing in the path adds a second failure mode with a
+different owner. The first `--abort` run here reported "UserAborted did not
+propagate" when `request_abort` had never been called at all — a keypress
+finding wearing a propagation finding's clothes. Hence the pre-flight in
+`--abort` mode, which confirms the monitor fires *before* the task starts and
+reports that as its own line.
+
+Run `--control` and `--simulate-abort` as the pair that proves the change:
+a guard that aborts correctly while breaking the success path passes every
+red-green check there is. Add `--abort` when you want the keyboard in it too.
 
 Prerequisites:
-  1. Chrome launched with `--remote-debugging-port=9222` (see
-     `browser_cdp_setup` in config, or launch it by hand).
+  1. Chrome launched with `--remote-debugging-port=<port>` on a throwaway
+     `--user-data-dir` (recent Chrome ignores the flag on a default profile).
+     If the port is not 9222, set `BROWSER_CDP_PORT` in the same shell —
+     `config` resolves DB, then env var, then default.
   2. The scratch page open in the active tab.
   3. TENKA itself NOT running — it owns the ESC monitor as a session
      singleton and two monitors on one keyboard is not a test of either.
+
+Note on what the probe accepts: any Chromium answering on the port. On this
+machine that was Lenovo Vantage's embedded `msedgewebview2`. `--expect-url`
+is the only thing standing between that and a DOM batch clicking through a
+system utility.
 """
 from __future__ import annotations
 
@@ -48,6 +64,17 @@ import sys
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+# A harness that dies before printing its verdict is worse than no harness.
+# The box-drawing separator and the em dashes in the failure messages are
+# undefined in cp1252, which is what stdout falls back to when this is piped
+# rather than run in a console -- so the first simulated-abort run raised
+# UnicodeEncodeError *after* the task had already aborted correctly, and
+# reported nothing at all.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 
 # ─── Log capture ─────────────────────────────────────────────────────────────
@@ -84,6 +111,17 @@ def _install_capture() -> _Capture:
 
 
 # ─── The run ─────────────────────────────────────────────────────────────────
+
+
+def _esc_still_down() -> bool:
+    """Is ESC physically held right now?
+
+    Reuses the monitor's own probe rather than a second implementation, so
+    "held" means the same thing to the pre-flight as it does to the thing
+    being pre-flighted.
+    """
+    from assistant.io.esc_monitor import _is_esc_down
+    return _is_esc_down()
 
 
 async def _verify_target(expect_url: str) -> str:
@@ -146,10 +184,20 @@ async def _main(argv: list[str]) -> int:
                          "instead of run_dom_task")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--abort", action="store_true",
-                      help="expect a UserAborted; hold ESC when told")
+                      help="expect a UserAborted; hold ESC when told. Runs a "
+                           "monitor pre-flight first, so a keypress that never "
+                           "registered is reported as its own failure")
+    mode.add_argument("--simulate-abort", action="store_true",
+                      help="same as --abort but fires abort.request_abort() "
+                           "from a timer instead of the keyboard. Deterministic; "
+                           "tests propagation only, not the ESC monitor")
     mode.add_argument("--control", action="store_true",
                       help="expect completion; do not touch the keyboard")
+    ap.add_argument("--fire-after", type=float, default=2.0,
+                    help="--simulate-abort only: seconds after GO to fire "
+                         "(default 2.0, which lands inside the first batch)")
     args = ap.parse_args(argv)
+    wants_abort = args.abort or args.simulate_abort
 
     cap = _install_capture()
 
@@ -187,20 +235,69 @@ async def _main(argv: list[str]) -> int:
 
     abort.reset()
     esc_monitor.start()
-    try:
-        if args.abort:
-            print("\n>>> GO. Hold ESC for at least 1 second, NOW. <<<\n")
-        else:
-            print("\n>>> GO. Control run — do not touch the keyboard. <<<\n")
 
-        raised: BaseException | None = None
-        result: str | None = None
-        try:
-            result = await router._execute_dom_task(args.goal)
-        except UserAborted as e:
-            raised = e
-        except Exception as e:                        # noqa: BLE001
-            raised = e
+    # ── Pre-flight: does the keypress even reach the flag? ──
+    #
+    # The first --abort run reported "UserAborted did not propagate" when what
+    # actually happened was that `request_abort` was never called at all: no
+    # `[abort] requested: esc_hold` line anywhere in the captured log. Those
+    # are two different failures with two different owners -- the ESC monitor
+    # is pre-existing, shipped machinery, and the guard under test is not --
+    # and a harness that renders them identically sends you to read the wrong
+    # code. So the keypress is confirmed *before* the task starts.
+    preflight_ok = True
+    if args.abort:
+        print("\n>>> PRE-FLIGHT: hold ESC now, for at least 1 second. <<<")
+        deadline = 20.0
+        waited = 0.0
+        while not abort.is_aborted() and waited < deadline:
+            await asyncio.sleep(0.1)
+            waited += 0.1
+        if abort.is_aborted():
+            print(f"    monitor fired after {waited:.1f}s. Release ESC.")
+            # The task must start from a clean flag, or `_execute_dom_task`
+            # aborts before it ever reaches the orchestrator and the run
+            # proves nothing about the fixed path.
+            abort.reset()
+            await asyncio.sleep(1.2)      # let the hold lapse past threshold
+            while _esc_still_down():
+                await asyncio.sleep(0.2)
+            abort.reset()
+        else:
+            preflight_ok = False
+            print(f"    monitor did NOT fire in {deadline:.0f}s.")
+
+    try:
+        if not preflight_ok:
+            raised: BaseException | None = None
+            result: str | None = None
+        else:
+            if args.abort:
+                print("\n>>> GO. Hold ESC again, for at least 1 second. <<<\n")
+            elif args.simulate_abort:
+                print(f"\n>>> GO. Firing abort in {args.fire_after:.1f}s — "
+                      f"keyboard not needed. <<<\n")
+            else:
+                print("\n>>> GO. Control run — do not touch the keyboard. <<<\n")
+
+            fired = None
+            if args.simulate_abort:
+                async def _fire() -> None:
+                    await asyncio.sleep(args.fire_after)
+                    abort.request_abort("esc_hold")
+                fired = asyncio.create_task(_fire())
+
+            raised = None
+            result = None
+            try:
+                result = await router._execute_dom_task(args.goal)
+            except UserAborted as e:
+                raised = e
+            except Exception as e:                    # noqa: BLE001
+                raised = e
+            finally:
+                if fired is not None and not fired.done():
+                    fired.cancel()
     finally:
         esc_monitor.stop()
         abort.reset()
@@ -210,6 +307,22 @@ async def _main(argv: list[str]) -> int:
     print("\n" + "─" * 68)
 
     checks: list[tuple[str, bool, str]] = []
+
+    if args.abort:
+        # First, and separately from everything else: did the keyboard reach
+        # the flag at all? A run that fails here has tested nothing about the
+        # guard, and saying so is the difference between "read router.py" and
+        # "hold the key down longer".
+        checks.append((
+            "the ESC monitor fired at all (pre-flight)",
+            preflight_ok,
+            "`request_abort` was never called, so nothing below was exercised. "
+            "Hold ESC down continuously for a full second — the threshold is "
+            "_HOLD_THRESHOLD_SECS = 1.0 and a released-and-repressed key "
+            "restarts the count. Or use --simulate-abort, which fires the "
+            "flag from a timer and takes the keyboard out of it.",
+        ))
+
     reached_dom = "[DA] DOM-mode running on page:" in log
     checks.append((
         "the fixed path actually ran (`DOM-mode running on page`)",
@@ -218,7 +331,13 @@ async def _main(argv: list[str]) -> int:
         "nothing below was tested",
     ))
 
-    if args.abort:
+    if wants_abort:
+        checks.append((
+            "the abort flag was set during the run",
+            "[abort] requested" in log or args.simulate_abort,
+            "no `[abort] requested` line -- the flag was never raised while "
+            "the task was running, whatever the pre-flight showed",
+        ))
         checks.append((
             "UserAborted propagated out of _execute_dom_task",
             isinstance(raised, UserAborted),
@@ -256,8 +375,10 @@ async def _main(argv: list[str]) -> int:
             ok = False
 
     print("─" * 68)
-    if args.abort and ok:
-        print("abort path clean.")
+    if wants_abort and ok:
+        print("abort path clean."
+              + ("  (flag fired by timer, not by ESC)"
+                 if args.simulate_abort else ""))
     elif ok:
         print(f"control path clean. reply: {result!r}")
     else:
