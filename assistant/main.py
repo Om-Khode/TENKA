@@ -959,6 +959,42 @@ def _match_batch_teach(text: str) -> tuple[str, str] | None:
 _LOCAL_SOURCES: frozenset[str] = frozenset({"stt", "chat"})
 
 
+async def _extract_and_store_facts(transcription: str) -> int:
+    """Pull personal facts out of a turn and store them. Returns how many.
+
+    §17.P9: this existed twice, once on each response path, and the copies had
+    already drifted. The streaming one never reported back, so
+    `personality.process_turn` was told no facts were learned on the very path
+    where facts are learned -- see `_note_personality`.
+
+    **Provenance is `single_inference`, and that is a deliberate demotion from
+    what the string used to imply.** The value was written `source=
+    "conversation"`, which reads like "the user said it". The user did say
+    something; a *model* decided which part of it was a fact, what to call the
+    key, and what the value was. That is an inference over the user's words,
+    not the words themselves -- and D3's rule is that an unverifiable model
+    claim is a single inference whatever it is labelled. Nothing gates facts by
+    provenance yet, so this changes no behaviour today; it stops the store
+    asserting something it cannot support on the day something does.
+    """
+    from .core.provenance import Provenance
+
+    facts = await llm.extract_facts(transcription)
+    for fact in facts:
+        memory_type = await llm.ask_for_memory_type(fact["key"], fact["value"])
+        memory.save_typed_fact(
+            key=fact["key"],
+            value=fact["value"],
+            source=Provenance.SINGLE_INFERENCE.value,
+            memory_type=memory_type,
+        )
+        logger.info(
+            f"[MEMORY] Extracted fact: {fact['key']}={fact['value']} "
+            f"(type={memory_type})"
+        )
+    return len(facts)
+
+
 async def _planner_llm_text(prompt, **kwargs) -> str:
     """`llm_func` for the plan runner: plain text, not an `LLMResult`.
 
@@ -2564,27 +2600,37 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
         _facts_extracted = False
         if not _use_streaming and intent_result.intent in ("small_talk", "unknown"):
             try:
-                facts = await llm.extract_facts(transcription)
-                for fact in facts:
-                    memory_type = await llm.ask_for_memory_type(fact["key"], fact["value"])
-                    memory.save_typed_fact(
-                        key=fact["key"],
-                        value=fact["value"],
-                        source="conversation",
-                        memory_type=memory_type,
-                    )
-                    logger.info(f"[MEMORY] Extracted fact: {fact['key']}={fact['value']} (type={memory_type})")
-                _facts_extracted = len(facts) > 0
+                _facts_extracted = await _extract_and_store_facts(transcription) > 0
             except Exception as e:
                 logger.debug(f"Fact extraction failed (non-critical): {e}")
 
-        # Event-driven personality trait bumps
-        try:
-            personality.process_turn(
-                transcription, intent_result.intent, _facts_extracted
-            )
-        except Exception as e:
-            logger.debug(f"[PERSONALITY] Event bump failed (non-critical): {e}")
+        # Event-driven personality trait bumps.
+        #
+        # Runs once per turn, and on the streaming path it runs *later* --
+        # after the deferred extraction, rather than here. It used to run here
+        # for both, which meant every streaming turn reported
+        # `facts_extracted=False`: the extraction that would have set it true
+        # happens after the audio finishes, a hundred lines below this line.
+        # The conversational path is the one where facts are learned, so the
+        # trait bump for learning something about the user could only ever fire
+        # on the path that mostly does not.
+        _personality_noted = False
+
+        def _note_personality(facts_extracted: bool) -> None:
+            nonlocal _personality_noted
+            if _personality_noted:
+                return
+            _personality_noted = True
+            try:
+                personality.process_turn(
+                    transcription, intent_result.intent, facts_extracted
+                )
+            except Exception as e:
+                logger.debug(
+                    f"[PERSONALITY] Event bump failed (non-critical): {e}")
+
+        if not _use_streaming:
+            _note_personality(_facts_extracted)
 
         # Instant preference learning from explicit corrections
         try:
@@ -2677,17 +2723,15 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
                 _save_turn(response_text)
 
                 # Deferred fact extraction — runs after audio finishes
+                _streamed_facts = 0
                 try:
-                    facts = await llm.extract_facts(transcription)
-                    for fact in facts:
-                        memory_type = await llm.ask_for_memory_type(fact["key"], fact["value"])
-                        memory.save_typed_fact(
-                            key=fact["key"], value=fact["value"],
-                            source="conversation", memory_type=memory_type,
-                        )
-                        logger.info(f"[MEMORY] Extracted fact: {fact['key']}={fact['value']} (type={memory_type})")
+                    _streamed_facts = await _extract_and_store_facts(
+                        transcription)
                 except Exception as e:
                     logger.debug(f"Fact extraction failed (non-critical): {e}")
+                # ...and only now can personality be told what this turn
+                # taught, which is the whole reason the call moved.
+                _note_personality(_streamed_facts > 0)
 
                 await bridge.send_command("set_expression", value="neutral")
                 await _finish_turn(bridge, source)
