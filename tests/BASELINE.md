@@ -161,7 +161,7 @@ has looked at, and it blocks the next phase.
 | `test_browser_dom.py` | GREEN | 49 | 0 | 0 | 0 | 0.7 |
 | `test_browser_dom_executor.py` | GREEN | 43 | 0 | 0 | 0 | 0.9 |
 | `test_browser_dom_integration.py` | SKIPPED | 0 | 0 | 0 | 16 | 0.6 |
-| `test_browser_dom_orchestrator.py` | GREEN | 25 | 0 | 0 | 0 | 1.7 |
+| `test_browser_dom_orchestrator.py` | GREEN | 36 | 0 | 0 | 0 | 2.0 |
 | `test_browser_dom_planner.py` | GREEN | 41 | 0 | 0 | 0 | 1.1 |
 | `test_browser_names_dedup.py` | RED | 8 | 1 | 0 | 0 | 0.6 |
 | `test_browser_routing.py` | GREEN | 50 | 0 | 0 | 0 | 0.9 |
