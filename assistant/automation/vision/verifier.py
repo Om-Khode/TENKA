@@ -248,7 +248,7 @@ async def _verify_goal(goal: str, llm_func: Callable) -> dict:
     else:
         screen_desc = screen.describe_screen_for_llm()
         raw = await ask_for_agent_verify(
-            verify_prompt + f"\n\nSCREEN TEXT:\n{screen_desc}",
+            verify_prompt + f"\n\n{screen_desc}",
             system_prompt=VERIFICATION_SYSTEM_PROMPT,
             json_mode=True,
         )
