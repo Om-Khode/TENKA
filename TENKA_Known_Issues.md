@@ -1238,3 +1238,105 @@ real vision run — which this change did not have and which §22 puts out of
 scope.
 
 Same family: [KI-14](#ki-14), [KI-15](#ki-15), [KI-16](#ki-16).
+
+---
+
+## KI-36: The tier-1 browser path checks abort once, at entry
+
+**Priority:** Medium (control — the stop button does not stop it)
+**Effort:** Low per site, but it is a behaviour change on an automation tier,
+so `.claude/rules/testing.md` requires a live test
+**Discovered:** 2026-08-28, while live-testing TENKA-v2 P13 loop 1. Found in
+the operator's own log, testing something else.
+**Status:** open
+
+**The defect.** `handle_browser_action` checks `abort.is_aborted()` once, at
+function entry (`actions/da_handlers.py`). After that the tier runs to
+completion: `router._execute_browser_task` is 246 lines with **zero** mentions
+of `abort`, across eight calls to `run_browser_steps`, and
+`automation/browser/automation.py` contains no abort check at all. So ESC held
+after the handler is entered is ignored for the rest of the task.
+
+**Observed, not inferred.** From a live session log:
+
+```
+21:58:44 [BROWSER] Launching Chromium (headless=False)...
+21:58:47 [abort]   requested: esc_hold
+21:58:50 [BROWSER] Step 1: navigate - {...}
+21:58:57 [llm]     Vision (Gemini gemini-2.5-flash) OK (788 tokens)
+21:58:57 [actions] Executed 'browser_action': Navigated to https://...
+```
+
+The abort is requested, and then a navigation runs, a paid vision call runs,
+and the tier reports **success**. The user pressed stop and was billed for a
+model call afterwards. A second ESC eleven seconds later did work — because it
+landed between turns, where the entry check sees it.
+
+**The comparison that makes this a defect rather than a design.** The sibling
+tier already does it right: `automation/native.py:run_app_steps` checks between
+every step and raises `UserAborted` rather than returning a string, with a
+comment explaining why. Two tiers, one contract, one of them honouring it.
+
+**Same family as** the P13 loop-1 fix (`router._execute_dom_task` turned an
+abort into `"__FALLBACK__"`), and the same underlying rule from
+`.claude/rules/automation.md`: never swallow `UserAborted`, and check at loop
+boundaries. That fix closed one path; this is the neighbouring one. Also
+related: `procedure_executor.run_procedure` has no abort boundary anywhere, so
+a replayed procedure cannot be stopped either — noted in TENKA-v2 §17.P13 as
+out of scope for that phase, since adding a boundary is new behaviour rather
+than a vocabulary migration.
+
+---
+
+## KI-37: The CDP probe accepts any Chromium-engined process on the debug port
+
+**Priority:** Medium (correctness, with a privacy edge)
+**Effort:** Low to detect, a decision to fix — see below
+**Discovered:** 2026-08-28, first run of `tools/live_p13_dom_abort.py` on the
+operator's machine
+**Status:** open
+
+**The defect.** `cdp_health_probe` GETs `/json/version` on the configured port
+and accepts the endpoint when the `Browser` field contains any of `chrome`,
+`chromium`, `edg` or `brave`. That answers "is this a Chromium DevTools
+endpoint", which is not the same question as "is this a browser the user is
+using". Anything embedding a Chromium webview and exposing a debug port
+satisfies it.
+
+**Observed.** On the machine in question, port 9222 was held by
+`msedgewebview2.exe` — an **embedded WebView2 control belonging to a
+preinstalled system utility**, not a browser anyone had opened. It identifies
+as `Edg/151.0.4129.107`, so the probe reported `available`, the attach
+succeeded, and `_pick_active_page` returned that control's page. TENKA was one
+step from perceiving and clicking inside a vendor system-management UI.
+
+**Two consequences, and the second is the quieter one:**
+
+1. **Actions land in the wrong surface.** DOM-mode would plan and dispatch
+   clicks against a window the user does not think of as a browser tab.
+2. **Its content is read and sent to a model.** DOM-mode perceives the
+   accessibility tree and puts it in the planner prompt. Whatever that
+   embedded surface is showing — account state, device identifiers, anything a
+   vendor utility renders — becomes prompt content. Nothing malicious is
+   required for this; it is the ordinary path working on an unintended target.
+
+**Mitigated only in the test harness so far.**
+`tools/live_p13_dom_abort.py` requires `--expect-url` and refuses when the
+active tab does not match, which is what stopped the first run. That protects
+the harness, not the assistant.
+
+**Not fixed here because the fix needs a decision, not a patch.** Candidates,
+none free:
+
+- Match the attached endpoint against the **foreground window's** process, so
+  the browser must be one the user is actually looking at. Strongest, and the
+  page picker already accepts a `prefer_window_title` hint that could be made
+  mandatory rather than advisory.
+- Require the endpoint to report more than one page, or a non-`about:` page —
+  cheap, and a heuristic, which is the category this project keeps regretting.
+- Have the operator opt in per port. Honest, and pushes a decision onto
+  someone who did not ask for one.
+
+Whichever is chosen, the probe should log *what* it attached to at INFO —
+today it logs the engine string, which is exactly the field that made a system
+utility look like Chrome.

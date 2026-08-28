@@ -49,7 +49,8 @@ Prerequisites:
      singleton and two monitors on one keyboard is not a test of either.
 
 Note on what the probe accepts: any Chromium answering on the port. On this
-machine that was Lenovo Vantage's embedded `msedgewebview2`. `--expect-url`
+machine that was a preinstalled utility's embedded `msedgewebview2`, which
+identifies as `Edg/...` and so passes the probe's engine check. `--expect-url`
 is the only thing standing between that and a DOM batch clicking through a
 system utility.
 """
@@ -132,7 +133,8 @@ async def _verify_target(expect_url: str) -> str:
     whatever that is; the gate has to happen before it, not inside it.
 
     Not hypothetical. The first run of this script found a CDP-capable **Edge**
-    on 9222 sitting on a Lenovo system-utility page. `--expect-url` is what
+    on 9222 -- an embedded webview belonging to a preinstalled utility, not a
+    browser anyone had opened. `--expect-url` is what
     stopped a DOM batch from clicking around in it.
 
     Raises `SystemExit` with a REFUSED message on any of the three gates.
