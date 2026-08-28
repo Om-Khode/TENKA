@@ -173,7 +173,7 @@ def _expected_external(s: str) -> Provenance:
     """The spellings that genuinely *are* external content, so the test above
     does not flag them as unmapped."""
     return (Provenance.EXTERNAL_CONTENT
-            if s in {"conversation", "tenka_resp", "ocr", "studio"}
+            if s in {"tenka_resp", "ocr", "studio"}
             else Provenance.SYSTEM)
 
 
@@ -219,3 +219,26 @@ def test_a_model_cannot_write_itself_to_the_top_of_the_ladder():
     assert classify("reflection") is Provenance.SINGLE_INFERENCE
     assert not at_least("reflection", Provenance.REPEATED_INFERENCE)
     assert not at_least("llm", Provenance.REPEATED_INFERENCE)
+
+
+def test_the_enums_own_values_classify_back_to_themselves():
+    """A value this module wrote must read back as what it wrote.
+
+    Obvious once stated, and it was missing: the first writer to store
+    `Provenance.SINGLE_INFERENCE.value` would have had it treated as an
+    unrecognised string and demoted to `EXTERNAL_CONTENT`, with a warning
+    blaming the caller. `main.py`'s fact extraction is that first writer.
+    """
+    for member in Provenance:
+        assert classify(member.value) is member, (
+            f"{member.value!r} does not round-trip -- a writer using the enum "
+            f"would be demoted to external content")
+
+
+def test_fact_extraction_is_not_recorded_as_the_user_speaking():
+    """D3. The user said something; a *model* decided which part was a fact,
+    what to call it, and what the value was. That is an inference over their
+    words, not the words themselves -- and it must not outrank one."""
+    assert classify("conversation") is Provenance.SINGLE_INFERENCE
+    assert not at_least("conversation", Provenance.REPEATED_INFERENCE)
+    assert not at_least("conversation", Provenance.EXPLICIT_USER_STATEMENT)

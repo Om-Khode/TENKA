@@ -101,8 +101,13 @@ _KNOWN: dict[str, Provenance] = {
     "llm": Provenance.SINGLE_INFERENCE,
     "code": Provenance.SINGLE_INFERENCE,
     "gemini_bbox": Provenance.SINGLE_INFERENCE,
+    # Written by `main.py`'s fact extraction until §17.P9 replaced it with the
+    # enum value. It reads like "the user said it", and the user did say
+    # *something* -- but a model chose which part was a fact, what to call the
+    # key and what the value was. That is an inference over the user's words,
+    # so the historical rows classify where the new ones are written.
+    "conversation": Provenance.SINGLE_INFERENCE,
     # read off the world; nobody vouches for it
-    "conversation": Provenance.EXTERNAL_CONTENT,
     "tenka_resp": Provenance.EXTERNAL_CONTENT,
     "ocr": Provenance.EXTERNAL_CONTENT,
     "studio": Provenance.EXTERNAL_CONTENT,
@@ -125,6 +130,18 @@ def classify(raw: "str | Provenance") -> Provenance:
     if isinstance(raw, Provenance):
         return raw
     key = (raw or "").strip().lower()
+
+    # A value this module itself wrote must read back as what it wrote.
+    # Obvious once stated, and it was missing: the first writer to store
+    # `Provenance.SINGLE_INFERENCE.value` would have had it classified as an
+    # unrecognised string and demoted to `EXTERNAL_CONTENT` -- with a warning
+    # blaming the caller. Checked before `_KNOWN` so a legacy spelling can
+    # never shadow a canonical one.
+    try:
+        return Provenance(key)
+    except ValueError:
+        pass
+
     known = _KNOWN.get(key)
     if known is not None:
         return known
