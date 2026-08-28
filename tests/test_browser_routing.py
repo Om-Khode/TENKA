@@ -260,15 +260,52 @@ class TestRouteBrowserContent(unittest.TestCase):
         self.assertEqual(meta["app"], "Chrome")
 
     def test_user_preference_propagated(self):
-        # preferences.get_preference returns a dict like
-        # {"key": ..., "value": ..., "confidence": ...}
+        # `get_preference` does `SELECT *`, so a real row carries every
+        # column including `source` -- which `set_preference` requires.
+        # This fixture used to omit it, and the omission stopped being
+        # harmless the moment the consumer began consulting provenance
+        # (D2, §10.3): a row with no source is refused, correctly, and the
+        # test then failed for a reason unrelated to what it checks.
         with patch("assistant.automation.browser.cdp.cdp_state_snapshot",
                    return_value=_FakeCdpState(True)), \
              patch("assistant.preferences.get_preference",
-                   return_value={"key": "automation_browser_mode", "value": "vision"}):
+                   return_value={"key": "automation_browser_mode",
+                                 "value": "vision", "source": "correction",
+                                 "confidence": 0.85}):
             mode, meta = da._route_browser_content("fill the form", "Chrome")
         self.assertEqual(mode, "vision")
         self.assertEqual(meta["reason"], "user_preference")
+
+    def test_a_guessed_preference_does_not_override_browser_routing(self):
+        """The other half, and the reason the check exists.
+
+        `_choose_browser_mode` treats `user_preference` as an override:
+        set, it returns that mode and the heuristics never run. A nightly
+        reflection cycle inventing this key at confidence 0.4 would
+        silently take over browser routing, so the value has to be one a
+        person actually stated.
+        """
+        with patch("assistant.automation.browser.cdp.cdp_state_snapshot",
+                   return_value=_FakeCdpState(True)), \
+             patch("assistant.preferences.get_preference",
+                   return_value={"key": "automation_browser_mode",
+                                 "value": "vision", "source": "reflection",
+                                 "confidence": 0.95}):
+            mode, meta = da._route_browser_content("fill the form", "Chrome")
+        self.assertNotEqual(
+            meta.get("reason"), "user_preference",
+            "a model-written preference overrode browser routing")
+
+    def test_a_preference_with_no_provenance_is_refused(self):
+        """Fail closed. A row that cannot say where it came from is not a
+        user statement, and this consumer accepts nothing less."""
+        with patch("assistant.automation.browser.cdp.cdp_state_snapshot",
+                   return_value=_FakeCdpState(True)), \
+             patch("assistant.preferences.get_preference",
+                   return_value={"key": "automation_browser_mode",
+                                 "value": "vision"}):
+            mode, meta = da._route_browser_content("fill the form", "Chrome")
+        self.assertNotEqual(meta.get("reason"), "user_preference")
 
     def test_browser_cdp_import_failure_falls_back_safely(self):
         # If browser_cdp can't import (unlikely but defensive), the bridge

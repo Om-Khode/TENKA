@@ -662,11 +662,38 @@ def _route_browser_content(goal: str, running_window: str) -> Tuple[str, Dict[st
     # via the preference store. Pure read-side — no mutations from the
     # routing path. Wrap in try/except so a corrupted preference DB
     # doesn't break routing.
+    #
+    # D2 (§10.3): provenance is consulted on read. This was the last consumer
+    # in the tree that read a preference and acted on it without asking where
+    # the value came from -- and it is the least forgiving place to skip that,
+    # because `_choose_browser_mode` treats `user_preference` as an *override*:
+    # set, it returns that mode and the heuristics never run.
+    #
+    # `EXPLICIT_USER_STATEMENT` rather than something lower, because that is
+    # what this key means. The docstring above says it: "always vision" or
+    # "always dom" is a decision a person makes, and the correction detector
+    # (`preferences.py`, `source="correction"`) is the path that records one.
+    # A nightly reflection cycle inventing the same key at confidence 0.4 must
+    # not silently take over browser routing, which is exactly what the
+    # unguarded read allowed.
+    #
+    # Nothing in the tree writes this key today, so this is a gate ahead of a
+    # writer rather than behind one. That is the cheap direction: the
+    # alternative is remembering to add it on the day someone does.
     try:
         from .. import preferences
+        from ..core.provenance import Provenance, at_least
         pref_row = preferences.get_preference("automation_browser_mode")
         if isinstance(pref_row, dict):
-            user_pref = pref_row.get("value")
+            if at_least(pref_row.get("source"),
+                        Provenance.EXPLICIT_USER_STATEMENT):
+                user_pref = pref_row.get("value")
+            else:
+                logger.info(
+                    "[DA] browser-mode preference ignored: source=%r is not a "
+                    "user statement, and this preference overrides routing",
+                    pref_row.get("source"),
+                )
     except Exception:
         user_pref = None
 
