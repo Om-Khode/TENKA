@@ -1960,6 +1960,26 @@ async def _execute_dom_task(
         else:
             result = await browser_dom_orchestrator.run_dom_task(goal, target_page)
     except Exception as e:
+        # never swallow a user abort into a fallback path —
+        # that re-triggers computer_task / TTS / vision while the
+        # user is trying to stop everything.
+        #
+        # The same guard sits on the type-shortcut path above, with the same
+        # comment, because that path had the same bug and it was fixed there
+        # first. `dom_executor.execute_dom_batch` raises `UserAborted` at every
+        # action boundary and the orchestrator deliberately lets it through, so
+        # without this line an ESC held mid-batch became `__FALLBACK__` — which
+        # is not an error string but an instruction to escalate a tier. It cost
+        # a false "crashed" log, a spoken "Working on it: <goal>", the user's
+        # terminal windows minimized, and one paid vision call in
+        # `_generate_initial_todos`, before `agent.py`'s first abort check
+        # finally stopped it. `da_handlers.handle_computer_task` already
+        # re-raises `UserAborted` around this call and answers it with
+        # "Stopped." at the handler level; the receiving end was built, and
+        # this was the one hole that stopped the abort from reaching it.
+        from assistant.core.abort import UserAborted
+        if isinstance(e, UserAborted):
+            raise
         logger.error(f"[DA] DOM-mode orchestrator crashed: {type(e).__name__}: {e}")
         return "__FALLBACK__"
 

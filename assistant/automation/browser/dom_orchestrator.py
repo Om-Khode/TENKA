@@ -25,7 +25,8 @@ Replan-on-validation-error:
      - form_input ref=ref0001: read-back mismatch: expected 'John' got ''"
   and adjusts. The feedback-plumbing alone fixes most cases.
 
-Never raises. Failures decay into a `DomTaskResult(success=False, reason=...)`.
+Failures decay into a `DomTaskResult` carrying a tagged `reason`. The loop does
+not catch `UserAborted` — see the note on `_REASON_OUTCOME` below.
 """
 
 from __future__ import annotations
@@ -35,6 +36,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from ...core.verdict import Outcome, speaks_as_done
 from . import dom as browser_dom, dom_executor as browser_dom_executor, dom_planner as browser_dom_planner
 from . import dom_mapper as browser_dom_mapper, dom_filler as browser_dom_filler
 
@@ -42,6 +44,74 @@ logger = logging.getLogger("browser_dom_orchestrator")
 
 
 # ─── Result type ──────────────────────────────────────────────────────────────
+#
+# TENKA-v2 §17.P13. This loop gave up its own status vocabulary and adopted
+# `core/verdict.py`'s. What it did *not* give up is its step generation, its
+# replan-on-failure strategy or its loop budget -- what unifies is the state
+# machine, not the strategy.
+#
+# The swap was provably behaviour-preserving, which is why this loop went
+# first. `success` was a `bool` stored alongside a `reason` tag, and across all
+# 31 construction sites the two never disagreed: `success=True` appeared with
+# `completed`, `completed_no_actions` and `completed_no_submit`, and with
+# nothing else. So the boolean carried no information the tag did not already
+# carry, and deriving it from the tag cannot change what any caller sees.
+#
+# **The boolean's real question was V8's, not V4's.** Its one reader
+# (`router.py:_execute_dom_task`) uses it to decide whether to speak
+# `final_summary` as a plain "Done." -- which is `speaks_as_done()` verbatim,
+# not `Outcome.is_evidence_of_success`. That distinction is load-bearing:
+# `completed_no_actions` and `completed_no_submit` are honestly `UNVERIFIED`
+# (nothing was dispatched; the form was filled and never submitted), and
+# `is_evidence_of_success` is False for `UNVERIFIED`. Deriving `success` from
+# it would have flipped both of those to failure and changed the reply the user
+# hears -- the exact behaviour change this phase forbids.
+
+_REASON_OUTCOME: dict[str, Outcome] = {
+    # ── the three that may speak as done ──
+    "completed": Outcome.SUCCEEDED,
+    # The planner declared done having dispatched nothing, and the form was
+    # filled but deliberately not submitted. Both finished; neither was
+    # confirmed by anything. `UNVERIFIED`, not `SUCCEEDED` -- and V6 says
+    # `UNVERIFIED` still speaks as done, so the reply is unchanged.
+    "completed_no_actions": Outcome.UNVERIFIED,
+    "completed_no_submit": Outcome.UNVERIFIED,
+
+    # ── budget ran out: something ran, nothing decided ──
+    "max_loops": Outcome.UNCERTAIN,
+    "max_attempts": Outcome.UNCERTAIN,
+    # Fields the planner could not resolve. `_format_unresolved_for_summary`
+    # already names them in the spoken reply, which is §11's disclosure rule
+    # arriving before the vocabulary did.
+    "validation_unresolved": Outcome.UNCERTAIN,
+
+    # ── positive evidence against ──
+    # The page returned the same validation errors twice, or rejected a value
+    # the user pinned. Both are the page telling us it did not work, which
+    # outranks not knowing.
+    "validation_no_progress": Outcome.FAILED,
+    "user_value_rejected": Outcome.FAILED,
+    "planner_failed": Outcome.FAILED,
+    "mapper_failed": Outcome.FAILED,
+    "fills_failed": Outcome.FAILED,
+    "submit_failed": Outcome.FAILED,
+    "loop_failure_at_max": Outcome.FAILED,
+
+    # ── never had a foundation to attempt on ──
+    # `UNSUPPORTED` is "no route exists; never attempted at all", and these are
+    # exactly the two tags `router.py` already sends to the vision tier rather
+    # than reporting. The member and the existing branch agree; the router
+    # still matches on `reason`, so nothing about that branch changes here.
+    "perceive_failed": Outcome.UNSUPPORTED,
+    "empty_tree": Outcome.UNSUPPORTED,
+}
+
+# An unmapped tag is `FAILED`, never `SUCCEEDED`. Same fail-closed shape as
+# `brain/task.may_transition` answering False for an unknown state and
+# `core/intent_capabilities`'s missing-row default: a tag added to the loop
+# without a row here goes nowhere good rather than everywhere, and a test turns
+# the omission into a failure instead of into a silent success claim.
+_UNMAPPED_OUTCOME = Outcome.FAILED
 
 
 @dataclass
@@ -49,21 +119,49 @@ class DomTaskResult:
     """
     What the orchestrator returns to its caller.
 
-    `success`         — True iff a planner iteration declared `done=True`
-                        AND the corresponding batch all-succeeded
-    `reason`          — short tag for telemetry / logging
-                        ("completed", "max_loops", "perceive_failed",
-                        "planner_failed", "no_actions", "loop_failure")
+    `reason`          — the tag, and the single source of truth for how this
+                        result reads. `outcome` and `success` are derived from
+                        it, so a result whose tag and verdict disagree cannot
+                        be constructed.
     `loops_used`      — how many perceive→plan→execute iterations ran
     `final_summary`   — TTS-friendly one-liner ≤200 chars
     `history`         — per-loop dict for debug / postmortem (NOT for
                         production telemetry — keep it short)
+
+    `outcome` is computed rather than stored for the reason
+    `brain/task.Task.outcome()` is: a stored answer can go stale against what
+    it was derived from, and a result's honesty must not depend on whether two
+    fields were updated together. The previous docstring is the argument --
+    it listed six reason tags, two of which (`no_actions`, `loop_failure`)
+    never existed under those names, while nine real tags went unlisted.
     """
-    success: bool
     reason: str
     loops_used: int = 0
     final_summary: str = ""
     history: list[dict] = field(default_factory=list)
+
+    @property
+    def outcome(self) -> Outcome:
+        """What came of this task. §17.P13."""
+        mapped = _REASON_OUTCOME.get(self.reason)
+        if mapped is None:
+            logger.warning(
+                "[DOM_ORCH] reason %r has no row in _REASON_OUTCOME — "
+                "reporting %s", self.reason, _UNMAPPED_OUTCOME.value,
+            )
+            return _UNMAPPED_OUTCOME
+        return mapped
+
+    @property
+    def success(self) -> bool:
+        """May the caller speak `final_summary` as a plain "Done."?
+
+        V8's question, which is what this flag was always answering. Kept
+        under its original name because its one reader asks exactly this and
+        renaming it would have been a second change riding along with the
+        first.
+        """
+        return speaks_as_done(self.outcome)
 
 
 # ─── Multi-form disambiguation ────────────────────────────────────────────────
@@ -785,8 +883,14 @@ async def run_dom_task(
     `page` is a Playwright `Page` (or test stub exposing the same surface
     used by browser_dom / browser_dom_executor).
 
-    Never raises. All failure modes return a DomTaskResult with
-    success=False and a tagged `reason`.
+    Every failure mode returns a `DomTaskResult` with a tagged `reason`.
+
+    **`UserAborted` is the one exception, and it is deliberate.**
+    `dom_executor.execute_dom_batch` raises it at each action boundary and this
+    loop does not catch it — an abort is not a failure mode of the task, it is
+    the user revoking the task, and a `reason` tag would put it back on the
+    list of things to recover from. The call at step 4 is left unwrapped for
+    exactly that reason; do not add a `try` around it.
     """
     history: list[dict] = []
     feedback = ""
@@ -843,7 +947,7 @@ async def run_dom_task(
             # belt-and-braces guards the orchestrator's contract.
             logger.warning(f"[DOM_ORCH] perceive raised: {type(e).__name__}: {e}")
             return DomTaskResult(
-                success=False, reason="perceive_failed",
+                reason="perceive_failed",
                 loops_used=loop_i,
                 final_summary="Could not read the page.",
                 history=history,
@@ -876,7 +980,7 @@ async def run_dom_task(
                     f"{nav_reason} — accepting submit"
                 )
                 return DomTaskResult(
-                    success=True, reason="completed",
+                    reason="completed",
                     loops_used=loop_i + 1,
                     final_summary="Form submitted.",
                     history=history,
@@ -899,7 +1003,7 @@ async def run_dom_task(
                     "[DOM_ORCH] post-submit perception clean — accepting submit"
                 )
                 return DomTaskResult(
-                    success=True, reason="completed",
+                    reason="completed",
                     loops_used=loop_i + 1,
                     final_summary="Form submitted.",
                     history=history,
@@ -946,7 +1050,7 @@ async def run_dom_task(
                         errs, full_tree.elements, tag="user_pin_bail",
                     )
                     return DomTaskResult(
-                        success=False, reason="user_value_rejected",
+                        reason="user_value_rejected",
                         loops_used=loop_i + 1,
                         final_summary=summary,
                         history=history,
@@ -974,7 +1078,7 @@ async def run_dom_task(
                 )
                 _log_validation_dump(errs, full_tree.elements, tag="bail")
                 return DomTaskResult(
-                    success=False, reason="validation_no_progress",
+                    reason="validation_no_progress",
                     loops_used=loop_i + 1,
                     final_summary=summary,
                     history=history,
@@ -1032,7 +1136,7 @@ async def run_dom_task(
             })
             if loop_i == max_loops - 1:
                 return DomTaskResult(
-                    success=False, reason="empty_tree",
+                    reason="empty_tree",
                     loops_used=loop_i + 1,
                     final_summary="No interactive elements found on page.",
                     history=history,
@@ -1123,7 +1227,7 @@ async def run_dom_task(
                         f"error(s) remain — reporting unresolved"
                     )
                     return DomTaskResult(
-                        success=False, reason="validation_unresolved",
+                        reason="validation_unresolved",
                         loops_used=loop_i + 1,
                         final_summary=_format_unresolved_for_summary(
                             scoped_tree.validation_errors,
@@ -1138,7 +1242,7 @@ async def run_dom_task(
                     "actions": 0, "result": "done_no_actions",
                 })
                 return DomTaskResult(
-                    success=True, reason="completed_no_actions",
+                    reason="completed_no_actions",
                     loops_used=loop_i + 1,
                     final_summary=plan.plan or "Nothing to do.",
                     history=history,
@@ -1152,7 +1256,7 @@ async def run_dom_task(
             })
             if loop_i == max_loops - 1:
                 return DomTaskResult(
-                    success=False, reason="planner_failed",
+                    reason="planner_failed",
                     loops_used=loop_i + 1,
                     final_summary="Planner produced no usable actions.",
                     history=history,
@@ -1187,7 +1291,7 @@ async def run_dom_task(
             if loop_i == max_loops - 1:
                 # Last loop and we still have failures — report.
                 return DomTaskResult(
-                    success=False, reason="loop_failure_at_max",
+                    reason="loop_failure_at_max",
                     loops_used=loop_i + 1,
                     final_summary=(
                         f"Could not complete: {len(batch.failed)} of "
@@ -1263,7 +1367,7 @@ async def run_dom_task(
                             f"{nav_reason} — accepting submit"
                         )
                         return DomTaskResult(
-                            success=True, reason="completed",
+                            reason="completed",
                             loops_used=loop_i + 1,
                             final_summary="Form submitted.",
                             history=history,
@@ -1307,7 +1411,7 @@ async def run_dom_task(
                                 f" — surfacing user_value_rejected"
                             )
                             return DomTaskResult(
-                                success=False, reason="user_value_rejected",
+                                reason="user_value_rejected",
                                 loops_used=loop_i + 1,
                                 final_summary=summary,
                                 history=history,
@@ -1323,7 +1427,7 @@ async def run_dom_task(
                         f"error(s) at max loops — reporting failure"
                     )
                     return DomTaskResult(
-                        success=False, reason="loop_failure_at_max",
+                        reason="loop_failure_at_max",
                         loops_used=loop_i + 1,
                         final_summary=_format_unresolved_for_summary(
                             verify_tree.validation_errors,
@@ -1340,13 +1444,13 @@ async def run_dom_task(
                     "[DOM_ORCH] final verify perception clean — accepting submit"
                 )
                 return DomTaskResult(
-                    success=True, reason="completed",
+                    reason="completed",
                     loops_used=loop_i + 1,
                     final_summary="Form submitted.",
                     history=history,
                 )
             return DomTaskResult(
-                success=True, reason="completed",
+                reason="completed",
                 loops_used=loop_i + 1,
                 final_summary=plan.plan or "Done.",
                 history=history,
@@ -1358,7 +1462,7 @@ async def run_dom_task(
 
     # Max loops exhausted without explicit success or failure.
     return DomTaskResult(
-        success=False, reason="max_loops",
+        reason="max_loops",
         loops_used=max_loops,
         final_summary=f"Could not complete within {max_loops} steps.",
         history=history,
@@ -1391,7 +1495,7 @@ async def run_dom_form_fill(
     except Exception as e:
         logger.warning(f"[DOM_FORM_FILL] perceive raised: {type(e).__name__}: {e}")
         return DomTaskResult(
-            success=False, reason="perceive_failed",
+            reason="perceive_failed",
             loops_used=0,
             final_summary="Could not read the page.",
             history=history,
@@ -1413,7 +1517,7 @@ async def run_dom_form_fill(
 
     if not scoped_tree.elements:
         return DomTaskResult(
-            success=False, reason="empty_tree",
+            reason="empty_tree",
             loops_used=0,
             final_summary="No interactive elements found on page.",
             history=history,
@@ -1441,7 +1545,7 @@ async def run_dom_form_fill(
                 "thinking": mapping.thinking,
             })
             return DomTaskResult(
-                success=False, reason="mapper_failed",
+                reason="mapper_failed",
                 loops_used=attempt + 1,
                 final_summary="Could not determine which fields to fill.",
                 history=history,
@@ -1482,7 +1586,7 @@ async def run_dom_form_fill(
             names = [f.field_name or f.ref for f in failed]
             logger.warning(f"[DOM_FORM_FILL] fills failed: {names}")
             return DomTaskResult(
-                success=False, reason="fills_failed",
+                reason="fills_failed",
                 loops_used=attempt + 1,
                 final_summary=f"Could not fill: {', '.join(names)}.",
                 history=history,
@@ -1572,7 +1676,7 @@ async def run_dom_form_fill(
                             history[-1]["fills_total"] = len(all_fill_results)
                             history[-1]["fills_failed"] = len(dep_failed)
                             return DomTaskResult(
-                                success=False, reason="fills_failed",
+                                reason="fills_failed",
                                 loops_used=attempt + 1,
                                 final_summary=(
                                     f"Could not fill: {', '.join(names)}."
@@ -1606,14 +1710,14 @@ async def run_dom_form_fill(
                         f"{type(exc).__name__}: {str(exc)[:200]}"
                     )
                     return DomTaskResult(
-                        success=False, reason="submit_failed",
+                        reason="submit_failed",
                         loops_used=attempt + 1,
                         final_summary="Could not click submit.",
                         history=history,
                     )
             else:
                 return DomTaskResult(
-                    success=False, reason="submit_failed",
+                    reason="submit_failed",
                     loops_used=attempt + 1,
                     final_summary="Could not locate submit button.",
                     history=history,
@@ -1627,7 +1731,7 @@ async def run_dom_form_fill(
 
         if not submit_clicked:
             return DomTaskResult(
-                success=True, reason="completed_no_submit",
+                reason="completed_no_submit",
                 loops_used=attempt + 1,
                 final_summary="Fields filled.",
                 history=history,
@@ -1648,7 +1752,7 @@ async def run_dom_form_fill(
             )
         except Exception:
             return DomTaskResult(
-                success=True, reason="completed",
+                reason="completed",
                 loops_used=attempt + 1,
                 final_summary="Form submitted.",
                 history=history,
@@ -1663,7 +1767,7 @@ async def run_dom_form_fill(
                 "detail": nav_reason,
             })
             return DomTaskResult(
-                success=True, reason="completed",
+                reason="completed",
                 loops_used=attempt + 1,
                 final_summary="Form submitted.",
                 history=history,
@@ -1671,7 +1775,7 @@ async def run_dom_form_fill(
 
         if not verify_tree.validation_errors:
             return DomTaskResult(
-                success=True, reason="completed",
+                reason="completed",
                 loops_used=attempt + 1,
                 final_summary="Form submitted.",
                 history=history,
@@ -1697,7 +1801,7 @@ async def run_dom_form_fill(
                     pinned_value_by_name, rejected_pinned_names,
                 )
                 return DomTaskResult(
-                    success=False, reason="user_value_rejected",
+                    reason="user_value_rejected",
                     loops_used=attempt + 1,
                     final_summary=summary,
                     history=history,
@@ -1705,7 +1809,7 @@ async def run_dom_form_fill(
 
         if attempt == _MAX_FORM_FILL_ATTEMPTS - 1:
             return DomTaskResult(
-                success=False, reason="validation_unresolved",
+                reason="validation_unresolved",
                 loops_used=attempt + 1,
                 final_summary=_format_unresolved_for_summary(
                     verify_tree.validation_errors,
@@ -1732,7 +1836,7 @@ async def run_dom_form_fill(
         )
 
     return DomTaskResult(
-        success=False, reason="max_attempts",
+        reason="max_attempts",
         loops_used=_MAX_FORM_FILL_ATTEMPTS,
         final_summary="Could not complete form fill.",
         history=history,

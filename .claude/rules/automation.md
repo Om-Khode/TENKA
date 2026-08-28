@@ -68,11 +68,19 @@ Never equate *no exception* with *success*.
 - **User-pinned values are HARD constraints.** "mobile as 99999" is never silently
   substituted. If the form rejects it, bail with a summary.
 - **Never swallow `UserAborted` into a string error.** Re-raise so the planner stops cleanly
-  (`core/abort.py`).
+  (`core/abort.py`). **A sentinel counts as a string, and is worse than an error one.**
+  `router._execute_dom_task` turned an abort into `"__FALLBACK__"`, which is not a failure
+  report but an instruction to escalate a tier — so ESC re-triggered TTS, minimized the
+  user's terminals and spent a vision call. Check every bare `except Exception` that can
+  return a sentinel, not just the ones that return prose.
 - **Schema-version every on-disk marker.** Bump on contract changes; reject older markers.
-- Six independent execute/retry/replan loops exist (`planner.py`, `vision/agent.py`,
+- Several independent execute/retry/replan loops exist (`vision/agent.py`,
   `browser/dom_orchestrator.py`, `procedure_executor.py`, `code_executor/orchestrator.py`,
-  `automation/recovery.py`). Do not add a seventh.
+  `automation/recovery.py`; the planner's became `brain/plan_runner.py`). Do not add
+  another. **Each keeps its own step generation, retry strategy and budget — what they
+  share is the state machine**, `core/verdict.py`'s `Outcome`/`Verdict`. A loop that
+  invents a new status vocabulary is the thing to reject; a loop that needs a different
+  escalation is fine. `recovery.py` and `browser/dom_orchestrator.py` have adopted it.
 
 ## Live automation tests
 
