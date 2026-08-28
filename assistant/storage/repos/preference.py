@@ -8,6 +8,7 @@ Takes a Database instance; all SQL goes through self._db.
 import logging
 from datetime import datetime, timedelta
 from typing import Optional
+from ...core.provenance import Provenance, spellings_at_least
 
 logger = logging.getLogger("preferences")
 
@@ -33,19 +34,23 @@ CONFIDENCE_APPLIED_OVERRIDDEN = -0.2    # preference used, user overrode it
 # the strict direction, matching `DEFAULT_REQUIRED` in
 # `core/intent_capabilities.py`, because a new writer nobody has classified
 # should not be trusted to steer routing on its first night.
-_MODEL_PROPOSED_SOURCES = frozenset({"reflection", "inference", "assistant"})
-
-# The user said it, in one form or another. These may start high.
+# Both sets are **derived** from `core/provenance.py`, not written out here.
 #
-# `explicit` was missing from the first version of this set, and
-# `tests/test_repo_preference.py` is what found it -- eleven of its cases use
-# `explicit` to mean exactly "the user stated this" while testing unrelated
-# storage mechanics, and every one of them started failing. The set was wrong,
-# not the tests. A spelling that plainly means user-stated has to be in here,
-# or the clamp treats a deliberate statement as a guess.
-USER_STATED_SOURCES = frozenset({
-    "user", "explicit", "correction", "confirmed",
-})
+# They used to be literals, and this module was the only place that knew what
+# `source` meant. Then §17.P9 added the durable-write ladder that answers the
+# same question for all eleven stores -- and the two disagreed: `assistant` and
+# `inference` were model-proposed here and unrecognised there, which the core
+# module resolves to `EXTERNAL_CONTENT`. One string, two answers, no way to
+# notice.
+#
+# `explicit` was missing from the first hand-written version of the user-stated
+# set, and `tests/test_repo_preference.py` is what found it -- eleven of its
+# cases use `explicit` to mean exactly "the user stated this" while testing
+# unrelated storage mechanics, and every one started failing. That is the
+# failure mode a derived set removes: the spelling has to be classified once,
+# in one table, and everything that asks follows.
+# The user said it, in one form or another. These may start high.
+USER_STATED_SOURCES = spellings_at_least(Provenance.EXPLICIT_USER_STATEMENT)
 
 # The highest confidence a preference can reach on model assertions alone.
 #
