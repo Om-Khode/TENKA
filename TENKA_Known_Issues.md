@@ -1340,3 +1340,76 @@ none free:
 Whichever is chosen, the probe should log *what* it attached to at INFO —
 today it logs the engine string, which is exactly the field that made a system
 utility look like Chrome.
+
+---
+
+## KI-38: A procedure whose trigger starts or ends with a filler word can never run
+
+**Priority:** Medium (correctness — the feature accepts input it will never honour)
+**Effort:** Low. One line, plus a decision about existing rows
+**Discovered:** 2026-08-28, while setting up the TENKA-v2 P13 loop-2 live test.
+The test procedure never fired; the utterance was classified as
+`code_executor` instead and answered with a CPU core count.
+**Status:** open
+
+**The defect.** `ProcedureRepo.match_trigger` normalizes the *utterance* and
+compares it against the *stored trigger raw*:
+
+```python
+normalized_input = self._normalize(text)     # fillers stripped
+...
+trigger = row["trigger"].lower()             # fillers NOT stripped
+if normalized_input == trigger: ...
+```
+
+`_normalize` strips leading and trailing filler words. The filler list includes
+`run`, `go`, `please`, `now`, `hey`, `hi`, `just`, `do it`, `can you`,
+`could you`, `would you` and the assistant's own name. So a trigger beginning
+or ending with any of them fails **all four** match tiers:
+
+| tier | why it misses |
+| --- | --- |
+| exact | `"the widget" != "run the widget"` |
+| prefix | the input is *shorter* than the trigger, so it cannot start with it |
+| contained | the trigger is not a substring of the shortened input |
+| subsequence | the stripped word is in `trigger_words` and not in `input_words` |
+
+Measured, with a trigger of `"<filler> the widget"` in each case:
+
+```
+run / go / please / hey / hi / just / now / do it   ->  no match, every tier
+```
+
+**Why it is worse than a miss.** Nothing refuses the trigger at teach time.
+`create_procedure` stores it, `manage_procedure` lists it back, and the user is
+told the procedure exists. It simply never fires — and because
+`match_trigger` runs *before* intent routing, the utterance falls through to
+the classifier and gets answered by something else entirely. In the discovery
+case that meant a stored keystroke program was replaced by generated Python.
+A silent, permanent no-op that looks like a working feature.
+
+`"run my backup"`, `"go check email"`, `"hey open work"` are all natural
+phrasings for a taught trigger, and all dead on arrival.
+
+**The fix is one line, and the decision is what to do about stored rows.**
+Comparing `self._normalize(row["trigger"])` instead of `row["trigger"].lower()`
+closes it for good. What that does *not* decide:
+
+- **Existing rows keep their raw text.** Normalizing on read makes them start
+  working, which is the intent — but a trigger that was `"run notes"` will
+  begin claiming `"notes"`, i.e. it gains a `contained` match it never had.
+  Given KI-16's neighbour (a one-word trigger claiming every sentence
+  containing that word), that widening wants the weak-tier weighing in
+  `main.py` re-checked, not assumed.
+- **Or normalize on write** and leave `match_trigger` alone. Narrower, but it
+  does nothing for the rows already stored, and two normalizers on one value
+  is how they drift.
+- Either way **teach-time should refuse a trigger that normalizes to empty**
+  (`"please"`, `"just now"`), which today is stored and matches everything or
+  nothing depending on the tier.
+
+Not fixed here because it is not P13's, and because the widening above needs
+its own live test against a real taught procedure rather than a unit test of
+the comparison.
+
+Same family: [KI-16](#ki-16) — weak matching claiming ordinary speech.
