@@ -2495,7 +2495,7 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
 
             _tracker.latency_action_ms = int((_time.monotonic() - _t0_action) * 1000)
             _tracker.action_dispatched = "planner"
-            if _tracker.action_outcome != "failure":
+            if _tracker.action_outcome not in _telemetry.HANDLER_REPORTED:
                 _tracker.action_outcome = "success"
         else:
             # Tool execution — run the matched handler (async for computer agent)
@@ -2508,8 +2508,14 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
             )
             _tracker.latency_action_ms = int((_time.monotonic() - _t0_action) * 1000)
             _tracker.action_dispatched = intent_result.intent
-            # Don't clobber a handler-reported failure (mark_action_failure)
-            if _tracker.action_outcome != "failure":
+            # Don't clobber anything a handler reported for itself.
+            # §17.P13: this read `!= "failure"`, and `mark_action_failure` was
+            # the only channel a handler had -- so `mark_action_uncertain` would
+            # have been overwritten here on the very next line and the vision
+            # agent's disclosure would have reached the user's ears and not the
+            # row. The set lives in `telemetry` so a third value cannot be
+            # added there and silently fail to work here.
+            if _tracker.action_outcome not in _telemetry.HANDLER_REPORTED:
                 _tracker.action_outcome = "success"
 
         if not _use_streaming:

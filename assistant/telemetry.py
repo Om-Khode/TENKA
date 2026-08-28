@@ -63,7 +63,30 @@ def reset_current_tracker(token: Token) -> None:
     _current_tracker.reset(token)
 
 
-# ─── Failure marking ────────────────────────────────────────────────────────
+# ─── Outcome marking ────────────────────────────────────────────────────────
+#
+# TENKA-v2 §17.P13. There was one channel here and it could say exactly one
+# thing: `"failure"`. Everything else became `"success"`, because `main.py`
+# assigns that after dispatch to any turn no handler contradicted.
+#
+# The vision agent is what made that a problem rather than a simplification. It
+# already implements §11's uncertainty discipline internally -- when vision
+# cannot confirm a TODO it marks it done-as-abandoned and the spoken reply says
+# "(couldn't visually confirm: mobile, email)". So the sentence the user hears
+# is honest and the row that gets stored says `success`, and
+# `_maybe_mark_correction` reads the row.
+#
+# Precedence is **failure > uncertain > success**, and it is an ordering rather
+# than a set of independent flags because two handlers in one turn can each know
+# something different. Positive evidence against outranks no evidence either
+# way -- `core/verdict.roll_up`'s argument, applied to the turn-level field
+# instead of to a task's steps.
+
+# The values `main.py` must not overwrite with "success" once a handler has set
+# them. Exported so the assignment site reads the rule from here rather than
+# repeating a literal, which is how `"uncertain"` would silently stop working
+# the first time someone added a third value.
+HANDLER_REPORTED = frozenset({"failure", "uncertain"})
 
 
 def mark_action_failure(error_class: str, reason: str = "") -> None:
@@ -76,7 +99,9 @@ def mark_action_failure(error_class: str, reason: str = "") -> None:
 
     No-op when no tracker is set in the current context (e.g. background
     tasks). First failure wins — subsequent calls in the same turn keep
-    the original error_class.
+    the original error_class. A failure also overrides an earlier
+    `mark_action_uncertain`: finding out it definitely did not work is
+    strictly more information than not being able to tell.
     """
     tracker = _current_tracker.get()
     if tracker is None:
@@ -89,6 +114,32 @@ def mark_action_failure(error_class: str, reason: str = "") -> None:
     tracker.error_class = cls
     if reason:
         logger.debug(f"[TELEMETRY] action_failure: {cls}: {reason[:200]}")
+
+
+def mark_action_uncertain(error_class: str, reason: str = "") -> None:
+    """Mark the current turn as having produced an unconfirmable result.
+
+    For a handler that did the work, believes it worked, and **could not
+    verify it** -- the vision agent trusting an action signature after vision
+    refused to confirm it three times. Not a failure: nothing says it did not
+    work. Not a success either, and that distinction is the whole reason this
+    exists rather than a second boolean.
+
+    Does not overwrite a `"failure"` already set this turn, for the reason
+    given above the module's precedence note. Idempotent: the first uncertain
+    keeps its `error_class`, so the earliest thing that could not be confirmed
+    is the one named in the row.
+    """
+    tracker = _current_tracker.get()
+    if tracker is None:
+        return
+    if tracker.action_outcome in HANDLER_REPORTED:
+        return
+    tracker.action_outcome = "uncertain"
+    cls = (error_class or "Unconfirmed")[:200]
+    tracker.error_class = cls
+    if reason:
+        logger.info(f"[TELEMETRY] action_uncertain: {cls}: {reason[:200]}")
 
 
 # ─── TurnTracker ────────────────────────────────────────────────────────────

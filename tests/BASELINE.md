@@ -381,6 +381,7 @@ has looked at, and it blocks the next phase.
 | `test_verification_outcome.py` | GREEN | 32 | 0 | 0 | 0 | 0.8 |
 | `test_verification_vision.py` | GREEN | 18 | 0 | 0 | 0 | 0.8 |
 | `test_vision_agent_abort_compat.py` | GREEN | 3 | 0 | 0 | 0 | 0.8 |
+| `test_vision_outcome_honesty.py` | GREEN | 16 | 0 | 0 | 0 | 0.7 |
 | `test_vision_cap.py` | GREEN | 4 | 0 | 0 | 0 | 0.9 |
 | `test_vision_snap.py` | EMPTY | 0 | 0 | 0 | 0 | 0.8 |
 | `test_vision_split.py` | GREEN | 28 | 0 | 0 | 0 | 0.9 |
