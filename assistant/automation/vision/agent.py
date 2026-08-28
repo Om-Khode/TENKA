@@ -2883,7 +2883,7 @@ async def _run_computer_task_inner(
             logger.warning("[AGENT] Screenshot failed — falling back to OCR pipeline")
             screen_desc = screen.describe_screen_for_llm()
             raw_response = await ask_for_plan(
-                vision_prompt + f"\n\nSCREEN TEXT:\n{screen_desc}",
+                vision_prompt + f"\n\n{screen_desc}",
                 system_prompt=VISION_PLANNER_SYSTEM_PROMPT,
                 json_mode=True,
             )

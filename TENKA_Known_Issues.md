@@ -1194,3 +1194,47 @@ not echo the goal.
 decision: either `_detect_running_app` consults open windows, or the
 browser-intent branch defers to vision when a browser is already open. Both are
 behaviour changes with a blast radius beyond this file.
+
+---
+
+## KI-35: Screen text reached the action-deciding prompts unfenced
+
+**Priority:** Medium (security)
+**Effort:** Low (fence at the producer; two callers, both audited)
+**Discovered:** 2026-08-28, TENKA-v2 P10 follow-up
+**Status:** **MITIGATED — not closed.** 2026-08-28.
+
+`io/screen.py:describe_screen_for_llm()` returns open window titles, the active
+window title, and OCR of the screen. It has exactly two callers, and both
+concatenated the result straight into a prompt:
+
+- `automation/vision/agent.py` — chooses the next action, i.e. where to click
+- `automation/vision/verifier.py` — decides whether the task succeeded
+
+So text rendered by anything on screen — a web page, a document, a message
+someone else wrote — arrived in the prompt that chooses what to press, in the
+same voice and at the same indentation as TENKA's own instruction. Neither file
+fenced anything: `render_untrusted_block` appeared zero times in the whole
+vision package.
+
+Both call sites also prefixed the block with a hand-written `SCREEN TEXT:`
+label, which sat *outside* any boundary and asserted in TENKA's voice what the
+content was — the shape that makes a forged closing tag useful, because
+everything after it reads as the assistant's own words again.
+
+**The fix.** `describe_screen_for_llm` now returns a labelled,
+nonce-delimited `screen_contents` block, fenced at the producer rather than at
+the two call sites — the reason `storage/repos/memory.py` gives for
+`build_recent_context`: one place can fence it as well as all of them can, and a
+third caller added later inherits it without knowing the rule exists. The
+hand-written labels are gone. A test enumerates the caller list, so a third
+caller fails loudly rather than silently escaping the audit.
+
+**Why this is not "FIXED".** Same reason as [KI-15](#ki-15), and TENKA-v2 §12.2
+C3 states it: fencing raises the cost of injection, it does not close it. The
+model is told which bytes are data; nothing makes it care. Closure needs an
+adversarial live test — payloads written to defeat the fence, driven through a
+real vision run — which this change did not have and which §22 puts out of
+scope.
+
+Same family: [KI-14](#ki-14), [KI-15](#ki-15), [KI-16](#ki-16).
