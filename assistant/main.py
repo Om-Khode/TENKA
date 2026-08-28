@@ -992,6 +992,12 @@ async def _extract_and_store_facts(transcription: str) -> int:
             f"[MEMORY] Extracted fact: {fact['key']}={fact['value']} "
             f"(type={memory_type})"
         )
+    # Logged even at zero, and that is the point: the only line this emitted
+    # before was per-fact, so "found nothing" and "never ran" looked identical
+    # in the log. Verifying the streaming path meant inferring it from an LLM
+    # response line and a timestamp -- which is not evidence, it is a guess
+    # with good manners.
+    logger.info("[MEMORY] Fact extraction: %d stored", len(facts))
     return len(facts)
 
 
@@ -2621,6 +2627,8 @@ async def _turn_pipeline(source: str, transcription: str, bridge: UnityBridge,
             if _personality_noted:
                 return
             _personality_noted = True
+            logger.info("[PERSONALITY] Turn noted (facts_extracted=%s)",
+                        facts_extracted)
             try:
                 personality.process_turn(
                     transcription, intent_result.intent, facts_extracted
