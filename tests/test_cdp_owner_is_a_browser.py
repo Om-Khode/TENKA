@@ -487,6 +487,37 @@ class TestScanningFindsTheBrowsersPort(unittest.TestCase):
         self.assertFalse(r.available)
         self.assertEqual(r.port, 9222)
 
+    def test_a_rejected_port_is_not_reported_as_available(self):
+        """The live failure of the first version of this scan.
+
+        With a webview answering on 9222 and nothing on the rest, the scan
+        rejected 9222 and then returned that same result as its fallback --
+        `available=True`, for a port it had just refused. `_choose_browser_mode`
+        reads `cdp_state_snapshot().available` to decide whether DOM-mode is on
+        the table, so that answer routes a task to a tier that then refuses it.
+
+        "Something answered" is not the question. "Is there a browser to drive"
+        is.
+        """
+        r = self._run_scan(available={9222}, browsers=set())
+        self.assertFalse(
+            r.available,
+            "a port that failed the browser check was reported as usable")
+
+    def test_the_rejection_reason_survives_into_the_error(self):
+        # "closed" sends someone looking for a browser that is not running.
+        # "9222 (port 9222)" sends them to the port that is actually occupied.
+        r = self._run_scan(available={9222}, browsers=set())
+        self.assertIn("9222", r.error)
+        self.assertIn("no browser found", r.error)
+
+    def test_nothing_answering_says_so_differently(self):
+        # The two failures want different words: nothing listening is a
+        # different thing to something listening that is not a browser.
+        r = self._run_scan(available=set(), browsers=set())
+        self.assertNotIn("no browser found", r.error)
+        self.assertIn("9222..9226", r.error)
+
     def test_a_port_that_answers_but_is_not_a_browser_is_skipped(self):
         r = self._run_scan(available={9222, 9224}, browsers={9224})
         self.assertEqual(r.port, 9224)

@@ -454,11 +454,9 @@ async def cdp_health_probe(
             and time.monotonic() - _cdp_state.probed_at < ttl):
         return _cdp_state
 
-    first: Optional[CdpProbeResult] = None
+    rejected: list[str] = []
     for candidate in range(base, base + span + 1):
         result = await probe_one_port(candidate, timeout, use_cache=use_cache)
-        if first is None:
-            first = result
         if not result.available:
             continue
 
@@ -472,13 +470,32 @@ async def cdp_health_probe(
             return result
 
         logger.info(f"[CDP] port {candidate} answers but is not a browser: {why}")
+        rejected.append(f"{candidate} ({why})")
 
-    # Nothing usable. Report the configured port's own result rather than the
-    # last one tried, so the error a caller logs is about the port the user
-    # actually set.
-    fallback = first or CdpProbeResult(
-        available=False, error="no ports probed", probed_at=time.monotonic(),
-        port=base)
+    # Nothing usable.
+    #
+    # **`available=False`, even though something answered.** The first version
+    # returned the first probe result, which for the live case was 9222 with
+    # `available=True` -- a port the scan had just rejected, reported as
+    # usable. `_choose_browser_mode` reads `cdp_state_snapshot().available` to
+    # decide whether DOM-mode is on the table, so that answer routes a task to
+    # a tier that will then refuse it. "Something answered" is not the question
+    # this function is for; "is there a browser to drive" is, and the answer
+    # was no.
+    #
+    # The rejections are carried in `error` because they are the useful half:
+    # "closed" sends someone looking for a browser that is not running, and
+    # "9222 (a webview owns it)" sends them to the actual problem.
+    detail = ("; ".join(rejected) if rejected
+              else f"no CDP endpoint on {base}..{base + span}")
+    fallback = CdpProbeResult(
+        available=False,
+        error=(f"no browser found — {detail}" if rejected else detail),
+        probed_at=time.monotonic(),
+        port=base,
+    )
+    if rejected:
+        logger.warning(f"[CDP] no usable browser port: {detail}")
     _cdp_state = fallback
     return fallback
 
