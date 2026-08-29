@@ -73,7 +73,13 @@ REFUSED = 403
 # that a *second* socket route added later fails
 # `test_the_event_socket_is_still_the_only_websocket_route` and has to be
 # classified by whoever adds it.
-WEBSOCKET_ROUTES = frozenset({"/v1/events"})
+# `/latch` is the browser extension's socket, added by the Latch tier. Its
+# per-listener behaviour is decided and pinned in
+# `tests/test_extension_ws.py::test_the_socket_is_refused_on_every_other_listener`:
+# it answers only on the `extension` listener and closes on every other one
+# before accepting. It is not in MATRIX because a socket has no HTTP status,
+# which is the same reason `/v1/events` is not.
+WEBSOCKET_ROUTES = frozenset({"/v1/events", "/latch"})
 
 # The Studio front-end's catch-all (`ui.py`'s `mount_ui`), recorded rather
 # than covered, because it is absent from every app in this file: these apps

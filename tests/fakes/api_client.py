@@ -54,8 +54,23 @@ class ApiTestClient(TestClient):
     def websocket_connect(self, url: str,
                           subprotocols: Sequence[str] | None = None,
                           **kwargs: Any) -> WebSocketTestSession:
+        # Derived from this client's own `base_url`, not from `LOCAL_PORT`.
+        #
+        # The original fix replaced Starlette's hard-coded `ws://testserver`
+        # with a hard-coded `ws://127.0.0.1:8787`, which is right for every
+        # caller that talks to the local listener and silently wrong for any
+        # that does not: the socket lands on 8787 while the same client's HTTP
+        # requests land on the port it asked for. A test opening a socket on a
+        # *different* listener would then be exercising `local` and asserting
+        # about something else -- green, and measuring nothing.
+        #
+        # Every existing caller passes `base_url=BASE_URL`, so this changes no
+        # behaviour for any of them.
         if url.startswith("/"):
-            url = f"ws://127.0.0.1:{LOCAL_PORT}{url}"
+            base = str(self.base_url).rstrip("/")
+            scheme = "wss" if base.startswith("https://") else "ws"
+            authority = base.split("://", 1)[1]
+            url = f"{scheme}://{authority}{url}"
         return super().websocket_connect(url, subprotocols, **kwargs)
 
 
