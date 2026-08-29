@@ -1241,14 +1241,18 @@ Same family: [KI-14](#ki-14), [KI-15](#ki-15), [KI-16](#ki-16).
 
 ---
 
-## KI-36: The tier-1 browser path checks abort once, at entry
+## KI-36: ~~The tier-1 browser path checks abort once, at entry~~ FIXED
 
 **Priority:** Medium (control — the stop button does not stop it)
 **Effort:** Low per site, but it is a behaviour change on an automation tier,
 so `.claude/rules/testing.md` requires a live test
 **Discovered:** 2026-08-28, while live-testing TENKA-v2 P13 loop 1. Found in
 the operator's own log, testing something else.
-**Status:** open
+**Fixed:** 2026-08-29 — `run_browser_steps` checks abort before launching the
+browser and between every step, raising `UserAborted` rather than returning a
+string, and `router.py`'s nine fallback-returning handlers all route through
+one `_reraise_if_user_aborted`. `tests/test_router_never_swallows_abort.py`.
+**Status:** FIXED
 
 **The defect.** `handle_browser_action` checks `abort.is_aborted()` once, at
 function entry (`actions/da_handlers.py`). After that the tier runs to
@@ -1277,14 +1281,36 @@ tier already does it right: `automation/native.py:run_app_steps` checks between
 every step and raises `UserAborted` rather than returning a string, with a
 comment explaining why. Two tiers, one contract, one of them honouring it.
 
-**Same family as** the P13 loop-1 fix (`router._execute_dom_task` turned an
-abort into `"__FALLBACK__"`), and the same underlying rule from
-`.claude/rules/automation.md`: never swallow `UserAborted`, and check at loop
-boundaries. That fix closed one path; this is the neighbouring one. Also
-related: `procedure_executor.run_procedure` has no abort boundary anywhere, so
-a replayed procedure cannot be stopped either — noted in TENKA-v2 §17.P13 as
-out of scope for that phase, since adding a boundary is new behaviour rather
-than a vocabulary migration.
+**It was a class, not two instances.** The P13 loop-1 fix guarded
+`_execute_dom_task`; a still-earlier fix guarded the type-shortcut path, with a
+hand-written comment naming the harm. Counting them found **nine** broad
+handlers in `router.py` that return `"__FALLBACK__"` and **seven were
+unguarded** — including the two this entry is about. Fixing the instance in
+front of you leaves the class alone, and it had been left alone twice.
+
+The rule now has one implementation, `_reraise_if_user_aborted`, called from
+all nine; the two hand-written copies were converted to it. An AST sweep fails
+on a handler that returns the sentinel without calling it, with a count floor
+so the target set cannot quietly shrink, and a second test fails if the rule
+starts being written inline again.
+
+**Two things the fix's own tests caught:**
+
+- The first version checked abort only *inside* the step loop, so an abort held
+  beforehand still launched a Chromium and then raised. The check now runs
+  before `ensure_browser` too — starting a browser for a cancelled task is the
+  same waste as the vision call that made this worth filing.
+- Removing the in-loop check was then a **green mutant**: every test set the
+  abort before calling, so the pre-launch check fired first and the in-loop one
+  was never exercised. The case that matters is ESC pressed *during* a run,
+  which is what the operator's log shows, so a test now aborts at step 1 and
+  asserts step 2 never starts.
+
+Still open, and noted here because it is the same shape:
+`procedure_executor.run_procedure` has no abort boundary anywhere, so a
+replayed procedure cannot be stopped. TENKA-v2 §17.P13 put it out of scope for
+that phase, since adding a boundary is new behaviour rather than a vocabulary
+migration.
 
 ---
 
