@@ -1,5 +1,5 @@
 """
-latch.py — the DOM tier, driven through the browser extension.
+drover.py — the DOM tier, driven through the browser extension.
 
 `ExtensionPage` satisfies `PageAdapter` (three members) and `ExtensionLocator`
 satisfies `LocatorAdapter` (nine methods), so `dom.py` and everything above it
@@ -20,13 +20,13 @@ error anyone sees; it is a confident wrong answer.
 ## `locator` only speaks one selector
 
 Every locator in the tier originates at `dom.py:1055`, built from the index the
-query just stamped. So `[data-latch-idx='N']` is the only shape that can arrive,
+query just stamped. So `[data-drover-idx='N']` is the only shape that can arrive,
 and any other selector is a caller that has invented one — refused with the
 selector quoted rather than silently matching nothing.
 
 ## Errors are exceptions, never sentinels
 
-An RPC error frame becomes a `LatchCallError` carrying its numeric code.
+An RPC error frame becomes a `DroverCallError` carrying its numeric code.
 `.claude/rules/automation.md` records what the alternative cost:
 `router._execute_dom_task` once turned an abort into `"__FALLBACK__"`, which is
 not a failure report but an instruction to escalate a tier — so ESC re-triggered
@@ -39,12 +39,12 @@ import logging
 import re
 from typing import Any
 
-from ...core import latch_protocol as proto
-from ...io.api.extension_ws import LatchCallError, LatchConnection
+from ...core import drover_protocol as proto
+from ...io.api.extension_ws import DroverCallError, DroverConnection
 from .dom_query_vendor import DOM_QUERY_JS
 from .page_adapter import LocatorAdapter, PageAdapter
 
-logger = logging.getLogger("browser.latch")
+logger = logging.getLogger("browser.drover")
 
 #: The only selector shape the DOM tier builds. Anchored at both ends: a
 #: selector that merely *contains* the attribute is still one this driver did
@@ -75,7 +75,7 @@ class ExtensionLocator:
     __slots__ = ("_conn", "_idx", "_query_params")
 
     def __init__(
-        self, connection: LatchConnection, idx: int,
+        self, connection: DroverConnection, idx: int,
         query_params: dict | None = None,
     ) -> None:
         self._conn = connection
@@ -90,7 +90,7 @@ class ExtensionLocator:
         for element in result.get("elements") or []:
             if element.get("idx") == self._idx:
                 return str(element.get(field, ""))
-        raise LatchCallError(
+        raise DroverCallError(
             proto.Err.BAD_SELECTOR,
             f"element {self._idx} is no longer on the page",
             method=proto.Rpc.QUERY,
@@ -163,7 +163,7 @@ class ExtensionPage:
 
     __slots__ = ("_conn", "_url", "_last_query_params")
 
-    def __init__(self, connection: LatchConnection, url: str = "") -> None:
+    def __init__(self, connection: DroverConnection, url: str = "") -> None:
         self._conn = connection
         self._url = url
         self._last_query_params: dict = {"filter": "interactive", "openComboboxes": False}

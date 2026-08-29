@@ -100,8 +100,8 @@ async def handle_browser_tabs(
         return await _reply(f"I don't know how to {action!r} a tab.")
 
     try:
-        from ..core import latch_protocol as proto
-        from ..io.api.extension_ws import LatchCallError, current_connection
+        from ..core import drover_protocol as proto
+        from ..io.api.extension_ws import DroverCallError, current_connection
     except ImportError as e:
         return await _reply(f"Couldn't load the browser driver: {e}")
 
@@ -174,7 +174,7 @@ async def handle_browser_tabs(
         await connection.call(proto.Rpc.TABS_ACTIVATE, {"tabId": target["id"]})
         return await _reply(f"Switched to {_describe(target)}.")
 
-    except LatchCallError as e:
+    except DroverCallError as e:
         # The extension answered, and said no. Its reason is more useful than
         # anything this layer could invent.
         return await _reply(f"The browser refused: {e.raw_message}")

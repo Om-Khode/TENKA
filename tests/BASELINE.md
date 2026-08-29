@@ -9,7 +9,7 @@ revert-and-rerun to attribute; this answers it in a second.
 - files: **304**
 - wall time, sequential: **~13.1 min**
 
-> **Partially stale, 2026-08-29.** The Latch tier removed five files and added
+> **Partially stale, 2026-08-29.** The Drover tier removed five files and added
 > nine; the rows below were edited by hand for those, and `test_6a5_api_fixes.py`
 > was corrected from GREEN to RED (KI-40 — it has been failing on `main` since
 > `543ed2d` on 2026-08-27, which is exactly the attribution this ledger exists

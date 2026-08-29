@@ -1,5 +1,5 @@
 """
-test_extension_ws.py — Latch Task 11: the socket, its handshake, and its calls.
+test_extension_ws.py — Drover Task 11: the socket, its handshake, and its calls.
 
 The security-relevant part of a handshake is the *order* of its checks, and a
 test that has to stand up a real WebSocket to assert an ordering gets written
@@ -36,7 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest  # noqa: E402
 
-from assistant.core import latch_protocol as proto  # noqa: E402
+from assistant.core import drover_protocol as proto  # noqa: E402
 from assistant.io.api import extension_ws as ws  # noqa: E402
 
 GOOD_DIGEST = "a" * 64
@@ -209,7 +209,7 @@ def test_the_incumbent_is_not_displaced():
     incumbent would pass the test above and leave the operator's browser
     disconnected.
     """
-    first = ws.LatchConnection(send_json=_noop, browser_name="firefox")
+    first = ws.DroverConnection(send_json=_noop, browser_name="firefox")
     ws.register(first)
     assert ws.is_occupied() is True
 
@@ -228,26 +228,26 @@ async def _noop(_frame):
 
 
 def test_the_snapshot_reports_disconnected_when_nothing_is_connected():
-    snap = ws.latch_state_snapshot()
+    snap = ws.drover_state_snapshot()
     assert snap.connected is False
     assert snap.browser_name == ""
 
 
 def test_the_snapshot_reports_the_connected_browser():
-    conn = ws.LatchConnection(send_json=_noop, browser_name="brave", extension_version="0.1.0")
+    conn = ws.DroverConnection(send_json=_noop, browser_name="brave", extension_version="0.1.0")
     ws.register(conn)
-    snap = ws.latch_state_snapshot()
+    snap = ws.drover_state_snapshot()
     assert snap.connected is True
     assert snap.browser_name == "brave"
     assert snap.extension_version == "0.1.0"
 
 
 def test_unregistering_closes_and_clears():
-    conn = ws.LatchConnection(send_json=_noop)
+    conn = ws.DroverConnection(send_json=_noop)
     ws.register(conn)
     ws.unregister(conn, "test")
     assert ws.current_connection() is None
-    assert ws.latch_state_snapshot().connected is False
+    assert ws.drover_state_snapshot().connected is False
 
 
 # ─── Calls ───────────────────────────────────────────────────────────────
@@ -264,7 +264,7 @@ def test_a_call_sends_a_request_and_resolves_on_its_reply():
         sent.append(frame)
 
     async def scenario():
-        conn = ws.LatchConnection(send_json=send)
+        conn = ws.DroverConnection(send_json=send)
         task = asyncio.create_task(conn.call(proto.Rpc.TABS_LIST, {}))
         await asyncio.sleep(0)
         conn.handle_frame({
@@ -288,7 +288,7 @@ def test_an_error_frame_raises_with_its_code_and_never_a_sentinel():
         sent.append(frame)
 
     async def scenario():
-        conn = ws.LatchConnection(send_json=send)
+        conn = ws.DroverConnection(send_json=send)
         task = asyncio.create_task(conn.call(proto.Rpc.ACT, {"idx": 3}))
         await asyncio.sleep(0)
         conn.handle_frame({
@@ -297,7 +297,7 @@ def test_an_error_frame_raises_with_its_code_and_never_a_sentinel():
         })
         return await asyncio.wait_for(task, timeout=1)
 
-    with pytest.raises(ws.LatchCallError) as excinfo:
+    with pytest.raises(ws.DroverCallError) as excinfo:
         _run(scenario())
     assert excinfo.value.code == proto.Err.BAD_SELECTOR
     assert "no element idx=3" in str(excinfo.value)
@@ -308,7 +308,7 @@ def test_a_timed_out_call_raises_and_releases_its_slot():
         return None
 
     async def scenario():
-        conn = ws.LatchConnection(send_json=send)
+        conn = ws.DroverConnection(send_json=send)
         for _ in range(50):
             with pytest.raises(TimeoutError):
                 await conn.call(proto.Rpc.INFO, {}, timeout=0.001)
@@ -328,26 +328,26 @@ def test_a_disconnect_fails_every_waiter_rather_than_hanging():
         sent.append(frame)
 
     async def scenario():
-        conn = ws.LatchConnection(send_json=send)
+        conn = ws.DroverConnection(send_json=send)
         task = asyncio.create_task(conn.call(proto.Rpc.QUERY, {}, timeout=5))
         await asyncio.sleep(0)
         conn.close("socket dropped")
         return await asyncio.wait_for(task, timeout=1)
 
-    with pytest.raises(ws.LatchDisconnected):
+    with pytest.raises(ws.DroverDisconnected):
         _run(scenario())
 
 
 def test_calling_a_closed_connection_raises_immediately():
-    conn = ws.LatchConnection(send_json=_noop)
+    conn = ws.DroverConnection(send_json=_noop)
     conn.close("gone")
-    with pytest.raises(ws.LatchDisconnected):
+    with pytest.raises(ws.DroverDisconnected):
         _run(conn.call(proto.Rpc.INFO, {}))
 
 
 def test_events_reach_subscribers_and_a_throwing_one_does_not_break_the_rest():
     seen: list[str] = []
-    conn = ws.LatchConnection(send_json=_noop)
+    conn = ws.DroverConnection(send_json=_noop)
     conn.on_event(lambda _f: (_ for _ in ()).throw(RuntimeError("bad subscriber")))
     conn.on_event(lambda f: seen.append(f["event"]))
 
@@ -365,7 +365,7 @@ def test_a_removed_callback_stops_receiving():
     def cb(frame):
         seen.append(frame["event"])
 
-    conn = ws.LatchConnection(send_json=_noop)
+    conn = ws.DroverConnection(send_json=_noop)
     conn.on_event(cb)
     conn.handle_frame({"type": proto.Frame.EVENT, "event": "tab_opened"})
     conn.remove_event_callback(cb)
@@ -374,7 +374,7 @@ def test_a_removed_callback_stops_receiving():
 
 
 def test_a_reply_for_an_unknown_id_is_ignored_not_fatal():
-    conn = ws.LatchConnection(send_json=_noop)
+    conn = ws.DroverConnection(send_json=_noop)
     conn.handle_frame({"type": proto.Frame.RESPONSE, "id": 999, "ok": True, "result": {}})
 
 
@@ -447,7 +447,7 @@ def _app_with(tmp_path, digest: str, listeners: dict[int, str]):
 
 
 def test_the_socket_is_refused_on_every_other_listener(tmp_path, monkeypatch):
-    """`/latch` answers on the extension listener and nowhere else.
+    """`/drover` answers on the extension listener and nowhere else.
 
     The failure this prevents is the worst one available here: serving a driver
     for the user's browser on `local`, whose policy grants EXECUTE and admin.
@@ -467,7 +467,7 @@ def test_the_socket_is_refused_on_every_other_listener(tmp_path, monkeypatch):
         client = ApiTestClient(app, base_url=f"http://127.0.0.1:{port}")
         try:
             with client.websocket_connect(
-                "/latch", headers={"origin": GOOD_ORIGIN}
+                "/drover", headers={"origin": GOOD_ORIGIN}
             ) as sock:
                 sock.send_text(json.dumps(hello()))
                 reply = json.loads(sock.receive_text())
@@ -493,7 +493,7 @@ def test_the_socket_accepts_on_its_own_listener(tmp_path, monkeypatch):
     app = _app_with(tmp_path, GOOD_DIGEST, {8790: "extension"})
 
     client = ApiTestClient(app, base_url="http://127.0.0.1:8790")
-    with client.websocket_connect("/latch", headers={"origin": GOOD_ORIGIN}) as sock:
+    with client.websocket_connect("/drover", headers={"origin": GOOD_ORIGIN}) as sock:
         sock.send_text(json.dumps(hello()))
         assert json.loads(sock.receive_text())["type"] == proto.Frame.WELCOME
 
@@ -512,7 +512,7 @@ def test_a_refusal_says_which_check_failed(tmp_path, monkeypatch):
     app = _app_with(tmp_path, GOOD_DIGEST, {8790: "extension"})
 
     client = ApiTestClient(app, base_url="http://127.0.0.1:8790")
-    with client.websocket_connect("/latch", headers={"origin": GOOD_ORIGIN}) as sock:
+    with client.websocket_connect("/drover", headers={"origin": GOOD_ORIGIN}) as sock:
         sock.send_text(json.dumps(hello(protocolVersion=99)))
         reply = json.loads(sock.receive_text())
     assert reply["type"] == proto.Frame.REJECT
@@ -531,7 +531,7 @@ def test_the_slot_is_freed_when_the_socket_closes(tmp_path, monkeypatch):
     client = ApiTestClient(app, base_url="http://127.0.0.1:8790")
 
     for _ in range(3):
-        with client.websocket_connect("/latch", headers={"origin": GOOD_ORIGIN}) as sock:
+        with client.websocket_connect("/drover", headers={"origin": GOOD_ORIGIN}) as sock:
             sock.send_text(json.dumps(hello()))
             assert json.loads(sock.receive_text())["type"] == proto.Frame.WELCOME
         assert ws.current_connection() is None, "the slot survived the socket"
@@ -566,7 +566,7 @@ def test_every_exit_path_from_the_socket_loop_frees_the_slot():
         if isinstance(node, ast.Try)
         and any("unregister" in ast.dump(h) for h in [node] + node.finalbody)
     ]
-    assert loops, "the latch socket's try/finally was not found; this guard needs updating"
+    assert loops, "the drover socket's try/finally was not found; this guard needs updating"
     block = loops[0]
 
     assert block.finalbody, "the teardown is not in a finally block"
@@ -606,7 +606,7 @@ def test_a_dead_incumbent_is_evicted():
         return None
 
     async def scenario():
-        conn = ws.LatchConnection(send_json=never_answers)
+        conn = ws.DroverConnection(send_json=never_answers)
         ws.register(conn)
         assert ws.is_occupied() is True
         evicted = await ws.evict_if_dead(timeout=0.05)
@@ -630,7 +630,7 @@ def test_a_live_incumbent_is_not_evicted():
         sent.append(frame)
 
     async def scenario():
-        conn = ws.LatchConnection(send_json=send)
+        conn = ws.DroverConnection(send_json=send)
         ws.register(conn)
 
         async def answer_when_asked():
@@ -669,7 +669,7 @@ def test_the_route_probes_before_refusing_a_second_client():
 
     source = inspect.getsource(app_module.create_app)
     assert "evict_if_dead" in source, (
-        "the latch route never probes the incumbent, so a ghost connection "
+        "the drover route never probes the incumbent, so a ghost connection "
         "holds the slot until the daemon restarts"
     )
     probe_at = source.index("evict_if_dead(")

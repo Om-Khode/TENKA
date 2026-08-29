@@ -637,7 +637,7 @@ class TestAbortIsNotAFallback(unittest.IsolatedAsyncioTestCase):
         page = MagicMock()
         page.url = "https://example.invalid/form"
         handle = MagicMock()
-        handle.kind = "latch"
+        handle.kind = "drover"
         handle.page = page
 
         with patch.object(bhandle, "get_browser_handle",

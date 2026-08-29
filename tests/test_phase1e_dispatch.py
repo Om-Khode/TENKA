@@ -38,7 +38,7 @@ def _run(coro):
 # ─── Helpers ─────────────────────────────────────────────────────────────
 
 
-def _make_handle(kind: str = "latch"):
+def _make_handle(kind: str = "drover"):
     """A driver handle, as `get_browser_handle` returns one.
 
     The context/page fakes that stood here are gone with the tab picker they

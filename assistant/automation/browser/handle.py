@@ -3,7 +3,7 @@ handle.py — which browser the DOM tier is about to drive, and why.
 
 Two kinds:
 
-  `latch`    — the browser the user already has open, through the extension.
+  `drover`    — the browser the user already has open, through the extension.
                Their profile, their logins, no launch flags.
   `bundled`  — TENKA's own Chromium. Signed out of everything, and the fallback
                whenever the extension is not connected.
@@ -35,14 +35,14 @@ from .page_adapter import PageAdapter
 
 logger = logging.getLogger("browser.handle")
 
-BrowserKind = Literal["latch", "bundled"]
+BrowserKind = Literal["drover", "bundled"]
 
 
 @dataclass(frozen=True)
 class BrowserHandle:
     """A page to drive, and the provenance of it.
 
-    `connection` is present only for `latch`. Callers that need to know whether
+    `connection` is present only for `drover`. Callers that need to know whether
     the browser is the user's own read `kind`; nothing should branch on
     `connection is None` as a proxy, because a future third driver would be
     neither.
@@ -60,20 +60,20 @@ class BrowserHandle:
         whether the session is the user's — that is what decides whether a
         login wall is expected.
         """
-        return self.kind == "latch"
+        return self.kind == "drover"
 
 
-async def get_browser_handle(*, prefer_latch: bool = True) -> BrowserHandle:
+async def get_browser_handle(*, prefer_drover: bool = True) -> BrowserHandle:
     """Resolve a browser to drive.
 
     Order: the extension if it is connected and preferred, otherwise bundled.
 
-    `prefer_latch=False` does not merely lose a race — it never touches the
+    `prefer_drover=False` does not merely lose a race — it never touches the
     connection at all. A caller that has asked for the bundled browser wants a
     clean profile, and quietly handing it the user's session would be a
     different task than the one it asked for.
     """
-    if not prefer_latch:
+    if not prefer_drover:
         return await _bundled("caller asked for the bundled browser")
 
     if not bool(getattr(config, "BROWSER_PREFER_EXTENSION", True)):
@@ -88,10 +88,10 @@ async def get_browser_handle(*, prefer_latch: bool = True) -> BrowserHandle:
     if connection is None:
         return await _bundled("no browser extension is connected")
 
-    from .latch import ExtensionPage
+    from .drover import ExtensionPage
 
     return BrowserHandle(
-        kind="latch",
+        kind="drover",
         page=ExtensionPage(connection),
         connection=connection,
     )

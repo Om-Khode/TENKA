@@ -3573,7 +3573,7 @@ async def async_main():
     # There was a non-blocking CDP probe here, warming a cache so the first
     # browser task knew whether to attach or fall back. The extension tier
     # needs none: it dials in on its own and registers itself, so there is no
-    # port to poll and no attachment to warm. `latch_state_snapshot()` answers
+    # port to poll and no attachment to warm. `drover_state_snapshot()` answers
     # "is a browser drivable?" from a dict, at any moment, with no I/O.
 
     # Auto-start whisper.cpp server if needed

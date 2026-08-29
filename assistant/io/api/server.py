@@ -481,7 +481,7 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     extension_sock = None
     try:
         extension_sock = bind_listener(extension_port, host)
-        extension_task = serve_socket(app, extension_sock, name="latch", primary=False)
+        extension_task = serve_socket(app, extension_sock, name="drover", primary=False)
     except BaseException as e:
         if extension_sock is not None:
             extension_sock.close()
@@ -539,7 +539,7 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
 
     logger.info(f"[API] Studio daemon listening on http://{host}:{port}")
     if extension_task is not None:
-        logger.info(f"[API] browser extension listener on ws://{host}:{extension_port}/latch")
+        logger.info(f"[API] browser extension listener on ws://{host}:{extension_port}/drover")
     return task
 
 

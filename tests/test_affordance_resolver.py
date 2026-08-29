@@ -193,7 +193,7 @@ def test_the_environment_is_a_parameter_not_a_read():
         for n in ast.walk(tree) if isinstance(n, ast.Call)
     }
     for reader in ("get_open_windows", "screenshot", "list_ocr_blocks",
-                   "latch_state_snapshot"):
+                   "drover_state_snapshot"):
         assert reader not in called, (
             f"the resolver reads the environment itself via {reader!r}")
 

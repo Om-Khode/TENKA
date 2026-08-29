@@ -1,5 +1,5 @@
 """
-test_extension_setup_intent.py — Latch Task 16: the setup intent.
+test_extension_setup_intent.py — Drover Task 16: the setup intent.
 
 What replaces the Chrome-shortcut generator. That one wrote launchers into the
 Desktop and Start Menu so the user could open Chrome with a debug flag; this
@@ -127,7 +127,7 @@ def test_status_names_the_connected_browser(home, handler):
     async def _noop(_frame):
         return None
 
-    ews.register(ews.LatchConnection(send_json=_noop, browser_name="firefox"))
+    ews.register(ews.DroverConnection(send_json=_noop, browser_name="firefox"))
     try:
         msg = _run(handler({"mode": "status"}))
         assert "firefox" in msg.lower()
@@ -205,7 +205,7 @@ def test_after_undo_the_socket_refuses_everything(home, handler):
     refuses when `expected_token` is falsy, which is what an absent store
     yields — the fail-closed path, exercised end to end.
     """
-    from assistant.core import latch_protocol as proto
+    from assistant.core import drover_protocol as proto
 
     _run(handler({"mode": "setup"}))
     token = ews.read_token(home)

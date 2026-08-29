@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest  # noqa: E402
 
-from assistant.core import latch_protocol as proto  # noqa: E402
+from assistant.core import drover_protocol as proto  # noqa: E402
 from assistant.io.api import extension_ws as ews  # noqa: E402
 
 
@@ -270,9 +270,9 @@ def test_an_unknown_action_is_refused(handler, connected):
 
 def test_the_browsers_own_refusal_is_passed_through(handler, monkeypatch):
     """Its reason beats anything this layer could invent."""
-    from assistant.io.api.extension_ws import LatchCallError
+    from assistant.io.api.extension_ws import DroverCallError
 
-    conn = FakeConnection(error=LatchCallError(proto.Err.NO_TAB, "tab 2 no longer exists"))
+    conn = FakeConnection(error=DroverCallError(proto.Err.NO_TAB, "tab 2 no longer exists"))
     monkeypatch.setattr(ews, "current_connection", lambda: conn)
 
     msg = _run(handler({"action": "list"}))

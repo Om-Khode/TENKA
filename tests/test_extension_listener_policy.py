@@ -1,5 +1,5 @@
 """
-test_extension_listener_policy.py — Latch Task 10: the fourth listener.
+test_extension_listener_policy.py — Drover Task 10: the fourth listener.
 
 The browser extension connects over a loopback WebSocket. Rather than
 hand-rolling a socket, it gets a `ListenerPolicy` and a port in the registry,
@@ -148,7 +148,7 @@ def test_the_extension_port_is_not_the_local_port():
 # Everything above this line passed while nothing listened on the port.
 #
 # `serve()` bound only `local` and built the app with
-# `listener_policies={port: "local"}`. The `/latch` route existed, the policy
+# `listener_policies={port: "local"}`. The `/drover` route existed, the policy
 # existed, the offset existed, and every unit test constructed its own app with
 # `{8790: "extension"}` by hand -- so the one thing nobody asserted was that the
 # daemon does the same. The extension sat in "Disconnected. Retrying shortly."

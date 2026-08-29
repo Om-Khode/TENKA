@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from ...core import latch_protocol as proto
+from ...core import drover_protocol as proto
 
 logger = logging.getLogger("api.extension_ws")
 
@@ -107,7 +107,7 @@ def read_token(home: Path | None = None) -> str | None:
         return None
     if raw.get("schema_version") != TOKEN_SCHEMA_VERSION:
         logger.warning(
-            f"[LATCH] ignoring extension token with schema_version="
+            f"[DROVER] ignoring extension token with schema_version="
             f"{raw.get('schema_version')!r} (expected {TOKEN_SCHEMA_VERSION}); "
             f"re-run the extension setup to mint a current one"
         )
@@ -125,7 +125,7 @@ def clear_token(home: Path | None = None) -> bool:
     except FileNotFoundError:
         return False
     except OSError as e:
-        logger.warning(f"[LATCH] could not remove {path}: {e}")
+        logger.warning(f"[DROVER] could not remove {path}: {e}")
         return False
 
 
@@ -208,7 +208,7 @@ def evaluate_handshake(
 
 
 @dataclass
-class LatchConnection:
+class DroverConnection:
     """One connected extension, and the calls in flight on it."""
 
     send_json: Callable[[dict], Any]
@@ -240,8 +240,8 @@ class LatchConnection:
     ) -> dict:
         """Send one request and await its reply.
 
-        Raises `LatchCallError` on an error frame, `TimeoutError` on silence,
-        and `LatchDisconnected` if the socket is gone. It never returns a
+        Raises `DroverCallError` on an error frame, `TimeoutError` on silence,
+        and `DroverDisconnected` if the socket is gone. It never returns a
         sentinel: `.claude/rules/automation.md` records what happened when a
         failure came back as `"__FALLBACK__"` — a string that is not a failure
         report but an instruction to escalate a tier.
@@ -250,7 +250,7 @@ class LatchConnection:
         leak nothing.
         """
         if self._closed:
-            raise LatchDisconnected("the extension is not connected")
+            raise DroverDisconnected("the extension is not connected")
 
         call_id = self._next_id
         self._next_id += 1
@@ -274,7 +274,7 @@ class LatchConnection:
             self._pending.pop(call_id, None)
 
         if not frame.get("ok"):
-            raise LatchCallError(
+            raise DroverCallError(
                 frame.get("code", proto.Err.INTERNAL),
                 str(frame.get("message", "")),
                 method=method,
@@ -295,7 +295,7 @@ class LatchConnection:
                     callback(frame)
                 except Exception as e:
                     # One bad subscriber must not take the transport down.
-                    logger.warning(f"[LATCH] event callback raised: {type(e).__name__}: {e}")
+                    logger.warning(f"[DROVER] event callback raised: {type(e).__name__}: {e}")
             return
         if kind == proto.Frame.PING:
             # Nothing to do and nothing to say. Its only job is to have been
@@ -303,7 +303,7 @@ class LatchConnection:
             # context from being suspended. Handled explicitly so it does not
             # land in the "unexpected frame" path and log every twenty seconds.
             return
-        logger.debug(f"[LATCH] ignoring unexpected frame type {kind!r}")
+        logger.debug(f"[DROVER] ignoring unexpected frame type {kind!r}")
 
     def close(self, reason: str = "closed") -> None:
         """Tear down, failing every call still waiting.
@@ -314,16 +314,16 @@ class LatchConnection:
         self._closed = True
         for call_id, future in list(self._pending.items()):
             if not future.done():
-                future.set_exception(LatchDisconnected(f"extension disconnected: {reason}"))
+                future.set_exception(DroverDisconnected(f"extension disconnected: {reason}"))
             self._pending.pop(call_id, None)
         self._event_callbacks.clear()
 
 
-class LatchDisconnected(RuntimeError):
+class DroverDisconnected(RuntimeError):
     """The extension is not connected, or went away mid-call."""
 
 
-class LatchCallError(RuntimeError):
+class DroverCallError(RuntimeError):
     """The extension answered with an error frame."""
 
     def __init__(self, code: int, message: str, *, method: str = "") -> None:
@@ -337,16 +337,16 @@ class LatchCallError(RuntimeError):
 # One process, one extension. Module-level rather than app-state because the
 # automation tier reaches for it and must not import the ASGI app to do so.
 
-_connection: LatchConnection | None = None
+_connection: DroverConnection | None = None
 
 #: Called whenever an extension connects. Push, not poll: a consumer that had
 #: to check periodically would miss events for up to its polling interval every
 #: time the browser restarted, and would spend the rest of the time asking a
 #: question whose answer had not changed.
-_on_connect: list[Callable[[LatchConnection], None]] = []
+_on_connect: list[Callable[[DroverConnection], None]] = []
 
 
-def on_connect(callback: Callable[[LatchConnection], None]) -> None:
+def on_connect(callback: Callable[[DroverConnection], None]) -> None:
     """Subscribe to connections. Idempotent -- the same callable registers once.
 
     Idempotent because the natural caller is an event source's `start()`, and
@@ -357,12 +357,12 @@ def on_connect(callback: Callable[[LatchConnection], None]) -> None:
         _on_connect.append(callback)
 
 
-def remove_connect_callback(callback: Callable[[LatchConnection], None]) -> None:
+def remove_connect_callback(callback: Callable[[DroverConnection], None]) -> None:
     if callback in _on_connect:
         _on_connect.remove(callback)
 
 
-def current_connection() -> LatchConnection | None:
+def current_connection() -> DroverConnection | None:
     return _connection if (_connection is not None and _connection.connected) else None
 
 
@@ -400,14 +400,14 @@ async def evict_if_dead(*, timeout: float = 2.0) -> bool:
         return False
     except Exception as e:
         logger.info(
-            f"[LATCH] evicting a connection that stopped answering "
+            f"[DROVER] evicting a connection that stopped answering "
             f"({type(e).__name__}); the slot is free"
         )
         unregister(conn, "stopped answering")
         return True
 
 
-def register(connection: LatchConnection) -> None:
+def register(connection: DroverConnection) -> None:
     global _connection
     _connection = connection
     for callback in list(_on_connect):
@@ -417,11 +417,11 @@ def register(connection: LatchConnection) -> None:
             # A subscriber that throws must not refuse the connection. The
             # socket is already up; what fails here is one consumer's wiring.
             logger.warning(
-                f"[LATCH] on-connect callback raised: {type(e).__name__}: {e}"
+                f"[DROVER] on-connect callback raised: {type(e).__name__}: {e}"
             )
 
 
-def unregister(connection: LatchConnection, reason: str = "closed") -> None:
+def unregister(connection: DroverConnection, reason: str = "closed") -> None:
     global _connection
     connection.close(reason)
     if _connection is connection:
@@ -429,7 +429,7 @@ def unregister(connection: LatchConnection, reason: str = "closed") -> None:
 
 
 @dataclass(frozen=True)
-class LatchState:
+class DroverState:
     """What the affordance snapshot and the router ask about.
 
     Mirrors the shape the removed `cdp_state_snapshot()` had, because the same
@@ -443,11 +443,11 @@ class LatchState:
     protocol_version: int = 0
 
 
-def latch_state_snapshot() -> LatchState:
+def drover_state_snapshot() -> DroverState:
     conn = current_connection()
     if conn is None:
-        return LatchState(connected=False)
-    return LatchState(
+        return DroverState(connected=False)
+    return DroverState(
         connected=True,
         browser_name=conn.browser_name,
         extension_version=conn.extension_version,

@@ -667,15 +667,15 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # anything — so it holds no device credential and there is nothing for the
     # capability machinery to decide. Two auth systems that never touch beat one
     # that half-shares a door.
-    @app.websocket("/latch")
-    async def latch(websocket: WebSocket) -> None:
+    @app.websocket("/drover")
+    async def drover(websocket: WebSocket) -> None:
         import json
 
         from .extension_ws import (
-            LatchConnection, evaluate_handshake, evict_if_dead, is_occupied,
+            DroverConnection, evaluate_handshake, evict_if_dead, is_occupied,
             read_token, register, unregister,
         )
-        from ...core import latch_protocol as latch_proto
+        from ...core import drover_protocol as drover_proto
 
         async def _close_quietly(code: int = 1008) -> None:
             """Close, tolerating a socket the client already dropped.
@@ -693,7 +693,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
 
         origin_header = websocket.headers.get("origin")
         logger.info(
-            f"[LATCH] connection attempt: origin={origin_header!r} "
+            f"[DROVER] connection attempt: origin={origin_header!r} "
             f"server={websocket.scope.get('server')} "
             f"registry={app.state.listener_policies}"
         )
@@ -717,14 +717,14 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             first = json.loads(await websocket.receive_text())
         except Exception as e:
             logger.warning(
-                f"[LATCH] first frame was unreadable ({type(e).__name__}: {e}); "
+                f"[DROVER] first frame was unreadable ({type(e).__name__}: {e}); "
                 f"closing"
             )
             await _close_quietly()
             return
 
         logger.info(
-            f"[LATCH] hello received: browser={first.get('browser')!r} "
+            f"[DROVER] hello received: browser={first.get('browser')!r} "
             f"protocol={first.get('protocolVersion')!r} "
             f"digest={str(first.get('domQuerySha256'))[:12]}... "
             f"token_present={bool(first.get('token'))}"
@@ -746,11 +746,11 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         )
         if not verdict.ok:
             logger.warning(
-                f"[LATCH] refused: {verdict.reason} (code={verdict.code})"
+                f"[DROVER] refused: {verdict.reason} (code={verdict.code})"
             )
             try:
                 await websocket.send_text(json.dumps({
-                    "type": latch_proto.Frame.REJECT,
+                    "type": drover_proto.Frame.REJECT,
                     "code": verdict.code,
                     "reason": verdict.reason,
                 }))
@@ -761,16 +761,16 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             await _close_quietly()
             return
 
-        connection = LatchConnection(
+        connection = DroverConnection(
             send_json=lambda frame: websocket.send_text(json.dumps(frame)),
             browser_name=str(first.get("browser", "other")),
             protocol_version=int(first.get("protocolVersion", 0)),
             extension_version=str(first.get("extensionVersion", "")),
         )
         register(connection)
-        await websocket.send_text(json.dumps({"type": latch_proto.Frame.WELCOME}))
+        await websocket.send_text(json.dumps({"type": drover_proto.Frame.WELCOME}))
         logger.info(
-            f"[LATCH] connected: browser={connection.browser_name!r} "
+            f"[DROVER] connected: browser={connection.browser_name!r} "
             f"version={connection.extension_version!r}"
         )
 
@@ -816,7 +816,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             # `is_occupied()` refuse the extension's own reconnect, and nothing
             # ever clears it.
             unregister(connection, reason)
-            logger.info(f"[LATCH] disconnected: {reason}")
+            logger.info(f"[DROVER] disconnected: {reason}")
 
     # FastAPI's schema builder has no representation for a WebSocketRoute --
     # it is skipped entirely, sweep and all. test_api_events.py's own

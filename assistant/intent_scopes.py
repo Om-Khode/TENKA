@@ -32,8 +32,8 @@ def _get_browser_driver_available() -> bool:
     browser is drivable.
     """
     try:
-        from .io.api.extension_ws import latch_state_snapshot
-        return latch_state_snapshot().connected
+        from .io.api.extension_ws import drover_state_snapshot
+        return drover_state_snapshot().connected
     except Exception:
         return False
 

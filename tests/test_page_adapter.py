@@ -1,10 +1,10 @@
 """
-test_page_adapter.py — Latch Task 1: the PageAdapter/LocatorAdapter seam.
+test_page_adapter.py — Drover Task 1: the PageAdapter/LocatorAdapter seam.
 
 The DOM tier touches a Playwright ``Page`` in exactly three places
 (``dom.py:972`` ``url``, ``:979`` ``evaluate``, ``:1055`` ``locator``) and a
 ``Locator`` through nine methods. This file pins that seam so a second
-implementation — the Latch extension — can satisfy it without the tier
+implementation — the Drover extension — can satisfy it without the tier
 noticing.
 
 What is tested:
@@ -208,7 +208,7 @@ class TestPageForwarding(unittest.TestCase):
     def test_locator_forwards_selector_verbatim(self):
         rec = _Recorder()
         page = PlaywrightPage(_FakePage(rec))
-        sel = "[data-latch-idx='7']"
+        sel = "[data-drover-idx='7']"
         page.locator(sel)
         name, args, _ = rec.only()
         self.assertEqual(name, "locator")
@@ -216,7 +216,7 @@ class TestPageForwarding(unittest.TestCase):
 
     def test_locator_returns_a_locator_adapter(self):
         page = PlaywrightPage(_FakePage(_Recorder()))
-        self.assertIsInstance(page.locator("[data-latch-idx='0']"), LocatorAdapter)
+        self.assertIsInstance(page.locator("[data-drover-idx='0']"), LocatorAdapter)
 
     def test_url_reads_through_to_the_wrapped_page_live(self):
         inner = _FakePage(_Recorder())
