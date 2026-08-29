@@ -1846,3 +1846,63 @@ The five fixtures are now committed and the file passes 16/16 against real
 Chromium. It takes ~104 seconds, which is most of why it is easy to leave
 unrun; it is the only coverage that exercises the JS query against a real DOM
 rather than against canned JSON.
+
+
+---
+
+## KI-44: ESC during one-shot TTS can kill the process silently
+
+**Severity:** Medium. **Status:** open, root cause identified but not proven by
+repro.
+
+**Symptom.** Holding ESC to interrupt a long spoken reply ended the process. No
+traceback, no `Voice Assistant shut down`, nothing after
+`[abort] requested: esc_hold` in the log. The window simply closed.
+
+**The mechanism, and it is written down in the code that has it.**
+`io/audio/streaming.py`'s module docstring states the design:
+
+> Barge-in: `stop_streaming()` sets a `threading.Event` that the audio player
+> polls — `sd.stop()` is called from the SAME thread as `sd.play()`, avoiding
+> concurrent PortAudio access.
+
+`stop_streaming()` then calls `sd.stop()` directly at the end of its body. The
+comment above that line says why — the one-shot `tts.speak` path queues audio
+through `sounddevice.play()` and never polls the event, so ESC could not
+silence small talk, nudges or reminders without it.
+
+That fixed a real problem and reintroduced the exact hazard the docstring
+exists to prevent. The call chain is:
+
+```
+cv1-esc-monitor thread
+  -> abort.request_abort("esc_hold")
+  -> subscribers run ON THAT THREAD
+  -> stop_streaming()
+  -> sd.stop()          # while the player thread is inside sd.play()
+```
+
+PortAudio is not thread-safe. A cross-thread stop during active playback can
+abort the process natively, which is precisely a death with no Python traceback
+and no shutdown log.
+
+**Not proven.** A silent process death has other possible causes, and this has
+been reproduced once, by accident. What makes it the leading candidate is that
+the file already documents the rule being broken, and the symptom is the exact
+shape a native abort produces.
+
+**Shape of a fix, not a prescription.** The one-shot path needs the same
+polled-event treatment the streaming path has, so `sd.stop()` is only ever
+called from the thread that called `sd.play()`. That means the one-shot player
+has to own a loop it can be interrupted from, rather than handing a buffer to
+`sounddevice.play()` and walking away.
+
+**Found** while testing the browser extension: a `browser_tabs` reply recited
+every tab title and produced 37 seconds of audio, and holding ESC to stop it is
+what triggered this. That reply is capped now (`_MAX_SPOKEN_TABS`), which
+removes one way to reach the hazard and none of the hazard.
+
+**Related, and worth stating as a rule rather than an anecdote:** a spoken reply
+long enough that the only way to stop it is the abort key is a reply that puts
+users on the most dangerous path in the system. The project rule -- TTS under
+120 characters -- is not about politeness.

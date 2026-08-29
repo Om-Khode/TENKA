@@ -101,12 +101,52 @@ def test_it_does_not_pretend_a_bundled_browser_would_do(handler, disconnected):
 # ─── list ────────────────────────────────────────────────────────────────
 
 
-def test_list_names_every_tab_and_marks_the_active_one(handler, connected):
+def test_list_gives_the_count_and_the_active_tab(handler, connected):
     msg = _run(handler({"action": "list"}))
     assert "3 tabs open" in msg
-    for title in ("Inbox — Mail", "Rust Tutorial — YouTube", "Docs"):
-        assert title in msg
     assert "you're on Rust Tutorial — YouTube" in msg
+
+
+def test_list_names_the_others_when_there_are_few(handler, connected):
+    msg = _run(handler({"action": "list"}))
+    assert "Inbox — Mail" in msg
+    assert "Docs" in msg
+
+
+def test_a_long_tab_list_is_summarised_rather_than_recited():
+    """Every reply here is SPOKEN.
+
+    The first version read all seven titles aloud: thirty-seven seconds of
+    audio, which the operator stopped by holding ESC — the only way to
+    interrupt it. A reply nobody can interrupt politely is one that makes
+    people reach for the abort key.
+    """
+    from assistant.actions.browser_tabs import _MAX_SPOKEN_TABS
+
+    many = [
+        {"id": i, "title": f"A rather long tab title number {i}",
+         "url": f"https://s{i}.invalid/", "active": i == 0, "windowId": 1}
+        for i in range(12)
+    ]
+    conn = FakeConnection(tabs=many)
+
+    import assistant.io.api.extension_ws as m
+    original = m.current_connection
+    m.current_connection = lambda: conn
+    try:
+        from assistant.actions.browser_tabs import handle_browser_tabs
+        msg = _run(handle_browser_tabs({"action": "list"}))
+    finally:
+        m.current_connection = original
+
+    assert "12 tabs open" in msg
+    assert "and 7 more" in msg, f"the rest were not summarised: {msg!r}"
+    # The active tab is named in the header, plus _MAX_SPOKEN_TABS others.
+    assert msg.count("A rather long tab title") == _MAX_SPOKEN_TABS + 1
+    assert len(msg) < 300, (
+        f"the spoken reply is {len(msg)} characters. The project rule is under "
+        f"120 where it can be; long replies become audio nobody can stop."
+    )
 
 
 def test_list_is_the_default_action(handler, connected):

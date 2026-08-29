@@ -34,6 +34,13 @@ logger = logging.getLogger("actions")
 #: what nothing else can do -- seeing and steering tabs that already exist.
 _ACTIONS = ("list", "close", "switch")
 
+#: How many other tabs to name aloud before summarising the rest.
+#:
+#: Every reply from this handler is spoken. Four titles plus the active one is
+#: roughly ten seconds; naming all of them produced thirty-seven, which is long
+#: enough that the only way to stop it is the abort key.
+_MAX_SPOKEN_TABS = 4
+
 
 def _score(tab: dict, query: str) -> int:
     """How well this tab matches what the user said. 0 means not at all.
@@ -115,13 +122,27 @@ async def handle_browser_tabs(
             if not tabs:
                 return await _reply("No tabs open.")
             active = next((t for t in tabs if t.get("active")), None)
-            lines = [
-                f"{'* ' if t is active else '  '}{_describe(t)}" for t in tabs
-            ]
+
+            # Named, then capped. Every reply here is SPOKEN, and the project
+            # rule is under 120 characters for exactly this reason: the first
+            # version read every title aloud and produced 37 seconds of audio
+            # for seven tabs. The operator held ESC to stop it, which is how
+            # this got found — a reply nobody can interrupt politely is one
+            # that makes people reach for the abort key.
             head = f"{len(tabs)} tab{'s' if len(tabs) != 1 else ''} open"
             if active is not None:
                 head += f", you're on {_describe(active)}"
-            return await _reply(head + ":\n" + "\n".join(lines))
+
+            others = [t for t in tabs if t is not active]
+            if not others:
+                return await _reply(head + ".")
+
+            shown = [_describe(t) for t in others[:_MAX_SPOKEN_TABS]]
+            rest = len(others) - len(shown)
+            tail = ", ".join(shown)
+            if rest > 0:
+                tail += f", and {rest} more"
+            return await _reply(f"{head}. Also: {tail}.")
 
         # close / switch both need exactly one tab.
         if not query:
