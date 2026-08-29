@@ -1,0 +1,8 @@
+# The DOM query JS is compared byte-for-byte against the Latch extension's copy
+# via SHA-256 at the WebSocket handshake. git's autocrlf would rewrite its line
+# endings on checkout, changing the digest with no code change involved -- the
+# handshake would then refuse every connection on a fresh clone, for a reason
+# nobody would think to look for. Marking it binary stops git touching the bytes.
+# The extension repo carries the matching rule; one side alone is not enough.
+assistant/automation/browser/vendor/dom_query.js binary
+assistant/automation/browser/vendor/dom_query.sha256 binary
