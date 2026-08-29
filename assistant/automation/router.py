@@ -1330,6 +1330,7 @@ async def _execute_browser_task(goal: str, llm_func, *, _from_planner: bool = Fa
     try:
         response = await _maybe_await(llm_func, prompt, task_type="intent", system_prompt=_plan_system, max_tokens=500)
     except Exception as e:
+        _reraise_if_user_aborted(e)
         logger.error(f"[DA] Browser LLM plan failed: {e}")
         return "__FALLBACK__"
 
@@ -1419,6 +1420,7 @@ async def _execute_browser_task(goal: str, llm_func, *, _from_planner: bool = Fa
                     logger.debug(f"[DA] Cache save failed (non-fatal): {e}")
             return res
         except Exception as e:
+            _reraise_if_user_aborted(e)
             logger.error(f"[DA] Two-pass run failed: {e}")
             return "__FALLBACK__"
 
@@ -1433,6 +1435,7 @@ async def _execute_browser_task(goal: str, llm_func, *, _from_planner: bool = Fa
                 logger.debug(f"[DA] Cache save failed (non-fatal): {e}")
         return res
     except Exception as e:
+        _reraise_if_user_aborted(e)
         logger.error(f"[DA] run_browser_steps failed: {e}")
         return "__FALLBACK__"
 
@@ -1487,6 +1490,32 @@ _APP_TARGET_STOP_WORDS = frozenset({
     "it", "that", "this", "now", "here", "them", "all", "mode",
     "field", "form", "input", "textbox", "box",
 })
+
+
+
+def _reraise_if_user_aborted(e: BaseException) -> None:
+    """Let a user's abort past a handler that would return `__FALLBACK__`.
+
+    KI-36/KI-39. `"__FALLBACK__"` is not an error string -- it is an
+    instruction to escalate to a more expensive tier. So a handler that
+    swallows `UserAborted` into it does not merely lose the abort, it
+    *re-triggers work*: the vision loop starts, TTS says "Working on it",
+    terminal windows are minimized and a vision call is billed, all while the
+    user is holding the key that means stop.
+
+    Nine broad handlers in this module return that sentinel. Two were guarded
+    by hand -- one on the type-shortcut path after the bug bit there, one on
+    the DOM path after it bit again -- and the other seven were not. Copying
+    the rule a ninth time is how it stays six-of-nine correct, so it lives here
+    once, and `tests/test_router_never_swallows_abort.py` fails on a handler
+    that returns the sentinel without calling it.
+
+    `.claude/rules/automation.md`: never swallow `UserAborted` into a string
+    error, and a sentinel counts as a string.
+    """
+    from assistant.core.abort import UserAborted
+    if isinstance(e, UserAborted):
+        raise e
 
 
 def _extract_target_app(goal: str) -> tuple[Optional[str], str]:
@@ -1725,12 +1754,7 @@ async def _execute_native_task(goal: str, llm_func) -> str:
                 logger.info(f"[DA] Type-shortcut completed: {res[:120]}")
                 return res
             except Exception as e:
-                # never swallow a user abort into a fallback path —
-                # that re-triggers computer_task / TTS / vision while the
-                # user is trying to stop everything.
-                from assistant.core.abort import UserAborted
-                if isinstance(e, UserAborted):
-                    raise
+                _reraise_if_user_aborted(e)
                 logger.error(f"[DA] Type-shortcut failed: {e}")
                 return "__FALLBACK__"
         else:
@@ -1767,6 +1791,7 @@ async def _execute_native_task(goal: str, llm_func) -> str:
     try:
         response = await _maybe_await(llm_func, prompt, task_type="intent", system_prompt=_plan_system, max_tokens=500)
     except Exception as e:
+        _reraise_if_user_aborted(e)
         logger.error(f"[DA] App LLM plan failed: {e}")
         return "__FALLBACK__"
 
@@ -1824,6 +1849,7 @@ async def _execute_native_task(goal: str, llm_func) -> str:
                 logger.debug(f"[DA] Cache save failed (non-fatal): {e}")
         return res
     except Exception as e:
+        _reraise_if_user_aborted(e)
         logger.error(f"[DA] run_app_steps failed: {e}")
         return "__FALLBACK__"
 
@@ -1972,6 +1998,7 @@ async def _execute_dom_task(
     try:
         from .browser import cdp as browser_cdp, dom_orchestrator as browser_dom_orchestrator
     except Exception as e:
+        _reraise_if_user_aborted(e)
         logger.warning(f"[DA] DOM-mode imports failed: {e}")
         return "__FALLBACK__"
 
@@ -1979,6 +2006,7 @@ async def _execute_dom_task(
     try:
         handle = await browser_cdp.get_or_attach_browser(prefer_cdp=True)
     except Exception as e:
+        _reraise_if_user_aborted(e)
         logger.warning(f"[DA] DOM-mode attach raised: {type(e).__name__}: {e}")
         return "__FALLBACK__"
 
@@ -2021,26 +2049,7 @@ async def _execute_dom_task(
         else:
             result = await browser_dom_orchestrator.run_dom_task(goal, target_page)
     except Exception as e:
-        # never swallow a user abort into a fallback path —
-        # that re-triggers computer_task / TTS / vision while the
-        # user is trying to stop everything.
-        #
-        # The same guard sits on the type-shortcut path above, with the same
-        # comment, because that path had the same bug and it was fixed there
-        # first. `dom_executor.execute_dom_batch` raises `UserAborted` at every
-        # action boundary and the orchestrator deliberately lets it through, so
-        # without this line an ESC held mid-batch became `__FALLBACK__` — which
-        # is not an error string but an instruction to escalate a tier. It cost
-        # a false "crashed" log, a spoken "Working on it: <goal>", the user's
-        # terminal windows minimized, and one paid vision call in
-        # `_generate_initial_todos`, before `agent.py`'s first abort check
-        # finally stopped it. `da_handlers.handle_computer_task` already
-        # re-raises `UserAborted` around this call and answers it with
-        # "Stopped." at the handler level; the receiving end was built, and
-        # this was the one hole that stopped the abort from reaching it.
-        from assistant.core.abort import UserAborted
-        if isinstance(e, UserAborted):
-            raise
+        _reraise_if_user_aborted(e)
         logger.error(f"[DA] DOM-mode orchestrator crashed: {type(e).__name__}: {e}")
         return "__FALLBACK__"
 

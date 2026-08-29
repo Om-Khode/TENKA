@@ -454,9 +454,41 @@ async def run_browser_steps(steps: List[Dict], *, _from_planner: bool = False, h
             _planner_page = None
             _planner_context = None
 
+        # Before the launch, not only between steps. `ensure_browser` starts a
+        # Chromium process, and starting one for a task the user has already
+        # cancelled is the same waste as the vision call that made KI-36 worth
+        # filing -- just earlier and more visible, since a browser window
+        # appears. The first version of this fix checked only inside the loop,
+        # and its own test caught the launch.
+        from ...core.abort import abort as _abort, UserAborted as _UserAborted
+        if _abort.is_aborted():
+            logger.info("[BROWSER] Aborted before launching the browser")
+            raise _UserAborted(_abort.reason or "esc_hold")
+
         browser = await ensure_browser(headless=headless)
 
         for i, step in enumerate(steps):
+            # KI-36. The abort boundary this tier did not have.
+            #
+            # `handle_browser_action` checks `abort.is_aborted()` once, on the
+            # way in, and nothing looked again -- so ESC held after the handler
+            # was entered was ignored for the rest of the task. Observed live:
+            # the abort was requested at 21:58:47, a navigation ran at 21:58:50,
+            # a vision call was billed at 21:58:57, and the tier reported
+            # **success**. The user pressed stop and was charged for a model
+            # call afterwards.
+            #
+            # Between steps, matching `native.py:run_app_steps`, which has had
+            # this check for a while: the sibling tier honoured the contract and
+            # this one did not, which is what made it a defect rather than a
+            # design. Raising rather than returning a string is the other half
+            # -- `_execute_browser_task` turns a returned error into
+            # `"__FALLBACK__"`, which escalates a tier instead of stopping.
+            from ...core.abort import abort, UserAborted
+            if abort.is_aborted():
+                logger.info(f"[BROWSER] Aborted before step {i+1}")
+                raise UserAborted(abort.reason or "esc_hold")
+
             action = step.get("action")
             params = step.get("params", {})
             verify_step = {"type": "browser", "action": action, "params": params}
@@ -663,6 +695,12 @@ async def run_browser_steps(steps: List[Dict], *, _from_planner: bool = False, h
         return "\n".join(results)
 
     except Exception as e:
+        # Never into a string. `native.py:run_app_steps` carries the same guard
+        # with the same reasoning: the planner must see an abort as an abort and
+        # stop, not as a step that failed and might be worth recovering from.
+        from ...core.abort import UserAborted
+        if isinstance(e, UserAborted):
+            raise
         logger.exception(f"[BROWSER] Run steps error: {type(e).__name__}: {e}")
         return f"Error running steps: {e}\nCompleted so far: " + "\n".join(results)
     finally:

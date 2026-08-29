@@ -317,6 +317,7 @@ has looked at, and it blocks the next phase.
 | `test_resolve_running_main.py` | GREEN | 6 | 0 | 0 | 0 | 1.1 |
 | `test_resolve_running_main_subprocess.py` | GREEN | 1 | 0 | 0 | 0 | 0.7 |
 | `test_router_content_verb_routing.py` | GREEN | 33 | 0 | 0 | 0 | 0.6 |
+| `test_router_never_swallows_abort.py` | GREEN | 13 | 0 | 0 | 0 | 0.5 |
 | `test_routing_overclaim.py` | GREEN | 54 | 0 | 0 | 0 | 1.0 |
 | `test_routing_trace.py` | EMPTY | 0 | 0 | 0 | 0 | 0.5 |
 | `test_runtime_config.py` | GREEN | 69 | 0 | 0 | 8 | 5.4 |
