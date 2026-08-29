@@ -1720,3 +1720,82 @@ hook refuses an amend there, both correctly.
 The full reasoning is on `fix/window-target-resolution` at `a2fc481`, which is
 not deleted — branches never are here, and this is one of the reasons why. Read
 that commit, not `734e7f9`'s title.
+
+
+---
+
+## KI-40: The handler-resolution sweep is red on `main`
+
+**Severity:** Low. **Status:** open, and not caused by the change that found it.
+
+`tests/test_6a5_api_fixes.py` asserts, from the AST, that exactly one site in
+the tree calls `tool_registry.get` — the premise being that `actions/__init__.py`
+is the only place a handler is resolved, so there is one place the capability
+gate has to sit (`.claude/rules/security.md`).
+
+There are three. `543ed2d` (2026-08-27, on `main`) added two more in
+`brain/selfknowledge.py`, which resolves handlers to read their docstrings when
+TENKA describes what she can do.
+
+**The gate is not bypassed.** `selfknowledge` reads `inspect.getdoc(handler)`
+and never calls one, so nothing dispatches around
+`actions.capability_refusal()`. What is wrong is the sweep's premise as written,
+and a structural security test that has been red for two days is one nobody is
+reading.
+
+Two ways out, and it needs a decision rather than a quiet re-number:
+
+1. Narrow the sweep to *calls* of a resolved handler rather than resolutions of
+   one, which is the property that actually matters.
+2. Exempt `selfknowledge` by name, with the argument written down — cheaper, and
+   it decays the first time someone adds a third reader.
+
+`tests/BASELINE.md` still records that file GREEN, so the ledger is stale for it
+too. Found while removing the CDP tier; the sweep was already failing before
+that work began, which is exactly what the ledger exists to let one prove.
+
+---
+
+## KI-41: The extension's credential is a loopback bearer token on disk
+
+**Severity:** Low, accepted, recorded so it is a decision rather than an
+oversight.
+
+The browser extension authenticates with a token stored in
+`~/.tenka/extension_token.json` and in the browser profile. Any process running
+as the user can read either, and any local process can reach the loopback port.
+
+**Accepted because the door opens onto an empty room.** The extension listener's
+capability ceiling is empty, so a stolen token grants zero intent authority —
+every HTTP route on that port refuses, and the socket speaks a vocabulary with
+no intents in it. What a thief gets is the ability to drive the browser, on a
+machine where they are already running as the user and could drive it directly.
+
+It is also strictly better than what it replaces: the CDP debug port accepted
+any local client with no token at all.
+
+Revisit if the extension listener is ever given a non-empty ceiling. That change
+is what would turn this from a low into something else.
+
+---
+
+## KI-42: Screenshots through the extension are viewport-only
+
+**Severity:** Low, accepted.
+
+`tabs.captureVisibleTab` captures the visible viewport of the **active** tab and
+has no full-page mode. A capture naming a non-active tab is refused rather than
+served a picture of whatever the user is looking at — and deliberately not
+worked around by activating the tab first, which would move the user's focus to
+satisfy a read.
+
+The bundled Chromium path still does full-page capture, so the capability is not
+gone from the system; it is gone from the driver that uses the user's own
+browser. Recorded because it is the one place the extension tier is worse than
+the CDP tier it replaced.
+
+**Related:** the DuckDuckGo browser is unreachable by *any* browser-tier
+mechanism — it supports no extensions and, being WebView2-based, exposes no
+debug port. It falls to the Terminator and vision tiers like any other opaque
+native window. Not a regression; recorded because a reader will otherwise assume
+a Chromium-ish browser is covered.

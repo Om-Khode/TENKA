@@ -9,6 +9,13 @@ revert-and-rerun to attribute; this answers it in a second.
 - files: **304**
 - wall time, sequential: **~13.1 min**
 
+> **Partially stale, 2026-08-29.** The Latch tier removed five files and added
+> nine; the rows below were edited by hand for those, and `test_6a5_api_fixes.py`
+> was corrected from GREEN to RED (KI-40 — it has been failing on `main` since
+> `543ed2d` on 2026-08-27, which is exactly the attribution this ledger exists
+> to make provable). The summary counts have NOT been recomputed. Re-run
+> `scripts/baseline.py` on an idle machine to rebuild it properly.
+
 | status | files |
 | --- | --- |
 | GREEN | 264 |
@@ -51,7 +58,6 @@ has looked at, and it blocks the next phase.
 | `test_computer_task_p3_button_hint.py` | RED | 3 | 0 | _unexplained_ |
 | `test_computer_task_p4_intent_config.py` | RED | 4 | 0 | _unexplained_ |
 | `test_context_compression.py` | RED | 8 | 0 | _unexplained_ |
-| `test_da_tab_selection.py` | RED | 1 | 0 | _unexplained_ |
 | `test_da_target_app.py` | EMPTY | 0 | 0 | _unexplained_ |
 | `test_da_url_routing.py` | EMPTY | 0 | 0 | _unexplained_ |
 | `test_debug_log_fixes.py` | RED | 3 | 0 | _unexplained_ |
@@ -85,7 +91,7 @@ has looked at, and it blocks the next phase.
 | `test_4a_whatsapp.py` | GREEN | 18 | 0 | 0 | 0 | 10.9 |
 | `test_4b_computer_task_polish.py` | GREEN | 14 | 0 | 0 | 0 | 0.6 |
 | `test_4c_app_not_running.py` | GREEN | 22 | 0 | 0 | 0 | 0.6 |
-| `test_6a5_api_fixes.py` | GREEN | 32 | 0 | 0 | 0 | 3.5 |
+| `test_6a5_api_fixes.py` | RED | 32 | 1 | 0 | 0 | 6.1 |
 | `test_6a5_fence_leaks.py` | GREEN | 54 | 0 | 0 | 0 | 9.8 |
 | `test_6a5_predispatch_gate.py` | GREEN | 37 | 0 | 0 | 0 | 12.3 |
 | `test_6b_host_scoping.py` | GREEN | 16 | 0 | 0 | 0 | 2.2 |
@@ -156,8 +162,6 @@ has looked at, and it blocks the next phase.
 | `test_brain_executor.py` | GREEN | 20 | 0 | 0 | 0 | 0.7 |
 | `test_brain_turn.py` | GREEN | 12 | 0 | 0 | 0 | 0.7 |
 | `test_brain_turn_pipeline.py` | GREEN | 16 | 0 | 0 | 0 | 2.1 |
-| `test_browser_cdp.py` | GREEN | 24 | 0 | 0 | 0 | 0.8 |
-| `test_browser_cdp_setup_hook.py` | GREEN | 44 | 0 | 0 | 0 | 1.0 |
 | `test_browser_dom.py` | GREEN | 49 | 0 | 0 | 0 | 0.7 |
 | `test_browser_dom_executor.py` | GREEN | 43 | 0 | 0 | 0 | 0.9 |
 | `test_browser_dom_integration.py` | SKIPPED | 0 | 0 | 0 | 16 | 0.6 |
@@ -165,7 +169,6 @@ has looked at, and it blocks the next phase.
 | `test_browser_dom_planner.py` | GREEN | 41 | 0 | 0 | 0 | 1.1 |
 | `test_browser_names_dedup.py` | RED | 8 | 1 | 0 | 0 | 0.6 |
 | `test_browser_routing.py` | GREEN | 50 | 0 | 0 | 0 | 0.9 |
-| `test_browser_setup.py` | GREEN | 30 | 0 | 0 | 0 | 1.4 |
 | `test_canvas_apps_are_data.py` | GREEN | 41 | 0 | 0 | 0 | 0.9 |
 | `test_ce_dyn.py` | GREEN | 75 | 0 | 0 | 0 | 6.5 |
 | `test_channel_registry.py` | RED | 0 | 3 | 0 | 0 | 0.6 |
@@ -182,7 +185,6 @@ has looked at, and it blocks the next phase.
 | `test_context_profiles.py` | GREEN | 35 | 0 | 0 | 0 | 0.6 |
 | `test_core_runtime_config.py` | GREEN | 8 | 0 | 0 | 0 | 0.6 |
 | `test_create_note_never_truncates.py` | GREEN | 12 | 0 | 0 | 0 | 0.9 |
-| `test_da_tab_selection.py` | RED | 24 | 1 | 0 | 0 | 0.7 |
 | `test_da_target_app.py` | EMPTY | 0 | 0 | 0 | 0 | 0.6 |
 | `test_da_url_routing.py` | EMPTY | 0 | 0 | 0 | 0 | 0.6 |
 | `test_daemon_deps.py` | GREEN | 2 | 0 | 0 | 0 | 1.0 |
@@ -391,4 +393,3 @@ has looked at, and it blocks the next phase.
 | `test_weak_procedure_match.py` | GREEN | 25 | 0 | 0 | 0 | 2.8 |
 | `test_window_target_resolution.py` | GREEN | 8 | 0 | 0 | 0 | 0.3 |
 | `test_typing_honours_its_target.py` | GREEN | 9 | 0 | 0 | 0 | 2.1 |
-| `test_cdp_owner_is_a_browser.py` | GREEN | 39 | 0 | 0 | 0 | 0.4 |
