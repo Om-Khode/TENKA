@@ -176,6 +176,42 @@ POLICIES: dict[str, ListenerPolicy] = {
         raisable=frozenset(),
         pairable=True,
     ),
+    # The browser extension's WebSocket. Loopback only, and the most closed
+    # listener in this table: it grants nothing, mints nothing, and administers
+    # nothing.
+    #
+    # The reason it can be this narrow is a direction argument. The extension
+    # is a **target, not a principal** -- TENKA drives it; it never asks TENKA
+    # to run an intent. Nothing it sends is a request for capability, so there
+    # is no capability for a ceiling to permit. An empty `ceiling` is therefore
+    # not a restriction on something that wanted more; it is the accurate
+    # description of a transport that carries commands outward and reports
+    # inward.
+    #
+    # What follows from that is the part worth stating: a stolen extension
+    # token grants **zero intent authority**. It is not a weakened session --
+    # every HTTP route on this port refuses, because `effective()` intersects
+    # the device's grants with an empty set and gets an empty set. The only
+    # thing the token opens is the WebSocket endpoint, which authenticates it
+    # in the protocol's own `hello` frame and speaks a vocabulary with no
+    # intents in it.
+    #
+    # `allow_bearer=False` and `pairable=False` for the same reason, and both
+    # are tighter than the first draft of the spec: the extension's credential
+    # is minted out of band by `browser_extension_setup` and pasted into the
+    # popup by the operator, so no pairing route needs to answer here, and the
+    # API's bearer machinery is never consulted -- the WS endpoint checks the
+    # token itself. Two auth systems that never touch are easier to reason
+    # about than one that half-shares.
+    "extension": ListenerPolicy(
+        name="extension",
+        admin=False,
+        allow_bearer=False,
+        secure_cookie=False,   # plain http on loopback; there is no TLS to require
+        ceiling=frozenset(),
+        raisable=frozenset(),
+        pairable=False,
+    ),
     # The Cloudflare quick tunnel that used to stand here (`quick`) was
     # removed in Milestone 6b, not narrowed: no device could ever
     # authenticate over it. Pairing was refused on it outright (spec §5.5--

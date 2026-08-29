@@ -51,9 +51,14 @@ def test_a_browser_setting_survives_too(db_at, monkeypatch):
     from assistant import config
     from assistant.storage.repos.settings import SettingsRepo
 
-    monkeypatch.setattr(config, "BROWSER_CDP_PORT", 9222, raising=False)
-    SettingsRepo(db_at.get_db()).set("browser_cdp_port", 9333, source="user")
+    monkeypatch.setattr(config, "BROWSER_EXTENSION_RPC_TIMEOUT", 30.0, raising=False)
+    SettingsRepo(db_at.get_db()).set("browser_extension_rpc_timeout", 12.5, source="user")
 
     config.reload_runtime_settings()
 
-    assert config.BROWSER_CDP_PORT == 9333
+    assert config.BROWSER_EXTENSION_RPC_TIMEOUT == 12.5, (
+        "a browser setting written by the user did not reach the module "
+        "constant. reload_runtime_settings() has to name every key it reloads, "
+        "and a new setting added without a line there is one the Studio UI can "
+        "appear to change while nothing reads the change."
+    )

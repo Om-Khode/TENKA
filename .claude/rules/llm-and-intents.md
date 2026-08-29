@@ -38,26 +38,35 @@ Deterministic paths that already exist and must not be replaced by an LLM call:
 
 ## Intents
 
-`config.INTENTS` is the single source of truth (38 entries); `ALLOWED_INTENTS = set(INTENTS)`
+`config.INTENTS` is the single source of truth (40 entries); `ALLOWED_INTENTS = set(INTENTS)`
 is the policy whitelist.
 
 ```
 small_talk, unknown, create_note, open_browser, get_time, computer_task, read_screen,
-find_and_click, code_executor, memory_query, start_recording, stop_recording,
-get_recording, summarize_recording, web_search, browse_url, file_task, set_reminder,
-cancel_reminder, hide_avatar, show_avatar, meet_face, recognize_face, forget_face,
-camera_look, planner, manage_shortcut, manage_procedure, manage_schedule,
-manage_monitor, manage_backup, enroll_voice, forget_voice, browser_cdp_setup, store_memory,
-forget_memory, shutdown, manifest_dispatch
+find_and_click, code_executor, memory_query, start_recording, stop_recording, get_recording,
+summarize_recording, web_search, browse_url, file_task, set_reminder, cancel_reminder,
+hide_avatar, show_avatar, meet_face, recognize_face, forget_face, camera_look, planner,
+manage_shortcut, manage_procedure, manage_schedule, manage_monitor, manage_backup,
+enroll_voice, forget_voice, browser_extension_setup, browser_tabs, store_memory,
+forget_memory, shutdown, manifest_dispatch, self_knowledge
 ```
 
 `browser_action` and `app_action` are registered handlers but **internal routing targets** —
 correctly absent from `INTENTS`, reached only from an intent that already passed the gate.
 
-**Adding an intent touches four places in sync:** `config.INTENTS`, the intent system
-prompt's catalogue (also `config.py`), `TENKA_Capabilities.md`, and
-`core/intent_capabilities.py`. The fourth is required by the fail-closed default — an
-unclassified intent requires `EXECUTE` and is refused over every transport.
+**Adding an intent touches five places in sync:** `config.INTENTS`, the intent system
+prompt's catalogue (also `config.py`), `TENKA_Capabilities.md`,
+`core/intent_capabilities.py` — **twice**: `REQUIRED_CAPABILITY`, and exactly one of
+`PERSISTS_AUTHORITY` / `TRANSIENT_AUTHORITY` — and `core/intent_scopes.py` when the intent
+only makes sense in one scope. The capability entries are required by the fail-closed
+default: an unclassified intent requires `EXECUTE` and is refused over every transport, and
+the authority pair is exhaustive with no default in either direction.
+
+**A new row competes with the ones already there.** `browser_tabs` first claimed an `open`
+action; `open_browser` already opened a URL in the user's default browser, so two rows
+described one request and the classifier picked neither — sending "open a tab for X" to a
+GUI vision loop. Before adding a verb, check nothing else already answers it, and say in
+the row what the intent is *not* for.
 
 Easy to confuse: `manage_schedule` = time-based/cron. `manage_monitor` = event-driven.
 `set_reminder` = one-time alert. `manage_backup` = TENKA's own data durability, not a user

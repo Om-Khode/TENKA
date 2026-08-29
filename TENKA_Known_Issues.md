@@ -1720,3 +1720,189 @@ hook refuses an amend there, both correctly.
 The full reasoning is on `fix/window-target-resolution` at `a2fc481`, which is
 not deleted — branches never are here, and this is one of the reasons why. Read
 that commit, not `734e7f9`'s title.
+
+
+---
+
+## KI-40: The handler-resolution sweep is red on `main`
+
+**Severity:** Low. **Status:** open, and not caused by the change that found it.
+
+`tests/test_6a5_api_fixes.py` asserts, from the AST, that exactly one site in
+the tree calls `tool_registry.get` — the premise being that `actions/__init__.py`
+is the only place a handler is resolved, so there is one place the capability
+gate has to sit (`.claude/rules/security.md`).
+
+There are three. `543ed2d` (2026-08-27, on `main`) added two more in
+`brain/selfknowledge.py`, which resolves handlers to read their docstrings when
+TENKA describes what she can do.
+
+**The gate is not bypassed.** `selfknowledge` reads `inspect.getdoc(handler)`
+and never calls one, so nothing dispatches around
+`actions.capability_refusal()`. What is wrong is the sweep's premise as written,
+and a structural security test that has been red for two days is one nobody is
+reading.
+
+Two ways out, and it needs a decision rather than a quiet re-number:
+
+1. Narrow the sweep to *calls* of a resolved handler rather than resolutions of
+   one, which is the property that actually matters.
+2. Exempt `selfknowledge` by name, with the argument written down — cheaper, and
+   it decays the first time someone adds a third reader.
+
+`tests/BASELINE.md` still records that file GREEN, so the ledger is stale for it
+too. Found while removing the CDP tier; the sweep was already failing before
+that work began, which is exactly what the ledger exists to let one prove.
+
+---
+
+## KI-41: The extension's credential is a loopback bearer token on disk
+
+**Severity:** Low, accepted, recorded so it is a decision rather than an
+oversight.
+
+The browser extension authenticates with a token stored in
+`~/.tenka/extension_token.json` and in the browser profile. Any process running
+as the user can read either, and any local process can reach the loopback port.
+
+**Accepted because the door opens onto an empty room.** The extension listener's
+capability ceiling is empty, so a stolen token grants zero intent authority —
+every HTTP route on that port refuses, and the socket speaks a vocabulary with
+no intents in it. What a thief gets is the ability to drive the browser, on a
+machine where they are already running as the user and could drive it directly.
+
+It is also strictly better than what it replaces: the CDP debug port accepted
+any local client with no token at all.
+
+Revisit if the extension listener is ever given a non-empty ceiling. That change
+is what would turn this from a low into something else.
+
+---
+
+## KI-42: Screenshots through the extension are viewport-only
+
+**Severity:** Low, accepted.
+
+`tabs.captureVisibleTab` captures the visible viewport of the **active** tab and
+has no full-page mode. A capture naming a non-active tab is refused rather than
+served a picture of whatever the user is looking at — and deliberately not
+worked around by activating the tab first, which would move the user's focus to
+satisfy a read.
+
+The bundled Chromium path still does full-page capture, so the capability is not
+gone from the system; it is gone from the driver that uses the user's own
+browser. Recorded because it is the one place the extension tier is worse than
+the CDP tier it replaced.
+
+**Related:** the DuckDuckGo browser is unreachable by *any* browser-tier
+mechanism — it supports no extensions and, being WebView2-based, exposes no
+debug port. It falls to the Terminator and vision tiers like any other opaque
+native window. Not a regression; recorded because a reader will otherwise assume
+a Chromium-ish browser is covered.
+
+
+---
+
+## KI-43: `visible` is wrong for an element inside a transparent container
+
+**Severity:** Low. **Status:** open, recorded rather than fixed.
+
+`dom_query.js`'s `isVisible` reads `getComputedStyle(el).opacity` on the element
+itself. `opacity` does not inherit, so an input inside an `opacity: 0` container
+computes to `1` and is reported `visible: true` — when nobody can see it.
+
+The other two hidden states are caught by accident rather than by that check:
+`display: none` on an ancestor gives the child a 0×0 rect, which the first line
+of `isVisible` catches, and `visibility` genuinely is an inherited property.
+Opacity is neither, so it falls through.
+
+**Not obviously a bug, which is why it is written down rather than patched.** An
+element inside a transparent container is still hit-testable, so a click on it
+works. What is wrong is only the claim: `visible` is supposed to mean a person
+can see it, and a planner reading `visible: true` off a faded-out panel will
+describe an action the user cannot follow.
+
+A fix means walking ancestors and multiplying opacity, on every element, in the
+hot path of every perceive. That is a real cost for a case nobody has hit yet.
+
+`tests/fixtures/dom/form_hidden.html` carries an element in this exact state,
+with a comment, so the next person to read the fixture finds the gap rather than
+assuming it was covered.
+
+**Found:** while building the DOM integration fixtures, which had never existed
+— see the note below.
+
+---
+
+<!-- Fixture note, 2026-08-29 -->
+
+**`tests/fixtures/dom/` did not exist**, so
+`tests/test_browser_dom_integration.py` had been skipping all 16 of its tests
+since it was written. The module is gated on `DOM_REAL_BROWSER=1` and skips
+cleanly when unset, so the absence never showed as a failure — a skip and a
+missing fixture look identical from the summary line.
+
+The five fixtures are now committed and the file passes 16/16 against real
+Chromium. It takes ~104 seconds, which is most of why it is easy to leave
+unrun; it is the only coverage that exercises the JS query against a real DOM
+rather than against canned JSON.
+
+
+---
+
+## KI-44: ESC during one-shot TTS can kill the process silently
+
+**Severity:** Medium. **Status:** open, root cause identified but not proven by
+repro.
+
+**Symptom.** Holding ESC to interrupt a long spoken reply ended the process. No
+traceback, no `Voice Assistant shut down`, nothing after
+`[abort] requested: esc_hold` in the log. The window simply closed.
+
+**The mechanism, and it is written down in the code that has it.**
+`io/audio/streaming.py`'s module docstring states the design:
+
+> Barge-in: `stop_streaming()` sets a `threading.Event` that the audio player
+> polls — `sd.stop()` is called from the SAME thread as `sd.play()`, avoiding
+> concurrent PortAudio access.
+
+`stop_streaming()` then calls `sd.stop()` directly at the end of its body. The
+comment above that line says why — the one-shot `tts.speak` path queues audio
+through `sounddevice.play()` and never polls the event, so ESC could not
+silence small talk, nudges or reminders without it.
+
+That fixed a real problem and reintroduced the exact hazard the docstring
+exists to prevent. The call chain is:
+
+```
+cv1-esc-monitor thread
+  -> abort.request_abort("esc_hold")
+  -> subscribers run ON THAT THREAD
+  -> stop_streaming()
+  -> sd.stop()          # while the player thread is inside sd.play()
+```
+
+PortAudio is not thread-safe. A cross-thread stop during active playback can
+abort the process natively, which is precisely a death with no Python traceback
+and no shutdown log.
+
+**Not proven.** A silent process death has other possible causes, and this has
+been reproduced once, by accident. What makes it the leading candidate is that
+the file already documents the rule being broken, and the symptom is the exact
+shape a native abort produces.
+
+**Shape of a fix, not a prescription.** The one-shot path needs the same
+polled-event treatment the streaming path has, so `sd.stop()` is only ever
+called from the thread that called `sd.play()`. That means the one-shot player
+has to own a loop it can be interrupted from, rather than handing a buffer to
+`sounddevice.play()` and walking away.
+
+**Found** while testing the browser extension: a `browser_tabs` reply recited
+every tab title and produced 37 seconds of audio, and holding ESC to stop it is
+what triggered this. That reply is capped now (`_MAX_SPOKEN_TABS`), which
+removes one way to reach the hazard and none of the hazard.
+
+**Related, and worth stating as a rule rather than an anecdote:** a spoken reply
+long enough that the only way to stop it is the abort key is a reply that puts
+users on the most dangerous path in the system. The project rule -- TTS under
+120 characters -- is not about politeness.

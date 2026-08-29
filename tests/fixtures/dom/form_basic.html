@@ -1,0 +1,63 @@
+<!doctype html>
+<!--
+  form_basic.html — the canonical interactive form.
+
+  Pinned by test_browser_dom_integration.TestFormBasic: exactly 10 interactive
+  elements (8 textboxes, 1 combobox, 1 button), every label associated by `for`,
+  and one input per type the perceiver maps to `textbox`. Adding a control here
+  changes those counts, so add one deliberately or add a new fixture.
+-->
+<html lang="en">
+<head><meta charset="utf-8"><title>Basic form</title></head>
+<body>
+  <h1>Create an account</h1>
+
+  <form id="signup" action="/submit" method="post">
+    <p>
+      <label for="first">First name</label>
+      <input id="first" name="first" type="text">
+    </p>
+    <p>
+      <label for="last">Last name</label>
+      <input id="last" name="last" type="text">
+    </p>
+    <p>
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email">
+    </p>
+    <p>
+      <label for="phone">Phone</label>
+      <input id="phone" name="phone" type="tel">
+    </p>
+    <p>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password">
+    </p>
+    <p>
+      <label for="birthday">Birthday</label>
+      <input id="birthday" name="birthday" type="date">
+    </p>
+    <p>
+      <label for="website">Website</label>
+      <input id="website" name="website" type="url">
+    </p>
+    <p>
+      <label for="company">Company</label>
+      <input id="company" name="company" type="text">
+    </p>
+    <p>
+      <label for="country">Country</label>
+      <select id="country" name="country">
+        <option value="">Choose one</option>
+        <option value="us">United States</option>
+        <option value="ca">Canada</option>
+        <option value="uk">United Kingdom</option>
+        <option value="in">India</option>
+      </select>
+    </p>
+    <p>
+      <button type="submit">Create account</button>
+    </p>
+  </form>
+</body>
+</html>

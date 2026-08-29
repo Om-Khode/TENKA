@@ -106,7 +106,8 @@ These are the three-tier automation system plus the supporting tools. Tier escal
 
 | Intent | What it does |
 | --- | --- |
-| `browser_cdp_setup` | One-time setup helper for connecting TENKA to your real Chrome over the DevTools Protocol (optional advanced feature). |
+| `browser_extension_setup` | Mints the credential the browser extension needs, so TENKA can drive whichever browser you already have open — Firefox, Chrome, Edge or Brave — in the profile you are already signed into. |
+| `browser_tabs` | See and steer the tabs already open in your browser — list them, close one, switch to one. Tabs are matched on what they call themselves, so "close the mail tab" works without TENKA knowing what any site is. Opening a *new* URL is `open_browser`. |
 | `self_knowledge` | Questions about TENKA herself — "what can you do", "which model are you using", "what personality are you". Answered from her **running state**: the affordance registry, `llm/router.py`'s resolved chain, the loaded personality. Never from this document, and never from the model's own idea of what TENKA is. When the fact is not available she says so rather than guessing. |
 | `unknown` | Sentinel — the classifier explicitly said "no idea what this is." Triggers a polite "I didn't catch that, can you rephrase?". |
 

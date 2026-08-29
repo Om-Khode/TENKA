@@ -53,7 +53,7 @@ class Environment:
     """
 
     open_windows: tuple[str, ...] = ()
-    cdp_available: bool = False
+    browser_driver_available: bool = False
     preferences: dict = field(default_factory=dict)
 
 

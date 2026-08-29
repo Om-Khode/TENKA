@@ -56,12 +56,24 @@ def eval_condition_code(compiled: Any, event_locals: dict) -> bool:
 # ─── Dispatch Helpers ────────────────────────────────────────────────────────
 
 def make_dedup_key(event: dict) -> str:
+    """What makes two events "the same event" for cooldown purposes.
+
+    The fallback used to be `""`, which is not "do not dedup" -- it is the
+    *same key for everything*. So every event of a type this function did not
+    know about collided with every other, and the bus dropped all but the first
+    within the cooldown. Latent for any new event source, and it bit the
+    browser one immediately: five page navigations in a minute became one.
+
+    `source_app|window_title` is the general shape and the one the window
+    events already use; media keeps its own because its identity is the track,
+    not the window. An event carrying neither field still lands on `"|"`, which
+    is the old behaviour for the events that genuinely have no content to key
+    on -- a deliberate floor rather than an accident.
+    """
     etype = event.get("event_type", "")
     if etype == "media_changed":
         return f"{event.get('title', '')}|{event.get('artist', '')}"
-    if etype in ("window_focus", "window_title"):
-        return f"{event.get('source_app', '')}|{event.get('window_title', '')}"
-    return ""
+    return f"{event.get('source_app', '')}|{event.get('window_title', '')}"
 
 
 def check_dispatch(monitor: dict, event: dict, *, now: float) -> bool:
@@ -142,6 +154,29 @@ class EventBus:
 
         self._load_monitors(MonitorRepo(db))
 
+        # Browser events, from the extension. Started here rather than in the
+        # message pump because it needs no Win32 pump: its events arrive on the
+        # asyncio loop through the WebSocket, and `_dispatch_event` is already
+        # called off-thread by the media source.
+        #
+        # Failure is one warning, not a dead bus: the browser is one source of
+        # events among three, and a browser that is not running must not stop
+        # window and media monitors from working.
+        self._browser_source = None
+        try:
+            from .event_sources.browser import BrowserEventSource
+            from ..io.api.extension_ws import (
+                current_connection, on_connect, remove_connect_callback,
+            )
+            self._browser_source = BrowserEventSource(
+                current_connection,
+                subscribe=on_connect,
+                unsubscribe=remove_connect_callback,
+            )
+            self._browser_source.start(self._dispatch_event)
+        except Exception as e:
+            logger.warning("[event-monitor] Browser source unavailable: %s", e)
+
         self._thread = threading.Thread(
             target=self._run_message_pump,
             name="em1-event-bus",
@@ -157,6 +192,13 @@ class EventBus:
         # or never-started pump therefore left armed timers behind, free to
         # dispatch a monitor action after the bus was told to stop.
         self._stop_requested = True
+        browser_source = getattr(self, "_browser_source", None)
+        if browser_source is not None:
+            try:
+                browser_source.stop()
+            except Exception as e:
+                logger.debug("[event-monitor] Browser source stop: %s", e)
+            self._browser_source = None
         for timer in self._debounce_timers.values():
             timer.cancel()
         self._debounce_timers.clear()

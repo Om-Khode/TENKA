@@ -42,7 +42,12 @@ REQUIRED_CAPABILITY: dict[str, Capability] = {
     "find_and_click": Capability.EXECUTE,
     "manifest_dispatch": Capability.EXECUTE,
     "planner": Capability.EXECUTE,
-    "browser_cdp_setup": Capability.EXECUTE,
+    "browser_extension_setup": Capability.EXECUTE,
+    # Listing tabs reveals what the user is reading, and closing one
+    # destroys a page she cannot get back. Both sit behind EXECUTE
+    # rather than splitting the read from the write: one intent, one
+    # capability, and the stronger of the two.
+    "browser_tabs": Capability.EXECUTE,
     "manage_procedure": Capability.EXECUTE,
     "manage_monitor": Capability.EXECUTE,
     "manage_schedule": Capability.EXECUTE,
@@ -135,6 +140,18 @@ PERSISTS_AUTHORITY: frozenset[str] = frozenset({
     "manage_procedure",   # procedure_executor.run_procedure, replayed on demand
     "manage_shortcut",    # a stored trigger that resolves to an intent later
     "manage_backup",      # enables a recurring off-machine upload
+    # Mints the credential the browser extension presents. The credential
+    # itself carries no intent authority -- the extension listener's ceiling is
+    # empty, and nothing it sends can run an intent -- so this is not the
+    # monitor-installs-a-callback shape. It is the other one the comment above
+    # describes: a durable capability gain bought with a temporary grant.
+    #
+    # Before setup the browser tier drives a bundled Chromium, signed out of
+    # everything. After it, and from then on, it drives the browser the user is
+    # actually signed into. A half-hour raise could mint that token and leave
+    # TENKA with permanent reach into the user's logged-in sessions long after
+    # the raise expired. Standing EXECUTE at the keyboard, not a raise.
+    "browser_extension_setup",
 })
 
 TRANSIENT_AUTHORITY: frozenset[str] = frozenset({
@@ -149,6 +166,6 @@ TRANSIENT_AUTHORITY: frozenset[str] = frozenset({
     "summarize_recording", "web_search", "browse_url", "file_task",
     "set_reminder", "cancel_reminder", "hide_avatar", "show_avatar",
     "meet_face", "recognize_face", "forget_face", "camera_look", "planner",
-    "enroll_voice", "forget_voice", "browser_cdp_setup", "store_memory",
+    "enroll_voice", "forget_voice", "store_memory", "browser_tabs",
     "forget_memory", "shutdown", "manifest_dispatch", "self_knowledge",
 })

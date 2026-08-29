@@ -1,0 +1,40 @@
+<!doctype html>
+<!--
+  form_collision.html — two controls that produce the SAME content-addressed ref.
+
+  Refs are `sha1(role|name|placeholder|bounds)` with bounds quantized to 8-px
+  buckets, so two identically-labelled inputs in different places do NOT collide
+  -- their positions differ. Forcing a real collision means stacking them: same
+  label, same size, same quantized position.
+
+  That is artificial as markup and exact as a test. The property under test is
+  `_disambiguate_ref`, and it only runs when two refs actually match. The
+  executor looks elements up BY REF: if both collapsed to one, every action
+  aimed at the second would land on the first, silently, and the form would
+  submit with one field written twice and one left empty.
+
+  Both refs must also reach `ref_to_locator` -- a ref the planner can see but the
+  executor cannot resolve is a plan step that fails at the last moment.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8"><title>Colliding refs</title>
+  <style>
+    /* Stacked exactly, so role, name, placeholder and bucketed bounds all match. */
+    #stack { position: relative; width: 300px; height: 40px; }
+    #stack input { position: absolute; top: 0; left: 0; width: 200px; height: 24px; }
+  </style>
+</head>
+<body>
+  <form id="feedback">
+    <div id="stack">
+      <label for="c1">Comment</label>
+      <input id="c1" name="comment_one" type="text" aria-label="Comment">
+      <label for="c2">Comment</label>
+      <input id="c2" name="comment_two" type="text" aria-label="Comment">
+    </div>
+
+    <p><button type="submit">Send</button></p>
+  </form>
+</body>
+</html>

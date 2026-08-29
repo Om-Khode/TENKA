@@ -129,6 +129,16 @@ class HostGate:
                     # A close sent in answer to the handshake, before any
                     # accept: the connection is refused, not established and
                     # then torn down.
+                    #
+                    # Logged because it was not, and a socket refused here is
+                    # indistinguishable from one that never arrived. That cost
+                    # an evening: the browser extension sat on "Retrying
+                    # shortly" while every log in the tree stayed silent.
+                    logger.warning(
+                        f"[API] HostGate refused a websocket: path="
+                        f"{scope.get('path')!r} host={host!r} port={port} "
+                        f"policy={policy_name!r}"
+                    )
                     await send({"type": "websocket.close", "code": 1008})
                 else:
                     await send({"type": "http.response.start", "status": 421,
@@ -361,13 +371,23 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                listener_policies: dict[int, str] | None = None,
                ui_bundle: UiBundle | None = None,
                pair_store: PairCodeStore | None = None,
-               raises: RaiseStore | None = None) -> FastAPI:
+               raises: RaiseStore | None = None,
+               extension_digest: str | None = None) -> FastAPI:
     # Eager, once: instance_secret() is uncached on the environment-override
     # path, and a wrong-length TENKA_SECRET raises ValueError. Resolving it
     # here means a misconfigured override fails when the app is built, not
     # as a 500 on the first authenticated request. The ValueError's own
     # message names TENKA_SECRET, so the operator knows what to fix.
     vault.instance_secret()
+
+    # The SHA-256 of the vendored `dom_query.js`, compared against the copy the
+    # browser extension shipped. Passed IN rather than imported: this module is
+    # `io/api`, which may reach `core/` and `config` and nothing else, and the
+    # vendored file lives under `automation/`. `main.py` supplies it — the one
+    # place allowed to see both tiers. `None` means the check has nothing to
+    # compare against, and `evaluate_handshake` refuses on a digest mismatch, so
+    # an unsupplied digest fails closed rather than skipping the comparison.
+    app_extension_digest = extension_digest
 
     @asynccontextmanager
     async def lifespan(instance: FastAPI):
@@ -634,6 +654,170 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # ─── the event socket ───────────────────────────────────────────────
     # Not a route module like the ones above: `test_every_registered_route_
     # rejects_an_anonymous_call` in test_api_auth.py walks app.openapi(), and
+
+    # ─── the browser extension's socket ──────────────────────────────────
+    # A different door from `/v1/events` and deliberately so: this one carries
+    # no capability at all. Its listener's ceiling is empty (`policy.py`), so
+    # every HTTP route on this port already refuses; what is left is one socket
+    # that speaks a vocabulary with no intents in it.
+    #
+    # It authenticates in the protocol's own `hello` frame rather than through
+    # `authenticate()`. That is not a shortcut around the API's auth: the
+    # extension is a target, not a principal — it never asks TENKA to run
+    # anything — so it holds no device credential and there is nothing for the
+    # capability machinery to decide. Two auth systems that never touch beat one
+    # that half-shares a door.
+    @app.websocket("/latch")
+    async def latch(websocket: WebSocket) -> None:
+        import json
+
+        from .extension_ws import (
+            LatchConnection, evaluate_handshake, evict_if_dead, is_occupied,
+            read_token, register, unregister,
+        )
+        from ...core import latch_protocol as latch_proto
+
+        async def _close_quietly(code: int = 1008) -> None:
+            """Close, tolerating a socket the client already dropped.
+
+            `WebSocket.close()` raises `WebSocketDisconnect(1006)` when the peer
+            has gone -- and every refusal path here closes, so a client that
+            hangs up mid-handshake turned a routine refusal into a full ASGI
+            traceback. The connection is already over; there is nothing left to
+            report but noise.
+            """
+            try:
+                await websocket.close(code=code)
+            except Exception:
+                pass
+
+        origin_header = websocket.headers.get("origin")
+        logger.info(
+            f"[LATCH] connection attempt: origin={origin_header!r} "
+            f"server={websocket.scope.get('server')} "
+            f"registry={app.state.listener_policies}"
+        )
+
+        policy = policy_for_scope(websocket.scope, app.state.listener_policies)
+        if policy is None or policy.name != "extension":
+            # Refused before `accept()`. Serving this socket on any other
+            # listener would put a driver for the user's browser on a port whose
+            # policy was written for something else — including, on `local`, one
+            # that grants EXECUTE.
+            await _close_quietly()
+            return
+
+        # Accept first, then decide: the verdict is a `reject` frame carrying a
+        # code, and a client that is told PROTOCOL_MISMATCH stops retrying
+        # forever. A bare TCP close cannot say which of the four checks failed,
+        # so the extension would back off and retry an unfixable state until
+        # someone reads a log.
+        await websocket.accept()
+        try:
+            first = json.loads(await websocket.receive_text())
+        except Exception as e:
+            logger.warning(
+                f"[LATCH] first frame was unreadable ({type(e).__name__}: {e}); "
+                f"closing"
+            )
+            await _close_quietly()
+            return
+
+        logger.info(
+            f"[LATCH] hello received: browser={first.get('browser')!r} "
+            f"protocol={first.get('protocolVersion')!r} "
+            f"digest={str(first.get('domQuerySha256'))[:12]}... "
+            f"token_present={bool(first.get('token'))}"
+        )
+
+        # Before refusing a newcomer for being second, check that the first is
+            # still there. A browser that reloads its background page leaves a
+        # socket open to the OS and attached to nothing, and the extension is
+        # then refused its own reconnect -- forever, about itself.
+        if is_occupied():
+            await evict_if_dead()
+
+        verdict = evaluate_handshake(
+            first,
+            origin=websocket.headers.get("origin"),
+            expected_token=read_token(),
+            expected_digest=app_extension_digest or "",
+            occupied=is_occupied(),
+        )
+        if not verdict.ok:
+            logger.warning(
+                f"[LATCH] refused: {verdict.reason} (code={verdict.code})"
+            )
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": latch_proto.Frame.REJECT,
+                    "code": verdict.code,
+                    "reason": verdict.reason,
+                }))
+            except Exception:
+                # The reject is a courtesy: it tells a client whether to stop
+                # retrying. A peer that left before hearing it needs nothing.
+                pass
+            await _close_quietly()
+            return
+
+        connection = LatchConnection(
+            send_json=lambda frame: websocket.send_text(json.dumps(frame)),
+            browser_name=str(first.get("browser", "other")),
+            protocol_version=int(first.get("protocolVersion", 0)),
+            extension_version=str(first.get("extensionVersion", "")),
+        )
+        register(connection)
+        await websocket.send_text(json.dumps({"type": latch_proto.Frame.WELCOME}))
+        logger.info(
+            f"[LATCH] connected: browser={connection.browser_name!r} "
+            f"version={connection.extension_version!r}"
+        )
+
+        # Initialised BEFORE the try, and the reason is not style.
+        #
+        # `asyncio.CancelledError` inherits from `BaseException`, not
+        # `Exception` -- so on shutdown neither handler matched, the `else`
+        # never ran, and `finally` read a name that was never bound:
+        # `UnboundLocalError: cannot access local variable 'reason'`. The socket
+        # was then never unregistered, so `is_occupied()` stayed true against a
+        # dead connection and the extension's own reconnect was refused.
+        #
+        # Cancellation is re-raised rather than swallowed: the task is being
+        # torn down and pretending otherwise leaves uvicorn waiting on it.
+        reason = "closed"
+        try:
+            while True:
+                frame = json.loads(await websocket.receive_text())
+                connection.handle_frame(frame)
+        except WebSocketDisconnect:
+            reason = "disconnected"
+        except asyncio.CancelledError:
+            # Swallowed, not re-raised, and only here.
+            #
+            # Cancellation on this socket means one thing: the daemon is
+            # stopping. Returning is what cancellation asked for -- the loop
+            # ends, `finally` unregisters, the coroutine completes. Re-raising
+            # is the textbook-correct move and it makes uvicorn log
+            # "Exception in ASGI application" with a full traceback on every
+            # ordinary shutdown.
+            #
+            # That trade is worth naming rather than assuming. A traceback that
+            # appears every single time you stop the program is one people stop
+            # reading, and an unread log is what turned tonight's three real
+            # bugs into an evening. The one thing cancellation must still do --
+            # release the slot -- happens in `finally` either way.
+            reason = "cancelled"
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+        finally:
+            # Unregister in `finally` so every exit path frees the slot. A
+            # connection left registered after its socket died makes
+            # `is_occupied()` refuse the extension's own reconnect, and nothing
+            # ever clears it.
+            unregister(connection, reason)
+            logger.info(f"[LATCH] disconnected: {reason}")
+
     # FastAPI's schema builder has no representation for a WebSocketRoute --
     # it is skipped entirely, sweep and all. test_api_events.py's own
     # unauthenticated-connect and invalid-token tests are what actually guard

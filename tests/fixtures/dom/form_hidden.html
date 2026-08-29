@@ -1,0 +1,93 @@
+<!doctype html>
+<!--
+  form_hidden.html — the difference between "not there" and "not usable".
+
+  Three states the perceiver must keep apart, because they call for different
+  next moves:
+
+    * `input[type=hidden]` has no role at all and is EXCLUDED. There is nothing
+      a user could do to it.
+    * disabled / aria-disabled are INCLUDED with `enabled=false`. The control
+      exists and the planner needs to know why it cannot be used -- "there is no
+      submit button" and "the submit button is disabled until you tick the box"
+      are different problems.
+    * display:none / visibility:hidden / opacity:0 are INCLUDED with
+      `visible=false`. Same argument: a field hidden behind a collapsed section
+      is reachable, and one that does not exist is not.
+
+  Every label carries its state in the text, because the tests select by name.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8"><title>Hidden and disabled</title>
+  <style>
+    .is-display-none    { display: none; }
+    .is-visibility-hidden { visibility: hidden; }
+    /* On the input itself. `opacity` does not inherit, so a computed style
+       read on a child of a transparent parent still says 1 -- see the
+       ancestor case below. */
+    .is-opacity-zero    { opacity: 0; }
+    .fades-its-children { opacity: 0; }
+  </style>
+</head>
+<body>
+  <form id="edges">
+    <input type="hidden" name="csrf" id="csrf" value="tok-not-a-control">
+
+    <p>
+      <label for="normal">Normal field</label>
+      <input id="normal" name="normal" type="text">
+    </p>
+
+    <p>
+      <label for="dis">Disabled field</label>
+      <input id="dis" name="dis" type="text" disabled>
+    </p>
+
+    <p>
+      <label for="ariadis">aria-disabled field</label>
+      <input id="ariadis" name="ariadis" type="text" aria-disabled="true">
+    </p>
+
+    <p class="is-display-none">
+      <label for="dn">display-none field</label>
+      <input id="dn" name="dn" type="text">
+    </p>
+
+    <p class="is-visibility-hidden">
+      <label for="vh">visibility-hidden field</label>
+      <input id="vh" name="vh" type="text">
+    </p>
+
+    <p>
+      <label for="oz">opacity-zero field</label>
+      <input id="oz" name="oz" type="text" class="is-opacity-zero">
+    </p>
+
+    <!--
+      KNOWN GAP, kept here on purpose rather than removed.
+
+      This input is inside a transparent container, so nobody can see it -- but
+      the perceiver reports `visible: true`. `isVisible` reads
+      `getComputedStyle(el).opacity` on the element, and opacity does not
+      inherit: the child's computed opacity is 1 no matter what the parent's is.
+
+      The other two hidden states are caught by accident rather than by that
+      check. `display:none` on a parent gives the child a 0x0 rect, and
+      `visibility` genuinely is an inherited property. Opacity is neither, so it
+      falls through.
+
+      Not fixed here because it is not clearly a bug: an element inside an
+      `opacity: 0` container is still hit-testable, so clicking it works. What is
+      wrong is only the claim -- `visible` is supposed to mean a person can see
+      it. Recorded as a known issue instead of quietly asserted either way.
+    -->
+    <p class="fades-its-children">
+      <label for="ozp">opacity-zero-parent field</label>
+      <input id="ozp" name="ozp" type="text">
+    </p>
+
+    <p><button type="submit">Save</button></p>
+  </form>
+</body>
+</html>

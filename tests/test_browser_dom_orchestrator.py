@@ -40,9 +40,9 @@ import assistant.automation.browser.dom as bdom
 import assistant.automation.browser.dom_planner as bdp
 import assistant.automation.browser.dom_executor as bde
 import assistant.automation.browser.dom_orchestrator as bdo
-# P13. `cdp` and `router` are stdlib+config at import time -- neither pulls
+# P13. `handle` and `router` are stdlib+config at import time -- neither pulls
 # Playwright or pyautogui, so importing them here cannot reach the desktop.
-import assistant.automation.browser.cdp as bcdp
+import assistant.automation.browser.handle as bhandle
 import assistant.automation.router as router
 from assistant.core.abort import UserAborted
 from assistant.core.verdict import Outcome, speaks_as_done
@@ -629,21 +629,19 @@ class TestAbortIsNotAFallback(unittest.IsolatedAsyncioTestCase):
     async def _run_router_with_abort(self):
         """Drive `router._execute_dom_task` to the point of abort.
 
-        CDP attach and page selection are stubbed on the modules the deferred
-        `from .browser import cdp` binds, which is where the lookup happens at
-        call time.
+        The driver is stubbed on the module the deferred
+        `from .browser import handle` binds, which is where the lookup happens
+        at call time. There is no page-selection stub any more: the extension
+        resolves every verb to the active tab itself.
         """
-        handle = MagicMock()
-        handle.kind = "cdp"
-        handle.attachment = MagicMock()
         page = MagicMock()
         page.url = "https://example.invalid/form"
+        handle = MagicMock()
+        handle.kind = "latch"
+        handle.page = page
 
-        with patch.object(bcdp, "get_or_attach_browser",
-                          new=AsyncMock(return_value=handle)), \
-             patch.object(router, "_pick_active_page",
-                          new=AsyncMock(return_value=page)), \
-             patch.object(bdo, "run_dom_task",
+        with patch.object(bhandle, "get_browser_handle",
+                          new=AsyncMock(return_value=handle)),              patch.object(bdo, "run_dom_task",
                           new=AsyncMock(side_effect=UserAborted("esc_hold"))):
             return await router._execute_dom_task("do the thing")
 

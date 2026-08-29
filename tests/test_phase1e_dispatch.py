@@ -3,7 +3,6 @@ test_phase1e_dispatch.py — Phase 1E: DOM-mode dispatch wiring.
 
 Tests the integration of detect_backend → execute_automation when the
 backend is "dom":
-  - _pick_active_page heuristics (skip chrome://, pick first user page)
   - _execute_dom_task happy path (attach → page → run_dom_task → success)
   - Failure modes that should fall back to vision-loop:
     * CDP attach returns kind="bundled" (race: probe stale)
@@ -29,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import assistant.automation.router as da
 import assistant.automation.browser.dom_orchestrator as bdo
-import assistant.automation.browser.cdp as bcdp
+import assistant.automation.browser.handle as bhandle
 
 
 def _run(coro):
@@ -39,197 +38,79 @@ def _run(coro):
 # ─── Helpers ─────────────────────────────────────────────────────────────
 
 
-class _FakePage:
-    def __init__(self, url: str = "https://example.com/"):
-        self.url = url
+def _make_handle(kind: str = "latch"):
+    """A driver handle, as `get_browser_handle` returns one.
 
-
-class _FakeContext:
-    def __init__(self, pages):
-        self.pages = pages
-
-
-class _FakeAttachment:
-    def __init__(self, contexts):
-        self.contexts = contexts
-
-
-def _make_handle(kind: str = "cdp", contexts=None):
-    return bcdp.BrowserHandle(
-        kind=kind,
-        browser=MagicMock(name="browser"),
-        attachment=_FakeAttachment(contexts or []) if kind == "cdp" else None,
-    )
-
-
-# ─── _pick_active_page ───────────────────────────────────────────────────
-
-
-class TestPickActivePage(unittest.TestCase):
-    def test_returns_none_when_no_attachment(self):
-        self.assertIsNone(da._pick_active_page(None))
-
-    def test_returns_none_when_no_contexts(self):
-        att = _FakeAttachment(contexts=[])
-        self.assertIsNone(da._pick_active_page(att))
-
-    def test_returns_none_when_contexts_have_no_pages(self):
-        att = _FakeAttachment(contexts=[_FakeContext([]), _FakeContext([])])
-        self.assertIsNone(da._pick_active_page(att))
-
-    def test_picks_first_user_page(self):
-        truein = _FakePage("https://truein.com/demo")
-        att = _FakeAttachment(contexts=[_FakeContext([truein])])
-        self.assertIs(da._pick_active_page(att), truein)
-
-    def test_skips_chrome_internal_pages(self):
-        new_tab = _FakePage("chrome://newtab/")
-        truein = _FakePage("https://truein.com/")
-        att = _FakeAttachment(contexts=[_FakeContext([new_tab, truein])])
-        self.assertIs(da._pick_active_page(att), truein)
-
-    def test_skips_extension_popups(self):
-        ext = _FakePage("chrome-extension://abc123/popup.html")
-        site = _FakePage("https://example.com/")
-        att = _FakeAttachment(contexts=[_FakeContext([ext, site])])
-        self.assertIs(da._pick_active_page(att), site)
-
-    def test_skips_devtools(self):
-        dt = _FakePage("devtools://devtools/inspector.html")
-        site = _FakePage("https://example.com/")
-        att = _FakeAttachment(contexts=[_FakeContext([dt, site])])
-        self.assertIs(da._pick_active_page(att), site)
-
-    def test_falls_back_to_chrome_internal_when_no_user_pages(self):
-        # All pages are chrome:// — return one anyway. Better than None
-        # because the user might be planning to navigate via the agent.
-        new_tab = _FakePage("chrome://newtab/")
-        att = _FakeAttachment(contexts=[_FakeContext([new_tab])])
-        self.assertIs(da._pick_active_page(att), new_tab)
-
-    def test_url_read_exception_skips_page(self):
-        bad = MagicMock()
-        type(bad).url = property(lambda _: (_ for _ in ()).throw(RuntimeError("dead")))
-        good = _FakePage("https://example.com/")
-        att = _FakeAttachment(contexts=[_FakeContext([bad, good])])
-        # The bad page raises on url read; we skip it and pick the good one.
-        self.assertIs(da._pick_active_page(att), good)
-
-    def test_walks_multiple_contexts(self):
-        # Different incognito-style contexts with separate pages
-        ctx1 = _FakeContext([_FakePage("chrome://newtab/")])
-        ctx2 = _FakeContext([_FakePage("https://example.com/")])
-        att = _FakeAttachment(contexts=[ctx1, ctx2])
-        page = da._pick_active_page(att)
-        self.assertEqual(page.url, "https://example.com/")
+    The context/page fakes that stood here are gone with the tab picker they
+    fed. The extension resolves every page verb to the active tab of the
+    current window, so there is no list of contexts for the router to sift and
+    nothing for a fake to stand in for.
+    """
+    return bhandle.BrowserHandle(kind=kind, page=MagicMock(), connection=MagicMock())
 
 
 # ─── _execute_dom_task ───────────────────────────────────────────────────
 
 
 class TestExecuteDomTask(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        # Reset CDP state between tests so cached attachments don't leak
-        bcdp.reset_state_for_test()
-
-    def tearDown(self):
-        bcdp.reset_state_for_test()
-
-    async def test_attach_returns_bundled_falls_back(self):
-        handle = _make_handle(kind="bundled")
-        with patch.object(bcdp, "get_or_attach_browser", new=AsyncMock(return_value=handle)):
+    async def test_a_bundled_handle_falls_back(self):
+        # The router chose "dom" because the user's own browser was open at the
+        # page. Driving the bundled one instead would run the task against a
+        # browser with none of her sessions.
+        with patch.object(bhandle, "get_browser_handle",
+                          new=AsyncMock(return_value=_make_handle(kind="bundled"))):
             result = await da._execute_dom_task("fill the form")
         self.assertEqual(result, "__FALLBACK__")
 
-    async def test_attach_raises_falls_back(self):
-        with patch.object(bcdp, "get_or_attach_browser",
+    async def test_a_resolve_failure_falls_back(self):
+        with patch.object(bhandle, "get_browser_handle",
                           new=AsyncMock(side_effect=RuntimeError("network"))):
             result = await da._execute_dom_task("fill the form")
         self.assertEqual(result, "__FALLBACK__")
 
-    async def test_no_pages_falls_back(self):
-        handle = _make_handle(contexts=[_FakeContext([])])
-        with patch.object(bcdp, "get_or_attach_browser", new=AsyncMock(return_value=handle)):
-            result = await da._execute_dom_task("fill the form")
-        self.assertEqual(result, "__FALLBACK__")
-
     async def test_happy_path_returns_summary(self):
-        page = _FakePage("https://truein.com/demo")
-        handle = _make_handle(contexts=[_FakeContext([page])])
+        # `success` is derived from `reason`, not stored -- a result whose tag
+        # and verdict disagree cannot be constructed.
         success = bdo.DomTaskResult(
-            success=True, reason="completed", loops_used=1,
+            reason="completed", loops_used=1,
             final_summary="Filled all 7 fields and submitted.",
             history=[],
         )
-        with patch.object(bcdp, "get_or_attach_browser", new=AsyncMock(return_value=handle)), \
-             patch.object(bdo, "run_dom_task", new=AsyncMock(return_value=success)):
+        # Both orchestrator entry points are patched. A form-shaped goal is
+        # routed to `run_dom_form_fill`, not `run_dom_task`, so patching only
+        # the latter let the real one run against a MagicMock page -- which
+        # failed with an empty tree and returned the sentinel, in a test named
+        # "happy path".
+        with patch.object(bhandle, "get_browser_handle",
+                          new=AsyncMock(return_value=_make_handle())),              patch.object(bdo, "run_dom_form_fill", new=AsyncMock(return_value=success)),              patch.object(bdo, "run_dom_task", new=AsyncMock(return_value=success)):
             result = await da._execute_dom_task("fill the demo form")
         self.assertEqual(result, "Filled all 7 fields and submitted.")
 
     async def test_orchestrator_crash_falls_back(self):
-        page = _FakePage("https://example.com/")
-        handle = _make_handle(contexts=[_FakeContext([page])])
-        with patch.object(bcdp, "get_or_attach_browser", new=AsyncMock(return_value=handle)), \
-             patch.object(bdo, "run_dom_task",
+        with patch.object(bhandle, "get_browser_handle",
+                          new=AsyncMock(return_value=_make_handle())),              patch.object(bdo, "run_dom_form_fill",
+                          new=AsyncMock(side_effect=RuntimeError("crash"))),              patch.object(bdo, "run_dom_task",
                           new=AsyncMock(side_effect=RuntimeError("crash"))):
             result = await da._execute_dom_task("fill")
         self.assertEqual(result, "__FALLBACK__")
 
-    async def test_perceive_failed_falls_back_to_vision(self):
-        page = _FakePage("https://example.com/")
-        handle = _make_handle(contexts=[_FakeContext([page])])
-        # perceive_failed = vision should retry — fall back
+    async def test_a_failed_task_reports_its_own_summary_not_a_sentinel(self):
+        """A task that ran and failed is not a reason to escalate a tier.
+
+        `.claude/rules/automation.md` records what a sentinel cost here once:
+        "__FALLBACK__" is not a failure report, it is an instruction, and
+        returning it for a real failure spends a vision call on a task that
+        already knows why it did not work.
+        """
         failed = bdo.DomTaskResult(
-            success=False, reason="perceive_failed", loops_used=0,
-            final_summary="Could not read the page.",
-            history=[],
+            reason="max_loops", loops_used=6,
+            final_summary="Could not find the submit button.", history=[],
         )
-        with patch.object(bcdp, "get_or_attach_browser", new=AsyncMock(return_value=handle)), \
-             patch.object(bdo, "run_dom_task", new=AsyncMock(return_value=failed)):
-            result = await da._execute_dom_task("fill")
-        self.assertEqual(result, "__FALLBACK__")
-
-    async def test_empty_tree_falls_back_to_vision(self):
-        page = _FakePage("https://example.com/")
-        handle = _make_handle(contexts=[_FakeContext([page])])
-        empty = bdo.DomTaskResult(
-            success=False, reason="empty_tree", loops_used=2,
-            final_summary="No interactive elements found on page.",
-            history=[],
-        )
-        with patch.object(bcdp, "get_or_attach_browser", new=AsyncMock(return_value=handle)), \
-             patch.object(bdo, "run_dom_task", new=AsyncMock(return_value=empty)):
-            result = await da._execute_dom_task("fill")
-        self.assertEqual(result, "__FALLBACK__")
-
-    async def test_max_loops_returns_summary_no_fallback(self):
-        # max_loops means DOM-mode tried but couldn't finish — vision-loop
-        # would just burn the same budget over again. Honest summary
-        # to the user instead.
-        page = _FakePage("https://example.com/")
-        handle = _make_handle(contexts=[_FakeContext([page])])
-        maxed = bdo.DomTaskResult(
-            success=False, reason="max_loops", loops_used=5,
-            final_summary="Could not complete within 5 steps.",
-            history=[],
-        )
-        with patch.object(bcdp, "get_or_attach_browser", new=AsyncMock(return_value=handle)), \
-             patch.object(bdo, "run_dom_task", new=AsyncMock(return_value=maxed)):
-            result = await da._execute_dom_task("fill")
-        self.assertEqual(result, "Could not complete within 5 steps.")
-
-    async def test_planner_failed_returns_summary_no_fallback(self):
-        page = _FakePage("https://example.com/")
-        handle = _make_handle(contexts=[_FakeContext([page])])
-        bad_plan = bdo.DomTaskResult(
-            success=False, reason="planner_failed", loops_used=2,
-            final_summary="Planner produced no usable actions.",
-            history=[],
-        )
-        with patch.object(bcdp, "get_or_attach_browser", new=AsyncMock(return_value=handle)), \
-             patch.object(bdo, "run_dom_task", new=AsyncMock(return_value=bad_plan)):
-            result = await da._execute_dom_task("fill")
-        self.assertEqual(result, "Planner produced no usable actions.")
+        with patch.object(bhandle, "get_browser_handle",
+                          new=AsyncMock(return_value=_make_handle())),              patch.object(bdo, "run_dom_form_fill", new=AsyncMock(return_value=failed)),              patch.object(bdo, "run_dom_task", new=AsyncMock(return_value=failed)):
+            result = await da._execute_dom_task("fill the form")
+        self.assertNotEqual(result, "__FALLBACK__")
+        self.assertIn("submit button", result)
 
 
 # ─── execute_automation routing ──────────────────────────────────────────
@@ -244,7 +125,10 @@ class TestExecuteAutomationRouting(unittest.IsolatedAsyncioTestCase):
                           new=AsyncMock(return_value="DOM-mode reply")) as h:
             result = await da.execute_automation("fill the form", llm_func=None)
         self.assertEqual(result, "DOM-mode reply")
-        h.assert_awaited_once_with("fill the form")
+        # The router also passes the foreground window title; asserted on the
+        # call happening rather than on an exact signature, which is the
+        # caller's business and not this test's subject.
+        h.assert_awaited_once()
 
     async def test_dom_fallback_propagates(self):
         # When _execute_dom_task returns __FALLBACK__, execute_automation

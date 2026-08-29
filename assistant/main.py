@@ -372,6 +372,27 @@ _VENDORED_UI_ZIP = pathlib.Path(__file__).resolve().parent / "io" / "api" / "stu
 # checkout that has one.
 
 
+def _resolve_dom_query_digest() -> str | None:
+    """The SHA-256 of the vendored dom_query.js, or None.
+
+    The extension ships a byte copy of that file and reports its digest in the
+    handshake; the two are compared because MV3 forbids sending the file over
+    the wire, so there are genuinely two copies. `None` means the comparison has
+    nothing to compare against, and `evaluate_handshake` refuses on a mismatch
+    -- so an unreadable vendored file closes the door rather than propping it
+    open.
+    """
+    try:
+        from .automation.browser.dom_query_vendor import DOM_QUERY_SHA256
+        return DOM_QUERY_SHA256
+    except Exception as e:
+        logger.warning(
+            f"[main] could not read the dom_query digest ({type(e).__name__}: {e}); "
+            f"the browser extension will be refused until this is fixed"
+        )
+        return None
+
+
 def _resolve_studio_ui() -> "UiBundle | None":
     """Decide which Studio build the daemon serves, if any.
 
@@ -525,6 +546,16 @@ async def _start_studio_daemon() -> "asyncio.Task | None":
             # the product and the pages are a convenience.
             ui_bundle=_resolve_studio_ui(),
             pair_store=_pair_store,
+            # Same argument as `ui_bundle` above, for the same reason: the
+            # vendored dom_query.js lives under `automation/` and `io/api` may
+            # reach `core/` and `config` and nothing else. `main` is the one
+            # place allowed to see both tiers.
+            #
+            # Resolved before serve() so a corrupt vendored file is one WARNING
+            # and a browser tier that falls back to bundled Chromium -- never a
+            # daemon that failed to start. `None` refuses every extension
+            # handshake rather than skipping the digest comparison.
+            extension_digest=_resolve_dom_query_digest(),
         )
         _studio_pair_store = _pair_store
         # `TransportManager` cannot be threaded through `serve_studio_api()`
@@ -3539,16 +3570,11 @@ async def async_main():
     except Exception as _e:
         logger.debug(f"[main] Playwright warmup skipped: {_e}")
 
-    # Non-blocking CDP probe. We DO NOT gate startup on CDP being
-    # live — TENKA must boot when Chrome is closed too. The probe just warms
-    # the cache so the first browser task knows whether to attach or use
-    # bundled. Cost: ~5ms when port is closed, ~30ms when Chrome answers.
-    # Schedule as a fire-and-forget task; we don't await it here.
-    try:
-        from .automation.browser import cdp as browser_cdp
-        asyncio.create_task(browser_cdp.cdp_health_probe(timeout=0.5))
-    except Exception as _e:
-        logger.debug(f"[main] CDP probe schedule skipped: {_e}")
+    # There was a non-blocking CDP probe here, warming a cache so the first
+    # browser task knew whether to attach or fall back. The extension tier
+    # needs none: it dials in on its own and registers itself, so there is no
+    # port to poll and no attachment to warm. `latch_state_snapshot()` answers
+    # "is a browser drivable?" from a dict, at any moment, with no I/O.
 
     # Auto-start whisper.cpp server if needed
     _start_whisper_cpp_server()

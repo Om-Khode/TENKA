@@ -33,7 +33,7 @@ Created by **Om Khode**. Licensed under [Apache 2.0](./LICENSE).
 "Who is this?" (looking at the camera)            → recognize_face
 ```
 
-The full list of ~38 intents — grouped by category with descriptions — lives in **[TENKA_Capabilities.md](./TENKA_Capabilities.md)**.
+The full list of ~40 intents — grouped by category with descriptions — lives in **[TENKA_Capabilities.md](./TENKA_Capabilities.md)**.
 
 ---
 

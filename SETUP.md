@@ -201,7 +201,7 @@ python -m assistant.main
 # Then in the chat: "set up Chrome CDP"
 ```
 
-This runs the `browser_cdp_setup` intent, which edits your Chrome shortcuts to add `--remote-debugging-port=9222`. Reversible via "undo Chrome setup". See `assistant/automation/browser/setup.py` for the gory details.
+This runs the `browser_extension_setup` intent, which mints a loopback credential and shows you where to paste it. Nothing on your system is modified: no shortcuts are edited and no launch flags are needed, because the extension drives the browser you already have open. Reversible via "undo the browser extension".
 
 ---
 
@@ -312,5 +312,5 @@ Everything in `~/TENKA/` is safe to delete to start over — TENKA will rebuild 
 Once setup is done, browse:
 
 - **[CONFIGURATION.md](./CONFIGURATION.md)** — every runtime knob, what it does, when you'd touch it.
-- **[TENKA_Capabilities.md](./TENKA_Capabilities.md)** — the 38 intents grouped by category. Useful for "what can I ask?".
+- **[TENKA_Capabilities.md](./TENKA_Capabilities.md)** — the 40 intents grouped by category. Useful for "what can I ask?".
 - **[TENKA_Known_Issues.md](./TENKA_Known_Issues.md)** — current punch list.

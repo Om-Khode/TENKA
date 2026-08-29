@@ -1,0 +1,41 @@
+<!doctype html>
+<!--
+  form_combobox.html — a native <select> and a custom ARIA combobox.
+
+  The custom one is deliberately CLOSED. The perceiver does not open comboboxes:
+  opening one is a click side effect, and a perceiver that changes the page it is
+  describing cannot be called twice for the same answer. The orchestrator's
+  open-then-reperceive flow owns that. So `options` is empty here, and the test
+  asserts it stays empty.
+-->
+<html lang="en">
+<head><meta charset="utf-8"><title>Combobox form</title></head>
+<body>
+  <form id="company">
+    <p>
+      <label for="size">Staff size (native &lt;select&gt;)</label>
+      <select id="size" name="size">
+        <option value="a">1-50</option>
+        <option value="b">51-100</option>
+        <option value="c">101-200</option>
+        <option value="d">201-500</option>
+        <option value="e">501+</option>
+      </select>
+    </p>
+
+    <p>
+      <span id="industry-label">Industry</span>
+      <div role="combobox"
+           aria-labelledby="industry-label"
+           aria-expanded="false"
+           aria-controls="industry-listbox"
+           tabindex="0">Select an industry</div>
+      <ul id="industry-listbox" role="listbox" hidden>
+        <li role="option">Software</li>
+        <li role="option">Manufacturing</li>
+        <li role="option">Healthcare</li>
+      </ul>
+    </p>
+  </form>
+</body>
+</html>

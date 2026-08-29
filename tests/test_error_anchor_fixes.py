@@ -6,7 +6,7 @@ error anchoring layer of `browser_dom.py`:
 
   A. Wrong anchor: the "Please enter a valid phone number." error anchored
      to "First name" instead of "Contact Number". The DOM proximity walker
-     used `cur.querySelector('[data-tenka-idx]')` which returns the FIRST
+     used `cur.querySelector('[data-latch-idx]')` which returns the FIRST
      descendant in DOM order — so when the error sits at form-level (below
      the submit button, no nearby input sibling), the walker arbitrarily
      picked the topmost form field.

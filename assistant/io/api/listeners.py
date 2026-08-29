@@ -58,6 +58,13 @@ LISTENER_OFFSETS: dict[str, int] = {
     "local": 0,
     "tailnet": 1,
     "funnel": 2,
+    # Offset 3 is the slot the removed `quick` policy held. Reused rather than
+    # skipped: the offsets are a dense map an operator reads off a log, and a
+    # gap would invite the next reader to wonder what used to be there. An
+    # operator with a stale `tailscale serve` mapping onto this port is caught
+    # by the preflight reconciliation described above, which refuses to start
+    # when a pre-existing mapping targets a port other than its own.
+    "extension": 3,
 }
 
 

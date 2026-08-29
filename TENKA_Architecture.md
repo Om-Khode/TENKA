@@ -241,7 +241,7 @@ assistant/
     manifest_dispatch.py   # Synthetic handler for manifest-routed phrases
     planner/               # Multi-step goal orchestration
     pending_handlers.py    # Multi-turn confirmations
-    browser_cdp_setup.py   # CDP attach helper
+    browser_extension_setup.py # extension credential + install steps
 
   code_executor/           # Sandboxed Python execution pipeline
   personalities/           # Swappable personality bases

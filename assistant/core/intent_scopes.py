@@ -7,7 +7,8 @@ system state scope, and which intents are always available regardless of scope.
 
 SCOPES = {
     "browser_mode": {
-        "browser_cdp_setup", "browse_url", "find_and_click", "read_screen",
+        "browser_extension_setup", "browser_tabs", "browse_url", "find_and_click",
+        "read_screen",
     },
     "recording_mode": {
         "start_recording", "stop_recording", "get_recording", "summarize_recording",
