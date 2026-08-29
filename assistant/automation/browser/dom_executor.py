@@ -32,6 +32,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from .page_adapter import LocatorAdapter
+
 logger = logging.getLogger("browser_dom_executor")
 
 
@@ -109,7 +111,7 @@ _DEFAULT_BATCH_BUDGET_MS = 30_000
 
 
 async def _dispatch_form_input(
-    locator: Any, action: dict, *, timeout_ms: int = _DEFAULT_ACTION_TIMEOUT_MS,
+    locator: LocatorAdapter, action: dict, *, timeout_ms: int = _DEFAULT_ACTION_TIMEOUT_MS,
 ) -> DomActionResult:
     """
     Fill a text input. Read back the value to verify it took. Most React
@@ -157,7 +159,7 @@ async def _dispatch_form_input(
 
 
 async def _dispatch_click_ref(
-    locator: Any, action: dict, *, timeout_ms: int = _DEFAULT_ACTION_TIMEOUT_MS,
+    locator: LocatorAdapter, action: dict, *, timeout_ms: int = _DEFAULT_ACTION_TIMEOUT_MS,
 ) -> DomActionResult:
     """
     Click an element. No generic post-verify — clicks have outcomes that
@@ -175,7 +177,7 @@ async def _dispatch_click_ref(
 
 
 async def _dispatch_select_option_ref(
-    locator: Any, action: dict, *, timeout_ms: int = _DEFAULT_ACTION_TIMEOUT_MS,
+    locator: LocatorAdapter, action: dict, *, timeout_ms: int = _DEFAULT_ACTION_TIMEOUT_MS,
 ) -> DomActionResult:
     """
     Native <select> option pick. Playwright's `select_option` accepts
@@ -247,7 +249,7 @@ async def _dispatch_select_option_ref(
 
 
 async def _dispatch_press_ref(
-    locator: Any, action: dict, *, timeout_ms: int = _DEFAULT_ACTION_TIMEOUT_MS,
+    locator: LocatorAdapter, action: dict, *, timeout_ms: int = _DEFAULT_ACTION_TIMEOUT_MS,
 ) -> DomActionResult:
     """
     Send a key to a focused element (Enter, Tab, Escape, etc.). No
@@ -327,7 +329,7 @@ _REPERCEIVE_TRIGGERS = frozenset({"reperceive"})
 async def execute_dom_batch(
     page: Any,
     actions: list[dict],
-    ref_to_locator: dict[str, Any],
+    ref_to_locator: dict[str, LocatorAdapter],
     *,
     action_timeout_ms: int = _DEFAULT_ACTION_TIMEOUT_MS,
     max_consecutive_failures: int = _DEFAULT_MAX_CONSECUTIVE_FAILURES,
