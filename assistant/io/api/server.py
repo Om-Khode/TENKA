@@ -515,13 +515,23 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
         # way: `TransportManager` owns them, they are started on request, and
         # `_stop_studio_daemon` stops them explicitly before cancelling the
         # primary. This one nobody asked for, so this is where it is buried.
-        def _stop_extension(_done_primary, _t=extension_task, _s=extension_sock):
-            if not _t.done():
-                _t.cancel()
+        def _close_extension_socket(_done_extension, _s=extension_sock):
+            # Closed only once its server task has finished. Closing it while
+            # uvicorn still had an accept pending is what produced a
+            # `WinError 995` traceback ("the I/O operation has been aborted")
+            # on every shutdown -- harmless, and exactly the kind of noise that
+            # teaches people to skim the end of a log.
             try:
                 _s.close()
             except OSError:
                 pass
+
+        def _stop_extension(_done_primary, _t=extension_task):
+            if _t.done():
+                _close_extension_socket(_t)
+                return
+            _t.add_done_callback(_close_extension_socket)
+            _t.cancel()
 
         task.add_done_callback(_stop_extension)
 
