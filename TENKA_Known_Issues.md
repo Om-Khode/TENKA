@@ -1439,11 +1439,32 @@ application, and the turn reports success)
 **Discovered:** 2026-08-29, live, while attempting the TENKA-v2 P13 loop-3
 test. The goal was `"open notepad and type hello world"`; "hello world" was
 typed into a Visual Studio Code document.
-**Fixed:** 2026-08-29 — `_APP_TARGET_SUFFIX_RE` accepts a quoted title and a
-trailing `window`/`app`, and one `_WORD_PUNCT` constant strips quotes at every
-site that splits a goal into candidate words.
-`tests/test_window_target_resolution.py`.
+**Fixed:** 2026-08-29, in two rounds. First: `_APP_TARGET_SUFFIX_RE` accepts a
+quoted title and a trailing `window`/`app`, and one `_WORD_PUNCT` constant
+strips quotes wherever a goal is split into candidate words. Second, after a
+live test showed the first round was incomplete: `into` added to the target
+prepositions, and `native.type_text` now honours the `window` it is given.
+`tests/test_window_target_resolution.py`,
+`tests/test_typing_honours_its_target.py`.
 **Status:** FIXED
+
+**Correction, and it is the point of this entry.** The first round struck fault
+3 below as "wrong — the check exists and fired". The check that fired was the
+**post-verification on the `focus` step**, a different step from the one that
+types. Nothing verified focus at the moment of the keypress, and the operator
+reproduced it deliberately on the next live run: they clicked their editor
+during the fourteen-second gap, "hello world" went into a source file, and
+TENKA said it had typed into Notepad.
+
+Two lessons, both cheap to state and both already paid for:
+
+- **A verification that fires is not evidence that the right thing is
+  verified.** The log line said `verify_failed (post): step 1 focus`, and I
+  read "step 1" as covering step 4.
+- **The live test found what three rounds of reasoning did not.** The first
+  round's fix was real and insufficient; only running it produced the four
+  planner phrasings that showed `into` was missing, and only a human moving
+  the focus on purpose showed the typing path never checked.
 
 **What happened, from the log.** Step 2 failed post-verification because focus
 had moved off Notepad. The planner built a recovery step that named the target
@@ -1485,19 +1506,28 @@ step **recovered**.
    is somewhere unexpected. The fallback re-targets to precisely the window
    that caused the problem.
 
-3. ~~**The native tier has no mid-typing focus guard.**~~ **This was wrong,
-   and the log I wrote it from says so.** `run_app_steps` post-verifies every
-   step and halts: the original attempt produced
-   `verify_failed (post): step 1 focus — active window is '… - Visual Studio
-   Code', expected to contain 'hunter2.txt - Notepad'` and returned
-   `VERIFY_FAILED` **without typing**. The safety check exists in the native
-   tier, fired, and did its job. What went wrong was entirely faults 1 and 2:
-   the *recovery* attempt then re-resolved the target and typed into the window
-   verification had just rejected. A narrower residual race — focus moving
-   between the post-verify and the keypress — is possible in principle, but
-   nothing here is evidence of it, and `ABORTED_WRONG_FOCUS` is a synchronous
-   check inside a primitive rather than the per-step verification this tier
-   already has.
+3. **`type_text` accepts a `window` and never reads it.** Restored after
+   being wrongly struck — see the correction note below. On the untargeted
+   path (`selector is None`) it calls `pyautogui.write`, which types into
+   whatever holds the OS focus; `window` is logged and then discarded. So a
+   step reading `type - {'text': 'hello world', 'window': '*hello world -
+   Notepad'}` sends the keystrokes wherever the user last clicked, and the
+   result string names the window it did not type into.
+
+   The window is wide. Measured from the live log: **fourteen seconds**
+   between the `focus` step and the keypress, spent on a Ctrl+N, a vision call
+   and a one-second wait.
+
+       11:20:50  Step 1: focus -> Notepad
+       11:20:50  Step 2: press_key ctrl+n
+       11:20:55  vision call
+       11:20:56  Step 3: wait 1s
+       11:21:04  Typing text: hello world into focus
+
+   The guard exists one tier up: `vision/agent.py:keyboard_type` takes
+   `expected_window` and returns `ABORTED_WRONG_FOCUS`. The deterministic tier
+   had the parameter and not the check — the safety property living in the
+   fallback path and not in the one that runs first.
 
 **What worked, and is worth keeping.** Post-verification caught the original
 focus mismatch (`verify_failed (post)`), and the spoken reply was honest about
@@ -1507,17 +1537,34 @@ recovered/success, so the honesty is in the sentence and not in the row —
 the same split TENKA-v2 §17.P13 closed for the vision agent and procedure
 replay, still open on this tier.
 
-**What the fix turned out to be, and what it was not.** Not a new guard: the
+**What the fix turned out to be.** For faults 1 and 2, not a new guard: the
 guard already existed. `_execute_native_task` refuses the active-window
 fallback whenever `_extract_target_app` reports an explicit target, with a
-comment naming this exact hazard — it was written after "type X in notepad"
-once fired Ctrl+N inside the user's IDE. **Quotes stopped it being reached.**
+comment naming this exact hazard — written after "type X in notepad" once
+fired Ctrl+N inside the user's IDE. **Punctuation and a missing preposition
+stopped it being reached**, so fault 2 needed no change once fault 1 was closed
+at both resolvers.
 
-So fault 2 needed no change at all once fault 1 was closed at both resolvers,
-and fault 3 was not a fault. What remains true and worth keeping in mind: the
-turn still recorded as recovered/success. Honesty in the sentence, not in the
-row — the split TENKA-v2 §17.P13 closed for the vision agent and procedure
-replay, still open on the planner's recovery path.
+Fault 3 needed a real one. `type_text` now checks the foreground against the
+`window` it was given, re-focuses once, and returns `ABORTED_WRONG_FOCUS`
+rather than typing — the tag the vision planner prompt, `recovery.py` and
+`agent._action_failed` already understand, so no new vocabulary. The check is
+title match plus process name and deliberately makes **no vision call**: the
+tier up escalates to a model as its third check, which is the wrong trade
+before every keystroke batch on the deterministic path.
+
+**Still open, and not this entry's.** The turn recorded as recovered/success
+even while the reply hedged. Honesty in the sentence, not in the row — the
+split TENKA-v2 §17.P13 closed for the vision agent and procedure replay, still
+open on the planner's recovery path.
+
+**Also observed and not fixed here:** the `Pre-step: new tab/document via
+ctrl+n` opens a *new* document, after which the step result still names the
+window that was focused before it. "Typed into hunter2.txt - Notepad" when the
+text went to a fresh Untitled tab. TENKA noticed out loud — "that last action
+opened a new blank document instead of typing into the one I already had
+open" — while the step recorded SUCCESS naming the old document. Same
+sentence-versus-row split as above.
 
 Related: [KI-36](#ki-36) (the same tier cannot be aborted mid-flight).
 

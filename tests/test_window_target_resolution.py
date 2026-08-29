@@ -60,6 +60,12 @@ class TestQuotedTargetIsExtracted(unittest.TestCase):
         ("type hello world in the notepad window", "notepad"),
         ("type hello world in the notepad app", "notepad"),
         ("multiply 3 and 4 on calculator", "calculator"),
+        # `into` -- the planner wrote this four times in one session and the
+        # first version of this fix did not accept it, so two of four runs
+        # still fell through to the active-window fallback.
+        ('type "hello world" into the Notepad window', "notepad"),
+        ('type "hello world" into notepad', "notepad"),
+        ("type hello world into 'hunter2.txt - Notepad'", "hunter2.txt - notepad"),
     ]
 
     def test_every_named_target_is_found(self):
@@ -102,6 +108,17 @@ class TestNothingIsClaimedThatWasNotNamed(unittest.TestCase):
         # No target clause at all.
         "type hello world",
         "open notepad",
+        # A goal that names no window. The planner wrote this one too, and
+        # "the current document" is not something this function can resolve --
+        # `_execute_native_task` must treat the absence as a reason for care,
+        # not as permission to use the foreground.
+        'type "hello world" into the current document',
+        # `to` is ordinary English and is deliberately NOT a target
+        # preposition. Adding it resolved this to an app called "list", which
+        # `_resolve_target_window` would Win-key search for.
+        "add it to the list",
+        "remind me to buy milk",
+        "send this to john",
     ]
 
     def test_none_of_these_yields_a_target(self):
