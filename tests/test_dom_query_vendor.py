@@ -124,6 +124,39 @@ class TestLoader(unittest.TestCase):
         self.assertEqual(js, raw.decode("utf-8"))
 
 
+class TestHostAgnosticAttribute(unittest.TestCase):
+    """The stamped index attribute is part of the wire protocol (SPEC 6.4).
+
+    It is named `data-latch-idx`, not after this host: the extension is
+    host-agnostic and its content script writes the same attribute this module
+    then selects on. A rename on one side alone leaves the query stamping one
+    name and the locator selecting another -- every element resolves to nothing
+    and the tier reports an empty page rather than an error.
+    """
+
+    def test_js_stamps_the_latch_attribute(self):
+        text = _JS_PATH.read_bytes().decode("utf-8")
+        self.assertIn("dataset.latchIdx", text)
+        self.assertIn("[data-latch-idx]", text)
+
+    def test_no_host_name_survives_in_the_shared_artifact(self):
+        text = _JS_PATH.read_bytes().decode("utf-8").lower()
+        self.assertNotIn(
+            "tenka", text,
+            "the shared JS names its host. It is byte-shared with a repo that "
+            "must not mention one (SPEC 9).",
+        )
+
+    def test_the_selector_dom_builds_matches_what_the_js_stamps(self):
+        # The two halves of the same contract, asserted against each other
+        # rather than each against a literal. A rename that updated only one
+        # side passes two separate literal checks and still resolves nothing.
+        js = _JS_PATH.read_bytes().decode("utf-8")
+        source = Path(bdom.__file__).read_text(encoding="utf-8")
+        self.assertIn("dataset.latchIdx", js)
+        self.assertIn("[data-latch-idx='{idx}']", source)
+
+
 class TestDomUsesTheVendoredCopy(unittest.TestCase):
 
     def test_dom_module_no_longer_holds_an_inline_js_literal(self):
@@ -137,13 +170,13 @@ class TestDomUsesTheVendoredCopy(unittest.TestCase):
     def test_dom_query_js_is_the_vendored_text(self):
         self.assertEqual(bdom._DOM_QUERY_JS, vendor.DOM_QUERY_JS)
 
-    def test_extraction_preserved_the_js_verbatim(self):
-        # Pinned against the digest recorded when the literal was lifted out of
-        # dom.py. If someone edits the JS, this fails and they must decide
-        # deliberately to re-pin it here and in the extension.
+    def test_js_digest_is_pinned(self):
+        # Pinned so an accidental edit fails loudly. The extension ships a byte
+        # copy and compares digests at handshake, so an edit here that is not
+        # mirrored there silently disables the extension tier.
         self.assertEqual(
             vendor.DOM_QUERY_SHA256,
-            "5567749cee86180ef456cd011f00ea33abf8ffb542a4a734c9d6388cc3f3b486",
+            "66c870ba204e3550ad13c4bb061ecfab38c28dcb366e5c4b1a1cd237941e0712",
             "the query JS changed. That is allowed, but the extension's copy "
             "must change identically or the handshake refuses the connection. "
             "Update both, then re-pin this digest.",

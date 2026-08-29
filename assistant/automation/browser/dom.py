@@ -19,8 +19,8 @@ Ref scheme (load-bearing):
   two elements with identical role+name+placeholder+8px-bucketed bounds).
 
 Locator strategy:
-  JS marks each captured element with `data-tenka-idx` (0,1,2,...). Python
-  builds a Playwright Locator via `[data-tenka-idx="N"]`. Indices are
+  JS marks each captured element with `data-latch-idx` (0,1,2,...). Python
+  builds a Playwright Locator via `[data-latch-idx="N"]`. Indices are
   per-perception (not stable across reads); refs ARE stable across reads
   when content is unchanged.
 
@@ -224,7 +224,7 @@ FilterMode = Literal["all", "interactive", "form"]
 # ─── The DOM-side query (one big evaluate) ────────────────────────────────────
 
 # Single JS function. Returns a list of dict objects, one per captured element.
-# Each captured element also gets `data-tenka-idx="N"` set so Python can build
+# Each captured element also gets `data-latch-idx="N"` set so Python can build
 # a Playwright Locator without needing CSS-path generation.
 #
 # The function takes one parameter `cfg` which carries the filter mode and
@@ -506,9 +506,9 @@ async def read_page_dom(
         base_ref = _build_ref(role, name, placeholder, bounds)
         ref = _disambiguate_ref(base_ref, used_refs)
 
-        # Locator via the data-tenka-idx attribute the JS just set.
+        # Locator via the data-latch-idx attribute the JS just set.
         try:
-            locator = page.locator(f"[data-tenka-idx='{idx}']")
+            locator = page.locator(f"[data-latch-idx='{idx}']")
         except Exception as e:
             logger.debug(f"[DOM] failed to build Locator for idx={idx}: {e}")
             continue

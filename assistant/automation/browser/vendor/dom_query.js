@@ -269,7 +269,7 @@
 
         // Mark with sequential idx so Python can build a Locator
         try {
-            el.dataset.tenkaIdx = String(idx);
+            el.dataset.latchIdx = String(idx);
         } catch (e) {
             // Some elements (e.g. SVG in older browsers) reject dataset.
             // Skip them — we can't reliably locate them anyway.
@@ -408,7 +408,7 @@
         //    The walker MUST stop at the first ancestor that contains
         //    MULTIPLE captures — that means the error sits at form/section
         //    level (e.g. an alert at the bottom of the form, below the
-        //    submit button), and `querySelector('[data-tenka-idx]')` would
+        //    submit button), and `querySelector('[data-latch-idx]')` would
         //    arbitrarily pick the FIRST descendant in DOM order (which is
         //    the topmost form field, not the field that failed).
         //    Single-capture ancestors are still trustworthy — that's the
@@ -418,9 +418,9 @@
             let hops = 0;
             while (cur && cur !== document.body && hops < 6) {
                 const captures = (cur.querySelectorAll
-                    ? cur.querySelectorAll('[data-tenka-idx]') : []);
+                    ? cur.querySelectorAll('[data-latch-idx]') : []);
                 if (captures.length === 1) {
-                    const i = parseInt(captures[0].dataset.tenkaIdx || '-1', 10);
+                    const i = parseInt(captures[0].dataset.latchIdx || '-1', 10);
                     if (!isNaN(i) && i >= 0) {
                         fieldIdx = i;
                         break;
