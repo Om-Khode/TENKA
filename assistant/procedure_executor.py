@@ -10,21 +10,139 @@ Improvements over the initial implementation:
 
 Public API:
     run_procedure(proc: dict, original_text: str) -> str
+    run_procedure_detailed(proc: dict, original_text: str) -> ProcedureResult
 """
 
 import asyncio
 import json
 import logging
 import re
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
 
 from . import config, procedures
+from .core.abort import UserAborted
+from .core.verdict import Outcome, roll_up
 
 logger = logging.getLogger("proc_exec")
 
 _MAX_RETRIES  = 2
 _RETRY_DELAYS = [0.8, 1.6]   # seconds between retry attempts
+
+
+# ─── What came of a step ─────────────────────────────────────────────────────
+#
+# TENKA-v2 §17.P13, loop 2. This loop keeps its own step generation, its
+# retry-with-backoff, its self-heal escalation and its stop-on-error rule. What
+# it gives up is its status vocabulary, which was `_is_error()` -- a substring
+# sniff over free prose, asked twice: once to decide whether to retry and once
+# to decide whether to abandon the whole procedure.
+#
+# **Why a substring sniff is not a status.** Measured against the result shapes
+# this module actually produces:
+#
+#     Opened chrome                                    continue
+#     Skipped (browser navigate opens the browser)     continue
+#     Skipped (already logged in)                      continue
+#     Skipped (element not found)                      HALTS
+#     Skipped (page still loading, timeout)            HALTS
+#     open completed (screen-verified)                 continue
+#     Typed: the file was not found on the server      HALTS
+#
+# Rows 4 and 5 are the sharp ones. `_self_heal` spends a **vision model call**
+# to decide `SKIP: <reason>`, returns `Skipped (<reason>)`, and then
+# `_is_error` reads the model's own reason text and abandons the procedure
+# anyway. The answer that was paid for is discarded by a substring match on
+# itself, and "element not found" / "timed out" are the natural words for why a
+# UI step can be skipped. Row 7 is the same mechanism with legitimate output:
+# a step that types or reads text containing "not found" halts the run.
+#
+# **The decision and the truth are allowed to differ, and that is the point.**
+# `_HALTS` reproduces `_is_error` exactly, tag for tag, so no procedure changes
+# course. `Outcome` records what actually happened, so the caller can stop
+# claiming success it never observed. Rows 4 and 5 therefore map to `FAILED`
+# even though the honest answer is `UNVERIFIED` -- preserved deliberately,
+# because P13 forbids behaviour changes and that fix wants its own live test.
+# `tests/test_procedure_executor.py` pins the equivalence over every shape
+# above, so the day someone corrects rows 4 and 5 they will be told which test
+# encodes the old behaviour.
+
+# The suffix `_self_heal` stamps on a step the vision model said had worked
+# after all. One constant, read by the producer and the classifier, because two
+# copies of a magic string drift and the drift is silent.
+_SCREEN_VERIFIED = "(screen-verified)"
+
+# An outcome in here abandons the step (stop retrying) and then the procedure.
+# `UNCERTAIN` and `UNVERIFIED` deliberately do not halt: a vision-confirmed
+# step and a deliberately skipped one both let the run continue today, and
+# `is_evidence_of_success` would have stopped both -- which is why the halt
+# rule is its own set rather than that property.
+_HALTS = frozenset({Outcome.FAILED, Outcome.UNSUPPORTED})
+
+
+@dataclass(frozen=True)
+class StepResult:
+    """One step's reported text and what it amounts to."""
+
+    step_num: int
+    text: str
+    outcome: Outcome
+
+    @property
+    def line(self) -> str:
+        """The `Step N: ...` line, verbatim as before P13.
+
+        The joined form of these is what both callers speak, so this string is
+        a compatibility surface, not a display detail.
+        """
+        return f"Step {self.step_num}: {self.text}"
+
+
+@dataclass(frozen=True)
+class ProcedureResult:
+    """What a replayed procedure came to.
+
+    `text` is byte-identical to what `run_procedure` returned before P13 --
+    that is the whole reason the structured form is additive rather than a
+    replacement. `outcome` is what did not exist: both callers had only prose,
+    and `main.py` recorded `action_outcome = "success"` unconditionally because
+    prose is not something you can branch on honestly.
+
+    Both derived, not stored, for the reason `brain/task.Task.outcome()` gives:
+    a stored answer goes stale against what it was derived from, and a result's
+    honesty must not depend on two fields being updated together.
+    """
+
+    steps: tuple[StepResult, ...] = ()
+    # Set only for the exits that never reach the step loop -- a refusal, or a
+    # procedure with no steps. Those are not step text and must not be parsed
+    # as though they were.
+    message: str = ""
+
+    @property
+    def text(self) -> str:
+        if self.message:
+            return self.message
+        return "\n".join(s.line for s in self.steps)
+
+    @property
+    def outcome(self) -> Outcome:
+        """`UNSUPPORTED` when nothing ran at all.
+
+        A refusal and an empty procedure are both "never attempted", which is
+        what that member means. Not `UNVERIFIED`: that is the operator's
+        recorded choice not to look, and nobody chose either of these.
+        """
+        if not self.steps:
+            return Outcome.UNSUPPORTED
+        return roll_up(s.outcome for s in self.steps)
+
+    @property
+    def halted(self) -> bool:
+        """Did the run stop early on a step it could not get past?"""
+        return any(s.outcome in _HALTS for s in self.steps)
+
 
 _SLOT_RE      = re.compile(r'\{(\w+)\}')
 _BUILTIN_VARS = frozenset({"user_input", "date", "time", "clipboard"})
@@ -155,6 +273,19 @@ def _get_window_context(step: dict) -> str | None:
 
 
 async def run_procedure(proc: dict, original_text: str) -> str:
+    """Execute a stored procedure and return the spoken-style report.
+
+    Thin wrapper over `run_procedure_detailed`, kept because both callers speak
+    this string and one of them feeds it to a summarising model. The text is
+    byte-identical to what this returned before §17.P13; a caller that wants to
+    know *whether it worked* asks for the detailed form instead of parsing
+    prose, which is what `main.py` was reduced to and why it recorded
+    `action_outcome = "success"` unconditionally.
+    """
+    return (await run_procedure_detailed(proc, original_text)).text
+
+
+async def run_procedure_detailed(proc: dict, original_text: str) -> ProcedureResult:
     """
     Execute a stored procedure step by step.
 
@@ -172,6 +303,11 @@ async def run_procedure(proc: dict, original_text: str) -> str:
     this is what catches a *third* caller nobody has written yet. Both were
     open at once when the 6a.5 review found this, which is the argument for
     having both.
+
+    **`UserAborted` propagates.** This module has no abort boundary of its own
+    (KI-36), so nothing raises it here yet; the step loop re-raises rather than
+    stringifying so that adding one later does not need this decision made
+    again under time pressure.
     """
     # Deferred import: `actions` pulls in the whole handler package, and this
     # module is imported by main.py and the scheduler at startup. The same
@@ -183,14 +319,19 @@ async def run_procedure(proc: dict, original_text: str) -> str:
     if _refusal is not None:
         logger.info(
             f"[PROC] Refused '{proc.get('name', '?')}': caller lacks execute")
-        return _refusal
+        # `message`, not a step: a refusal is something the caller is told, and
+        # putting it where step text goes would let `_classify` decide what a
+        # security decision "amounts to". The outcome is `UNSUPPORTED` --
+        # nothing was attempted -- and `speaks_as_done` is False for it, so a
+        # refusal cannot be summarised as a completed procedure.
+        return ProcedureResult(message=_refusal)
 
     steps = proc.get("steps", [])
     if not steps:
-        return "Procedure has no steps."
+        return ProcedureResult(message="Procedure has no steps.")
 
     variables    = await _build_variables(proc, original_text)
-    results: list[str] = []
+    results: list[StepResult] = []
     active_window: str | None = None
 
     for i, raw_step in enumerate(steps):
@@ -199,7 +340,8 @@ async def run_procedure(proc: dict, original_text: str) -> str:
         stype    = step.get("type", "")
 
         if _should_skip_open_before_navigate(step, steps, i):
-            results.append(f"Step {step_num}: Skipped (browser navigate opens the browser)")
+            _skip = "Skipped (browser navigate opens the browser)"
+            results.append(StepResult(step_num, _skip, _classify(_skip)))
             logger.info(f"[PROC] Step {step_num}: skipped 'open browser' — next step is browser navigate")
             continue
 
@@ -212,6 +354,7 @@ async def run_procedure(proc: dict, original_text: str) -> str:
             await _ensure_foreground(active_window)
 
         result = None
+        outcome = Outcome.UNCERTAIN
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 if stype == "app":
@@ -220,10 +363,25 @@ async def run_procedure(proc: dict, original_text: str) -> str:
                     result = await _execute_browser_step_via_app(step, active_window)
                 else:
                     result = f"Unknown step type '{stype}'"
+            except UserAborted:
+                # Never into a string. The user revoking the task is not a step
+                # that failed, and treating it as one is expensive here rather
+                # than merely wrong: `Exception: esc_hold` trips `_is_error`, so
+                # the step retries twice with backoff and then spends a vision
+                # call on `_self_heal` asking the screen whether the thing the
+                # user just cancelled had worked.
+                #
+                # Nothing beneath this raises `UserAborted` today -- the
+                # per-function `automation.native` calls used here have no abort
+                # boundary, only `run_app_steps` does, and this module has no
+                # boundary of its own either (KI-36). So this guard costs no
+                # behaviour and closes the door ahead of whoever adds one.
+                raise
             except Exception as exc:
                 result = f"Exception: {exc}"
 
-            if not _is_error(result):
+            outcome = _classify(result)
+            if outcome not in _HALTS:
                 break
 
             if attempt < _MAX_RETRIES:
@@ -237,14 +395,15 @@ async def run_procedure(proc: dict, original_text: str) -> str:
                 healed = await _self_heal(step, result)
                 if healed is not None:
                     result = healed
+                    outcome = _classify(result)
 
-        results.append(f"Step {step_num}: {result}")
+        results.append(StepResult(step_num, result, outcome))
 
         new_ctx = _get_window_context(step)
         if new_ctx:
             active_window = new_ctx
 
-        if _is_error(result):
+        if outcome in _HALTS:
             logger.warning(f"[PROC] Stopped at step {step_num}: {result}")
             break
 
@@ -253,7 +412,12 @@ async def run_procedure(proc: dict, original_text: str) -> str:
     except Exception as e:
         logger.debug(f"[PROC] record_usage failed (non-critical): {e}")
 
-    return "\n".join(results)
+    outcome_result = ProcedureResult(steps=tuple(results))
+    logger.info(
+        f"[PROC] '{proc.get('name', '?')}' finished: "
+        f"{outcome_result.outcome.value} over {len(results)} step(s)"
+    )
+    return outcome_result
 
 
 # ─── Variable Resolution ──────────────────────────────────────────────────────
@@ -411,6 +575,13 @@ def _should_skip_open_before_navigate(step: dict, steps: list, idx: int) -> bool
 
 
 def _is_error(result: str) -> bool:
+    """The pre-P13 predicate, kept as the *definition* of the old behaviour.
+
+    Not dead code and not a shim: `_classify` is required to agree with it on
+    the halt decision for every result shape, and the test that pins that reads
+    this function. Deleting it would leave the equivalence claim with nothing to
+    compare against.
+    """
     if not result:
         return False
     low = result.lower()
@@ -418,6 +589,45 @@ def _is_error(result: str) -> bool:
         "error", "failed", "not found", "couldn't", "cannot",
         "exception", "timed out", "timeout", "not available",
     ))
+
+
+def _classify(result: str) -> Outcome:
+    """What a step's reported text amounts to. §17.P13.
+
+    Required invariant, pinned by test:
+
+        (_classify(text) in _HALTS) == _is_error(text)      for all text
+
+    So the run takes the same course it always did. What changes is that a
+    skip and a vision-confirmed guess stop being indistinguishable from a
+    clean success once the run is over.
+    """
+    if not result:
+        # `_is_error("")` is False, so an empty result continued before and
+        # continues now. It is not evidence of anything, though, and calling it
+        # SUCCEEDED is the "absence of an exception is success" reading this
+        # phase exists to remove.
+        return Outcome.UNCERTAIN
+
+    if result.startswith("Skipped ("):
+        # A step deliberately not run: the browser-navigate elision, or
+        # `_self_heal` deciding it was safe to skip. `UNVERIFIED` is exactly
+        # that -- nothing to verify -- **except** where the reason text trips
+        # the old substring sniff, which halts the procedure today. Preserved,
+        # and wrong; see the module note above.
+        return Outcome.FAILED if _is_error(result) else Outcome.UNVERIFIED
+
+    if _is_error(result):
+        return Outcome.FAILED
+
+    if result.endswith(_SCREEN_VERIFIED):
+        # The retries all failed and a vision call said it had worked anyway.
+        # That is a model looking at a screenshot, not positive evidence, and
+        # reporting it as `SUCCEEDED` is what makes a task claim more than it
+        # knows. The run still continues, exactly as before.
+        return Outcome.UNCERTAIN
+
+    return Outcome.SUCCEEDED
 
 
 # ─── Self-Heal ────────────────────────────────────────────────────────────────

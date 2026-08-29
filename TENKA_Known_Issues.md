@@ -1238,3 +1238,288 @@ real vision run — which this change did not have and which §22 puts out of
 scope.
 
 Same family: [KI-14](#ki-14), [KI-15](#ki-15), [KI-16](#ki-16).
+
+---
+
+## KI-36: The tier-1 browser path checks abort once, at entry
+
+**Priority:** Medium (control — the stop button does not stop it)
+**Effort:** Low per site, but it is a behaviour change on an automation tier,
+so `.claude/rules/testing.md` requires a live test
+**Discovered:** 2026-08-28, while live-testing TENKA-v2 P13 loop 1. Found in
+the operator's own log, testing something else.
+**Status:** open
+
+**The defect.** `handle_browser_action` checks `abort.is_aborted()` once, at
+function entry (`actions/da_handlers.py`). After that the tier runs to
+completion: `router._execute_browser_task` is 246 lines with **zero** mentions
+of `abort`, across eight calls to `run_browser_steps`, and
+`automation/browser/automation.py` contains no abort check at all. So ESC held
+after the handler is entered is ignored for the rest of the task.
+
+**Observed, not inferred.** From a live session log:
+
+```
+21:58:44 [BROWSER] Launching Chromium (headless=False)...
+21:58:47 [abort]   requested: esc_hold
+21:58:50 [BROWSER] Step 1: navigate - {...}
+21:58:57 [llm]     Vision (Gemini gemini-2.5-flash) OK (788 tokens)
+21:58:57 [actions] Executed 'browser_action': Navigated to https://...
+```
+
+The abort is requested, and then a navigation runs, a paid vision call runs,
+and the tier reports **success**. The user pressed stop and was billed for a
+model call afterwards. A second ESC eleven seconds later did work — because it
+landed between turns, where the entry check sees it.
+
+**The comparison that makes this a defect rather than a design.** The sibling
+tier already does it right: `automation/native.py:run_app_steps` checks between
+every step and raises `UserAborted` rather than returning a string, with a
+comment explaining why. Two tiers, one contract, one of them honouring it.
+
+**Same family as** the P13 loop-1 fix (`router._execute_dom_task` turned an
+abort into `"__FALLBACK__"`), and the same underlying rule from
+`.claude/rules/automation.md`: never swallow `UserAborted`, and check at loop
+boundaries. That fix closed one path; this is the neighbouring one. Also
+related: `procedure_executor.run_procedure` has no abort boundary anywhere, so
+a replayed procedure cannot be stopped either — noted in TENKA-v2 §17.P13 as
+out of scope for that phase, since adding a boundary is new behaviour rather
+than a vocabulary migration.
+
+---
+
+## KI-37: The CDP probe accepts any Chromium-engined process on the debug port
+
+**Priority:** Medium (correctness, with a privacy edge)
+**Effort:** Low to detect, a decision to fix — see below
+**Discovered:** 2026-08-28, first run of `tools/live_p13_dom_abort.py` on the
+operator's machine
+**Status:** open
+
+**The defect.** `cdp_health_probe` GETs `/json/version` on the configured port
+and accepts the endpoint when the `Browser` field contains any of `chrome`,
+`chromium`, `edg` or `brave`. That answers "is this a Chromium DevTools
+endpoint", which is not the same question as "is this a browser the user is
+using". Anything embedding a Chromium webview and exposing a debug port
+satisfies it.
+
+**Observed.** On the machine in question, port 9222 was held by
+`msedgewebview2.exe` — an **embedded WebView2 control belonging to a
+preinstalled system utility**, not a browser anyone had opened. It identifies
+as `Edg/151.0.4129.107`, so the probe reported `available`, the attach
+succeeded, and `_pick_active_page` returned that control's page. TENKA was one
+step from perceiving and clicking inside a vendor system-management UI.
+
+**Two consequences, and the second is the quieter one:**
+
+1. **Actions land in the wrong surface.** DOM-mode would plan and dispatch
+   clicks against a window the user does not think of as a browser tab.
+2. **Its content is read and sent to a model.** DOM-mode perceives the
+   accessibility tree and puts it in the planner prompt. Whatever that
+   embedded surface is showing — account state, device identifiers, anything a
+   vendor utility renders — becomes prompt content. Nothing malicious is
+   required for this; it is the ordinary path working on an unintended target.
+
+**Mitigated only in the test harness so far.**
+`tools/live_p13_dom_abort.py` requires `--expect-url` and refuses when the
+active tab does not match, which is what stopped the first run. That protects
+the harness, not the assistant.
+
+**Not fixed here because the fix needs a decision, not a patch.** Candidates,
+none free:
+
+- Match the attached endpoint against the **foreground window's** process, so
+  the browser must be one the user is actually looking at. Strongest, and the
+  page picker already accepts a `prefer_window_title` hint that could be made
+  mandatory rather than advisory.
+- Require the endpoint to report more than one page, or a non-`about:` page —
+  cheap, and a heuristic, which is the category this project keeps regretting.
+- Have the operator opt in per port. Honest, and pushes a decision onto
+  someone who did not ask for one.
+
+Whichever is chosen, the probe should log *what* it attached to at INFO —
+today it logs the engine string, which is exactly the field that made a system
+utility look like Chrome.
+
+---
+
+## KI-38: A procedure whose trigger starts or ends with a filler word can never run
+
+**Priority:** Medium (correctness — the feature accepts input it will never honour)
+**Effort:** Low. One line, plus a decision about existing rows
+**Discovered:** 2026-08-28, while setting up the TENKA-v2 P13 loop-2 live test.
+The test procedure never fired; the utterance was classified as
+`code_executor` instead and answered with a CPU core count.
+**Status:** open
+
+**The defect.** `ProcedureRepo.match_trigger` normalizes the *utterance* and
+compares it against the *stored trigger raw*:
+
+```python
+normalized_input = self._normalize(text)     # fillers stripped
+...
+trigger = row["trigger"].lower()             # fillers NOT stripped
+if normalized_input == trigger: ...
+```
+
+`_normalize` strips leading and trailing filler words. The filler list includes
+`run`, `go`, `please`, `now`, `hey`, `hi`, `just`, `do it`, `can you`,
+`could you`, `would you` and the assistant's own name. So a trigger beginning
+or ending with any of them fails **all four** match tiers:
+
+| tier | why it misses |
+| --- | --- |
+| exact | `"the widget" != "run the widget"` |
+| prefix | the input is *shorter* than the trigger, so it cannot start with it |
+| contained | the trigger is not a substring of the shortened input |
+| subsequence | the stripped word is in `trigger_words` and not in `input_words` |
+
+Measured, with a trigger of `"<filler> the widget"` in each case:
+
+```
+run / go / please / hey / hi / just / now / do it   ->  no match, every tier
+```
+
+**Why it is worse than a miss.** Nothing refuses the trigger at teach time.
+`create_procedure` stores it, `manage_procedure` lists it back, and the user is
+told the procedure exists. It simply never fires — and because
+`match_trigger` runs *before* intent routing, the utterance falls through to
+the classifier and gets answered by something else entirely. In the discovery
+case that meant a stored keystroke program was replaced by generated Python.
+A silent, permanent no-op that looks like a working feature.
+
+`"run my backup"`, `"go check email"`, `"hey open work"` are all natural
+phrasings for a taught trigger, and all dead on arrival.
+
+**The fix is one line, and the decision is what to do about stored rows.**
+Comparing `self._normalize(row["trigger"])` instead of `row["trigger"].lower()`
+closes it for good. What that does *not* decide:
+
+- **Existing rows keep their raw text.** Normalizing on read makes them start
+  working, which is the intent — but a trigger that was `"run notes"` will
+  begin claiming `"notes"`, i.e. it gains a `contained` match it never had.
+  Given KI-16's neighbour (a one-word trigger claiming every sentence
+  containing that word), that widening wants the weak-tier weighing in
+  `main.py` re-checked, not assumed.
+- **Or normalize on write** and leave `match_trigger` alone. Narrower, but it
+  does nothing for the rows already stored, and two normalizers on one value
+  is how they drift.
+- Either way **teach-time should refuse a trigger that normalizes to empty**
+  (`"please"`, `"just now"`), which today is stored and matches everything or
+  nothing depending on the tier.
+
+Not fixed here because it is not P13's, and because the widening above needs
+its own live test against a real taught procedure rather than a unit test of
+the comparison.
+
+Same family: [KI-16](#ki-16) — weak matching claiming ordinary speech.
+
+---
+
+## KI-39: Recovery typed into the wrong window and reported success
+
+**Priority:** Medium-High (correctness — keystrokes land in an unintended
+application, and the turn reports success)
+**Effort:** Low for the matcher; the fallback is a design decision
+**Discovered:** 2026-08-29, live, while attempting the TENKA-v2 P13 loop-3
+test. The goal was `"open notepad and type hello world"`; "hello world" was
+typed into a Visual Studio Code document.
+**Status:** open
+
+**What happened, from the log.** Step 2 failed post-verification because focus
+had moved off Notepad. The planner built a recovery step that named the target
+correctly:
+
+```
+[PLANNER] Recovery step 3: [app_action] type "hello world" in the 'hunter2.txt - Notepad' window
+[SCREEN]  Active window: "… - Visual Studio Code"
+[DA]      Fallback: using active window '… - Visual Studio Code' (no keyword match)
+[APP]     Typing text: hello world into focus
+[PLANNER] Step 2 marked 'recovered' — all recovery steps succeeded
+```
+
+The recovery knew the right window, could not resolve it, silently retargeted
+to whatever happened to be focused, typed there, and the planner marked the
+step **recovered**.
+
+**Three faults in one chain. The first is a one-line bug.**
+
+1. **The quoting defeats the matcher.** `_detect_running_app` builds candidate
+   words with `w.lower().strip(".,!?")` — which does not strip quotes or
+   apostrophes — and the planner's own recovery prompt wraps window names in
+   single quotes. Reproduced:
+
+   ```
+   goal        type "hello world" in the 'hunter2.txt - Notepad' window
+   candidates  ['"hello', 'world"', "'hunter2.txt", "notepad'"]
+   app part    'notepad'
+   matches     []            <-  "notepad'" is not in "notepad"
+   ```
+
+   One component writes a name the sibling component cannot read. Neither is
+   wrong alone.
+
+2. **No-match falls back to the active window.** Having lost the target, the
+   resolver uses whatever is focused *now*. For a first attempt that is a
+   reasonable convenience; for a **recovery from a focus failure** it is the
+   worst possible default, because the reason recovery is running is that focus
+   is somewhere unexpected. The fallback re-targets to precisely the window
+   that caused the problem.
+
+3. **The native tier has no mid-typing focus guard.** `ABORTED_WRONG_FOCUS` —
+   the check that refuses to type when the expected window is not focused —
+   exists only in `automation/vision/agent.py`'s `keyboard_type` /
+   `keyboard_hotkey` / `keyboard_press`. `automation/native.py` focuses and then
+   types, so anything that steals focus in between gets the keystrokes. The
+   safety property exists in the *fallback* tier and not in the tier that runs
+   first.
+
+**What worked, and is worth keeping.** Post-verification caught the original
+focus mismatch (`verify_failed (post)`), and the spoken reply was honest about
+the outcome: *"the focus was a bit off … so I ended up typing it into a new
+file in Visual Studio Code instead."* The turn nevertheless recorded as
+recovered/success, so the honesty is in the sentence and not in the row —
+the same split TENKA-v2 §17.P13 closed for the vision agent and procedure
+replay, still open on this tier.
+
+**Why this is not fixed here.** Fault 1 is a one-line strip fix, but it is not
+worth shipping alone: with the target resolving correctly, fault 2 stops firing
+in *this* case while remaining wrong for the next one, and fault 3 leaves the
+window between focus and keypress open regardless. The three want one change
+with one live test — a recovery that cannot silently retarget, and a native
+typing path that refuses like the vision one does.
+
+Related: [KI-36](#ki-36) (the same tier cannot be aborted mid-flight).
+
+---
+
+## KI-37 addendum — observed in ordinary use, 2026-08-29
+
+Not a test this time. A `computer_task` form-fill routed correctly to DOM mode
+against the user's Chrome window, then attached to the wrong browser entirely:
+
+```
+[CDP] probe OK port=9222 browser='Edg/151.0.4129.107'
+[DA]  Routing goal '…': backend=dom, reason=form_intent app='demosite - Google Chrome'
+[DA]  DOM-mode running on page: 'https://vantage.csw.lenovo.com/…'
+[DOM_FORM_FILL] perceived 7 elements
+[DOM_MAPPER] mapping goal to 0 fields
+```
+
+The router identified the right window (`app='demosite - Google Chrome'`) and
+the CDP layer then handed it a preinstalled utility's embedded webview, because
+that is what answers on 9222. The user's Chrome was on another port.
+
+Two things this adds to the entry above:
+
+- **It is not a corner case.** It cost an ordinary request, silently, and the
+  only reason it was diagnosable is that the page URL is logged. Without that
+  line the symptom is "she says she can't see the form" with the form plainly
+  on screen.
+- **The failure was graceful, which is why it will go unreported.** The mapper
+  found nothing form-shaped and said "I couldn't figure out which fields to
+  fill" — reasonable-sounding, and wrong. Users retype the request rather than
+  report it.
+
+Raises the practical priority of the foreground-window check proposed above,
+whichever of the three options is chosen.

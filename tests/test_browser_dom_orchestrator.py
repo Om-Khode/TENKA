@@ -40,6 +40,12 @@ import assistant.automation.browser.dom as bdom
 import assistant.automation.browser.dom_planner as bdp
 import assistant.automation.browser.dom_executor as bde
 import assistant.automation.browser.dom_orchestrator as bdo
+# P13. `cdp` and `router` are stdlib+config at import time -- neither pulls
+# Playwright or pyautogui, so importing them here cannot reach the desktop.
+import assistant.automation.browser.cdp as bcdp
+import assistant.automation.router as router
+from assistant.core.abort import UserAborted
+from assistant.core.verdict import Outcome, speaks_as_done
 
 
 def _run(coro):
@@ -480,6 +486,259 @@ class TestRunDomTask(unittest.IsolatedAsyncioTestCase):
         # Planner received the full tree (1 element, no scoping)
         called_tree = p.call_args[0][1]  # second positional arg
         self.assertEqual(len(called_tree.elements), 1)
+
+
+# ─── P13: the state machine ──────────────────────────────────────────────
+#
+# TENKA-v2 §17.P13. This loop gave up its own status vocabulary for
+# `core/verdict.py`'s. These tests pin the two properties the phase requires:
+# identical observable behaviour (the 25 tests above, unchanged), and no new
+# success path.
+
+
+class TestReasonOutcomeTable(unittest.TestCase):
+    """`speaks_as_done(outcome)` must agree with the old boolean, tag for tag.
+
+    The migration's whole claim is that `success` carried no information the
+    `reason` tag did not already carry. This is that claim as an assertion,
+    enumerated rather than sampled: the three tags that were constructed with
+    `success=True` in the pre-P13 tree, and the twelve that were constructed
+    with `success=False`, taken from all 31 construction sites.
+
+    If a future tag is added to the loop and mapped so that it speaks as done,
+    this test is what says so.
+    """
+
+    # Exactly the tags that appeared as `success=True` before P13.
+    SPOKE_AS_DONE = frozenset({
+        "completed", "completed_no_actions", "completed_no_submit",
+    })
+    # Exactly the tags that appeared as `success=False` before P13.
+    DID_NOT = frozenset({
+        "max_loops", "max_attempts", "validation_unresolved",
+        "validation_no_progress", "user_value_rejected", "planner_failed",
+        "mapper_failed", "fills_failed", "submit_failed",
+        "loop_failure_at_max", "perceive_failed", "empty_tree",
+    })
+
+    def test_table_covers_every_tag_and_nothing_else(self):
+        # A tag in the loop with no row falls through to _UNMAPPED_OUTCOME,
+        # and a row with no tag is dead weight that will drift. Both are
+        # bugs, so the table and the census must match exactly.
+        self.assertEqual(
+            set(bdo._REASON_OUTCOME), self.SPOKE_AS_DONE | self.DID_NOT,
+        )
+
+    def test_success_matches_pre_p13_boolean_for_every_tag(self):
+        for reason in sorted(self.SPOKE_AS_DONE):
+            with self.subTest(reason=reason):
+                self.assertTrue(bdo.DomTaskResult(reason=reason).success)
+        for reason in sorted(self.DID_NOT):
+            with self.subTest(reason=reason):
+                self.assertFalse(bdo.DomTaskResult(reason=reason).success)
+
+    def test_only_completed_is_evidence_of_success(self):
+        # The three done-speaking tags are not equally strong, and flattening
+        # them back into a boolean is what P13 removed. `completed_no_actions`
+        # dispatched nothing; `completed_no_submit` never pressed submit.
+        # Both may speak as done (V6) and neither is evidence (V4).
+        self.assertIs(
+            bdo.DomTaskResult(reason="completed").outcome, Outcome.SUCCEEDED,
+        )
+        for reason in ("completed_no_actions", "completed_no_submit"):
+            with self.subTest(reason=reason):
+                r = bdo.DomTaskResult(reason=reason)
+                self.assertIs(r.outcome, Outcome.UNVERIFIED)
+                self.assertFalse(r.outcome.is_evidence_of_success)
+                self.assertTrue(r.success)
+
+    def test_budget_exhaustion_is_uncertain_not_failed(self):
+        # Nobody looked and nobody knows. Reporting FAILED here would be the
+        # inverse of KI-31: positive evidence claimed where there is none.
+        for reason in ("max_loops", "max_attempts", "validation_unresolved"):
+            with self.subTest(reason=reason):
+                self.assertIs(
+                    bdo.DomTaskResult(reason=reason).outcome,
+                    Outcome.UNCERTAIN,
+                )
+
+    def test_no_foundation_is_unsupported(self):
+        # The two tags router.py already routes to the vision tier.
+        for reason in ("perceive_failed", "empty_tree"):
+            with self.subTest(reason=reason):
+                self.assertIs(
+                    bdo.DomTaskResult(reason=reason).outcome,
+                    Outcome.UNSUPPORTED,
+                )
+
+    def test_unmapped_reason_fails_closed(self):
+        # A tag added to the loop and forgotten here must not read as done.
+        # Same shape as `brain/task.may_transition` answering False for an
+        # unknown state: the omission goes nowhere good, loudly.
+        r = bdo.DomTaskResult(reason="some_tag_nobody_mapped")
+        with self.assertLogs("browser_dom_orchestrator", level="WARNING") as cm:
+            self.assertIs(r.outcome, Outcome.FAILED)
+        self.assertIn("no row in _REASON_OUTCOME", "\n".join(cm.output))
+        self.assertFalse(r.success)
+
+    def test_nothing_outside_the_completed_tags_speaks_as_done(self):
+        # The invariant, stated over the table itself rather than over the
+        # census: nothing that is not a `completed_*` tag may speak as done.
+        # This is what catches a *new* tag mapped to SUCCEEDED or UNVERIFIED.
+        for reason, outcome in bdo._REASON_OUTCOME.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    speaks_as_done(outcome), reason in self.SPOKE_AS_DONE,
+                )
+
+
+# ─── P13: abort is not a failure mode ────────────────────────────────────
+
+
+class TestAbortIsNotAFallback(unittest.IsolatedAsyncioTestCase):
+    """ESC held mid-batch must reach the caller as `UserAborted`.
+
+    `dom_executor.execute_dom_batch` raises it at every action boundary and
+    `run_dom_task` deliberately does not catch it. The hole was one level up:
+    `router._execute_dom_task` caught it with a bare `except Exception` and
+    returned `"__FALLBACK__"`, which is not an error string but an instruction
+    to escalate to the vision tier -- so an abort re-triggered TTS, minimized
+    the user's terminals and spent a vision call before anything stopped.
+
+    `.claude/rules/automation.md`: "Never swallow `UserAborted` into a string
+    error."
+    """
+
+    async def test_orchestrator_lets_user_aborted_through(self):
+        tree = _make_tree([
+            _elem("r1", form_id="form-0", role="textbox", name="A"),
+            _elem("r2", form_id="form-0", role="button", name="Submit"),
+        ])
+        actions = [{"type": "form_input", "ref": "r1", "value": "X"}]
+        plan = bdp.DomPlan(
+            thinking="fill", plan="ok",
+            actions=actions, done=True, needs_reperceive=False,
+        )
+        with patch.object(bdom, "read_page_dom", new=AsyncMock(return_value=tree)), \
+             patch.object(bdp, "plan_dom_actions", new=AsyncMock(return_value=plan)), \
+             patch.object(bde, "execute_dom_batch",
+                          new=AsyncMock(side_effect=UserAborted("esc_hold"))):
+            with self.assertRaises(UserAborted):
+                await bdo.run_dom_task("fill the form", MagicMock())
+
+    async def _run_router_with_abort(self):
+        """Drive `router._execute_dom_task` to the point of abort.
+
+        CDP attach and page selection are stubbed on the modules the deferred
+        `from .browser import cdp` binds, which is where the lookup happens at
+        call time.
+        """
+        handle = MagicMock()
+        handle.kind = "cdp"
+        handle.attachment = MagicMock()
+        page = MagicMock()
+        page.url = "https://example.invalid/form"
+
+        with patch.object(bcdp, "get_or_attach_browser",
+                          new=AsyncMock(return_value=handle)), \
+             patch.object(router, "_pick_active_page",
+                          new=AsyncMock(return_value=page)), \
+             patch.object(bdo, "run_dom_task",
+                          new=AsyncMock(side_effect=UserAborted("esc_hold"))):
+            return await router._execute_dom_task("do the thing")
+
+    async def test_router_reraises_instead_of_falling_back(self):
+        with self.assertRaises(UserAborted):
+            await self._run_router_with_abort()
+
+    async def test_router_does_not_log_abort_as_a_crash(self):
+        # The log line is the user-visible symptom in the transcript, and it
+        # is what made this look like an orchestrator bug rather than an
+        # abort. Asserted separately from the raise because a guard placed
+        # after the `logger.error` would pass the test above and still lie.
+        with self.assertLogs(router.logger, level="INFO") as cm:
+            with self.assertRaises(UserAborted):
+                await self._run_router_with_abort()
+        self.assertNotIn("crashed", "\n".join(cm.output))
+
+
+class TestTheRaiseHasSomewhereToLand(unittest.TestCase):
+    """The receiver of the re-raise, pinned structurally.
+
+    CLAUDE.md rule 10: a boundary is only as good as the enumeration of paths
+    around it. Making `_execute_dom_task` raise is worth nothing if its caller
+    stops re-raising, and that caller is code this commit did not touch — so
+    nothing else would notice. `da_handlers.handle_computer_task` wraps the
+    `execute_automation` call in `except UserAborted: raise` and answers it
+    with "Stopped." at the function level.
+
+    Structural rather than executed, deliberately: driving `handle_computer_task`
+    for real means importing and stubbing `automation.vision`, and a stub that
+    misses (`stubs must patch where the import looks`) hands the mouse and
+    keyboard to the vision loop. The end-to-end proof is the live test in the
+    commit message; this is the regression guard that costs nothing.
+    """
+
+    def test_computer_task_reraises_abort_around_execute_automation(self):
+        import ast
+        from pathlib import Path
+
+        src = (Path(__file__).parent.parent / "assistant" / "actions"
+               / "da_handlers.py").read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.AsyncFunctionDef)
+                  and n.name == "handle_computer_task")
+
+        # The property is about *handler order*, not about a re-raise existing
+        # somewhere in the function. The first draft of this test asserted the
+        # latter and passed with the guard deleted: the function-level `try`
+        # also wraps the call and also re-raises, so `any(...)` found it and
+        # said nothing. Python picks the first matching handler, so what
+        # matters is that no broad `except Exception` around this call can be
+        # reached by a `UserAborted` first.
+        def _is_broad(h: ast.ExceptHandler) -> bool:
+            if h.type is None:
+                return True
+            names = ([e for e in h.type.elts] if isinstance(h.type, ast.Tuple)
+                     else [h.type])
+            return any(getattr(n, "id", None) in ("Exception", "BaseException")
+                       for n in names)
+
+        def _reraises_abort(h: ast.ExceptHandler) -> bool:
+            return (getattr(h.type, "id", None) == "UserAborted"
+                    and any(isinstance(s, ast.Raise) and s.exc is None
+                            for s in ast.walk(h)))
+
+        guarding = [
+            t for t in ast.walk(fn)
+            if isinstance(t, ast.Try)
+            and any(isinstance(c, ast.Call)
+                    and getattr(c.func, "attr", None) == "execute_automation"
+                    for c in ast.walk(t))
+        ]
+        self.assertTrue(
+            guarding,
+            "handle_computer_task no longer calls execute_automation inside a "
+            "try -- re-check where a raised UserAborted now lands",
+        )
+
+        unshielded = []
+        for t in guarding:
+            shielded = False
+            for h in t.handlers:
+                if _reraises_abort(h):
+                    shielded = True
+                elif _is_broad(h) and not shielded:
+                    unshielded.append((h.lineno, ast.unparse(h.type)
+                                       if h.type else "bare except"))
+        self.assertFalse(
+            unshielded,
+            f"a broad handler around execute_automation is reachable by "
+            f"UserAborted at {unshielded} -- an abort raised by "
+            f"router._execute_dom_task decays into the vision-loop fallback "
+            f"again, which is the defect P13 removed",
+        )
 
 
 if __name__ == "__main__":

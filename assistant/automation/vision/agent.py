@@ -3,6 +3,62 @@
 Plans and executes multi-step computer tasks using screen reading,
 pyautogui + pynput for mouse/keyboard, LLM for planning, and
 LLM-based goal verification after each action batch.
+
+─── TENKA-v2 §17.P13: this loop did not migrate, and why ────────────────────
+
+P13 unified the state machine across the execute/retry/replan loops. This one
+adopted it **at its boundary only**. The phase says a loop that cannot adopt
+the shared machine without changing behaviour is left alone and documented
+rather than forced; this is the documentation.
+
+**§28 read the internals as one list. There are two.**
+
+    actions      the executable units. Planned per loop by the vision planner,
+                 capped at MAX_STEPS, dispatched by `execute_all_actions`
+                 (~466 lines and its own action table).
+    todo_list    a completeness checklist, derived from the goal by a separate
+                 vision call, matched to actions *after the fact* by
+                 `_match_actions_to_todos`.
+
+§28 called `todo_list` "a `TaskStep` with a verification state machine" and
+told P2 to design `TaskStep` against it. That is half right: it *is* a
+per-item state machine (`pending_visual_confirm`, `confirm_strikes`,
+`confirm_abandoned`), but it is not a step. `brain.task.TaskStep` maps to
+`actions`; `todo_list` has no counterpart in the contracts at all, because the
+contracts have no *checklist* type -- a `Verdict` attaches to a step, and these
+items attach to a goal. Typing it as a step would type it wrong. Migrating
+`actions` instead means rewriting the dispatch table, which is the rewrite the
+phase forbids.
+
+**And there was no status vocabulary to give up.** The other two loops each had
+one: `DomTaskResult.success` beside a reason tag, and `_is_error()`'s substring
+sniff. This loop's completion signal is `_verify_goal()`'s `achieved` -- a
+boolean from a *model*. Replacing that is a change to the verifier contract,
+not a vocabulary migration.
+
+**§28.1 was right, and it is why the boundary was the whole job.** When vision
+cannot confirm a TODO after `_MAX_CONFIRM_STRIKES` strict NOs and a permissive
+NO, this loop marks it done-as-abandoned and `_append_abandoned_suffix` puts
+"(couldn't visually confirm: <fields>)" in the spoken reply. That is §11's
+`UNCERTAIN`-with-disclosure, implemented here before it was specified.
+
+What was wrong was that the honesty stopped at the speaker:
+
+  - the reply hedged and the stored `action_outcome` said `success`, because
+    `mark_action_failure` was the only channel a handler had and `main.py`
+    stamps `success` on anything no handler contradicted. Fixed by
+    `telemetry.mark_action_uncertain`, called from
+    `_append_abandoned_suffix` -- the one function that already knows.
+  - two of the three give-up exits told telemetry nothing, so a task that
+    produced no actions at all stored as one that worked. Fixed by
+    `_mark_agent_failure`.
+  - a check on `"ABORTED" in result` returned "Task aborted by user." for
+    `ABORTED_WRONG_FOCUS`, a recoverable focus refusal that no abort produces.
+    Deleted; see the note at that site.
+
+`tests/test_vision_outcome_honesty.py` pins all three, plus the premise that
+no genuine abort produces an `ABORTED` result string -- if that ever changes,
+the deleted check becomes defensible again and the test is where it is noticed.
 """
 
 import json
@@ -2663,6 +2719,25 @@ async def _confirm_pending_select_todos(
 # ─── Agentic Planning Loop ──────────────────────────────────────────────────
 
 
+def _mark_agent_failure(error_class: str, reason: str = "") -> None:
+    """Record that this vision task did not accomplish anything.
+
+    §17.P13. Three exits give up -- no LLM, an unparseable plan, and the
+    max-loops fall-through -- and only the last one told telemetry. The other
+    two returned a graceful sentence, which `main.py` reads as nothing having
+    contradicted `"success"`.
+
+    One helper rather than three copies of the try/except, and it swallows its
+    own errors for the same reason `_append_abandoned_suffix` does: telemetry
+    must never be why a user gets no reply.
+    """
+    try:
+        from ... import telemetry as _telemetry
+        _telemetry.mark_action_failure(error_class, reason)
+    except Exception as e:
+        logger.debug(f"[AGENT] failure marking failed (non-critical): {e}")
+
+
 def _append_abandoned_suffix(success_text: str) -> str:
     """
     Fix A: append "(couldn't visually confirm: <fields>)" to a success
@@ -2672,10 +2747,35 @@ def _append_abandoned_suffix(success_text: str) -> str:
 
     No-op when there are no abandoned TODOs (the common case). Capped at
     ~200 chars total so it fits a single TTS utterance without truncation.
+
+    **Also records the uncertainty, and that is deliberate here rather than at
+    the call sites.** TENKA-v2 §17.P13: this loop already implemented §11's
+    discipline in what it *says*, and stored `action_outcome = "success"` for
+    the same turn -- `main.py` assigns that after dispatch to anything no
+    handler contradicted, and `mark_action_failure` was the only channel a
+    handler had. So the sentence was honest and the row was not, and
+    `telemetry._maybe_mark_correction` reads the row.
+
+    The marking belongs *in* this function on the argument KI-35's fix makes
+    for fencing at the producer: one place can do it as well as all of them
+    can, and a fifth call site added later inherits it without knowing the rule
+    exists. This function is already the only thing that knows abandonment
+    happened, and is already called on every success exit -- there is no exit
+    list to keep in sync, which is what would eventually be got wrong.
     """
     suffix_body = _task_state.abandoned_field_summary(max_fields=2)
     if not suffix_body:
         return success_text
+    try:
+        from ... import telemetry as _telemetry
+        _telemetry.mark_action_uncertain(
+            "VisionConfirmAbandoned",
+            f"{_task_state.confirm_abandoned_count} TODO(s) trusted on action "
+            f"signature after vision refused to confirm: {suffix_body}",
+        )
+    except Exception as e:
+        # Telemetry must never cost a completed task its reply.
+        logger.debug(f"[AGENT] uncertain marking failed (non-critical): {e}")
     base = (success_text or "").rstrip()
     # Strip trailing punctuation we'd duplicate
     while base.endswith((".", "!", "?")):
@@ -2888,13 +2988,20 @@ async def _run_computer_task_inner(
                 json_mode=True,
             )
 
+        # §17.P13: both give-up exits below returned a graceful sentence, and
+        # `main.py` stamped `action_outcome = "success"` on the turn because no
+        # handler had said otherwise. A task that never produced a single action
+        # was stored as one that worked. The max-loops exit at the bottom of
+        # this function already marked itself; these two did not.
         if raw_response == "__LLM_UNAVAILABLE__":
+            _mark_agent_failure("VisionAgentNoLLM", goal)
             return "Sorry, I couldn't plan the task — no LLM is available right now."
 
         # Step 4: Parse the plan
         plan = _parse_plan(raw_response)
         if plan is None:
             logger.error(f"[AGENT] Failed to parse LLM plan: {raw_response[:200]}")
+            _mark_agent_failure("VisionAgentUnparseablePlan", raw_response[:160])
             return "Sorry, I couldn't understand the action plan from the LLM."
 
         thinking = plan.get("thinking", "")
@@ -2915,8 +3022,30 @@ async def _run_computer_task_inner(
             action_history.extend(results)
             last_execution_results = results
 
-            if any("ABORTED" in r for r in results):
-                return "Task aborted by user."
+            # §17.P13 removed a check here that read:
+            #
+            #     if any("ABORTED" in r for r in results):
+            #         return "Task aborted by user."
+            #
+            # **No user abort ever reached it.** The only strings in this module
+            # containing `ABORTED` are `ABORTED_WRONG_FOCUS:`, produced by
+            # `keyboard_type` / `keyboard_hotkey` / `keyboard_press` when they
+            # refuse to type because the expected window is not focused -- a
+            # safety refusal, and a recoverable one. A genuine abort *raises*
+            # `_UserAborted` (`_check_abort` at the top of this loop and inside
+            # `execute_all_actions`), so it never becomes a result string at
+            # all. The check therefore fired only for the focus refusal, and
+            # did two wrong things with it: told the user they had aborted
+            # something they had not, and abandoned the task.
+            #
+            # The second is the expensive one. `VISION_PLANNER_SYSTEM_PROMPT`
+            # instructs the planner, in as many words, that on seeing
+            # `ABORTED_WRONG_FOCUS` it must add a `focus_application` step and
+            # retry -- so the recovery was specified, prompted for, and then
+            # cut off one line before the planner could see the result. The
+            # results are already in `action_history`, which the next loop's
+            # prompt renders, so deleting the early return is what connects the
+            # prompt to the thing it is telling the model to do.
 
             # Update TODO state after the batch. Fail-open inside the helper
             # — never blocks task progress. Runs BEFORE checkpoint so the
@@ -3131,14 +3260,7 @@ async def _run_computer_task_inner(
     remaining = final_check.get("remaining", "")
     msg = f"I wasn't able to complete that fully. Here's where I got to: {remaining}" if remaining else f"I wasn't able to fully complete: {goal}"
     logger.warning(f"[AGENT] {msg}")
-    try:
-        from ... import telemetry as _telemetry
-        _telemetry.mark_action_failure(
-            "VisionAgentMaxLoops",
-            (remaining or goal)[:160],
-        )
-    except Exception:
-        pass
+    _mark_agent_failure("VisionAgentMaxLoops", (remaining or goal)[:160])
     if tts_func:
         await tts_func(msg)
     return msg
