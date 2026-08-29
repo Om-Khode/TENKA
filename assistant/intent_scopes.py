@@ -18,11 +18,22 @@ _last_scope: tuple[str, int] = ("general", 0)
 
 # ─── State Accessors (mockable seams) ─────────────────────────────────────
 
-def _get_cdp_available() -> bool:
+def _get_browser_driver_available() -> bool:
+    """Can the browser tier drive a browser the user is actually using?
+
+    This does not merely pick a code path -- it decides whether the whole turn
+    is scoped to `browser_mode`, which is what TENKA believes she can currently
+    do. Left pointing at a mechanism that no longer exists, she would go on
+    claiming a browser affordance she had lost, and the first sign of it would
+    be a task that quietly does nothing.
+
+    False when nothing is connected, deliberately: the bundled browser is a
+    fallback for a task already under way, not a reason to believe the user's
+    browser is drivable.
+    """
     try:
-        from .automation.browser.cdp import cdp_state_snapshot
-        snap = cdp_state_snapshot()
-        return snap is not None and snap.available
+        from .io.api.extension_ws import latch_state_snapshot
+        return latch_state_snapshot().connected
     except Exception:
         return False
 
@@ -57,7 +68,7 @@ def detect_scope(turn_number: int) -> tuple[str, set[str]]:
     global _last_scope
 
     detected = "general"
-    if _get_cdp_available():
+    if _get_browser_driver_available():
         detected = "browser_mode"
     elif _get_recording_active():
         detected = "recording_mode"

@@ -1,7 +1,7 @@
 """
 test_browser_routing.py — Phase 1D: routing decision (`_choose_browser_mode`).
 
-Pure decision-table tests. The function takes (goal, cdp_state) and returns
+Pure decision-table tests. The function takes (goal, driver_state) and returns
 (mode, reason_meta). No I/O, no LLM, no side effects — straightforward
 unit tests.
 
@@ -33,10 +33,18 @@ import assistant.automation.router as da
 import assistant.config as cfg
 
 
-class _FakeCdpState:
-    """Minimal stand-in for browser_cdp.CdpProbeResult."""
-    def __init__(self, available: bool):
-        self.available = available
+class _FakeDriverState:
+    """Minimal stand-in for `extension_ws.LatchState`.
+
+    The field is `connected`, not `available`: an extension either has a live
+    socket or it has not, and there is no probe whose cached answer could be
+    stale. Renamed with the mechanism rather than aliased, so a call site still
+    reading `.available` fails loudly instead of quietly reading False and
+    routing every browser task to the bundled browser.
+    """
+
+    def __init__(self, connected: bool):
+        self.connected = connected
 
 
 # ─── _choose_browser_mode: each priority branch ──────────────────────────
@@ -53,7 +61,7 @@ class TestChooseBrowserMode(unittest.TestCase):
     # ── Priority 1: kill-switch ──
     def test_kill_switch_off_returns_bundled(self):
         cfg.BROWSER_DOM_MODE_ENABLED = False
-        mode, meta = da._choose_browser_mode("fill the form", _FakeCdpState(True))
+        mode, meta = da._choose_browser_mode("fill the form", _FakeDriverState(True))
         self.assertEqual(mode, "playwright_bundled")
         self.assertEqual(meta["reason"], "dom_mode_flag_off")
 
@@ -61,22 +69,22 @@ class TestChooseBrowserMode(unittest.TestCase):
         # Kill-switch wins over canvas — both want non-DOM, but the user
         # explicitly disabled DOM so we honor that intent literally.
         cfg.BROWSER_DOM_MODE_ENABLED = False
-        mode, _ = da._choose_browser_mode("draw in figma", _FakeCdpState(True))
+        mode, _ = da._choose_browser_mode("draw in figma", _FakeDriverState(True))
         self.assertEqual(mode, "playwright_bundled")
 
     # ── Priority 2: canvas / WebGL keywords ──
     def test_canvas_figma_routes_to_vision(self):
-        mode, meta = da._choose_browser_mode("draw a square in figma", _FakeCdpState(True))
+        mode, meta = da._choose_browser_mode("draw a square in figma", _FakeDriverState(True))
         self.assertEqual(mode, "vision")
         self.assertEqual(meta["reason"], "canvas_intent")
 
     def test_canvas_miro_routes_to_vision(self):
-        mode, _ = da._choose_browser_mode("add a sticky note on miro", _FakeCdpState(True))
+        mode, _ = da._choose_browser_mode("add a sticky note on miro", _FakeDriverState(True))
         self.assertEqual(mode, "vision")
 
     def test_canvas_google_slides_routes_to_vision(self):
         mode, _ = da._choose_browser_mode(
-            "edit the deck on google slides", _FakeCdpState(True),
+            "edit the deck on google slides", _FakeDriverState(True),
         )
         self.assertEqual(mode, "vision")
 
@@ -84,32 +92,32 @@ class TestChooseBrowserMode(unittest.TestCase):
         # "fill" is a form-intent keyword, but figma is canvas.
         # Canvas wins — DOM-mode would fail on canvas pages.
         mode, _ = da._choose_browser_mode(
-            "fill in details on the figma board", _FakeCdpState(True),
+            "fill in details on the figma board", _FakeDriverState(True),
         )
         self.assertEqual(mode, "vision")
 
     # ── Priority 3: CDP unavailable ──
-    def test_cdp_unavailable_form_intent_bundled(self):
-        mode, meta = da._choose_browser_mode("fill the form", _FakeCdpState(False))
+    def test_extension_unavailable_form_intent_bundled(self):
+        mode, meta = da._choose_browser_mode("fill the form", _FakeDriverState(False))
         self.assertEqual(mode, "playwright_bundled")
-        self.assertEqual(meta["reason"], "cdp_unavailable")
+        self.assertEqual(meta["reason"], "extension_unavailable")
 
-    def test_cdp_state_none_treated_as_unavailable(self):
-        # When the cache hasn't probed yet, cdp_state may be None.
+    def test_a_none_driver_state_is_treated_as_unavailable(self):
+        # Nothing has looked yet, so `driver_state` may be None. None refuses.
         # Treat as unavailable.
         mode, _ = da._choose_browser_mode("fill the form", None)
         self.assertEqual(mode, "playwright_bundled")
 
-    def test_cdp_unavailable_canvas_still_vision(self):
+    def test_extension_unavailable_canvas_still_vision(self):
         # Canvas check fires before CDP check — vision regardless of CDP.
-        mode, meta = da._choose_browser_mode("draw in figma", _FakeCdpState(False))
+        mode, meta = da._choose_browser_mode("draw in figma", _FakeDriverState(False))
         self.assertEqual(mode, "vision")
         self.assertEqual(meta["reason"], "canvas_intent")
 
     # ── Priority 4: user preference ──
     def test_user_preference_dom_wins(self):
         mode, meta = da._choose_browser_mode(
-            "summarize this page", _FakeCdpState(True), user_preference="dom",
+            "summarize this page", _FakeDriverState(True), user_preference="dom",
         )
         # Preference overrides extraction-intent's bundled default
         self.assertEqual(mode, "dom")
@@ -117,7 +125,7 @@ class TestChooseBrowserMode(unittest.TestCase):
 
     def test_user_preference_vision_wins(self):
         mode, meta = da._choose_browser_mode(
-            "fill the form", _FakeCdpState(True), user_preference="vision",
+            "fill the form", _FakeDriverState(True), user_preference="vision",
         )
         # Preference overrides form-intent's DOM default
         self.assertEqual(mode, "vision")
@@ -126,7 +134,7 @@ class TestChooseBrowserMode(unittest.TestCase):
     def test_user_preference_invalid_value_ignored(self):
         # Unknown preference values fall through to heuristic
         mode, meta = da._choose_browser_mode(
-            "fill the form", _FakeCdpState(True), user_preference="garbage",
+            "fill the form", _FakeDriverState(True), user_preference="garbage",
         )
         self.assertEqual(mode, "dom")
         self.assertEqual(meta["reason"], "form_intent")
@@ -135,88 +143,88 @@ class TestChooseBrowserMode(unittest.TestCase):
         # Canvas wins over preference — preference can't make us run DOM
         # mode against a Figma canvas (would fail anyway)
         mode, _ = da._choose_browser_mode(
-            "draw in figma", _FakeCdpState(True), user_preference="dom",
+            "draw in figma", _FakeDriverState(True), user_preference="dom",
         )
         self.assertEqual(mode, "vision")
 
     # ── Priority 5: form-intent keywords ──
     def test_form_intent_fill_routes_to_dom(self):
-        mode, meta = da._choose_browser_mode("fill the form", _FakeCdpState(True))
+        mode, meta = da._choose_browser_mode("fill the form", _FakeDriverState(True))
         self.assertEqual(mode, "dom")
         self.assertEqual(meta["reason"], "form_intent")
 
     def test_form_intent_login_routes_to_dom(self):
-        mode, _ = da._choose_browser_mode("log in to truein", _FakeCdpState(True))
+        mode, _ = da._choose_browser_mode("log in to truein", _FakeDriverState(True))
         self.assertEqual(mode, "dom")
 
     def test_form_intent_signup_routes_to_dom(self):
-        mode, _ = da._choose_browser_mode("sign up for a new account", _FakeCdpState(True))
+        mode, _ = da._choose_browser_mode("sign up for a new account", _FakeDriverState(True))
         self.assertEqual(mode, "dom")
 
     def test_form_intent_signin_routes_to_dom(self):
-        mode, _ = da._choose_browser_mode("sign in with my credentials", _FakeCdpState(True))
+        mode, _ = da._choose_browser_mode("sign in with my credentials", _FakeDriverState(True))
         self.assertEqual(mode, "dom")
 
     def test_form_intent_book_routes_to_dom(self):
-        mode, _ = da._choose_browser_mode("book a demo", _FakeCdpState(True))
+        mode, _ = da._choose_browser_mode("book a demo", _FakeDriverState(True))
         self.assertEqual(mode, "dom")
 
     def test_form_intent_register_routes_to_dom(self):
-        mode, _ = da._choose_browser_mode("register for the event", _FakeCdpState(True))
+        mode, _ = da._choose_browser_mode("register for the event", _FakeDriverState(True))
         self.assertEqual(mode, "dom")
 
     def test_form_intent_complete_form_routes_to_dom(self):
         mode, _ = da._choose_browser_mode(
-            "complete the demo form", _FakeCdpState(True),
+            "complete the demo form", _FakeDriverState(True),
         )
         self.assertEqual(mode, "dom")
 
     # ── Priority 6: extraction-intent keywords ──
     def test_extraction_summarize_routes_to_bundled(self):
-        mode, meta = da._choose_browser_mode("summarize this page", _FakeCdpState(True))
+        mode, meta = da._choose_browser_mode("summarize this page", _FakeDriverState(True))
         self.assertEqual(mode, "playwright_bundled")
         self.assertEqual(meta["reason"], "extraction_intent")
 
     def test_extraction_read_routes_to_bundled(self):
-        mode, _ = da._choose_browser_mode("read the article", _FakeCdpState(True))
+        mode, _ = da._choose_browser_mode("read the article", _FakeDriverState(True))
         self.assertEqual(mode, "playwright_bundled")
 
     def test_extraction_what_does_routes_to_bundled(self):
         mode, _ = da._choose_browser_mode(
-            "what does this page say about pricing", _FakeCdpState(True),
+            "what does this page say about pricing", _FakeDriverState(True),
         )
         self.assertEqual(mode, "playwright_bundled")
 
     def test_extraction_tell_me_routes_to_bundled(self):
         mode, _ = da._choose_browser_mode(
-            "tell me the headline of this article", _FakeCdpState(True),
+            "tell me the headline of this article", _FakeDriverState(True),
         )
         self.assertEqual(mode, "playwright_bundled")
 
     # ── Priority 7: default ──
-    def test_default_with_cdp_up_routes_to_dom(self):
+    def test_default_with_a_browser_connected_routes_to_dom(self):
         # Goal doesn't match any specific keyword — default to DOM
         mode, meta = da._choose_browser_mode(
-            "do something on the page", _FakeCdpState(True),
+            "do something on the page", _FakeDriverState(True),
         )
         self.assertEqual(mode, "dom")
-        self.assertEqual(meta["reason"], "cdp_default")
+        self.assertEqual(meta["reason"], "extension_default")
 
-    def test_default_no_cdp_routes_to_bundled(self):
+    def test_default_with_nothing_connected_routes_to_bundled(self):
         # Same goal but CDP down — bundled
         mode, _ = da._choose_browser_mode(
-            "do something on the page", _FakeCdpState(False),
+            "do something on the page", _FakeDriverState(False),
         )
         self.assertEqual(mode, "playwright_bundled")
 
     # ── Empty / edge ──
-    def test_empty_goal_with_cdp_up_routes_to_dom(self):
-        mode, meta = da._choose_browser_mode("", _FakeCdpState(True))
+    def test_empty_goal_with_a_browser_connected_routes_to_dom(self):
+        mode, meta = da._choose_browser_mode("", _FakeDriverState(True))
         self.assertEqual(mode, "dom")
-        self.assertEqual(meta["reason"], "cdp_default")
+        self.assertEqual(meta["reason"], "extension_default")
 
-    def test_empty_goal_cdp_down_routes_to_bundled(self):
-        mode, _ = da._choose_browser_mode("", _FakeCdpState(False))
+    def test_empty_goal_with_nothing_connected_routes_to_bundled(self):
+        mode, _ = da._choose_browser_mode("", _FakeDriverState(False))
         self.assertEqual(mode, "playwright_bundled")
 
 
@@ -227,31 +235,31 @@ class TestRouteBrowserContent(unittest.TestCase):
     """
     `_route_browser_content` bridges _choose_browser_mode's return into
     detect_backend's vocabulary. Tests focus on:
-      - cdp_state read from browser_cdp module
+      - driver_state read from the extension module
       - user_preference read from preferences
       - meta tagged with running_window
       - error swallowing on import/lookup failures
     """
 
-    def test_cdp_unavailable_returns_vision_not_playwright_bundled(self):
+    def test_extension_unavailable_returns_vision_not_playwright_bundled(self):
         # Phase 1E hotfix: in browser-content scenarios (user has their
         # own browser open at the page), "playwright_bundled" doesn't
         # make sense. _route_browser_content translates it to "vision"
         # and tags meta with translated_from for telemetry.
-        with patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(False)), \
+        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(False)), \
              patch("assistant.preferences.get_preference", return_value=None):
             mode, meta = da._route_browser_content(
                 "fill form", "Firefox - Truein"
             )
         self.assertEqual(mode, "vision")
         self.assertEqual(meta["app"], "Firefox - Truein")
-        self.assertEqual(meta["reason"], "cdp_unavailable")
+        self.assertEqual(meta["reason"], "extension_unavailable")
         self.assertEqual(meta["translated_from"], "playwright_bundled")
 
-    def test_cdp_available_form_intent_returns_dom(self):
-        with patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(True)), \
+    def test_a_connected_extension_with_a_form_intent_returns_dom(self):
+        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             mode, meta = da._route_browser_content(
                 "fill the form", "Chrome",
@@ -266,8 +274,8 @@ class TestRouteBrowserContent(unittest.TestCase):
         # harmless the moment the consumer began consulting provenance
         # (D2, §10.3): a row with no source is refused, correctly, and the
         # test then failed for a reason unrelated to what it checks.
-        with patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(True)), \
+        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference",
                    return_value={"key": "automation_browser_mode",
                                  "value": "vision", "source": "correction",
@@ -285,8 +293,8 @@ class TestRouteBrowserContent(unittest.TestCase):
         silently take over browser routing, so the value has to be one a
         person actually stated.
         """
-        with patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(True)), \
+        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference",
                    return_value={"key": "automation_browser_mode",
                                  "value": "vision", "source": "reflection",
@@ -299,23 +307,23 @@ class TestRouteBrowserContent(unittest.TestCase):
     def test_a_preference_with_no_provenance_is_refused(self):
         """Fail closed. A row that cannot say where it came from is not a
         user statement, and this consumer accepts nothing less."""
-        with patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(True)), \
+        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference",
                    return_value={"key": "automation_browser_mode",
                                  "value": "vision"}):
             mode, meta = da._route_browser_content("fill the form", "Chrome")
         self.assertNotEqual(meta.get("reason"), "user_preference")
 
-    def test_browser_cdp_import_failure_falls_back_safely(self):
-        # If browser_cdp can't import (unlikely but defensive), the bridge
-        # should not raise — treat as cdp unavailable. After Phase 1E
-        # hotfix, "playwright_bundled" gets translated to "vision" in the
+    def test_a_driver_import_failure_falls_back_safely(self):
+        # If the extension module cannot import (unlikely, but this is the
+        # bridge and it must not raise), treat it as no extension connected.
+        # "playwright_bundled" is then translated to "vision" in the
         # browser-content scenario.
-        with patch.dict("sys.modules", {"assistant.automation.browser.cdp": None}):
+        with patch.dict("sys.modules", {"assistant.io.api.extension_ws": None}):
             mode, meta = da._route_browser_content("fill form", "Chrome")
         self.assertEqual(mode, "vision")
-        self.assertEqual(meta["reason"], "cdp_unavailable")
+        self.assertEqual(meta["reason"], "extension_unavailable")
         self.assertEqual(meta["translated_from"], "playwright_bundled")
         self.assertEqual(meta["app"], "Chrome")
 
@@ -339,8 +347,8 @@ class TestDetectBackendFallback(unittest.TestCase):
         # Mock screen.get_open_windows to include a Chrome window
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["Truein - Google Chrome", "Notepad"]), \
-             patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(True)), \
+             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("fill this form with testing values")
         # CDP up + form-intent → DOM-mode
@@ -351,13 +359,13 @@ class TestDetectBackendFallback(unittest.TestCase):
     def test_fill_form_falls_to_vision_when_cdp_down(self):
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["Truein - Google Chrome"]), \
-             patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(False)), \
+             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(False)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("fill this form with testing values")
         # CDP down → playwright_bundled → translated to vision
         self.assertEqual(backend, "vision")
-        self.assertEqual(meta["reason"], "cdp_unavailable")
+        self.assertEqual(meta["reason"], "extension_unavailable")
 
     def test_fallback_inactive_when_no_browser_window(self):
         # No browser open — fallback shouldn't fire
@@ -373,8 +381,8 @@ class TestDetectBackendFallback(unittest.TestCase):
         browser-content because the form-fill is the actual task."""
         with patch("assistant.automation.router._detect_running_app",
                    return_value="Truein - Google Chrome"), \
-             patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(True)), \
+             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend(
                 "open chrome and fill that form with testing values"
@@ -442,8 +450,8 @@ class TestAppContextPatternFormGuard(unittest.TestCase):
     def test_fill_with_maths_not_treated_as_app(self):
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["demosite - Google Chrome"]), \
-             patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(True)), \
+             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("Fill the subjects field with Maths")
         self.assertNotEqual(meta.get("reason"), "app_context_pattern")
@@ -457,8 +465,8 @@ class TestAppContextPatternFormGuard(unittest.TestCase):
     def test_fill_form_with_value_routes_dom(self):
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["App - Google Chrome"]), \
-             patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(True)), \
+             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("fill this form with testing values")
         self.assertEqual(backend, "dom")
@@ -484,8 +492,8 @@ class TestFormIntentExpandedKeywords(unittest.TestCase):
     def test_set_routes_to_dom_with_browser_open(self):
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["demosite - Google Chrome"]), \
-             patch("assistant.automation.browser.cdp.cdp_state_snapshot",
-                   return_value=_FakeCdpState(True)), \
+             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+                   return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("Set State to NCR in this form")
         self.assertEqual(backend, "dom")
@@ -511,18 +519,21 @@ def _run(coro):
 
 
 class TestDomFormFillRouting(unittest.TestCase):
-    """Verify _execute_dom_task calls run_dom_form_fill for form-intent goals."""
+    """Verify `_execute_dom_task` calls `run_dom_form_fill` for form goals.
 
-    # _execute_dom_task imports browser_cdp / browser_dom_orchestrator
-    # LOCALLY (lazy import at line ~1565 of router.py), so patches must
-    # target the source modules, not `router.<name>` which never exists.
+    `_execute_dom_task` imports the handle and orchestrator LOCALLY, so patches
+    target the source modules rather than `router.<name>`, which never exists.
+
+    The page-picking mock these tests used to carry is gone with the function it
+    stood in for: the extension resolves every page verb to the active tab of
+    the current window, so there is no list of contexts to sift.
+    """
+
     @patch("assistant.automation.browser.dom_orchestrator.run_dom_form_fill", new_callable=AsyncMock)
     @patch("assistant.automation.browser.dom_orchestrator.run_dom_task", new_callable=AsyncMock)
-    @patch("assistant.automation.router._pick_active_page", new_callable=AsyncMock)
-    @patch("assistant.automation.browser.cdp.get_or_attach_browser", new_callable=AsyncMock)
-    def test_form_intent_uses_form_fill(self, mock_cdp, mock_pick, mock_old, mock_new):
-        mock_cdp.return_value = MagicMock(kind="cdp", attachment=MagicMock())
-        mock_pick.return_value = MagicMock()
+    @patch("assistant.automation.browser.handle.get_browser_handle", new_callable=AsyncMock)
+    def test_form_intent_uses_form_fill(self, mock_handle, mock_old, mock_new):
+        mock_handle.return_value = MagicMock(kind="latch", page=MagicMock())
         mock_new.return_value = MagicMock(
             success=True, final_summary="Form submitted.", reason="completed",
         )
@@ -532,17 +543,33 @@ class TestDomFormFillRouting(unittest.TestCase):
 
     @patch("assistant.automation.browser.dom_orchestrator.run_dom_form_fill", new_callable=AsyncMock)
     @patch("assistant.automation.browser.dom_orchestrator.run_dom_task", new_callable=AsyncMock)
-    @patch("assistant.automation.router._pick_active_page", new_callable=AsyncMock)
-    @patch("assistant.automation.browser.cdp.get_or_attach_browser", new_callable=AsyncMock)
-    def test_non_form_uses_old_loop(self, mock_cdp, mock_pick, mock_old, mock_new):
-        mock_cdp.return_value = MagicMock(kind="cdp", attachment=MagicMock())
-        mock_pick.return_value = MagicMock()
+    @patch("assistant.automation.browser.handle.get_browser_handle", new_callable=AsyncMock)
+    def test_non_form_uses_old_loop(self, mock_handle, mock_old, mock_new):
+        mock_handle.return_value = MagicMock(kind="latch", page=MagicMock())
         mock_old.return_value = MagicMock(
             success=True, final_summary="Done.", reason="completed",
         )
         _run(da._execute_dom_task("Click the search button"))
         mock_old.assert_called_once()
         mock_new.assert_not_called()
+
+    @patch("assistant.automation.browser.dom_orchestrator.run_dom_form_fill", new_callable=AsyncMock)
+    @patch("assistant.automation.browser.dom_orchestrator.run_dom_task", new_callable=AsyncMock)
+    @patch("assistant.automation.browser.handle.get_browser_handle", new_callable=AsyncMock)
+    def test_a_bundled_handle_falls_back_rather_than_driving_it(
+        self, mock_handle, mock_old, mock_new
+    ):
+        """The router said "dom" and the extension went away in between.
+
+        Driving the bundled browser here would run the task against a browser
+        with none of the user's sessions -- on a goal the router chose precisely
+        because her own browser was open at the page.
+        """
+        mock_handle.return_value = MagicMock(kind="bundled", page=MagicMock())
+        result = _run(da._execute_dom_task("Fill the registration form"))
+        self.assertEqual(result, "__FALLBACK__")
+        mock_new.assert_not_called()
+        mock_old.assert_not_called()
 
 
 if __name__ == "__main__":

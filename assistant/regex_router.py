@@ -98,31 +98,38 @@ _MUSIC_CTRL_RE = re.compile(
     re.I,
 )
 
-# Chrome CDP setup — bidirectional. The verb and the chrome/cdp noun can
+# Browser extension setup — bidirectional. The verb and the noun can
 # appear in either order, separated by up to ~40 chars of intervening words.
 # Critical safety net: this fires BEFORE intent classification, so a goal
 # like "set up chrome" can never fall through to computer_task → vision loop.
-_CDP_SETUP_VERBS = r"set\s*up|setup|configure|enable|prepare|prep|activate"
-_CDP_NOUNS = r"chrome|cdp|remote\s+debug(?:ging)?(?:\s+port)?|debug\s+port"
-_CDP_SETUP_RE = re.compile(
-    rf"\b(?:{_CDP_SETUP_VERBS})\b[\w\s,'\"-]{{0,40}}\b(?:{_CDP_NOUNS})\b"
+# `set it up` / `set that up` are ordinary English and the old pattern missed
+# them: it required "set" and "up" to be adjacent. The optional pronoun is
+# bounded to one word so this cannot swallow a whole clause.
+_EXT_SETUP_VERBS = (r"set\s*(?:it\s+|that\s+|them\s+)?up|setup|configure|enable"
+                   r"|prepare|prep|activate|connect")
+# No brand name. The old pattern matched "chrome" and "cdp" because the
+# mechanism was Chrome-only; this one drives whatever browser is open, so
+# naming one would be both wrong and a THE-rule violation.
+_EXT_NOUNS = r"browser\s+extension|extension|latch|browser\s+control"
+_EXT_SETUP_RE = re.compile(
+    rf"\b(?:{_EXT_SETUP_VERBS})\b[\w\s,'\"-]{{0,40}}\b(?:{_EXT_NOUNS})\b"
     rf"|"
-    rf"\b(?:{_CDP_NOUNS})\b[\w\s,'\"-]{{0,40}}\b(?:{_CDP_SETUP_VERBS})\b",
+    rf"\b(?:{_EXT_NOUNS})\b[\w\s,'\"-]{{0,40}}\b(?:{_EXT_SETUP_VERBS})\b",
     re.I,
 )
 
-# Undo requires an unambiguous CDP-related noun (not bare "chrome" — that
+# Undo requires an unambiguous noun (not a bare browser name — that
 # would catch "remove chrome" meaning uninstall the browser).
-_CDP_UNDO_VERBS = r"undo|reverse|unset|revert|restore|deactivate"
-_CDP_UNDO_NOUNS = r"chrome\s+(?:setup|cdp|debug(?:ging)?)|cdp|remote\s+debug(?:ging)?(?:\s+port)?|debug\s+port"
-_CDP_UNDO_RE = re.compile(
-    rf"\b(?:{_CDP_UNDO_VERBS})\b[\w\s,'\"-]{{0,40}}\b(?:{_CDP_UNDO_NOUNS})\b"
+_EXT_UNDO_VERBS = r"undo|reverse|unset|revert|restore|deactivate|disconnect"
+_EXT_UNDO_NOUNS = r"browser\s+extension|extension|latch|browser\s+control"
+_EXT_UNDO_RE = re.compile(
+    rf"\b(?:{_EXT_UNDO_VERBS})\b[\w\s,'\"-]{{0,40}}\b(?:{_EXT_UNDO_NOUNS})\b"
     rf"|"
-    rf"\b(?:{_CDP_UNDO_NOUNS})\b[\w\s,'\"-]{{0,40}}\b(?:{_CDP_UNDO_VERBS})\b",
+    rf"\b(?:{_EXT_UNDO_NOUNS})\b[\w\s,'\"-]{{0,40}}\b(?:{_EXT_UNDO_VERBS})\b",
     re.I,
 )
 
-_CDP_PREVIEW_MARKERS = ("preview", "show me", "what would", "what will", "dry run", "dry-run")
+_EXT_PREVIEW_MARKERS = ("preview", "show me", "what would", "what will", "dry run", "dry-run")
 
 # Recording
 _START_REC_RE = re.compile(
@@ -469,16 +476,16 @@ def pre_route(text: str) -> IntentResult | None:
     # Strip once and reuse for every exact-phrase set check below.
     tl_norm = tl.rstrip(".?!,;: ")
 
-    # ── Chrome CDP setup — checked first so the goal can never fall
+    # ── Browser extension setup — checked first so the goal can never fall
     # through to computer_task (which would route to the vision loop and
     # type the literal goal string into search bars in a runaway). Undo
     # is checked before setup because "undo chrome setup" contains both
     # the undo-verb and the setup-verb.
-    if _CDP_UNDO_RE.search(tl):
-        return IntentResult(intent="browser_cdp_setup", response=t, params={"mode": "undo"})
-    if _CDP_SETUP_RE.search(tl):
-        mode = "preview" if any(p in tl for p in _CDP_PREVIEW_MARKERS) else "setup"
-        return IntentResult(intent="browser_cdp_setup", response=t, params={"mode": mode})
+    if _EXT_UNDO_RE.search(tl):
+        return IntentResult(intent="browser_extension_setup", response=t, params={"mode": "undo"})
+    if _EXT_SETUP_RE.search(tl):
+        mode = "preview" if any(p in tl for p in _EXT_PREVIEW_MARKERS) else "setup"
+        return IntentResult(intent="browser_extension_setup", response=t, params={"mode": mode})
 
     # ── Exact phrase sets — zero regex overhead ───────────────────────────
     # Use tl_norm so STT-appended terminal punctuation doesn't bypass these.

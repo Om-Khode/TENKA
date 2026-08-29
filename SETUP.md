@@ -201,7 +201,7 @@ python -m assistant.main
 # Then in the chat: "set up Chrome CDP"
 ```
 
-This runs the `browser_cdp_setup` intent, which edits your Chrome shortcuts to add `--remote-debugging-port=9222`. Reversible via "undo Chrome setup". See `assistant/automation/browser/setup.py` for the gory details.
+This runs the `browser_extension_setup` intent, which mints a loopback credential and shows you where to paste it. Nothing on your system is modified: no shortcuts are edited and no launch flags are needed, because the extension drives the browser you already have open. Reversible via "undo the browser extension".
 
 ---
 

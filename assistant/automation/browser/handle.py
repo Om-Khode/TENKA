@@ -17,7 +17,7 @@ A downgrade to `bundled` emits exactly one INFO line naming why. This is not
 decoration. The extension not being connected is invisible from the outside —
 the task still runs, it just runs against a browser with none of the user's
 sessions, and the first symptom is a login wall on a site they are signed into.
-`cdp.py` kept the same discipline for the same reason, and it is the only thing
+The CDP tier this replaces kept the same discipline, and it was the only thing
 that made "why did it use the bundled browser?" answerable from a log.
 
 The line is emitted per resolution, not per process: a run that silently

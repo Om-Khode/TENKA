@@ -233,9 +233,8 @@ These can only be changed with `/set <name> <value>` from inside TENKA. They liv
 | `verify_strict_text_match` | `false` | `true` catches autocomplete drift but false-fails on phone/email auto-formatting. `false` uses case-insensitive contains. |
 | `verify_min_confidence` | `0.5` | Vision-tier confidence threshold to count as a real failure. |
 | `verify_max_retries` | `1` | Self-heal attempts per step. Hard-capped at 1 — endless retry bricks demos. |
-| `browser_prefer_cdp` | `true` | Try to attach to a running Chrome with `--remote-debugging-port=9222` before launching bundled Chromium. |
-| `browser_cdp_port` | `9222` | Port to probe for Chrome's CDP endpoint. |
-| `browser_cdp_probe_ttl` | `30.0` | How long the CDP availability probe is cached (seconds). |
+| `browser_prefer_extension` | `true` | Drive whichever browser the extension is connected from — the one you already have open, with your logins. Off = always use the bundled Chromium, which starts signed out. |
+| `browser_extension_rpc_timeout` | `30.0` | Seconds to wait for the extension to answer one call before giving up. |
 | `browser_dom_mode_enabled` | `true` | Master switch for the DOM-aware browser planner. Off = always use the vision-loop fallback. |
 | `browser_dom_tree_token_budget` | `4000` | Max tokens the perceived element tree may consume in the DOM-planner prompt. |
 | `browser_dom_cache_ttl` | `10.0` | DOM tree cache TTL (seconds). |

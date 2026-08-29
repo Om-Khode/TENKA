@@ -42,7 +42,7 @@ REQUIRED_CAPABILITY: dict[str, Capability] = {
     "find_and_click": Capability.EXECUTE,
     "manifest_dispatch": Capability.EXECUTE,
     "planner": Capability.EXECUTE,
-    "browser_cdp_setup": Capability.EXECUTE,
+    "browser_extension_setup": Capability.EXECUTE,
     "manage_procedure": Capability.EXECUTE,
     "manage_monitor": Capability.EXECUTE,
     "manage_schedule": Capability.EXECUTE,
@@ -149,6 +149,6 @@ TRANSIENT_AUTHORITY: frozenset[str] = frozenset({
     "summarize_recording", "web_search", "browse_url", "file_task",
     "set_reminder", "cancel_reminder", "hide_avatar", "show_avatar",
     "meet_face", "recognize_face", "forget_face", "camera_look", "planner",
-    "enroll_voice", "forget_voice", "browser_cdp_setup", "store_memory",
+    "enroll_voice", "forget_voice", "browser_extension_setup", "store_memory",
     "forget_memory", "shutdown", "manifest_dispatch", "self_knowledge",
 })

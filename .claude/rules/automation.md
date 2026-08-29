@@ -18,7 +18,7 @@ is the layer most tempted to special-case an app.
 | Tier | Mechanism | Vision cost |
 | --- | --- | --- |
 | 0. manifest | learned YAML selector chain (`manifest_dispatcher`) | 0 |
-| 1. `browser_action` | Playwright + CDP/DOM → websites | 0 |
+| 1. `browser_action` | browser extension (any browser) + DOM → websites; bundled Chromium as fallback | 0 |
 | 2. `app_action` | Terminator → native Windows apps | 0 |
 | 3. `computer_task` | vision loop → **fallback only** | 3–10 calls |
 
@@ -63,6 +63,17 @@ Never equate *no exception* with *success*.
 - **Terminator SDK (PyO3) is sync.** Wrap in `asyncio.to_thread()`. `Locator.get_text()`
   works only on resolved element chains, not intermediate `Locator` objects.
 - **Playwright is not thread-safe.** All calls on the same event loop.
+- **The browser tier is a `PageAdapter`, not a Playwright `Page`.** Three members
+  (`url`, `evaluate`, `locator`) and nine locator methods; that is the whole surface the
+  DOM tier touches, and it is what a second driver has to satisfy. `automation.py`'s
+  `get_page`/`extract_*`/`browse_url` family is deliberately **outside** the seam — it owns a
+  page lifecycle (`new_context`, `context.close`) a browser extension has no equivalent for.
+- **`dom_query.js` is byte-shared with the extension** and compared by SHA-256 at handshake.
+  Editing it means re-pinning the digest in both repos, and `.gitattributes` must mark it
+  `binary` on both sides or `autocrlf` changes the hash with no code change involved.
+- **The extension is a target, not a principal.** Its listener's ceiling is empty, so a
+  stolen extension token carries zero intent authority. Nothing it sends is a request to run
+  an intent, and nothing on that port answers.
 - **Step-planning prompts must NOT include examples that match test cases.** Examples teach
   patterns; matching examples make tests prove nothing. Same shape, different content.
 - **User-pinned values are HARD constraints.** "mobile as 99999" is never silently
