@@ -1799,3 +1799,50 @@ mechanism — it supports no extensions and, being WebView2-based, exposes no
 debug port. It falls to the Terminator and vision tiers like any other opaque
 native window. Not a regression; recorded because a reader will otherwise assume
 a Chromium-ish browser is covered.
+
+
+---
+
+## KI-43: `visible` is wrong for an element inside a transparent container
+
+**Severity:** Low. **Status:** open, recorded rather than fixed.
+
+`dom_query.js`'s `isVisible` reads `getComputedStyle(el).opacity` on the element
+itself. `opacity` does not inherit, so an input inside an `opacity: 0` container
+computes to `1` and is reported `visible: true` — when nobody can see it.
+
+The other two hidden states are caught by accident rather than by that check:
+`display: none` on an ancestor gives the child a 0×0 rect, which the first line
+of `isVisible` catches, and `visibility` genuinely is an inherited property.
+Opacity is neither, so it falls through.
+
+**Not obviously a bug, which is why it is written down rather than patched.** An
+element inside a transparent container is still hit-testable, so a click on it
+works. What is wrong is only the claim: `visible` is supposed to mean a person
+can see it, and a planner reading `visible: true` off a faded-out panel will
+describe an action the user cannot follow.
+
+A fix means walking ancestors and multiplying opacity, on every element, in the
+hot path of every perceive. That is a real cost for a case nobody has hit yet.
+
+`tests/fixtures/dom/form_hidden.html` carries an element in this exact state,
+with a comment, so the next person to read the fixture finds the gap rather than
+assuming it was covered.
+
+**Found:** while building the DOM integration fixtures, which had never existed
+— see the note below.
+
+---
+
+<!-- Fixture note, 2026-08-29 -->
+
+**`tests/fixtures/dom/` did not exist**, so
+`tests/test_browser_dom_integration.py` had been skipping all 16 of its tests
+since it was written. The module is gated on `DOM_REAL_BROWSER=1` and skips
+cleanly when unset, so the absence never showed as a failure — a skip and a
+missing fixture look identical from the summary line.
+
+The five fixtures are now committed and the file passes 16/16 against real
+Chromium. It takes ~104 seconds, which is most of why it is easy to leave
+unrun; it is the only coverage that exercises the JS query against a real DOM
+rather than against canned JSON.
