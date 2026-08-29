@@ -390,4 +390,4 @@ has looked at, and it blocks the next phase.
 | `test_weak_procedure_match.py` | GREEN | 25 | 0 | 0 | 0 | 2.8 |
 | `test_window_target_resolution.py` | GREEN | 8 | 0 | 0 | 0 | 0.3 |
 | `test_typing_honours_its_target.py` | GREEN | 9 | 0 | 0 | 0 | 2.1 |
-| `test_cdp_owner_is_a_browser.py` | GREEN | 15 | 0 | 0 | 0 | 0.3 |
+| `test_cdp_owner_is_a_browser.py` | GREEN | 25 | 0 | 0 | 0 | 0.3 |

@@ -1294,10 +1294,35 @@ than a vocabulary migration.
 **Effort:** Low to detect, a decision to fix — see below
 **Discovered:** 2026-08-28, first run of `tools/live_p13_dom_abort.py` on the
 operator's machine; seen again 2026-08-29 during an ordinary request
-**Fixed:** 2026-08-29 — `cdp_owner_is_a_browser()` requires the listening
-process, or one generation either side of it, to own a visible top-level
-window whose title names a known browser. `connect_to_existing_chrome` refuses
-before importing Playwright. `tests/test_cdp_owner_is_a_browser.py`.
+**Fixed:** 2026-08-29, in two rounds. `cdp_owner_is_a_browser()` requires the
+listening process, or one generation either side of it, to own a visible
+top-level window whose title names a known browser, and
+`connect_to_existing_chrome` refuses before importing Playwright.
+`tests/test_cdp_owner_is_a_browser.py`.
+
+**The first round approved the wrong socket, and the live test caught it.**
+Windows lets two processes hold one port through different address families.
+With Chrome launched on a port a webview already had:
+
+```
+::1:9222        pid 9676   chrome
+127.0.0.1:9222  pid 24516  msedgewebview2
+```
+
+`_owner_pid` returned the first `LISTEN` row it found — Chrome, on IPv6 — so
+the check logged *"chrome.exe owns 'httpbin.org/forms/post - Google Chrome'"*
+and approved, while the probe and the attach both address `127.0.0.1` and
+reached the webview. DOM-mode ran against the settings panel again, this time
+with a green check above it in the log. The owner lookup is now IPv4-only, and
+several IPv4 listeners on one port is reported as undecidable rather than
+guessed at.
+
+**A second signal, added after.** `/json/version` carries the endpoint's own
+User-Agent, and the webview answered `LenovoVantage/3.0.0.197` — it said what
+it was and nothing read it. A browser's is a `Mozilla/5.0 …` string. Consulted
+**only** when the process check is blind, never to override a positive answer:
+a browser launched with a custom `--user-agent` must not be locked out on this
+alone.
 **Status:** FIXED
 
 **The defect.** `cdp_health_probe` GETs `/json/version` on the configured port

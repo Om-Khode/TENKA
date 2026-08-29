@@ -64,6 +64,14 @@ class CdpProbeResult:
     ws_endpoint: str = ""       # webSocketDebuggerUrl from /json/version
     error: str = ""             # short reason when not available
     probed_at: float = 0.0      # time.monotonic() when this probe ran
+    # KI-37. `/json/version` reports the endpoint's own User-Agent, and a
+    # browser's is a `Mozilla/5.0 ...` string while an embedded webview often
+    # carries its host's name. The live case answered
+    # `"User-Agent": "LenovoVantage/3.0.0.197"` -- the endpoint said what it
+    # was and nothing read it. Used only to turn a *blind* ownership check into
+    # a refusal; a browser with a custom UA must not be locked out on this
+    # alone.
+    user_agent: str = ""
 
 
 @dataclass
@@ -153,41 +161,43 @@ async def cdp_health_probe(
     # decisions on the hot path. Pulling in aiohttp/httpx for one GET would
     # add 40+ ms of import cost. We run it in a thread to keep the event
     # loop free.
-    def _do_request() -> tuple[bool, str, str, str]:
+    def _do_request() -> tuple[bool, str, str, str, str]:
         try:
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if resp.status != 200:
-                    return False, "", "", f"http {resp.status}"
+                    return False, "", "", f"http {resp.status}", ""
                 body = resp.read(8192)  # /json/version is tiny; 8KB is plenty
             try:
                 data = json.loads(body)
             except json.JSONDecodeError:
-                return False, "", "", "non-json response (port held by something else)"
+                return False, "", "", "non-json response (port held by something else)", ""
             browser = str(data.get("Browser", "") or "")
             ws_endpoint = str(data.get("webSocketDebuggerUrl", "") or "")
+            user_agent = str(data.get("User-Agent", "") or "")
             # Sanity check: Chrome's response always identifies as Chrome/Chromium/Edg/Brave.
             # Anything else is a cuckoo on port 9222 — treat as unavailable.
             if not browser:
-                return False, "", "", "missing Browser field"
+                return False, "", "", "missing Browser field", ""
             lower = browser.lower()
             if not any(tag in lower for tag in ("chrome", "chromium", "edg", "brave")):
-                return False, browser, ws_endpoint, "non-chromium browser on port"
-            return True, browser, ws_endpoint, ""
+                return False, browser, ws_endpoint, "non-chromium browser on port", user_agent
+            return True, browser, ws_endpoint, "", user_agent
         except urllib.error.URLError as e:
-            return False, "", "", f"connection failed: {e.reason}"
+            return False, "", "", f"connection failed: {e.reason}", ""
         except (TimeoutError, OSError) as e:
-            return False, "", "", f"network error: {e}"
+            return False, "", "", f"network error: {e}", ""
         except Exception as e:
-            return False, "", "", f"unexpected: {type(e).__name__}: {e}"
+            return False, "", "", f"unexpected: {type(e).__name__}: {e}", ""
 
-    available, browser, ws_endpoint, error = await asyncio.to_thread(_do_request)
+    available, browser, ws_endpoint, error, user_agent = await asyncio.to_thread(_do_request)
     result = CdpProbeResult(
         available=available,
         browser=browser,
         ws_endpoint=ws_endpoint,
         error=error,
         probed_at=now,
+        user_agent=user_agent,
     )
     _cdp_state = result
 
@@ -212,14 +222,54 @@ async def cdp_health_probe(
 # ─── Attach ───────────────────────────────────────────────────────────────────
 
 
+# The addresses a connection to `http://127.0.0.1:<port>` can actually land on.
+# **Not `::1`**, and that distinction is the whole of KI-37's second round.
+#
+# Windows lets two processes listen on the same port through different address
+# families. Observed on the operator's machine, with Chrome launched on 9222
+# while a webview already held it:
+#
+#     ::1:9222        pid 9676   chrome
+#     127.0.0.1:9222  pid 24516  msedgewebview2
+#
+# The first version of `_owner_pid` returned the first LISTEN row it found on
+# the port -- Chrome, on IPv6 -- so the ownership check reported
+# "chrome.exe owns 'httpbin.org/forms/post - Google Chrome'" and approved,
+# while `connect_over_cdp("http://127.0.0.1:9222")` reached the webview and
+# DOM-mode ran against a settings panel. The check was right about a socket
+# nobody was going to use.
+#
+# `cdp_health_probe` and `connect_to_existing_chrome` both address the endpoint
+# as `127.0.0.1`, so that is the socket whose owner matters. `0.0.0.0` counts
+# because a wildcard IPv4 bind serves loopback too.
+_V4_LOOPBACK_BINDS = frozenset({"127.0.0.1", "0.0.0.0"})
+
+
 def _owner_pid(port: int) -> Optional[int]:
-    """Which process is listening on `port`? `None` when it cannot be told."""
+    """Which process serves `http://127.0.0.1:<port>`?
+
+    `None` when it cannot be told. Returns the owner of the **IPv4** listener
+    specifically -- see `_V4_LOOPBACK_BINDS` for why that is not pedantry.
+    """
     try:
         import psutil
-        for conn in psutil.net_connections(kind="tcp"):
-            if (conn.status == "LISTEN" and conn.laddr
-                    and conn.laddr.port == port and conn.pid):
-                return conn.pid
+        candidates = [
+            c for c in psutil.net_connections(kind="tcp")
+            if (c.status == "LISTEN" and c.laddr and c.laddr.port == port
+                and c.pid and c.laddr.ip in _V4_LOOPBACK_BINDS)
+        ]
+        if not candidates:
+            return None
+        pids = {c.pid for c in candidates}
+        if len(pids) > 1:
+            # Two processes serving the same IPv4 socket should not happen; if
+            # it does, nothing here can say which one answers, and guessing is
+            # how this bug worked in the first place.
+            logger.warning(
+                f"[CDP] port {port} has several IPv4 listeners {sorted(pids)} — "
+                f"cannot say which answers")
+            return None
+        return candidates[0].pid
     except Exception as e:
         logger.debug(f"[CDP] could not read the port's owner: {e}")
     return None
@@ -377,6 +427,22 @@ async def connect_to_existing_chrome(
         )
         return None
     if owned is None:
+        # A second, independent signal, consulted **only here**. The endpoint
+        # reports its own User-Agent and a browser's is a `Mozilla/5.0 ...`
+        # string; the live webview answered `LenovoVantage/3.0.0.197`, saying
+        # plainly what it was while nothing read it.
+        #
+        # Never used to refuse when the process check gave a positive answer:
+        # a browser launched with a custom `--user-agent` must not be locked
+        # out on this alone. It only decides the blind case, where the
+        # alternative is attaching on no evidence at all.
+        ua = (probe.user_agent or "").strip()
+        if ua and not ua.lower().startswith("mozilla/"):
+            logger.warning(
+                f"[CDP] attach REFUSED on port {p}: the ownership check was "
+                f"blind ({why}) and the endpoint's User-Agent is {ua!r}, which "
+                f"is not a browser's. Falling back.")
+            return None
         logger.warning(f"[CDP] browser-ownership check was blind ({why}) — attaching anyway")
     else:
         logger.info(f"[CDP] port {p} owner check: {why}")

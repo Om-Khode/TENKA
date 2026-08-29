@@ -283,5 +283,122 @@ class TestTheAttachPathActuallyConsultsIt(unittest.TestCase):
         self.assertEqual(reached, [1], "an accepted browser was refused")
 
 
+class TestTheSocketWeActuallyUse(unittest.TestCase):
+    """KI-37, second round: the owner of the *IPv4* listener is the one that
+    matters, because that is where `http://127.0.0.1:<port>` lands.
+
+    Windows lets two processes hold one port through different address
+    families. Measured on the operator's machine after launching Chrome on a
+    port a webview already held:
+
+        ::1:9222        pid 9676   chrome
+        127.0.0.1:9222  pid 24516  msedgewebview2
+
+    The first `_owner_pid` returned the first LISTEN row it found, so the check
+    reported "chrome.exe owns 'httpbin.org/forms/post - Google Chrome'" and
+    approved -- while the probe and the attach both reached the webview and
+    DOM-mode ran against a settings panel. The check was right about a socket
+    nobody was going to use.
+    """
+
+    def _conns(self, rows):
+        """rows: [(ip, port, status, pid)]"""
+        psutil = types.ModuleType("psutil")
+        psutil.net_connections = lambda kind=None: [
+            types.SimpleNamespace(
+                laddr=types.SimpleNamespace(ip=ip, port=port),
+                status=status, pid=pid)
+            for ip, port, status, pid in rows
+        ]
+        psutil.Process = MagicMock()
+        return patch.dict(sys.modules, {"psutil": psutil})
+
+    def test_the_ipv4_owner_wins_over_an_ipv6_listener(self):
+        # The live layout, IPv6 first so the old "first row" behaviour would
+        # pick Chrome.
+        with self._conns([("::1", 9222, "LISTEN", 9676),
+                          ("127.0.0.1", 9222, "LISTEN", 24516)]):
+            self.assertEqual(cdp._owner_pid(9222), 24516)
+
+    def test_ordering_does_not_change_the_answer(self):
+        with self._conns([("127.0.0.1", 9222, "LISTEN", 24516),
+                          ("::1", 9222, "LISTEN", 9676)]):
+            self.assertEqual(cdp._owner_pid(9222), 24516)
+
+    def test_a_wildcard_ipv4_bind_counts(self):
+        # 0.0.0.0 serves loopback too.
+        with self._conns([("0.0.0.0", 9222, "LISTEN", 500)]):
+            self.assertEqual(cdp._owner_pid(9222), 500)
+
+    def test_an_ipv6_only_listener_is_not_the_owner(self):
+        # Nothing serves `http://127.0.0.1:9222`, so there is no owner to
+        # report -- "blind", not "chrome".
+        with self._conns([("::1", 9222, "LISTEN", 9676)]):
+            self.assertIsNone(cdp._owner_pid(9222))
+
+    def test_other_ports_and_non_listening_rows_are_ignored(self):
+        with self._conns([("127.0.0.1", 9333, "LISTEN", 1),
+                          ("127.0.0.1", 9222, "ESTABLISHED", 2)]):
+            self.assertIsNone(cdp._owner_pid(9222))
+
+    def test_two_ipv4_listeners_is_reported_as_undecidable(self):
+        # Should not happen; if it does, nothing here can say which answers,
+        # and guessing is how the first round of this bug worked.
+        with self._conns([("127.0.0.1", 9222, "LISTEN", 1),
+                          ("0.0.0.0", 9222, "LISTEN", 2)]):
+            self.assertIsNone(cdp._owner_pid(9222))
+
+
+class TestTheEndpointsOwnUserAgent(unittest.TestCase):
+    """A second signal, and deliberately a weak one.
+
+    `/json/version` carries the endpoint's User-Agent. The live webview
+    answered `LenovoVantage/3.0.0.197` -- it said what it was, and nothing read
+    it. Used **only** to decide the blind case: a browser launched with a
+    custom `--user-agent` must not be locked out on this alone.
+    """
+
+    def _attach(self, ua, owned):
+        probe = cdp.CdpProbeResult(available=True, browser="Edg/151.0",
+                                   ws_endpoint="ws://x", user_agent=ua)
+        reached = []
+
+        def _mark():
+            reached.append(1)
+            raise RuntimeError("stop here")
+
+        fake_pw = types.ModuleType("playwright")
+        fake_async = types.ModuleType("playwright.async_api")
+        fake_async.async_playwright = _mark
+        with patch.object(cdp, "cdp_health_probe",
+                          new=AsyncMock(return_value=probe)),              patch.object(cdp, "cdp_owner_is_a_browser",
+                          return_value=(owned, "because")),              patch.dict(sys.modules, {"playwright": fake_pw,
+                                      "playwright.async_api": fake_async}):
+            result = asyncio.run(cdp.connect_to_existing_chrome(port=9222))
+        return result, reached
+
+    def test_a_blind_check_plus_a_host_user_agent_refuses(self):
+        result, reached = self._attach("LenovoVantage/3.0.0.197", None)
+        self.assertIsNone(result)
+        self.assertEqual(reached, [], "it reached Playwright despite refusing")
+
+    def test_a_blind_check_plus_a_browser_user_agent_attaches(self):
+        result, reached = self._attach(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", None)
+        self.assertEqual(reached, [1], "a real browser was refused on its UA")
+
+    def test_a_blind_check_with_no_user_agent_attaches(self):
+        # Absent evidence is not evidence.
+        _, reached = self._attach("", None)
+        self.assertEqual(reached, [1])
+
+    def test_a_positive_owner_check_ignores_the_user_agent(self):
+        # The process evidence is stronger, and a custom --user-agent is a
+        # thing people set.
+        _, reached = self._attach("SomethingCustom/1.0", True)
+        self.assertEqual(reached, [1],
+                         "a UA check overrode a positive ownership answer")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
