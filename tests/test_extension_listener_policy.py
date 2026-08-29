@@ -141,3 +141,101 @@ def test_the_extension_port_is_not_the_local_port():
     # ceiling holding EXECUTE and SYSTEM_CONTROL.
     base = config.STUDIO_API_PORT
     assert port_for(POLICY_NAME, base) != port_for("local", base)
+
+
+# ─── The listener is actually bound ──────────────────────────────────────
+#
+# Everything above this line passed while nothing listened on the port.
+#
+# `serve()` bound only `local` and built the app with
+# `listener_policies={port: "local"}`. The `/latch` route existed, the policy
+# existed, the offset existed, and every unit test constructed its own app with
+# `{8790: "extension"}` by hand -- so the one thing nobody asserted was that the
+# daemon does the same. The extension sat in "Disconnected. Retrying shortly."
+# for a reason no test could see.
+
+
+def test_serve_registers_the_extension_port_in_listener_policies():
+    """A port absent from `listener_policies` grants nothing and refuses
+    everything, so registering it matters as much as binding the socket.
+
+    Read out of the `listener_policies=` argument itself, not by searching the
+    function for the word "extension". The first version of this test did the
+    latter and passed against the bug it was written for, because
+    `port_for("extension", port)` contains that word too. A structural test that
+    matches a substring matches the wrong thing eventually.
+    """
+    import ast
+    import inspect
+
+    from assistant.io.api import server
+
+    tree = ast.parse(inspect.getsource(server.serve).lstrip())
+
+    mappings = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and getattr(node.func, "id", None) == "create_app"):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "listener_policies" and isinstance(kw.value, ast.Dict):
+                mappings.append([
+                    v.value for v in kw.value.values if isinstance(v, ast.Constant)
+                ])
+
+    assert mappings, "serve() does not pass a literal listener_policies dict"
+    names = mappings[0]
+    assert "local" in names, f"the local listener is missing: {names}"
+    assert "extension" in names, (
+        f"listener_policies maps {names}. The route, the policy and the port "
+        f"offset can all be correct while the daemon registers only `local` -- "
+        f"which is exactly what shipped, and the extension sat on 'Retrying "
+        f"shortly' with nothing in any log."
+    )
+
+
+def test_serve_binds_a_second_socket():
+    import ast
+    import inspect
+
+    from assistant.io.api import server
+
+    tree = ast.parse(inspect.getsource(server.serve).lstrip())
+    binds = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "bind_listener"
+    ]
+    assert len(binds) >= 2, (
+        f"serve() calls bind_listener {len(binds)} time(s). The extension "
+        f"listener needs its own socket; the policy alone binds nothing."
+    )
+
+
+def test_the_extension_listener_is_not_allowed_to_take_the_daemon_down():
+    """A browser driver that cannot bind must not stop TENKA answering.
+
+    Asserted on the source rather than by standing up a daemon with the port
+    already taken -- that is a slow test, and a slow test is one that stops
+    being run.
+    """
+    import inspect
+
+    from assistant.io.api import server
+
+    source = inspect.getsource(server.serve)
+    marker = "extension_sock = bind_listener"
+    assert marker in source, "the extension bind moved; this guard needs updating"
+
+    before = source[: source.index(marker)]
+    after = source[source.index(marker) :]
+
+    assert before.rstrip().endswith("try:"), (
+        "the extension bind is not the first statement of a try block. A port "
+        "collision there would propagate and stop the Studio daemon starting "
+        "at all -- so a browser driver failing would take the assistant with it."
+    )
+    assert "logger.warning" in after, (
+        "a failed extension bind is swallowed without a word. The symptom is a "
+        "browser extension stuck on 'Retrying shortly' and nothing in the log."
+    )

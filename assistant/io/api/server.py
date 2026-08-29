@@ -32,6 +32,7 @@ import uvicorn
 from fastapi import FastAPI
 
 from .app import create_app
+from .listeners import port_for
 from .events import EventHub
 from .pairing import PairCodeStore
 from .raises import RaiseStore
@@ -147,7 +148,15 @@ def _refuse_a_second_primary() -> None:
     existing = _listeners
     if existing is None:
         return
-    if any(not task.done() for task in existing.tasks.values()):
+    # `cancelling()` as well as `done()`: a task that has been asked to stop is
+    # not one that is still serving, and it may need a loop iteration or two to
+    # notice. `serve()` binds the extension listener beside the primary and
+    # cancels it from the primary's done-callback, so between "the primary
+    # finished" and "the extension task is done" there is a window where the
+    # daemon is stopping and nothing is serving. Reading only `done()` there
+    # refuses a restart for a listener that is already on its way out.
+    if any(not task.done() and not task.cancelling()
+           for task in existing.tasks.values()):
         raise RuntimeError(
             "a Studio daemon is already serving in this process; stop it "
             "before starting another (two primary listeners would each run "
@@ -351,6 +360,7 @@ def serve_socket(app: FastAPI, sock: socket.socket, *, name: str,
 
 
 def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
+          extension_digest: str | None = None,
           port: int = 8787, origins: list[str],
           hub: EventHub | None = None,
           ui_bundle: UiBundle | None = None,
@@ -421,9 +431,29 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
     # starts -- `HostGate` and `authenticate()` both hold the dict itself, not
     # a copy, so an entry added or dropped is live on the very next request --
     # rather than relying on any property of the traffic itself.
+    # The extension listener is bound here beside `local`, not started on demand
+    # by `TransportManager` the way the tunnels are. The difference is what
+    # dials which way: a tunnel is something TENKA reaches out and starts, while
+    # the browser extension dials IN and retries on its own alarm. A socket that
+    # only appears once somebody asks for it is a socket the extension has
+    # already been failing to reach, quietly, since the browser started.
+    extension_port = port_for("extension", port)
+
+    # The digest of the vendored dom_query.js, compared against the copy the
+    # extension shipped. Passed IN by the caller: `io/api` may reach `core/` and
+    # `config` and nothing else, and the vendored file lives under
+    # `automation/`. `main.py` is the one place allowed to see both tiers, so it
+    # supplies this; a lazy import here would still be an import, and
+    # import-linter counts it.
+    #
+    # `None` refuses every handshake rather than skipping the comparison, so a
+    # caller that forgets fails closed and loudly.
     app = create_app(runtime, vault, origins=origins, hub=hub,
-                     listener_policies={port: "local"}, ui_bundle=ui_bundle,
-                     pair_store=pair_store, raises=raises)
+                     listener_policies={port: "local",
+                                        extension_port: "extension"},
+                     ui_bundle=ui_bundle,
+                     pair_store=pair_store, raises=raises,
+                     extension_digest=extension_digest)
 
     # Bound here, synchronously, before any task exists. A port collision is
     # then raised out of this call -- where `_start_studio_daemon()`'s own
@@ -443,10 +473,63 @@ def serve(runtime: StudioRuntime, vault: TokenVault, *, host: str = _HOST,
         sock.close()
         raise
 
-    _listeners = StudioListeners(app=app, tasks={"local": task},
-                                 sockets={"local": sock})
+    # The extension socket is bound after the primary one and is NOT allowed to
+    # take the daemon down with it: a browser driver failing to bind must not
+    # stop TENKA from answering, so a collision here is one warning and a tier
+    # that falls back to the bundled browser.
+    extension_task = None
+    extension_sock = None
+    try:
+        extension_sock = bind_listener(extension_port, host)
+        extension_task = serve_socket(app, extension_sock, name="latch", primary=False)
+    except BaseException as e:
+        if extension_sock is not None:
+            extension_sock.close()
+            extension_sock = None
+        extension_task = None
+        logger.warning(
+            f"[API] could not bind the browser-extension listener on "
+            f"{host}:{extension_port} ({type(e).__name__}: {e}); browser tasks "
+            f"will use the bundled browser"
+        )
+
+    tasks = {"local": task}
+    socks = {"local": sock}
+    if extension_task is not None and extension_sock is not None:
+        tasks["extension"] = extension_task
+        socks["extension"] = extension_sock
+
+        # The extension listener dies with the primary, without anybody having
+        # to remember.
+        #
+        # `serve()` returns the primary task and nothing else, and every caller
+        # -- `main._stop_studio_daemon` included -- stops the daemon by
+        # cancelling exactly that. A second task started in here and left to
+        # outlive it would keep its socket bound after a stop, so the next
+        # `serve()` would refuse with "a daemon is already serving" and the port
+        # would still be taken. That is the orphaned-handle failure this
+        # module's docstrings warn about three separate times; the fix is not to
+        # warn a fourth.
+        #
+        # Transports are the other case and are deliberately NOT handled this
+        # way: `TransportManager` owns them, they are started on request, and
+        # `_stop_studio_daemon` stops them explicitly before cancelling the
+        # primary. This one nobody asked for, so this is where it is buried.
+        def _stop_extension(_done_primary, _t=extension_task, _s=extension_sock):
+            if not _t.done():
+                _t.cancel()
+            try:
+                _s.close()
+            except OSError:
+                pass
+
+        task.add_done_callback(_stop_extension)
+
+    _listeners = StudioListeners(app=app, tasks=tasks, sockets=socks)
 
     logger.info(f"[API] Studio daemon listening on http://{host}:{port}")
+    if extension_task is not None:
+        logger.info(f"[API] browser extension listener on ws://{host}:{extension_port}/latch")
     return task
 
 

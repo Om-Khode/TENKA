@@ -275,7 +275,14 @@ async def test_a_second_listener_serves_the_same_app_under_its_own_policy(tmp_pa
                         origins=["http://localhost:3000"])
     handle = server.current_listeners()
     assert handle is not None, "serve() left no StudioListeners for main.py to hold"
-    assert handle.app.state.listener_policies == {local_port: "local"}
+    # `local` plus the browser-extension socket. The extension listener is
+    # bound at boot rather than started on demand because the extension dials
+    # IN and retries on its own alarm -- a socket that only appears when
+    # somebody asks for it is one the extension has already been failing to
+    # reach, quietly, since the browser started. It is loopback-only with an
+    # empty capability ceiling, so it is `local`-shaped, not transport-shaped.
+    assert set(handle.app.state.listener_policies.values()) == {"local", "extension"}
+    assert handle.app.state.listener_policies[local_port] == "local"
 
     sock = server.bind_listener(tailnet_port)
     handle.app.state.listener_policies[tailnet_port] = "tailnet"
@@ -363,16 +370,23 @@ async def test_registering_a_second_listener_never_touches_the_local_entry(tmp_p
                         port=local_port, origins=[])
     try:
         registry = server.current_listeners().app.state.listener_policies
-        assert registry == {local_port: "local"}
+        # `local` plus the browser-extension listener `serve()` binds beside it.
+        assert registry[local_port] == "local"
+        assert "extension" in registry.values()
 
         registry[tailnet_port] = "tailnet"
         assert registry[local_port] == "local"
         assert policy_for_port(local_port, registry) is POLICIES["local"]
         assert policy_for_port(tailnet_port, registry) is POLICIES["tailnet"]
 
-        # And back out again, which is a transport's stop path.
+        # And back out again, which is a transport's stop path. The point is
+        # that removing a transport's entry leaves the OTHER entries untouched
+        # -- asserted per key rather than against a whole-dict literal, which
+        # was really an assertion about how many listeners exist.
         del registry[tailnet_port]
-        assert registry == {local_port: "local"}
+        assert tailnet_port not in registry
+        assert registry[local_port] == "local"
+        assert "extension" in registry.values()
         assert policy_for_port(local_port, registry) is POLICIES["local"]
         assert policy_for_port(tailnet_port, registry) is None
     finally:
@@ -531,17 +545,26 @@ async def test_every_listener_pins_the_same_uvicorn_security_flags(tmp_path, mon
     await asyncio.sleep(0.3)
 
     try:
-        assert len(built) == 2, f"expected one uvicorn.Config per listener, got {built}"
+        # Three: `local`, the browser-extension socket `serve()` binds beside
+        # it, and the tailnet socket this test adds. The count is asserted
+        # rather than the flags alone because the point of the test is "every
+        # listener", and a listener that stopped being built would make the
+        # flag loop vacuous.
+        assert len(built) == 3, f"expected one uvicorn.Config per listener, got {built}"
         for config in built:
             assert config.proxy_headers is False
             assert not config.forwarded_allow_ips
             assert config.log_config is None
             assert config.access_log is False
             assert config.log_level == "warning"
+        # Asserted as a count, not a fixed list: the property is "exactly one
+        # primary", and pinning the literal made it a test of how many
+        # listeners happen to exist.
         lifespans = [config.lifespan for config in built]
-        assert lifespans == ["on", "off"], (
+        assert lifespans.count("on") == 1, (
             f"exactly one listener may own the app's lifespan, got {lifespans}"
         )
+        assert set(lifespans) <= {"on", "off"}, lifespans
     finally:
         await _cancel(task, second)
 
@@ -2100,7 +2123,17 @@ async def test_the_daemon_boots_with_only_the_local_listener(tmp_path, monkeypat
         assert task is not None, "sanity: the daemon must have actually started"
         handle = server.current_listeners()
         assert handle is not None
-        assert handle.app.state.listener_policies == {18990: "local"}, (
+        # The invariant spec §2.1 states is that no TRANSPORT starts at boot --
+        # tailnet and funnel reach outward and must be asked for. The
+        # browser-extension listener is neither: loopback-only, empty ceiling,
+        # and bound at boot for the reason above. Asserted as "no transport"
+        # rather than "exactly one entry", because the latter was a proxy for
+        # the former and the proxy stopped being true.
+        names = set(handle.app.state.listener_policies.values())
+        assert names == {"local", "extension"}, (
+            f"unexpected listeners at boot: {names}"
+        )
+        assert not (names & {"tailnet", "funnel"}), (
             "a transport started at boot -- spec §2.1 says only local binds"
         )
         transports = getattr(handle.app.state, "transports", None)
