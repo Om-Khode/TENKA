@@ -297,6 +297,12 @@ class LatchConnection:
                     # One bad subscriber must not take the transport down.
                     logger.warning(f"[LATCH] event callback raised: {type(e).__name__}: {e}")
             return
+        if kind == proto.Frame.PING:
+            # Nothing to do and nothing to say. Its only job is to have been
+            # sent: the traffic is what keeps the extension's background
+            # context from being suspended. Handled explicitly so it does not
+            # land in the "unexpected frame" path and log every twenty seconds.
+            return
         logger.debug(f"[LATCH] ignoring unexpected frame type {kind!r}")
 
     def close(self, reason: str = "closed") -> None:

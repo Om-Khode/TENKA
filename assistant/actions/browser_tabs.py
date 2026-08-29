@@ -26,7 +26,13 @@ from .registry import tool_registry
 logger = logging.getLogger("actions")
 
 #: Read-only verbs answer even when several tabs match; the rest need one.
-_ACTIONS = ("list", "close", "switch", "open")
+#:
+#: No `open`. `open_browser` already opens a URL in the user's default browser
+#: with `webbrowser.open`, and a second intent for the same request is the
+#: over-claim shape this project keeps paying for: two rows competing, and
+#: whichever the classifier happens to prefer wins. What lands here is only
+#: what nothing else can do -- seeing and steering tabs that already exist.
+_ACTIONS = ("list", "close", "switch")
 
 
 def _score(tab: dict, query: str) -> int:
@@ -65,11 +71,10 @@ async def handle_browser_tabs(
     params: dict, llm_response: str = "", bridge=None, **kwargs
 ) -> str:
     """
-    params: {"action": "list" | "close" | "switch" | "open", "query": str}
+    params: {"action": "list" | "close" | "switch", "query": str}
 
-    `query` is what the user called the tab (for close/switch) or the url to
-    open. It is matched against titles and urls, never against a list of known
-    sites.
+    `query` is what the user called the tab. It is matched against titles and
+    urls, never against a list of known sites.
     """
     action = (params.get("action") or "list").lower()
     query = (params.get("query") or "").strip()
@@ -104,13 +109,6 @@ async def handle_browser_tabs(
         )
 
     try:
-        if action == "open":
-            if not query:
-                return await _reply("Where should I open it? Give me a URL.")
-            url = query if "://" in query else f"https://{query}"
-            await connection.call(proto.Rpc.TABS_OPEN, {"url": url, "active": True})
-            return await _reply(f"Opened {url}.")
-
         tabs = (await connection.call(proto.Rpc.TABS_LIST, {})).get("tabs") or []
 
         if action == "list":

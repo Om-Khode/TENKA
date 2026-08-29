@@ -203,31 +203,20 @@ def test_switch_with_no_query_also_refuses(handler, connected):
     assert proto.Rpc.TABS_ACTIVATE not in connected.methods()
 
 
-# ─── open ────────────────────────────────────────────────────────────────
+# ─── open is deliberately NOT here ───────────────────────────────────────
 
 
-def test_open_adds_a_scheme_when_the_user_omits_one(handler, connected):
-    _run(handler({"action": "open", "query": "example.invalid/page"}))
-    method, params = connected.calls[-1]
-    assert method == proto.Rpc.TABS_OPEN
-    assert params["url"] == "https://example.invalid/page"
+def test_open_is_not_an_action_this_intent_claims(handler, connected):
+    """`open_browser` already opens a URL in the user's default browser.
 
-
-def test_open_leaves_an_explicit_scheme_alone(handler, connected):
-    _run(handler({"action": "open", "query": "http://example.invalid/"}))
-    assert connected.calls[-1][1]["url"] == "http://example.invalid/"
-
-
-def test_open_with_no_url_asks(handler, connected):
-    msg = _run(handler({"action": "open"}))
-    assert "Where should I open it" in msg
-    assert proto.Rpc.TABS_OPEN not in connected.methods()
-
-
-def test_open_does_not_need_to_list_tabs_first(handler, connected):
-    # A round trip nobody needs is a round trip that can fail.
-    _run(handler({"action": "open", "query": "example.invalid"}))
-    assert connected.methods() == [proto.Rpc.TABS_OPEN]
+    A second intent for the same request means two rows competing in the
+    classifier's table and whichever it happens to prefer winning -- the exact
+    over-claim shape that sends "open a tab for X" to a GUI vision loop, which
+    is what it did before this was removed.
+    """
+    msg = _run(handler({"action": "open", "query": "example.invalid"}))
+    assert "don't know how to" in msg
+    assert connected.calls == [], "it opened a tab anyway"
 
 
 # ─── Errors ──────────────────────────────────────────────────────────────

@@ -360,6 +360,7 @@ get_recording       | session_id?     | retrieve a session ("latest" if user say
 summarize_recording | session_id?     | summarize a session (defaults to "latest")
 web_search          | query           | current/recent/time-sensitive info (news, scores, prices, who-currently-X)
 browse_url          | url             | READ/SUMMARIZE a page's content (infer URL if only site named)
+browser_tabs        | action, query   | tabs ALREADY open in the user's browser: "what tabs do I have", "close the X tab", "switch to X". NOT for opening a new URL -- that is open_browser
 file_task           | goal            | ALL file ops: find, read, list, open, write, rename, move, delete
 set_reminder        | goal            | one-time reminder — include ALL time words in goal
 cancel_reminder     | goal            | cancel one or all reminders
@@ -380,7 +381,6 @@ forget_voice        | {}              | delete saved voiceprint
 store_memory        | content         | "remember my/the X is Y" — storing a fact (NOT meet_face, NOT reminder)
 forget_memory       | content         | "forget about X" / "delete memory of X" — removing a stored fact (NOT forget_face/forget_voice)
 browser_extension_setup | mode        | set up / check / undo the browser extension (setup/status/preview/undo)
-browser_tabs        | action, query   | tabs in the user's own browser: list / close / switch / open. "what tabs are open", "close the mail tab", "switch to youtube"
 shutdown            | {}              | YOU exit ("shut down", "exit", "quit", "close yourself") — not the machine
 self_knowledge      | query           | questions about TENKA HERSELF: what she can do, which model she is using, what she is doing now, her own limits
 unknown             | {}              | truly unintelligible/empty input ONLY

@@ -42,6 +42,11 @@ class Frame:
     REQUEST: Final[str] = "request"
     RESPONSE: Final[str] = "response"
     EVENT: Final[str] = "event"
+    #: Client -> server, periodically, while the socket is open. Carries
+    #: nothing and expects no reply. It exists because an open socket does not
+    #: keep an MV3 background context alive -- only traffic does -- so without
+    #: it the extension is suspended after ~30s idle and the connection drops.
+    PING: Final[str] = "ping"
 
 
 class Rpc:
