@@ -129,6 +129,16 @@ class HostGate:
                     # A close sent in answer to the handshake, before any
                     # accept: the connection is refused, not established and
                     # then torn down.
+                    #
+                    # Logged because it was not, and a socket refused here is
+                    # indistinguishable from one that never arrived. That cost
+                    # an evening: the browser extension sat on "Retrying
+                    # shortly" while every log in the tree stayed silent.
+                    logger.warning(
+                        f"[API] HostGate refused a websocket: path="
+                        f"{scope.get('path')!r} host={host!r} port={port} "
+                        f"policy={policy_name!r}"
+                    )
                     await send({"type": "websocket.close", "code": 1008})
                 else:
                     await send({"type": "http.response.start", "status": 421,
@@ -667,6 +677,13 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         )
         from ...core import latch_protocol as latch_proto
 
+        origin_header = websocket.headers.get("origin")
+        logger.info(
+            f"[LATCH] connection attempt: origin={origin_header!r} "
+            f"server={websocket.scope.get('server')} "
+            f"registry={app.state.listener_policies}"
+        )
+
         policy = policy_for_scope(websocket.scope, app.state.listener_policies)
         if policy is None or policy.name != "extension":
             # Refused before `accept()`. Serving this socket on any other
@@ -684,9 +701,20 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         await websocket.accept()
         try:
             first = json.loads(await websocket.receive_text())
-        except Exception:
+        except Exception as e:
+            logger.warning(
+                f"[LATCH] first frame was unreadable ({type(e).__name__}: {e}); "
+                f"closing"
+            )
             await websocket.close(code=1008)
             return
+
+        logger.info(
+            f"[LATCH] hello received: browser={first.get('browser')!r} "
+            f"protocol={first.get('protocolVersion')!r} "
+            f"digest={str(first.get('domQuerySha256'))[:12]}... "
+            f"token_present={bool(first.get('token'))}"
+        )
 
         verdict = evaluate_handshake(
             first,
@@ -696,7 +724,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             occupied=is_occupied(),
         )
         if not verdict.ok:
-            logger.info(
+            logger.warning(
                 f"[LATCH] refused: {verdict.reason} (code={verdict.code})"
             )
             await websocket.send_text(json.dumps({
@@ -720,16 +748,29 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             f"version={connection.extension_version!r}"
         )
 
+        # Initialised BEFORE the try, and the reason is not style.
+        #
+        # `asyncio.CancelledError` inherits from `BaseException`, not
+        # `Exception` -- so on shutdown neither handler matched, the `else`
+        # never ran, and `finally` read a name that was never bound:
+        # `UnboundLocalError: cannot access local variable 'reason'`. The socket
+        # was then never unregistered, so `is_occupied()` stayed true against a
+        # dead connection and the extension's own reconnect was refused.
+        #
+        # Cancellation is re-raised rather than swallowed: the task is being
+        # torn down and pretending otherwise leaves uvicorn waiting on it.
+        reason = "closed"
         try:
             while True:
                 frame = json.loads(await websocket.receive_text())
                 connection.handle_frame(frame)
         except WebSocketDisconnect:
             reason = "disconnected"
+        except asyncio.CancelledError:
+            reason = "cancelled"
+            raise
         except Exception as e:
             reason = f"{type(e).__name__}: {e}"
-        else:
-            reason = "closed"
         finally:
             # Unregister in `finally` so every exit path frees the slot. A
             # connection left registered after its socket died makes

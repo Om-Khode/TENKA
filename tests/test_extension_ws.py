@@ -535,3 +535,57 @@ def test_the_slot_is_freed_when_the_socket_closes(tmp_path, monkeypatch):
             sock.send_text(json.dumps(hello()))
             assert json.loads(sock.receive_text())["type"] == proto.Frame.WELCOME
         assert ws.current_connection() is None, "the slot survived the socket"
+
+
+def test_every_exit_path_from_the_socket_loop_frees_the_slot():
+    """The teardown must run whatever ends the loop -- including a
+    `BaseException`.
+
+    `asyncio.CancelledError` inherits from `BaseException`, not `Exception`. The
+    first version of this handler bound its `reason` in an `except Exception`
+    and an `else`, so a cancellation matched neither: the `finally` read a name
+    that was never bound and raised `UnboundLocalError` on the way out. The
+    connection was then never unregistered, `is_occupied()` stayed true against
+    a dead socket, and the extension's own reconnect was refused for as long as
+    the process lived.
+
+    Read from the source because the alternative is cancelling a real uvicorn
+    task mid-receive, which is a slow and flaky way to assert a two-line
+    property.
+    """
+    import ast
+    import inspect
+
+    from assistant.io.api import app as app_module
+
+    source = inspect.getsource(app_module.create_app)
+    tree = ast.parse(source.lstrip())
+
+    loops = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Try)
+        and any("unregister" in ast.dump(h) for h in [node] + node.finalbody)
+    ]
+    assert loops, "the latch socket's try/finally was not found; this guard needs updating"
+    block = loops[0]
+
+    assert block.finalbody, "the teardown is not in a finally block"
+
+    # `reason` must be bound before the try, not only inside its handlers.
+    fn_source = source[: source.index("try:", source.index("while True:") - 400)]
+    assert 'reason = "closed"' in fn_source, (
+        "the teardown's `reason` is bound only inside exception handlers. A "
+        "BaseException -- CancelledError is one -- matches none of them, and "
+        "the finally then raises UnboundLocalError instead of unregistering."
+    )
+
+    handled = []
+    for handler in block.handlers:
+        if handler.type is None:
+            handled.append("bare")
+        else:
+            handled.append(ast.unparse(handler.type))
+    assert any("CancelledError" in h for h in handled), (
+        f"cancellation is not handled explicitly: {handled}. It is not an "
+        f"Exception, so `except Exception` does not catch it."
+    )
