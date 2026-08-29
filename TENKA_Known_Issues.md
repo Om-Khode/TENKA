@@ -1431,7 +1431,7 @@ Same family: [KI-16](#ki-16) — weak matching claiming ordinary speech.
 
 ---
 
-## KI-39: Recovery typed into the wrong window and reported success
+## KI-39: ~~Recovery typed into the wrong window and reported success~~ FIXED
 
 **Priority:** Medium-High (correctness — keystrokes land in an unintended
 application, and the turn reports success)
@@ -1439,7 +1439,11 @@ application, and the turn reports success)
 **Discovered:** 2026-08-29, live, while attempting the TENKA-v2 P13 loop-3
 test. The goal was `"open notepad and type hello world"`; "hello world" was
 typed into a Visual Studio Code document.
-**Status:** open
+**Fixed:** 2026-08-29 — `_APP_TARGET_SUFFIX_RE` accepts a quoted title and a
+trailing `window`/`app`, and one `_WORD_PUNCT` constant strips quotes at every
+site that splits a goal into candidate words.
+`tests/test_window_target_resolution.py`.
+**Status:** FIXED
 
 **What happened, from the log.** Step 2 failed post-verification because focus
 had moved off Notepad. The planner built a recovery step that named the target
@@ -1481,13 +1485,19 @@ step **recovered**.
    is somewhere unexpected. The fallback re-targets to precisely the window
    that caused the problem.
 
-3. **The native tier has no mid-typing focus guard.** `ABORTED_WRONG_FOCUS` —
-   the check that refuses to type when the expected window is not focused —
-   exists only in `automation/vision/agent.py`'s `keyboard_type` /
-   `keyboard_hotkey` / `keyboard_press`. `automation/native.py` focuses and then
-   types, so anything that steals focus in between gets the keystrokes. The
-   safety property exists in the *fallback* tier and not in the tier that runs
-   first.
+3. ~~**The native tier has no mid-typing focus guard.**~~ **This was wrong,
+   and the log I wrote it from says so.** `run_app_steps` post-verifies every
+   step and halts: the original attempt produced
+   `verify_failed (post): step 1 focus — active window is '… - Visual Studio
+   Code', expected to contain 'hunter2.txt - Notepad'` and returned
+   `VERIFY_FAILED` **without typing**. The safety check exists in the native
+   tier, fired, and did its job. What went wrong was entirely faults 1 and 2:
+   the *recovery* attempt then re-resolved the target and typed into the window
+   verification had just rejected. A narrower residual race — focus moving
+   between the post-verify and the keypress — is possible in principle, but
+   nothing here is evidence of it, and `ABORTED_WRONG_FOCUS` is a synchronous
+   check inside a primitive rather than the per-step verification this tier
+   already has.
 
 **What worked, and is worth keeping.** Post-verification caught the original
 focus mismatch (`verify_failed (post)`), and the spoken reply was honest about
@@ -1497,12 +1507,17 @@ recovered/success, so the honesty is in the sentence and not in the row —
 the same split TENKA-v2 §17.P13 closed for the vision agent and procedure
 replay, still open on this tier.
 
-**Why this is not fixed here.** Fault 1 is a one-line strip fix, but it is not
-worth shipping alone: with the target resolving correctly, fault 2 stops firing
-in *this* case while remaining wrong for the next one, and fault 3 leaves the
-window between focus and keypress open regardless. The three want one change
-with one live test — a recovery that cannot silently retarget, and a native
-typing path that refuses like the vision one does.
+**What the fix turned out to be, and what it was not.** Not a new guard: the
+guard already existed. `_execute_native_task` refuses the active-window
+fallback whenever `_extract_target_app` reports an explicit target, with a
+comment naming this exact hazard — it was written after "type X in notepad"
+once fired Ctrl+N inside the user's IDE. **Quotes stopped it being reached.**
+
+So fault 2 needed no change at all once fault 1 was closed at both resolvers,
+and fault 3 was not a fault. What remains true and worth keeping in mind: the
+turn still recorded as recovered/success. Honesty in the sentence, not in the
+row — the split TENKA-v2 §17.P13 closed for the vision agent and procedure
+replay, still open on the planner's recovery path.
 
 Related: [KI-36](#ki-36) (the same tier cannot be aborted mid-flight).
 

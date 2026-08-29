@@ -388,3 +388,4 @@ has looked at, and it blocks the next phase.
 | `test_vision_split.py` | GREEN | 28 | 0 | 0 | 0 | 0.9 |
 | `test_wake_word_fallback.py` | GREEN | 4 | 0 | 0 | 0 | 0.7 |
 | `test_weak_procedure_match.py` | GREEN | 25 | 0 | 0 | 0 | 2.8 |
+| `test_window_target_resolution.py` | GREEN | 8 | 0 | 0 | 0 | 0.3 |
