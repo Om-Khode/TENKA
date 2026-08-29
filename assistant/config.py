@@ -781,6 +781,19 @@ DIALOG_ENGAGEMENT_GATE_ENABLED = _runtime_setting(
 # Connect to user's already-open Chrome instead of always launching the
 # bundled Chromium. Requires Chrome to be launched with --remote-debugging-port.
 # When CDP is unreachable, all paths fall back to bundled Chromium silently.
+BROWSER_PREFER_EXTENSION = _runtime_setting(
+    "browser_prefer_extension", True, cast=bool,
+    description="When True (default), the browser tier drives whichever "
+                "browser the Latch extension is connected from -- the one the "
+                "user already has open, with their logins. Off = always use "
+                "the bundled Chromium, which starts signed out.",
+)
+BROWSER_EXTENSION_RPC_TIMEOUT = _runtime_setting(
+    "browser_extension_rpc_timeout", 30.0, cast=float,
+    description="Seconds to wait for the extension to answer one call before "
+                "giving up. A call that never returns is worse than one that "
+                "fails: nothing goes red, and the pending slot leaks.",
+)
 BROWSER_PREFER_CDP = _runtime_setting(
     "browser_prefer_cdp", True, cast=bool,
     description="When True (default), TENKA tries to attach to a running "
@@ -935,6 +948,7 @@ def reload_runtime_settings() -> None:
     global STUDIO_API_ENABLED, STUDIO_API_PORT, STUDIO_API_ORIGINS, STUDIO_UI_PATH
     global BROWSER_CDP_PORT, BROWSER_CDP_PORT_SCAN, BROWSER_CDP_PROBE_TTL, BROWSER_DOM_CACHE_TTL
     global BROWSER_DOM_MODE_ENABLED, BROWSER_DOM_TREE_TOKEN_BUDGET, BROWSER_PREFER_CDP
+    global BROWSER_PREFER_EXTENSION, BROWSER_EXTENSION_RPC_TIMEOUT
     global DETERMINISTIC_MATCHING_ENABLED, DIALOG_ENGAGEMENT_GATE_ENABLED
     global DROPDOWN_COMMIT_GUARD_ENABLED, DYNAMIC_BUDGET_ENABLED
 
@@ -977,6 +991,8 @@ def reload_runtime_settings() -> None:
     STUDIO_API_ORIGINS = new_values.get("studio_api_origins", STUDIO_API_ORIGINS)
     STUDIO_UI_PATH = new_values.get("studio_ui_path", STUDIO_UI_PATH)
 
+    BROWSER_PREFER_EXTENSION = new_values.get("browser_prefer_extension", BROWSER_PREFER_EXTENSION)
+    BROWSER_EXTENSION_RPC_TIMEOUT = new_values.get("browser_extension_rpc_timeout", BROWSER_EXTENSION_RPC_TIMEOUT)
     BROWSER_CDP_PORT = new_values.get("browser_cdp_port", BROWSER_CDP_PORT)
     BROWSER_CDP_PORT_SCAN = new_values.get("browser_cdp_port_scan", BROWSER_CDP_PORT_SCAN)
     BROWSER_CDP_PROBE_TTL = new_values.get("browser_cdp_probe_ttl", BROWSER_CDP_PROBE_TTL)
