@@ -311,3 +311,125 @@ def test_subsequence_remainder_single_word():
     # Single-word triggers don't do subsequence matching
     result = ProcedureRepo.subsequence_remainder("open", "open editor")
     assert result == "open editor"
+
+
+# --- KI-38: a trigger with filler words at either end ---
+#
+# `match_trigger` normalized the utterance and compared it against the stored
+# trigger raw, so `run`, `go`, `please`, `now`, `hey`, `just`, `do it` and the
+# assistant's own name each made a trigger permanently unmatchable -- on all
+# four tiers, silently, with nothing refusing it at teach time.
+#
+# Found live: a procedure taught as "run the p13 check" never fired once, and
+# the utterance fell through to the classifier, which answered a stored
+# keystroke program with generated Python.
+
+# From the repo's own filler list. Enumerated rather than sampled, because the
+# defect was uniform across them and one example would not show the fix is too.
+_LEADING_FILLERS = ["run", "go", "please", "now", "hey", "hi", "just",
+                    "do it", "can you", "could you", "would you", "tenka"]
+
+
+@pytest.mark.parametrize("filler", _LEADING_FILLERS)
+def test_a_trigger_starting_with_any_filler_still_matches(repo, filler):
+    trigger = f"{filler} the widget"
+    repo.create_procedure(trigger, "Widget", _STEPS)
+    m = repo.match_trigger(trigger)
+    assert m is not None, f"a procedure taught as {trigger!r} can never be run"
+    assert m["name"] == "Widget"
+
+
+def test_a_trigger_ending_with_a_filler_still_matches(repo):
+    # `_normalize` strips at both ends; only the leading case was seen live,
+    # so this is the half that was never observed failing.
+    repo.create_procedure("open the widget now", "Trailing", _STEPS)
+    m = repo.match_trigger("open the widget now")
+    assert m is not None
+    assert m["name"] == "Trailing"
+
+
+@pytest.mark.parametrize("said", [
+    "daily report", "please daily report", "run daily report",
+    "daily report now", "tenka daily report",
+])
+def test_the_utterance_may_still_carry_fillers_the_trigger_does_not(repo, said):
+    # What `_normalize` existed for in the first place, and what the fix must
+    # not cost.
+    repo.create_procedure("daily report", "Report", _STEPS)
+    m = repo.match_trigger(said)
+    assert m is not None, f"{said!r} no longer reaches the trigger"
+    assert m["name"] == "Report"
+
+
+def test_an_exact_match_is_still_reported_as_exact(repo):
+    # The tier drives `main.py:_weak_trigger_yields`. A strong match that
+    # started reporting `contained` would begin yielding to `pre_route`, which
+    # is a routing change wearing a matching fix's clothes.
+    repo.create_procedure("run the widget", "Widget", _STEPS)
+    assert repo.match_trigger("run the widget")["match_tier"] == "exact"
+
+
+@pytest.mark.parametrize("said", [
+    "what is the weather in pune", "please", "run", "open notepad",
+])
+def test_an_unrelated_utterance_still_matches_nothing(repo, said):
+    # The control. Normalizing both sides must not turn matching into
+    # something that claims everything.
+    repo.create_procedure("run the widget", "Widget", _STEPS)
+    assert repo.match_trigger(said) is None
+
+
+def test_longest_match_is_measured_after_normalization(repo):
+    """The sort has to rank by the same string the tiers compare.
+
+    The first draft of this test was a green mutant: reverting the sort to raw
+    length left it passing, because its two triggers landed in *different*
+    tiers and tier precedence decided the winner regardless of order. Order
+    only matters *within* a tier, so both candidates must reach the same one.
+
+    Both of these are `contained` matches on the utterance, and their raw and
+    normalized lengths rank in opposite directions:
+
+        "can you run the widget"   raw 22  ->  normalized "the widget"      10
+        "widget factory"           raw 14  ->  normalized "widget factory"  14
+
+    Sorted raw, the first wins and the more specific match is discarded.
+    """
+    repo.create_procedure("can you run the widget", "Vague", _STEPS)
+    repo.create_procedure("widget factory", "Specific", _STEPS)
+
+    m = repo.match_trigger("open the widget factory today")
+    assert m is not None
+    assert m["match_tier"] == "contained", (
+        f"both triggers must reach the same tier for order to be under test; "
+        f"got {m['match_tier']}")
+    assert m["name"] == "Specific", (
+        "the shorter normalized trigger won, so the sort is ranking by raw "
+        "length while the tiers compare normalized strings")
+
+
+# --- KI-38: the all-filler case, which cannot occur ---
+#
+# The KI writeup proposed refusing a trigger that normalizes to the empty
+# string, on the grounds that `"" in anything` would make it claim every turn.
+# There is no such trigger. `_filler_re` strips a leading filler only when
+# whitespace follows it, and a trailing one only when whitespace precedes it,
+# so the first and last tokens always survive. This pins that, so nobody adds
+# the guard back on the strength of the writeup.
+
+
+def test_no_all_filler_phrase_normalizes_to_empty(repo):
+    import itertools
+    fillers = ["please", "now", "tenka", "go", "do it", "run", "hey", "hi",
+               "can you", "could you", "would you", "just"]
+    empties = [
+        " ".join(c)
+        for n in (1, 2, 3)
+        for c in itertools.product(fillers, repeat=n)
+        if not repo._normalize(" ".join(c))
+    ]
+    assert not empties, (
+        f"{len(empties)} all-filler phrases normalize to empty, e.g. "
+        f"{empties[:3]}. The contained tier would match them against every "
+        f"utterance -- match_trigger now needs the guard KI-38 proposed."
+    )

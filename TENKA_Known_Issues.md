@@ -1343,14 +1343,17 @@ utility look like Chrome.
 
 ---
 
-## KI-38: A procedure whose trigger starts or ends with a filler word can never run
+## KI-38: ~~A procedure whose trigger starts or ends with a filler word can never run~~ FIXED
 
 **Priority:** Medium (correctness — the feature accepts input it will never honour)
 **Effort:** Low. One line, plus a decision about existing rows
 **Discovered:** 2026-08-28, while setting up the TENKA-v2 P13 loop-2 live test.
 The test procedure never fired; the utterance was classified as
 `code_executor` instead and answered with a CPU core count.
-**Status:** open
+**Fixed:** 2026-08-29 — `match_trigger` normalizes both sides, and the
+longest-match sort measures the normalized trigger so it ranks by the string
+the tiers actually compare. Tests in `tests/test_repo_procedure.py`.
+**Status:** FIXED
 
 **The defect.** `ProcedureRepo.match_trigger` normalizes the *utterance* and
 compares it against the *stored trigger raw*:
@@ -1404,13 +1407,25 @@ closes it for good. What that does *not* decide:
 - **Or normalize on write** and leave `match_trigger` alone. Narrower, but it
   does nothing for the rows already stored, and two normalizers on one value
   is how they drift.
-- Either way **teach-time should refuse a trigger that normalizes to empty**
-  (`"please"`, `"just now"`), which today is stored and matches everything or
-  nothing depending on the tier.
+- ~~Either way **teach-time should refuse a trigger that normalizes to empty**~~
+  **This part of the writeup was wrong, and checking it is what showed that.**
+  No trigger normalizes to empty. `_filler_re` strips a leading filler only
+  when whitespace follows it and a trailing one only when whitespace precedes
+  it, so the first and last tokens always survive -- enumerated over all 1,884
+  filler phrases up to three words, none produced `""`. A guard was written,
+  found to be a branch no input can reach, and removed; the impossibility is
+  pinned by a test instead, so nobody adds it back on the strength of this
+  paragraph.
 
-Not fixed here because it is not P13's, and because the widening above needs
-its own live test against a real taught procedure rather than a unit test of
-the comparison.
+**On the widening.** Normalizing on read does make a trigger stored as
+`"run notes"` claim the bare word `"notes"` under `contained`. That lands on
+an existing guard rather than on nothing: `main.py:_weak_trigger_yields`
+already defers `contained` and `subsequence` matches to `pre_route` for the
+intents in `_NAMES_AN_OBJECT`, which is the machinery KI-16's neighbour
+produced. Strong tiers never consult it, so an exact match still beats the
+classifier exactly as before -- pinned by a test, because a strong match that
+started reporting `contained` would begin yielding and that is a routing
+change wearing a matching fix's clothes.
 
 Same family: [KI-16](#ki-16) — weak matching claiming ordinary speech.
 
