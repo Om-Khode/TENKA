@@ -1413,3 +1413,113 @@ its own live test against a real taught procedure rather than a unit test of
 the comparison.
 
 Same family: [KI-16](#ki-16) — weak matching claiming ordinary speech.
+
+---
+
+## KI-39: Recovery typed into the wrong window and reported success
+
+**Priority:** Medium-High (correctness — keystrokes land in an unintended
+application, and the turn reports success)
+**Effort:** Low for the matcher; the fallback is a design decision
+**Discovered:** 2026-08-29, live, while attempting the TENKA-v2 P13 loop-3
+test. The goal was `"open notepad and type hello world"`; "hello world" was
+typed into a Visual Studio Code document.
+**Status:** open
+
+**What happened, from the log.** Step 2 failed post-verification because focus
+had moved off Notepad. The planner built a recovery step that named the target
+correctly:
+
+```
+[PLANNER] Recovery step 3: [app_action] type "hello world" in the 'hunter2.txt - Notepad' window
+[SCREEN]  Active window: "… - Visual Studio Code"
+[DA]      Fallback: using active window '… - Visual Studio Code' (no keyword match)
+[APP]     Typing text: hello world into focus
+[PLANNER] Step 2 marked 'recovered' — all recovery steps succeeded
+```
+
+The recovery knew the right window, could not resolve it, silently retargeted
+to whatever happened to be focused, typed there, and the planner marked the
+step **recovered**.
+
+**Three faults in one chain. The first is a one-line bug.**
+
+1. **The quoting defeats the matcher.** `_detect_running_app` builds candidate
+   words with `w.lower().strip(".,!?")` — which does not strip quotes or
+   apostrophes — and the planner's own recovery prompt wraps window names in
+   single quotes. Reproduced:
+
+   ```
+   goal        type "hello world" in the 'hunter2.txt - Notepad' window
+   candidates  ['"hello', 'world"', "'hunter2.txt", "notepad'"]
+   app part    'notepad'
+   matches     []            <-  "notepad'" is not in "notepad"
+   ```
+
+   One component writes a name the sibling component cannot read. Neither is
+   wrong alone.
+
+2. **No-match falls back to the active window.** Having lost the target, the
+   resolver uses whatever is focused *now*. For a first attempt that is a
+   reasonable convenience; for a **recovery from a focus failure** it is the
+   worst possible default, because the reason recovery is running is that focus
+   is somewhere unexpected. The fallback re-targets to precisely the window
+   that caused the problem.
+
+3. **The native tier has no mid-typing focus guard.** `ABORTED_WRONG_FOCUS` —
+   the check that refuses to type when the expected window is not focused —
+   exists only in `automation/vision/agent.py`'s `keyboard_type` /
+   `keyboard_hotkey` / `keyboard_press`. `automation/native.py` focuses and then
+   types, so anything that steals focus in between gets the keystrokes. The
+   safety property exists in the *fallback* tier and not in the tier that runs
+   first.
+
+**What worked, and is worth keeping.** Post-verification caught the original
+focus mismatch (`verify_failed (post)`), and the spoken reply was honest about
+the outcome: *"the focus was a bit off … so I ended up typing it into a new
+file in Visual Studio Code instead."* The turn nevertheless recorded as
+recovered/success, so the honesty is in the sentence and not in the row —
+the same split TENKA-v2 §17.P13 closed for the vision agent and procedure
+replay, still open on this tier.
+
+**Why this is not fixed here.** Fault 1 is a one-line strip fix, but it is not
+worth shipping alone: with the target resolving correctly, fault 2 stops firing
+in *this* case while remaining wrong for the next one, and fault 3 leaves the
+window between focus and keypress open regardless. The three want one change
+with one live test — a recovery that cannot silently retarget, and a native
+typing path that refuses like the vision one does.
+
+Related: [KI-36](#ki-36) (the same tier cannot be aborted mid-flight).
+
+---
+
+## KI-37 addendum — observed in ordinary use, 2026-08-29
+
+Not a test this time. A `computer_task` form-fill routed correctly to DOM mode
+against the user's Chrome window, then attached to the wrong browser entirely:
+
+```
+[CDP] probe OK port=9222 browser='Edg/151.0.4129.107'
+[DA]  Routing goal '…': backend=dom, reason=form_intent app='demosite - Google Chrome'
+[DA]  DOM-mode running on page: 'https://vantage.csw.lenovo.com/…'
+[DOM_FORM_FILL] perceived 7 elements
+[DOM_MAPPER] mapping goal to 0 fields
+```
+
+The router identified the right window (`app='demosite - Google Chrome'`) and
+the CDP layer then handed it a preinstalled utility's embedded webview, because
+that is what answers on 9222. The user's Chrome was on another port.
+
+Two things this adds to the entry above:
+
+- **It is not a corner case.** It cost an ordinary request, silently, and the
+  only reason it was diagnosable is that the page URL is logged. Without that
+  line the symptom is "she says she can't see the form" with the form plainly
+  on screen.
+- **The failure was graceful, which is why it will go unreported.** The mapper
+  found nothing form-shaped and said "I couldn't figure out which fields to
+  fill" — reasonable-sounding, and wrong. Users retype the request rather than
+  report it.
+
+Raises the practical priority of the foreground-window check proposed above,
+whichever of the three options is chosen.
