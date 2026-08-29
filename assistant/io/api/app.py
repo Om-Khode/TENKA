@@ -677,6 +677,20 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         )
         from ...core import latch_protocol as latch_proto
 
+        async def _close_quietly(code: int = 1008) -> None:
+            """Close, tolerating a socket the client already dropped.
+
+            `WebSocket.close()` raises `WebSocketDisconnect(1006)` when the peer
+            has gone -- and every refusal path here closes, so a client that
+            hangs up mid-handshake turned a routine refusal into a full ASGI
+            traceback. The connection is already over; there is nothing left to
+            report but noise.
+            """
+            try:
+                await websocket.close(code=code)
+            except Exception:
+                pass
+
         origin_header = websocket.headers.get("origin")
         logger.info(
             f"[LATCH] connection attempt: origin={origin_header!r} "
@@ -690,7 +704,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             # listener would put a driver for the user's browser on a port whose
             # policy was written for something else — including, on `local`, one
             # that grants EXECUTE.
-            await websocket.close(code=1008)
+            await _close_quietly()
             return
 
         # Accept first, then decide: the verdict is a `reject` frame carrying a
@@ -706,7 +720,7 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                 f"[LATCH] first frame was unreadable ({type(e).__name__}: {e}); "
                 f"closing"
             )
-            await websocket.close(code=1008)
+            await _close_quietly()
             return
 
         logger.info(
@@ -727,12 +741,17 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             logger.warning(
                 f"[LATCH] refused: {verdict.reason} (code={verdict.code})"
             )
-            await websocket.send_text(json.dumps({
-                "type": latch_proto.Frame.REJECT,
-                "code": verdict.code,
-                "reason": verdict.reason,
-            }))
-            await websocket.close(code=1008)
+            try:
+                await websocket.send_text(json.dumps({
+                    "type": latch_proto.Frame.REJECT,
+                    "code": verdict.code,
+                    "reason": verdict.reason,
+                }))
+            except Exception:
+                # The reject is a courtesy: it tells a client whether to stop
+                # retrying. A peer that left before hearing it needs nothing.
+                pass
+            await _close_quietly()
             return
 
         connection = LatchConnection(
