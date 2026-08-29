@@ -1323,6 +1323,36 @@ it was and nothing read it. A browser's is a `Mozilla/5.0 …` string. Consulted
 **only** when the process check is blind, never to override a positive answer:
 a browser launched with a custom `--user-agent` must not be locked out on this
 alone.
+
+**Third round: finding the port instead of arguing over it.** 9222 is two
+conventions at once — Chrome's debug port and the WebView2 default — so on this
+machine the squatter respawns at boot and the user's Chrome can never have the
+port they asked for. Refusing correctly still left them with no browser
+automation.
+
+`cdp_health_probe()` with no port now searches: `BROWSER_CDP_PORT` and
+`BROWSER_CDP_PORT_SCAN` (default 4) ports past it, returning the first
+endpoint that is both available *and* a browser by the checks above. An
+explicit `port=` never scans — a caller naming a port is not asking to search,
+and searching on their behalf would drive a browser they did not mean.
+
+Two consistency defects closed alongside it, both the same shape as the
+second round:
+
+- **The probe result now carries the port it describes**, and the attach uses
+  that rather than re-reading config. A probe passing for one socket while the
+  connection opens another is how a green check ended up above the wrong
+  behaviour.
+- **The probe cache is keyed on the port**, not on age alone. It was returned
+  on age, so once scanning existed a probe of 9333 could be answered by a
+  cached 9222 result.
+
+And `automation/browser/setup.py` — which writes the "Chrome (TENKA-CDP)"
+shortcut — had its own hardcoded `9222` and never read `BROWSER_CDP_PORT`. Two
+halves of one feature with independent notions of the port: changing the
+setting left the shortcut launching Chrome on the old one, TENKA probing the
+new one, and nothing saying why it stopped working. Both now read the same
+setting, with a test that fails if either stops.
 **Status:** FIXED
 
 **The defect.** `cdp_health_probe` GETs `/json/version` on the configured port

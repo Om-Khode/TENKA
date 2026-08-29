@@ -224,10 +224,30 @@ def _patch_playwright(session):
 
 
 class TestConnectToExistingChrome(unittest.TestCase):
+    """The attach path, with the KI-37 ownership check stubbed.
+
+    Without the stub these tests read **real machine state**: the check asks
+    which process is listening on port 9222 and what windows it owns, so
+    `test_success_path_returns_attachment` passed or failed depending on what
+    happened to be running on the developer's desktop. It went red the moment
+    the check landed, on a machine where a webview held that port -- which is
+    the right way to find out, but not something a unit test should depend on.
+
+    `cdp_owner_is_a_browser` is patched on the module under test, which is
+    where `_endpoint_is_a_browser` resolves it. The check has its own tests in
+    `tests/test_cdp_owner_is_a_browser.py`, including the ones that assert the
+    attach path consults it at all.
+    """
+
     def setUp(self):
         cdp.reset_state_for_test()
+        self._owner = patch.object(
+            cdp, "cdp_owner_is_a_browser",
+            return_value=(True, "stubbed: a browser owns this port"))
+        self._owner.start()
 
     def tearDown(self):
+        self._owner.stop()
         cdp.reset_state_for_test()
         sys.modules.pop("playwright.async_api", None)
 

@@ -425,3 +425,42 @@ class TestShortcutTargets(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# --- The shortcut and the prober describe the same port ---
+
+
+def test_the_shortcut_follows_the_configured_port():
+    """`setup.py` had its own `9222` while `BROWSER_CDP_PORT` is a runtime
+    setting, so changing the setting left the shortcut launching Chrome on the
+    old port, TENKA probing the new one, and nothing saying why it stopped
+    working. Two halves of one feature with independent notions of the port.
+
+    Asserted through the public entry point rather than on `_configured_port`,
+    because the bug was the entry point not calling it.
+    """
+    from unittest.mock import patch as _patch
+
+    from assistant import config as _config
+    from assistant.automation.browser import setup as _setup
+
+    with _patch.object(_config, "BROWSER_CDP_PORT", 9333):
+        assert _setup._configured_port() == 9333
+        assert _setup.setup_chrome_cdp(dry_run=True).port == 9333, (
+            "the shortcut would launch Chrome on a port TENKA does not probe")
+        # `is_setup_done` reads the same setting, or an existing marker for the
+        # old port would be accepted for the new one.
+        assert _setup.is_setup_done.__defaults__ == (None,), (
+            "is_setup_done took a hardcoded port default again")
+
+
+def test_an_explicit_port_still_wins():
+    """The setting is the default, not an override. A caller naming a port --
+    a test, or a user with two browsers -- gets that port."""
+    from unittest.mock import patch as _patch
+
+    from assistant import config as _config
+    from assistant.automation.browser import setup as _setup
+
+    with _patch.object(_config, "BROWSER_CDP_PORT", 9333):
+        assert _setup.setup_chrome_cdp(dry_run=True, port=9444).port == 9444

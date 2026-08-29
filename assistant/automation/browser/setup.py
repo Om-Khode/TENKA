@@ -52,6 +52,26 @@ def _marker_path() -> Path:
 
 
 _BACKUP_SUFFIX = ".tenka.bak"
+def _configured_port() -> int:
+    """The port TENKA will actually probe.
+
+    Read from `config` rather than hardcoded, because the shortcut this module
+    writes and the prober in `cdp.py` describe the same thing and must not be
+    able to disagree. They could: `BROWSER_CDP_PORT` is a runtime setting, and
+    this module had its own `9222` — so changing the setting left the shortcut
+    launching Chrome on the old port, TENKA probing the new one, and nothing
+    saying why it stopped working.
+
+    Imported lazily and defensively: `setup.py` is reachable from a handler
+    that must not fail to load because config is mid-reload.
+    """
+    try:
+        from ... import config
+        return int(getattr(config, "BROWSER_CDP_PORT", 9222))
+    except Exception:
+        return 9222
+
+
 _DEFAULT_PORT = 9222
 
 # Marker schema version. Bump whenever the shortcut args / setup behaviour
@@ -124,7 +144,7 @@ class UndoResult:
 # ─── Marker file helpers ──────────────────────────────────────────────────────
 
 
-def is_setup_done(port: int = _DEFAULT_PORT) -> bool:
+def is_setup_done(port: Optional[int] = None) -> bool:
     """True iff:
       - a marker exists for the given port, AND
       - the marker's schema version matches `_SETUP_SCHEMA_VERSION` (otherwise
@@ -136,6 +156,7 @@ def is_setup_done(port: int = _DEFAULT_PORT) -> bool:
     the current args. This is the upgrade path when we change the shortcut
     contract (e.g. adding `--user-data-dir`).
     """
+    port = _configured_port() if port is None else port
     p = _marker_path()
     if not p.is_file():
         return False
@@ -562,7 +583,7 @@ def _shortcut_targets() -> list[Path]:
 
 def setup_chrome_cdp(
     *,
-    port: int = _DEFAULT_PORT,
+    port: Optional[int] = None,
     dry_run: bool = False,
     require_chrome_closed: bool = False,  # No longer needed — we don't touch existing shortcuts
 ) -> SetupResult:
@@ -582,6 +603,12 @@ def setup_chrome_cdp(
     at least one created shortcut still exists, returns ok=True with an
     "already configured" message.
     """
+    # `None` means "whatever TENKA is configured to probe". The shortcut and
+    # the prober describing the same port is the whole point -- see
+    # `_configured_port`.
+    port = _configured_port() if port is None else port
+    logger.info(f"[BROWSER_SETUP] configuring Chrome shortcut for port {port}")
+
     chrome_exe = find_chrome_executable()
     if chrome_exe is None:
         return SetupResult(
