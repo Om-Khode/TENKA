@@ -488,12 +488,104 @@ def _sync_type_text(text: str, selector: str = None, window: str = None) -> str:
             return f"Failed to type text: {e}"
     raise RuntimeError("No backend available")
 
+def _focus_matches(expected_window: str) -> tuple[bool, str]:
+    """Is `expected_window` the foreground window right now?
+
+    Returns `(matches, active_title)`. Cheap on purpose -- a title substring
+    check and a process-name check, and **no vision call**. The vision agent's
+    `_check_focus_or_dialog` escalates to a model as its third check; this runs
+    before every untargeted keystroke batch on the deterministic tier, where a
+    model call per batch is the wrong trade.
+
+    The process check is the same idea as the vision agent's: an app that
+    renames its window while working ("Artist - Song") still owns the
+    foreground, and refusing to type into it would be a regression dressed as
+    a safety feature.
+    """
+    from ..io import screen
+
+    active = ""
+    try:
+        active = screen.get_active_window() or ""
+    except Exception as e:
+        # Cannot see the foreground: say so rather than guessing either way.
+        # The caller treats "unknown" as a mismatch, which is the fail-closed
+        # direction for a keystroke.
+        logger.debug(f"[APP] focus check could not read the active window: {e}")
+        return False, ""
+
+    if expected_window.lower() in active.lower():
+        return True, active
+
+    try:
+        import ctypes
+        import psutil
+
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        exe = psutil.Process(pid.value).name().lower().replace(".exe", "")
+        words = [w for w in expected_window.lower().split() if len(w) > 2]
+        if any(w in exe for w in words):
+            logger.info(
+                f"[APP] Focus check: title mismatch but process matches "
+                f"('{exe}' ~ '{expected_window}') — '{active}' is the right app")
+            return True, active
+    except Exception as e:
+        logger.debug(f"[APP] Process-based focus check failed: {e}")
+
+    return False, active
+
+
 async def type_text(text: str, selector: str = None, window: str = None) -> str:
     """
     Type text into a UI element or the focused field.
+
+    **`window` is honoured on the untargeted path, and KI-39 is why.** With no
+    selector this types with `pyautogui.write`, which goes wherever the OS
+    focus is. `window` used to be accepted, logged, and then never consulted --
+    so a step reading
+
+        type - {'text': 'hello world', 'window': '*hello world - Notepad'}
+
+    typed into whatever the user had clicked since, and reported success naming
+    the window it had not typed into. Observed live: fourteen seconds passed
+    between the `focus` step and the keystrokes (a Ctrl+N, a vision call and a
+    wait in between), the operator clicked their editor, and "hello world"
+    landed in a source file while the turn recorded as done.
+
+    The same guard already existed one tier up -- `vision/agent.py`'s
+    `keyboard_type` takes `expected_window` and returns `ABORTED_WRONG_FOCUS`.
+    The deterministic tier had the parameter and not the check, which is the
+    safety property living in the fallback and not in the path that runs first.
+
+    One re-focus is attempted before refusing, because the common case is a
+    transient steal rather than the user deliberately moving on.
     """
     if not is_available(): return "Native automation not available."
     logger.info(f"[APP] Typing text: {text} into {selector or 'focus'}")
+
+    # Untargeted typing goes to the foreground. If a window was named, it is a
+    # claim about where these keystrokes belong, and it gets checked.
+    if window and not selector:
+        ok, active = _focus_matches(window)
+        if not ok:
+            logger.warning(
+                f"[APP] Focus moved before typing: expected '{window}', "
+                f"active '{active}' — re-focusing once")
+            try:
+                await focus_window(window)
+                await asyncio.sleep(0.15)
+            except Exception as e:
+                logger.debug(f"[APP] re-focus raised: {e}")
+            ok, active = _focus_matches(window)
+        if not ok:
+            msg = (f"ABORTED_WRONG_FOCUS: expected window containing "
+                   f"'{window}' but '{active or 'unknown'}' is focused — "
+                   f"refusing to type {len(text)} characters into it")
+            logger.warning(f"[APP] {msg}")
+            return msg
     try:
         if _backend == "terminator":
             desktop = ensure_desktop()

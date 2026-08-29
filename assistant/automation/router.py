@@ -1450,13 +1450,36 @@ async def _execute_browser_task(goal: str, llm_func, *, _from_planner: bool = Fa
 # Two alternatives, quoted first so a title containing spaces is taken whole,
 # plus an optional trailing noun because "in the X window" is how both the
 # planner and ordinary speech name one.
+# `into` and `to` are here because the planner writes them and the first fix
+# did not include them. Four consecutive runs of one goal produced four
+# phrasings of the same step:
+#
+#     type "hello world" in notepad                    -> resolved
+#     type "hello world" into the Notepad window       -> no target
+#     type "hello world" into notepad                  -> no target
+#     type "hello world" into the current document     -> names nothing
+#
+# Only the first reached the guard. The fourth names no window at all and is
+# outside what this function can answer -- see `_execute_native_task`, which
+# treats "no explicit target" as a reason to be careful rather than as
+# permission.
+#
+# **`to` and `onto` are deliberately absent.** The first draft added every
+# preposition that can mean "put this there", on the argument that a list a
+# generating model must guess correctly will be wrong again. That argument is
+# fine and the conclusion was not: `to` is ordinary English, and
+# `add it to the list` immediately resolved to an app called "list", which
+# `_resolve_target_window` would Win-key search for. That is the hazard
+# `_GENERIC_CATEGORY_WORDS` exists to prevent, arriving through the repair.
+# `into` is here because the planner was observed writing it four times in one
+# session; the rest are the ones that were already earning their place.
 _APP_TARGET_SUFFIX_RE = re.compile(
-    r"""\b(?:on|in|with|using)\s+(?:the\s+)?
+    r"""\b(?:into|on|in|with|using)\s+(?:the\s+)?
         (?:
             ['"]([^'"]+)['"]                # a quoted window title
           | (\w+)                           # or a bare app name
         )
-        (?:\s+(?:window|app|application))?  # "... in the X window"
+        (?:\s+(?:window|app|application|tab))?  # "... in the X window"
         \s*$""",
     re.IGNORECASE | re.VERBOSE,
 )
