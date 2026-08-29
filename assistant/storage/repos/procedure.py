@@ -280,8 +280,12 @@ class ProcedureRepo:
         normalized_input = self._normalize(text)
         input_words = normalized_input.split()
 
-        # Sort by trigger length descending so longest match wins
-        rows = sorted(rows, key=lambda r: len(r["trigger"]), reverse=True)
+        # Sort by trigger length descending so longest match wins. Measured
+        # on the *normalized* trigger (KI-38) because that is what the tiers
+        # below compare: sorting raw would rank "run notes" above "notepad"
+        # while matching the shorter of the two.
+        rows = sorted(rows, key=lambda r: len(self._normalize(r["trigger"])),
+                      reverse=True)
 
         exact = None
         prefix = None
@@ -289,7 +293,43 @@ class ProcedureRepo:
         subsequence = None
 
         for row in rows:
-            trigger = row["trigger"].lower()
+            # **Both sides normalized, or neither.** KI-38: this read
+            # `row["trigger"].lower()` while the utterance above went through
+            # `_normalize`, which strips leading and trailing fillers -- `run`,
+            # `go`, `please`, `now`, `hey`, `just`, `do it`, and the assistant's
+            # own name. So a trigger beginning or ending with one of those could
+            # not match on *any* tier:
+            #
+            #   stored     "run the p13 check"
+            #   spoken     "run the p13 check"  -> normalized "the p13 check"
+            #   exact      "the p13 check" != "run the p13 check"
+            #   prefix     the input is shorter, so it cannot start with it
+            #   contained  the trigger is not a substring of the shortened input
+            #   subseq     "run" is in trigger_words and not in input_words
+            #
+            # Nothing refused it at teach time either: `create_procedure` stored
+            # it, `manage_procedure` listed it back, and the user was told the
+            # procedure existed. It simply never fired, and because this runs
+            # ahead of intent routing the utterance fell through to the
+            # classifier -- observed answering a stored keystroke program with
+            # generated Python.
+            #
+            # Normalized on *read* rather than on write so the rows already
+            # stored start working. That does widen `contained` for a trigger
+            # like "run notes", which now claims the bare word "notes" -- but
+            # `main.py:_weak_trigger_yields` already exists for exactly that
+            # shape and defers weak tiers to `pre_route`, so the widening lands
+            # on a guard rather than on nothing.
+            # No empty-result guard, and that is checked rather than assumed.
+            # The KI-38 writeup worried that an all-filler trigger would
+            # normalize to `""`, which is `in` every utterance and would claim
+            # every turn. It cannot: `_filler_re` strips a leading filler only
+            # when whitespace follows it and a trailing one only when
+            # whitespace precedes it, so the first and last tokens always
+            # survive. Enumerated over all 1,884 filler phrases up to three
+            # words -- none normalizes to empty. A guard here would be a branch
+            # no input can reach, with a test that can only pass vacuously.
+            trigger = self._normalize(row["trigger"])
 
             if normalized_input == trigger:
                 exact = row
