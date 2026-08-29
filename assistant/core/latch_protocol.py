@@ -90,6 +90,13 @@ ELEMENT_KEYS: Final[frozenset[str]] = frozenset({
     "value", "visible",
 })
 
+#: Top-level keys of a `page.query` result. `url` is read in the same snapshot
+#: as the elements: comparing a URL fetched separately against elements fetched
+#: a moment later is precisely the mistake navigation detection would make.
+QUERY_RESULT_KEYS: Final[frozenset[str]] = frozenset({
+    "elements", "url", "validation_errors", "viewport",
+})
+
 #: Actions `page.act` accepts.
 ACTIONS: Final[frozenset[str]] = frozenset({
     "click", "fill", "press", "select", "check", "uncheck",

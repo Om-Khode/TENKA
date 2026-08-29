@@ -176,7 +176,7 @@ class TestDomUsesTheVendoredCopy(unittest.TestCase):
         # mirrored there silently disables the extension tier.
         self.assertEqual(
             vendor.DOM_QUERY_SHA256,
-            "66c870ba204e3550ad13c4bb061ecfab38c28dcb366e5c4b1a1cd237941e0712",
+            "efa84f142c64ac56cf245fa6e78890b67a7cbb67c19329fe2a331fafe26eed94",
             "the query JS changed. That is allowed, but the extension's copy "
             "must change identically or the handshake refuses the connection. "
             "Update both, then re-pin this digest.",

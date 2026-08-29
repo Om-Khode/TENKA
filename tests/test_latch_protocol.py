@@ -100,6 +100,10 @@ def test_element_keys_match():
     assert set(_js_string_list(_js(), "ELEMENT_KEYS")) == set(py_protocol.ELEMENT_KEYS)
 
 
+def test_query_result_keys_match():
+    assert set(_js_string_list(_js(), "QUERY_RESULT_KEYS")) == set(py_protocol.QUERY_RESULT_KEYS)
+
+
 def test_actions_match():
     assert set(_js_string_list(_js(), "ACTIONS")) == set(py_protocol.ACTIONS)
 
