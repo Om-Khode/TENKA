@@ -38,6 +38,7 @@ from .recording import (
 )
 from .voice import handle_enroll_voice, handle_forget_voice
 from .browser_extension_setup import handle_browser_extension_setup
+from .browser_tabs import handle_browser_tabs
 from .camera import (
     handle_pending_camera_settings, handle_camera_look,
     handle_pending_forget_face, handle_meet_face,

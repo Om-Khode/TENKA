@@ -32,8 +32,12 @@ class TestConstants:
                 )
 
     def test_browser_scope_contents(self):
+        # `browser_tabs` joined when the extension made tab control possible:
+        # naming a tab is only a sensible thing to say while a browser is what
+        # she is looking at.
         assert SCOPES["browser_mode"] == {
-            "browser_extension_setup", "browse_url", "find_and_click", "read_screen"
+            "browser_extension_setup", "browser_tabs", "browse_url",
+            "find_and_click", "read_screen",
         }
 
     def test_recording_scope_contents(self):

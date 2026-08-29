@@ -311,6 +311,7 @@ INTENTS = [
     "enroll_voice",
     "forget_voice",
     "browser_extension_setup",
+    "browser_tabs",
     "store_memory",
     "forget_memory",
     "shutdown",
@@ -379,6 +380,7 @@ forget_voice        | {}              | delete saved voiceprint
 store_memory        | content         | "remember my/the X is Y" — storing a fact (NOT meet_face, NOT reminder)
 forget_memory       | content         | "forget about X" / "delete memory of X" — removing a stored fact (NOT forget_face/forget_voice)
 browser_extension_setup | mode        | set up / check / undo the browser extension (setup/status/preview/undo)
+browser_tabs        | action, query   | tabs in the user's own browser: list / close / switch / open. "what tabs are open", "close the mail tab", "switch to youtube"
 shutdown            | {}              | YOU exit ("shut down", "exit", "quit", "close yourself") — not the machine
 self_knowledge      | query           | questions about TENKA HERSELF: what she can do, which model she is using, what she is doing now, her own limits
 unknown             | {}              | truly unintelligible/empty input ONLY

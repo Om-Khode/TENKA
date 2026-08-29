@@ -43,6 +43,11 @@ REQUIRED_CAPABILITY: dict[str, Capability] = {
     "manifest_dispatch": Capability.EXECUTE,
     "planner": Capability.EXECUTE,
     "browser_extension_setup": Capability.EXECUTE,
+    # Listing tabs reveals what the user is reading, and closing one
+    # destroys a page she cannot get back. Both sit behind EXECUTE
+    # rather than splitting the read from the write: one intent, one
+    # capability, and the stronger of the two.
+    "browser_tabs": Capability.EXECUTE,
     "manage_procedure": Capability.EXECUTE,
     "manage_monitor": Capability.EXECUTE,
     "manage_schedule": Capability.EXECUTE,
@@ -161,6 +166,6 @@ TRANSIENT_AUTHORITY: frozenset[str] = frozenset({
     "summarize_recording", "web_search", "browse_url", "file_task",
     "set_reminder", "cancel_reminder", "hide_avatar", "show_avatar",
     "meet_face", "recognize_face", "forget_face", "camera_look", "planner",
-    "enroll_voice", "forget_voice", "store_memory",
+    "enroll_voice", "forget_voice", "store_memory", "browser_tabs",
     "forget_memory", "shutdown", "manifest_dispatch", "self_knowledge",
 })
