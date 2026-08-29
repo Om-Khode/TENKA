@@ -4,4 +4,4 @@ from .base import EventSource
 
 source_registry: RegistryBase[EventSource] = RegistryBase("event_source")
 
-from . import media, window  # noqa: E402, F401 — triggers registration
+from . import browser, media, window  # noqa: E402, F401 — triggers registration
