@@ -1288,13 +1288,17 @@ than a vocabulary migration.
 
 ---
 
-## KI-37: The CDP probe accepts any Chromium-engined process on the debug port
+## KI-37: ~~The CDP probe accepts any Chromium-engined process on the debug port~~ FIXED
 
 **Priority:** Medium (correctness, with a privacy edge)
 **Effort:** Low to detect, a decision to fix — see below
 **Discovered:** 2026-08-28, first run of `tools/live_p13_dom_abort.py` on the
-operator's machine
-**Status:** open
+operator's machine; seen again 2026-08-29 during an ordinary request
+**Fixed:** 2026-08-29 — `cdp_owner_is_a_browser()` requires the listening
+process, or one generation either side of it, to own a visible top-level
+window whose title names a known browser. `connect_to_existing_chrome` refuses
+before importing Playwright. `tests/test_cdp_owner_is_a_browser.py`.
+**Status:** FIXED
 
 **The defect.** `cdp_health_probe` GETs `/json/version` on the configured port
 and accepts the endpoint when the `Browser` field contains any of `chrome`,
@@ -1325,21 +1329,41 @@ step from perceiving and clicking inside a vendor system-management UI.
 active tab does not match, which is what stopped the first run. That protects
 the harness, not the assistant.
 
-**Not fixed here because the fix needs a decision, not a patch.** Candidates,
-none free:
+**What the fix is, and the idea it is not.** The three options first sketched
+here were: match against the foreground window's process; require more than one
+page; or make the operator opt in per port. None was taken as written.
 
-- Match the attached endpoint against the **foreground window's** process, so
-  the browser must be one the user is actually looking at. Strongest, and the
-  page picker already accepts a `prefer_window_title` hint that could be made
-  mandatory rather than advisory.
-- Require the endpoint to report more than one page, or a non-`about:` page —
-  cheap, and a heuristic, which is the category this project keeps regretting.
-- Have the operator opt in per port. Honest, and pushes a decision onto
-  someone who did not ask for one.
+**The executable name is not the discriminator**, which is the obvious first
+idea and is wrong: `"edge" in "msedgewebview2"` is True, so matching the
+process name against the known-browser list *accepts* precisely the process
+this exists to reject. A test pins that, including a guard that fails if the
+premise ever stops holding.
 
-Whichever is chosen, the probe should log *what* it attached to at INFO —
-today it logs the engine string, which is exactly the field that made a system
-utility look like Chrome.
+What separates them is a **window**. A browser the user is looking at owns a
+visible top-level window whose title carries the browser's name — the
+convention all of them follow, because that is how a person finds one on a
+taskbar. An embedded webview renders inside its host and owns none of its own;
+the host's window is titled after the host. Measured on the machine in
+question: the webview's pid owned no visible window at all.
+
+Not the *foreground* window, which was the first sketch — that would refuse a
+browser sitting behind the terminal the request was typed into. Any visible
+browser window belonging to the listening process's tree is enough, searched
+one generation either side because which process holds the socket versus the
+window depends on how the browser was launched.
+
+Browser names come from `core/known_apps`' `browser` category, so a new browser
+is added as data rather than as a branch.
+
+**Three outcomes, not two.** `True` attaches, `False` refuses, and `None` —
+the check could not run — attaches with a warning. Refusing on
+inability-to-check would disable DOM-mode wherever process enumeration is
+restricted, turning a correctness fix into an availability bug on machines that
+never had the problem. "I could not tell" is not a finding. Both directions are
+mutation-proven.
+
+The refusal log names what was found instead of the engine string, which was
+the field that made a system utility look like Chrome.
 
 ---
 
