@@ -364,6 +364,43 @@ def is_occupied() -> bool:
     return current_connection() is not None
 
 
+async def evict_if_dead(*, timeout: float = 2.0) -> bool:
+    """Free the slot if whoever holds it is no longer answering.
+
+    Returns True when a dead incumbent was evicted.
+
+    **Why this is needed at all.** "The first connection keeps the socket" is
+    the right rule, and it silently assumed the incumbent is alive. A browser
+    that reloads its background page, or is killed, can leave a socket that is
+    open to the operating system and attached to nothing -- the server's
+    `receive_text()` simply waits forever. `is_occupied()` then stays true and
+    refuses the extension's own reconnect, with "another extension is already
+    connected", about itself. Observed exactly that: one UUID, refused every
+    few seconds, until the daemon restarted.
+
+    Liveness is asked, not assumed: one cheap round trip the incumbent must
+    answer. A live one answers in milliseconds on loopback; a ghost answers
+    never and is dropped.
+
+    The security property is unchanged. A newcomer can displace a **dead**
+    incumbent, never a live one -- and a caller holding a valid token could
+    already have waited for the dead socket to be noticed some other way.
+    """
+    conn = current_connection()
+    if conn is None:
+        return False
+    try:
+        await conn.call(proto.Rpc.TABS_LIST, {}, timeout=timeout)
+        return False
+    except Exception as e:
+        logger.info(
+            f"[LATCH] evicting a connection that stopped answering "
+            f"({type(e).__name__}); the slot is free"
+        )
+        unregister(conn, "stopped answering")
+        return True
+
+
 def register(connection: LatchConnection) -> None:
     global _connection
     _connection = connection

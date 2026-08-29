@@ -672,8 +672,8 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         import json
 
         from .extension_ws import (
-            LatchConnection, evaluate_handshake, is_occupied, read_token,
-            register, unregister,
+            LatchConnection, evaluate_handshake, evict_if_dead, is_occupied,
+            read_token, register, unregister,
         )
         from ...core import latch_protocol as latch_proto
 
@@ -729,6 +729,13 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
             f"digest={str(first.get('domQuerySha256'))[:12]}... "
             f"token_present={bool(first.get('token'))}"
         )
+
+        # Before refusing a newcomer for being second, check that the first is
+            # still there. A browser that reloads its background page leaves a
+        # socket open to the OS and attached to nothing, and the extension is
+        # then refused its own reconnect -- forever, about itself.
+        if is_occupied():
+            await evict_if_dead()
 
         verdict = evaluate_handshake(
             first,

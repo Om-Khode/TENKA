@@ -589,3 +589,92 @@ def test_every_exit_path_from_the_socket_loop_frees_the_slot():
         f"cancellation is not handled explicitly: {handled}. It is not an "
         f"Exception, so `except Exception` does not catch it."
     )
+
+
+# ─── A ghost must not hold the slot ──────────────────────────────────────
+#
+# "The first connection keeps the socket" is right, and it silently assumed the
+# incumbent is alive. A browser that reloads its background page leaves a socket
+# open to the OS and attached to nothing: `receive_text()` waits forever,
+# `is_occupied()` stays true, and the extension is refused its own reconnect
+# with "another extension is already connected" -- about itself, every few
+# seconds, until the daemon restarts. Observed in exactly that shape.
+
+
+def test_a_dead_incumbent_is_evicted():
+    async def never_answers(_frame):
+        return None
+
+    async def scenario():
+        conn = ws.LatchConnection(send_json=never_answers)
+        ws.register(conn)
+        assert ws.is_occupied() is True
+        evicted = await ws.evict_if_dead(timeout=0.05)
+        return evicted, ws.current_connection()
+
+    evicted, remaining = _run(scenario())
+    assert evicted is True, "a connection that never answers still holds the slot"
+    assert remaining is None
+
+
+def test_a_live_incumbent_is_not_evicted():
+    """The half that protects a working session.
+
+    A probe that dropped everyone would satisfy the test above and hand the
+    socket to whoever asked last -- which is the exact behaviour the
+    one-client rule exists to prevent.
+    """
+    sent: list[dict] = []
+
+    async def send(frame):
+        sent.append(frame)
+
+    async def scenario():
+        conn = ws.LatchConnection(send_json=send)
+        ws.register(conn)
+
+        async def answer_when_asked():
+            for _ in range(100):
+                await asyncio.sleep(0)
+                if sent:
+                    conn.handle_frame({
+                        "type": proto.Frame.RESPONSE, "id": sent[0]["id"],
+                        "ok": True, "result": {"tabs": []},
+                    })
+                    return
+
+        asyncio.create_task(answer_when_asked())
+        evicted = await ws.evict_if_dead(timeout=1.0)
+        return evicted, ws.current_connection() is conn
+
+    evicted, still_there = _run(scenario())
+    assert evicted is False, "a live connection was evicted"
+    assert still_there, "the live incumbent lost its slot"
+
+
+def test_evicting_an_empty_slot_is_not_an_error():
+    assert _run(ws.evict_if_dead(timeout=0.05)) is False
+
+
+def test_the_route_probes_before_refusing_a_second_client():
+    """The eviction has to be reachable from the handshake, not merely exist.
+
+    Every unit test above passes against a route that never calls it, and the
+    symptom of that is precisely what was observed: a correct rule, a correct
+    helper, and an extension refused its own reconnect.
+    """
+    import inspect
+
+    from assistant.io.api import app as app_module
+
+    source = inspect.getsource(app_module.create_app)
+    assert "evict_if_dead" in source, (
+        "the latch route never probes the incumbent, so a ghost connection "
+        "holds the slot until the daemon restarts"
+    )
+    probe_at = source.index("evict_if_dead(")
+    verdict_at = source.index("verdict = evaluate_handshake(")
+    assert probe_at < verdict_at, (
+        "the probe runs after the handshake verdict, which has already refused "
+        "the newcomer by then"
+    )
