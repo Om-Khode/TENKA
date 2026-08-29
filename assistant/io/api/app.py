@@ -786,8 +786,21 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
         except WebSocketDisconnect:
             reason = "disconnected"
         except asyncio.CancelledError:
+            # Swallowed, not re-raised, and only here.
+            #
+            # Cancellation on this socket means one thing: the daemon is
+            # stopping. Returning is what cancellation asked for -- the loop
+            # ends, `finally` unregisters, the coroutine completes. Re-raising
+            # is the textbook-correct move and it makes uvicorn log
+            # "Exception in ASGI application" with a full traceback on every
+            # ordinary shutdown.
+            #
+            # That trade is worth naming rather than assuming. A traceback that
+            # appears every single time you stop the program is one people stop
+            # reading, and an unread log is what turned tonight's three real
+            # bugs into an evening. The one thing cancellation must still do --
+            # release the slot -- happens in `finally` either way.
             reason = "cancelled"
-            raise
         except Exception as e:
             reason = f"{type(e).__name__}: {e}"
         finally:
