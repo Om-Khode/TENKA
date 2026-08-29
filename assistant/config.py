@@ -310,7 +310,7 @@ INTENTS = [
     "manage_backup",
     "enroll_voice",
     "forget_voice",
-    "browser_cdp_setup",
+    "browser_extension_setup",
     "store_memory",
     "forget_memory",
     "shutdown",
@@ -378,7 +378,7 @@ enroll_voice        | {}              | register voice for speaker verification
 forget_voice        | {}              | delete saved voiceprint
 store_memory        | content         | "remember my/the X is Y" — storing a fact (NOT meet_face, NOT reminder)
 forget_memory       | content         | "forget about X" / "delete memory of X" — removing a stored fact (NOT forget_face/forget_voice)
-browser_cdp_setup   | mode            | configure browser --remote-debugging-port (setup/undo/preview)
+browser_extension_setup | mode        | set up / check / undo the browser extension (setup/status/preview/undo)
 shutdown            | {}              | YOU exit ("shut down", "exit", "quit", "close yourself") — not the machine
 self_knowledge      | query           | questions about TENKA HERSELF: what she can do, which model she is using, what she is doing now, her own limits
 unknown             | {}              | truly unintelligible/empty input ONLY
@@ -777,44 +777,28 @@ DIALOG_ENGAGEMENT_GATE_ENABLED = _runtime_setting(
                 "engagement; can close form-modals the agent is filling).",
 )
 
-# ─── Chrome CDP Attach (browser_cdp.py) ────
-# Connect to user's already-open Chrome instead of always launching the
-# bundled Chromium. Requires Chrome to be launched with --remote-debugging-port.
-# When CDP is unreachable, all paths fall back to bundled Chromium silently.
-BROWSER_PREFER_CDP = _runtime_setting(
-    "browser_prefer_cdp", True, cast=bool,
-    description="When True (default), TENKA tries to attach to a running "
-                "Chrome with --remote-debugging-port=9222 before launching "
-                "its own bundled Chromium. Off = always use bundled.",
+# ─── Browser extension driver ────────────────────────────────────────────────
+
+BROWSER_PREFER_EXTENSION = _runtime_setting(
+    "browser_prefer_extension", True, cast=bool,
+    description="When True (default), the browser tier drives whichever "
+                "browser the extension is connected from -- the one the user "
+                "already has open, with their logins. Off = always use the "
+                "bundled Chromium, which starts signed out.",
 )
-BROWSER_CDP_PORT = _runtime_setting(
-    "browser_cdp_port", 9222, cast=int,
-    description="Port to probe for Chrome's CDP endpoint. Default 9222 is "
-                "the Chrome convention. Change only if you launch Chrome "
-                "with a non-default --remote-debugging-port.",
-)
-BROWSER_CDP_PORT_SCAN = _runtime_setting(
-    "browser_cdp_port_scan", 4, cast=int,
-    description="How many ports past BROWSER_CDP_PORT to try when the "
-                "configured one is not a usable browser. 9222 is both the "
-                "Chrome convention and the WebView2 default, so an embedded "
-                "webview from some other application can be sitting on it "
-                "(KI-37) -- scanning finds the real browser a port or two "
-                "along instead of making the user reconfigure around a "
-                "squatter. 0 disables scanning and uses the configured port "
-                "only. Each extra port costs one loopback TCP connect (~5ms "
-                "when closed), and the result is cached for "
-                "BROWSER_CDP_PROBE_TTL.",
-)
-BROWSER_CDP_PROBE_TTL = _runtime_setting(
-    "browser_cdp_probe_ttl", 30.0, cast=float,
-    description="How long (seconds) the CDP availability probe result is "
-                "cached. Lower = more probes (slight latency); higher = "
-                "stale state risks (e.g. user closed Chrome mid-session). "
-                "30s is the sweet spot.",
+BROWSER_EXTENSION_RPC_TIMEOUT = _runtime_setting(
+    "browser_extension_rpc_timeout", 30.0, cast=float,
+    description="Seconds to wait for the extension to answer one call before "
+                "giving up. A call that never returns is worse than one that "
+                "fails: nothing goes red, and the pending slot leaks.",
 )
 
-# ─── DOM accessibility-tree perception (browser_dom.py) ────
+# The Chrome CDP attach settings stood here: a port to probe, how many ports
+# past it to scan, and a probe cache TTL. All three existed because port 9222
+# is two conventions at once -- Chrome's debug port and WebView2's default --
+# and because attaching was expensive enough to cache. The extension dials in
+# and registers itself, so there is no port, no scan, and no cache.
+
 BROWSER_DOM_TREE_TOKEN_BUDGET = _runtime_setting(
     "browser_dom_tree_token_budget", 4000, cast=int,
     description="Max tokens the perceived element tree may consume in the "
@@ -933,8 +917,9 @@ def reload_runtime_settings() -> None:
     global VERIFY_VISION_FALLBACK, VERIFY_STRICT_TEXT_MATCH
     global VERIFY_MIN_CONFIDENCE, VERIFY_MAX_RETRIES
     global STUDIO_API_ENABLED, STUDIO_API_PORT, STUDIO_API_ORIGINS, STUDIO_UI_PATH
-    global BROWSER_CDP_PORT, BROWSER_CDP_PORT_SCAN, BROWSER_CDP_PROBE_TTL, BROWSER_DOM_CACHE_TTL
-    global BROWSER_DOM_MODE_ENABLED, BROWSER_DOM_TREE_TOKEN_BUDGET, BROWSER_PREFER_CDP
+    global BROWSER_DOM_CACHE_TTL
+    global BROWSER_DOM_MODE_ENABLED, BROWSER_DOM_TREE_TOKEN_BUDGET
+    global BROWSER_PREFER_EXTENSION, BROWSER_EXTENSION_RPC_TIMEOUT
     global DETERMINISTIC_MATCHING_ENABLED, DIALOG_ENGAGEMENT_GATE_ENABLED
     global DROPDOWN_COMMIT_GUARD_ENABLED, DYNAMIC_BUDGET_ENABLED
 
@@ -977,14 +962,12 @@ def reload_runtime_settings() -> None:
     STUDIO_API_ORIGINS = new_values.get("studio_api_origins", STUDIO_API_ORIGINS)
     STUDIO_UI_PATH = new_values.get("studio_ui_path", STUDIO_UI_PATH)
 
-    BROWSER_CDP_PORT = new_values.get("browser_cdp_port", BROWSER_CDP_PORT)
-    BROWSER_CDP_PORT_SCAN = new_values.get("browser_cdp_port_scan", BROWSER_CDP_PORT_SCAN)
-    BROWSER_CDP_PROBE_TTL = new_values.get("browser_cdp_probe_ttl", BROWSER_CDP_PROBE_TTL)
+    BROWSER_PREFER_EXTENSION = new_values.get("browser_prefer_extension", BROWSER_PREFER_EXTENSION)
+    BROWSER_EXTENSION_RPC_TIMEOUT = new_values.get("browser_extension_rpc_timeout", BROWSER_EXTENSION_RPC_TIMEOUT)
     BROWSER_DOM_CACHE_TTL = new_values.get("browser_dom_cache_ttl", BROWSER_DOM_CACHE_TTL)
     BROWSER_DOM_MODE_ENABLED = new_values.get("browser_dom_mode_enabled", BROWSER_DOM_MODE_ENABLED)
     BROWSER_DOM_TREE_TOKEN_BUDGET = new_values.get(
         "browser_dom_tree_token_budget", BROWSER_DOM_TREE_TOKEN_BUDGET)
-    BROWSER_PREFER_CDP = new_values.get("browser_prefer_cdp", BROWSER_PREFER_CDP)
 
     DETERMINISTIC_MATCHING_ENABLED = new_values.get(
         "deterministic_matching_enabled", DETERMINISTIC_MATCHING_ENABLED)

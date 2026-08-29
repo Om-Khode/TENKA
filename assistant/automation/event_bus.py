@@ -56,12 +56,24 @@ def eval_condition_code(compiled: Any, event_locals: dict) -> bool:
 # ─── Dispatch Helpers ────────────────────────────────────────────────────────
 
 def make_dedup_key(event: dict) -> str:
+    """What makes two events "the same event" for cooldown purposes.
+
+    The fallback used to be `""`, which is not "do not dedup" -- it is the
+    *same key for everything*. So every event of a type this function did not
+    know about collided with every other, and the bus dropped all but the first
+    within the cooldown. Latent for any new event source, and it bit the
+    browser one immediately: five page navigations in a minute became one.
+
+    `source_app|window_title` is the general shape and the one the window
+    events already use; media keeps its own because its identity is the track,
+    not the window. An event carrying neither field still lands on `"|"`, which
+    is the old behaviour for the events that genuinely have no content to key
+    on -- a deliberate floor rather than an accident.
+    """
     etype = event.get("event_type", "")
     if etype == "media_changed":
         return f"{event.get('title', '')}|{event.get('artist', '')}"
-    if etype in ("window_focus", "window_title"):
-        return f"{event.get('source_app', '')}|{event.get('window_title', '')}"
-    return ""
+    return f"{event.get('source_app', '')}|{event.get('window_title', '')}"
 
 
 def check_dispatch(monitor: dict, event: dict, *, now: float) -> bool:

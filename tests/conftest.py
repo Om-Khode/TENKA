@@ -25,7 +25,7 @@ _GUARDED_MODULES = [
     "assistant.llm",
     "assistant.intent",
     "assistant.automation.browser.automation",
-    "assistant.automation.browser.cdp",
+    "assistant.automation.browser.handle",
     "assistant.automation.browser.dom_orchestrator",
     "assistant.automation.native",
     "assistant.automation.router",

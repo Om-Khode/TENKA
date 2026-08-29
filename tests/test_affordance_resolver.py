@@ -175,7 +175,7 @@ def test_resolution_is_a_pure_function_of_registry_and_environment(registry):
     """Same inputs, same answer. The environment is passed in rather than read,
     so resolution does not depend on what happened to be open at that instant
     -- which is neither reasonable for a caller nor pinnable by a test."""
-    env = Environment(open_windows=("Notepad",), cdp_available=True)
+    env = Environment(open_windows=("Notepad",), browser_driver_available=True)
 
     first = resolve("open notepad", env, registry=registry)
     second = resolve("open notepad", env, registry=registry)
@@ -193,7 +193,7 @@ def test_the_environment_is_a_parameter_not_a_read():
         for n in ast.walk(tree) if isinstance(n, ast.Call)
     }
     for reader in ("get_open_windows", "screenshot", "list_ocr_blocks",
-                   "cdp_state_snapshot"):
+                   "latch_state_snapshot"):
         assert reader not in called, (
             f"the resolver reads the environment itself via {reader!r}")
 

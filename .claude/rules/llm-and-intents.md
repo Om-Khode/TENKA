@@ -47,7 +47,7 @@ find_and_click, code_executor, memory_query, start_recording, stop_recording,
 get_recording, summarize_recording, web_search, browse_url, file_task, set_reminder,
 cancel_reminder, hide_avatar, show_avatar, meet_face, recognize_face, forget_face,
 camera_look, planner, manage_shortcut, manage_procedure, manage_schedule,
-manage_monitor, manage_backup, enroll_voice, forget_voice, browser_cdp_setup, store_memory,
+manage_monitor, manage_backup, enroll_voice, forget_voice, browser_extension_setup, store_memory,
 forget_memory, shutdown, manifest_dispatch
 ```
 

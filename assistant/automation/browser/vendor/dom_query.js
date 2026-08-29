@@ -545,6 +545,11 @@
     return {
         elements: out,
         viewport: [window.innerWidth || 0, window.innerHeight || 0],
+        // Read in the same snapshot as the elements, deliberately. A
+        // caller that fetched the url in a separate round trip could
+        // compare a url from one moment against elements from another,
+        // and navigation detection is exactly that comparison.
+        url: (location && location.href) || '',
         validation_errors: dedupedErrors,
     };
 }

@@ -76,8 +76,9 @@ _BROWSER_INTENT_PATTERNS = re.compile(
 
 # ─── DOM-mode routing patterns ──────────────────────────────────────────────
 #
-# Goals shaped like form-fill / submit / login → prefer DOM-mode when CDP
-# is up. Keep the keyword list aligned with browser_dom_orchestrator's
+# Goals shaped like form-fill / submit / login → prefer DOM-mode when a
+# browser driver is connected. Keep the keyword list aligned with
+# browser_dom_orchestrator's
 # _SUBMIT_NAME_TOKENS so the routing layer and the planner agree on what
 # "form-shape" means.
 _FORM_INTENT_RE = re.compile(
@@ -97,7 +98,7 @@ _EXTRACTION_RE = re.compile(
 )
 
 # Canvas / WebGL / Flutter Web heavy apps where DOM perception is opaque.
-# These ALWAYS route to vision regardless of CDP availability.
+# These ALWAYS route to vision regardless of which browser driver is up.
 # Generic words that describe a drawing surface. These are not brand names and
 # belong in an expression: "whiteboard", "canvas" and "draw" mean the same
 # thing whoever makes the app. The nine product names that used to sit beside
@@ -389,13 +390,13 @@ def _build_new_tab_hint(window_title: str, goal: str) -> str:
 #
 # Three small, side-effect-free probes onto the OS so callers can ask "what is
 # the user actually looking at right now?" without each one re-implementing
-# psutil / pygetwindow / CDP plumbing. `detect_active_app()` is the public
+# psutil / pygetwindow / browser-driver plumbing. `detect_active_app()` is the public
 # composite — the manifest layer's manifest_registry reads it to choose which app manifest
 # to apply, and preference-based routing can be re-expressed in terms of it later.
 #
 # Keep these synchronous. The browser-URL probe deliberately returns "" when
-# the only available source would require an async Playwright/CDP attachment
-# — async callers that need a live URL go through `_pick_active_page`.
+# the only available source would require an async call to the connected browser
+# — async callers that need a live URL ask the connected browser for it.
 
 
 def _get_running_processes() -> list[str]:
@@ -443,13 +444,12 @@ def _get_foreground_window_title() -> str:
 def _get_active_browser_url() -> str:
     """Return the URL of the user's focused browser tab, or "" if unknown.
 
-    Reading the live tab URL requires an async Playwright/CDP attachment
-    (see `_pick_active_page`), which can't run from a synchronous probe.
-    The synchronous path returns "" so manifest dispatch can fall back to
-    the window-title / process-name signals. Async callers that need the
-    URL must go through the CDP attachment directly.
+    Reading the live tab URL means an RPC to the connected browser, which
+    cannot run from a synchronous probe. The synchronous path returns "" so
+    manifest dispatch falls back to the window-title / process-name signals.
+    Async callers that need the URL ask the browser driver directly.
     """
-    # TODO(manifest): wire async CDP read once a sync-from-async bridge exists (Session 4+).
+    # TODO(manifest): wire the async read once a sync-from-async bridge exists.
     return ""
 
 
@@ -461,7 +461,7 @@ def detect_active_app() -> dict[str, Any]:
     Used by the manifest layer's ``manifest_registry.get_for_active_app()`` and reusable by
     any other caller that needs the same active-window signal that backs
     preference-based routing — avoids duplicating the psutil / pygetwindow /
-    CDP plumbing.
+    browser-driver plumbing.
     """
     return {
         "process_names": _get_running_processes(),
@@ -586,31 +586,32 @@ def _detect_running_app(goal: str) -> Optional[str]:
 
 def _choose_browser_mode(
     goal: str,
-    cdp_state: Any,
+    driver_state: Any,
     *,
     user_preference: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Pick how to handle a browser-content task. Returns
     `(mode, reason_meta)` where mode is one of:
-      - "dom"                — DOM orchestrator (CDP attach + DOM planner)
+      - "dom"                — DOM orchestrator (extension driver + DOM planner)
       - "vision"             — legacy vision-loop fallback (computer_agent.py)
       - "playwright_bundled" — bundled Chromium (TENKA launches its own
                                browser; used when goal needs a browser we
                                control end-to-end, not the user's session)
 
-    `cdp_state` is the cached `CdpProbeResult` from `browser_cdp.cdp_state_snapshot()`.
+    `driver_state` is a `LatchState` from `extension_ws.latch_state_snapshot()`:
+    whether a browser extension is connected right now.
     `user_preference` overrides the heuristics — if set, returns that mode
     immediately. Loaded from preferences at the call site.
 
     Decision priority:
       1. DOM-mode kill-switch off → bundled
       2. Canvas/WebGL keyword → vision (DOM is opaque)
-      3. CDP unavailable → bundled (DOM-mode requires user's Chrome)
+      3. No extension connected → bundled (DOM-mode drives the user's browser)
       4. User preference → that mode
       5. Form-intent keyword → DOM
       6. Extraction-intent keyword → bundled (DOM perception waste)
-      7. Default → DOM (CDP is up; lean on the cheap path)
+      7. Default → DOM (a browser is connected; lean on the cheap path)
 
     The function is PURE — no I/O, no LLM calls, no side effects. It's safe
     to call repeatedly per task without performance impact.
@@ -622,16 +623,17 @@ def _choose_browser_mode(
         return "playwright_bundled", {"reason": "dom_mode_flag_off"}
 
     # 2. Canvas / WebGL apps — DOM is opaque, vision is the only path.
-    #    This wins even when CDP is up because the DOM tree won't have
+    #    This wins even when a browser is connected because the DOM tree won't have
     #    actionable content (the canvas element is a single <canvas>).
     if _CANVAS_INTENT_RE.search(goal) or _names_a_canvas_app(goal):
         return "vision", {"reason": "canvas_intent"}
 
-    # 3. CDP availability is necessary for DOM-mode (it's how we get to
-    #    the user's existing tab). When unreachable, fall back to bundled.
-    cdp_available = bool(getattr(cdp_state, "available", False)) if cdp_state else False
-    if not cdp_available:
-        return "playwright_bundled", {"reason": "cdp_unavailable"}
+    # 3. DOM-mode drives the browser the user already has open, which means a
+    #    connected extension. Without one there is no existing tab to reach, so
+    #    fall back to the bundled browser.
+    driver_connected = bool(getattr(driver_state, "connected", False)) if driver_state else False
+    if not driver_connected:
+        return "playwright_bundled", {"reason": "extension_unavailable"}
 
     # 4. User preference — explicit user override of the heuristic
     if user_preference in ("dom", "vision", "playwright_bundled"):
@@ -645,8 +647,8 @@ def _choose_browser_mode(
     if _EXTRACTION_RE.search(goal):
         return "playwright_bundled", {"reason": "extraction_intent"}
 
-    # 7. Default when CDP is up — lean toward DOM-mode (cheaper path)
-    return "dom", {"reason": "cdp_default"}
+    # 7. Default with a browser connected — lean toward DOM-mode (cheaper path)
+    return "dom", {"reason": "extension_default"}
 
 
 def _route_browser_content(goal: str, running_window: str) -> Tuple[str, Dict[str, Any]]:
@@ -662,13 +664,13 @@ def _route_browser_content(goal: str, running_window: str) -> Tuple[str, Dict[st
     function and tag the meta with the running window so downstream code
     can log which app the decision was made against.
     """
-    cdp_state = None
+    driver_state = None
     user_pref = None
     try:
-        from .browser import cdp as browser_cdp
-        cdp_state = browser_cdp.cdp_state_snapshot()
+        from ..io.api.extension_ws import latch_state_snapshot
+        driver_state = latch_state_snapshot()
     except Exception:
-        cdp_state = None
+        driver_state = None
     # User can persist a preference for "always vision" or "always dom"
     # via the preference store. Pure read-side — no mutations from the
     # routing path. Wrap in try/except so a corrupted preference DB
@@ -708,13 +710,13 @@ def _route_browser_content(goal: str, running_window: str) -> Tuple[str, Dict[st
     except Exception:
         user_pref = None
 
-    mode, meta = _choose_browser_mode(goal, cdp_state, user_preference=user_pref)
+    mode, meta = _choose_browser_mode(goal, driver_state, user_preference=user_pref)
     # In the browser-content scenario (user already has their own browser
     # open at the target page), "playwright_bundled" doesn't make sense —
-    # we can't operate on the user's existing session without CDP. Fall
-    # to vision-loop, the established legacy behaviour. The Chrome setup
-    # script is what makes CDP available in the first place; until the
-    # user opts in, vision is the right fallback.
+    # we can't operate on the user's existing session without the extension
+    # connected. Fall to vision-loop, the established legacy behaviour.
+    # Installing the extension is what makes that session reachable at all;
+    # until the user does, vision is the right fallback.
     if mode == "playwright_bundled":
         meta = {**meta, "translated_from": "playwright_bundled"}
         mode = "vision"
@@ -745,8 +747,8 @@ def detect_backend(goal: str) -> Tuple[str, Dict[str, Any]]:
         running = _detect_running_app(goal)
         if running and _BROWSER_NAMES.search(running):
             # Browser-content goal targeting an already-open browser session.
-            # Try to upgrade to DOM-mode when CDP is attached to the user's
-            # Chrome. Falls back to vision-loop when CDP isn't available,
+            # Try to upgrade to DOM-mode when the extension is connected to
+            # the user's browser. Falls back to vision-loop when it is not,
             # the goal is canvas-shaped, or the kill-switch is off.
             return _route_browser_content(goal, running)
         if is_search or (not running and not run_app_match):
@@ -765,14 +767,14 @@ def detect_backend(goal: str) -> Tuple[str, Dict[str, Any]]:
             #     intentional focus on the browser app. Native is right.
             if _BROWSER_ONLY_GOAL_RE.match(goal.strip()):
                 return "native", {"reason": "running_app_detected", "app": running_window}
-            # 3b. Form-shape goal — DOM mode wins when CDP is up; falls
+            # 3b. Form-shape goal — DOM mode wins when a browser is connected; falls
             #     to vision-loop in `_route_browser_content` otherwise.
             #     Preserves the "open chrome and fill form" carve-out.
             if _FORM_INTENT_RE.search(goal):
                 return _route_browser_content(goal, running_window)
             # 3c. Content-shape goal ("play X on youtube", "search Y") —
             #     route to Playwright bundled, NOT _route_browser_content.
-            #     With CDP down (default), _route_browser_content collapses
+            #     With no extension connected, _route_browser_content collapses
             #     to vision-loop (3-10 vision calls). The bundled-browser
             #     path opens Chromium and navigates — zero vision calls,
             #     which is the README-promised behavior.
@@ -824,7 +826,7 @@ def detect_backend(goal: str) -> Tuple[str, Dict[str, Any]]:
     # _BROWSER_INTENT_PATTERNS regex misses because of its rigid
     # (the\s+)? clause. When ANY open window is a browser AND the goal
     # is form-shape (per _FORM_INTENT_RE), delegate to browser-content
-    # routing — which picks DOM-mode (CDP attach) or falls to vision.
+    # routing — which picks DOM-mode (the extension driver) or falls to vision.
     if _FORM_INTENT_RE.search(goal):
         try:
             from ..io import screen as _screen
@@ -1980,62 +1982,51 @@ async def _execute_dom_task(
     Dispatch entry for the DOM-aware browser path.
 
     Steps:
-      1. Attach to the user's Chrome via browser_cdp (CDP probe → connect).
-      2. Pick the user's active tab from the attached contexts.
-      3. Run the perceive→plan→execute orchestrator (browser_dom_orchestrator).
-      4. Format the DomTaskResult into a TTS-friendly reply.
+      1. Resolve a browser to drive (`handle.get_browser_handle`).
+      2. Run the perceive→plan→execute orchestrator.
+      3. Format the DomTaskResult into a TTS-friendly reply.
 
-    `foreground_window_title` is the OS-level active Chrome window title
-    (e.g. "Truein: AI Based... - Google Chrome"). When supplied, the page
-    picker prefers the CDP page whose <title> matches the stripped window
-    title — fixes the multi-tab case where MRU order disagrees with the
-    user's foreground tab.
+    There used to be a step between 1 and 2: pick the user's active tab out of
+    the attached contexts, preferring the one whose <title> matched the OS-level
+    foreground window, because Playwright's `pages` ordering does not follow
+    focus. The extension makes that step disappear rather than solve it — every
+    `page.*` verb resolves to the active tab of the current window unless told
+    otherwise, and the browser is the authority on which tab that is.
+    `foreground_window_title` is therefore accepted and unused, kept only so the
+    call sites do not have to change.
 
-    Returns the spoken-style result string, or "__FALLBACK__" when CDP
-    attachment fails / no tabs / orchestrator can't proceed — the caller
-    routes that to vision-loop.
+    Returns the spoken-style result string, or "__FALLBACK__" when no browser is
+    connected or the orchestrator cannot proceed — the caller routes that to the
+    vision loop.
     """
     try:
-        from .browser import cdp as browser_cdp, dom_orchestrator as browser_dom_orchestrator
+        from .browser import (
+            dom_orchestrator as browser_dom_orchestrator,
+            handle as browser_handle,
+        )
     except Exception as e:
         _reraise_if_user_aborted(e)
         logger.warning(f"[DA] DOM-mode imports failed: {e}")
         return "__FALLBACK__"
 
-    # 1. Attach
+    # 1. Resolve a browser.
     try:
-        handle = await browser_cdp.get_or_attach_browser(prefer_cdp=True)
+        handle = await browser_handle.get_browser_handle(prefer_latch=True)
     except Exception as e:
         _reraise_if_user_aborted(e)
-        logger.warning(f"[DA] DOM-mode attach raised: {type(e).__name__}: {e}")
+        logger.warning(f"[DA] DOM-mode resolve raised: {type(e).__name__}: {e}")
         return "__FALLBACK__"
 
-    if handle.kind != "cdp":
-        # The router said "dom" but get_or_attach_browser couldn't get CDP.
-        # Likely race: probe was cached available but Chrome closed. Fall back.
+    if handle.kind != "latch":
+        # The router said "dom" but no extension is connected. Most likely a
+        # race: the snapshot said connected and the browser closed in between.
         logger.info(
-            f"[DA] DOM-mode requested but attach returned kind={handle.kind!r} "
+            f"[DA] DOM-mode requested but the driver is kind={handle.kind!r} "
             f"— falling back to vision-loop"
         )
         return "__FALLBACK__"
 
-    # 2. Pick the user's active tab. When the OS-level foreground window
-    # title is known, prefer the CDP page whose <title> matches — this is
-    # the only signal that survives across multi-tab Chrome windows, since
-    # Playwright's `pages` list ordering is not aligned with foreground.
-    # Falls back to first non-internal page (MRU-ish) when no match.
-    try:
-        target_page = await _pick_active_page(
-            handle.attachment,
-            prefer_window_title=foreground_window_title,
-        )
-    except Exception as e:
-        logger.warning(f"[DA] page selection failed: {type(e).__name__}: {e}")
-        target_page = None
-
-    if target_page is None:
-        logger.info("[DA] DOM-mode: no active page found in CDP-attached browser")
-        return "__FALLBACK__"
+    target_page = handle.page
 
     # 3. Run the orchestrator
     try:
@@ -2080,98 +2071,13 @@ async def _execute_dom_task(
     return result.final_summary or "I wasn't able to complete that fully."
 
 
-def _strip_browser_window_suffix(window_title: str) -> str:
-    """
-    Strip the trailing browser-name suffix from an OS window title to
-    recover the underlying page <title>. Returns "" when the input is
-    empty / generic ("Google Chrome" with no page).
-    """
-    if not window_title:
-        return ""
-    stripped = _BROWSER_WINDOW_SUFFIX_RE.sub("", window_title).strip()
-    # If stripping consumed everything, the window had no real page title
-    # (e.g. just "Google Chrome" on a blank New Tab). Treat as no-hint.
-    if not stripped or stripped.lower() == window_title.strip().lower():
-        # Second clause: suffix didn't match at all. Could be a non-Chrome
-        # browser we don't know about, or unusual locale. Keep the title
-        # as-is — substring matching will still work in most cases.
-        return stripped if stripped else ""
-    return stripped
-
-
-async def _pick_active_page(attachment, prefer_window_title: Optional[str] = None) -> Any:
-    """
-    Among the user's open tabs, pick the most likely "current" one.
-
-    When `prefer_window_title` is supplied (e.g. the OS-level foreground
-    Chrome window title), this strips the browser-name suffix and matches
-    the remainder against each candidate page's `<title>`. Substring-match
-    is bidirectional (Chrome may truncate long page titles in the window
-    chrome). On match, returns that page.
-
-    Otherwise — or when no candidate page's title matches — falls through
-    to the original MRU-walk heuristic: first non-internal page wins.
-
-    Returns None when there are no usable pages.
-    """
-    if attachment is None or not getattr(attachment, "contexts", None):
-        return None
-
-    # Collect non-internal candidates first so we can title-match across
-    # all of them (not just within a single context).
-    candidates: list = []
-    for ctx in attachment.contexts:
-        try:
-            pages = list(getattr(ctx, "pages", []) or [])
-        except Exception:
-            continue
-        for p in pages:
-            try:
-                url = (p.url or "").lower()
-            except Exception:
-                continue
-            if url.startswith(("chrome://", "chrome-extension://", "devtools://",
-                               "edge://", "brave://", "about:")):
-                continue
-            candidates.append(p)
-
-    # Title-match path — only when we have a hint AND multiple candidates.
-    # Single-candidate or no-hint short-circuits to the MRU fallback below
-    # (cheap; avoids awaiting page.title() in the common case).
-    if prefer_window_title and len(candidates) > 1:
-        page_title_hint = _strip_browser_window_suffix(prefer_window_title).lower()
-        if page_title_hint:
-            for p in candidates:
-                try:
-                    pt = (await p.title() or "").strip().lower()
-                except Exception:
-                    continue
-                if not pt:
-                    continue
-                if pt == page_title_hint or pt in page_title_hint or page_title_hint in pt:
-                    logger.info(
-                        f"[DA] _pick_active_page: matched tab by title "
-                        f"hint={page_title_hint!r} → page={pt!r}"
-                    )
-                    return p
-            logger.info(
-                f"[DA] _pick_active_page: no tab matched window-title hint "
-                f"{page_title_hint!r}; falling through to MRU"
-            )
-
-    if candidates:
-        return candidates[0]
-
-    # Fallback: first page across any context, even chrome://newtab —
-    # better than None for goals like "navigate to X".
-    for ctx in attachment.contexts:
-        try:
-            for p in ctx.pages:
-                return p
-        except Exception:
-            continue
-    return None
-
+# `_pick_active_page` stood here. It sifted the CDP-attached contexts for the
+# tab the user was actually looking at, matching the OS-level foreground window
+# title against each page's <title> because Playwright's `pages` ordering does
+# not follow focus. The extension driver does not need it: every page verb
+# resolves to the active tab of the current window, and the browser is the
+# authority on which that is. Deleted rather than kept for the bundled path --
+# a bundled browser has exactly one page, which TENKA opened.
 
 async def execute_automation(goal: str, llm_func, tts_func=None, bridge_func=None) -> str:
     backend, meta = detect_backend(goal)
@@ -2190,7 +2096,7 @@ async def execute_automation(goal: str, llm_func, tts_func=None, bridge_func=Non
             return "__FALLBACK__"
         return res
     elif backend == "dom":
-        # DOM-aware path via CDP attach + DOM planner orchestrator.
+        # DOM-aware path via the extension driver + DOM planner orchestrator.
         # On any infrastructure failure (no CDP, no usable page, perceive
         # crash) we return "__FALLBACK__" and the caller routes to vision-loop.
         # Passes the OS-level foreground window title so the page picker can

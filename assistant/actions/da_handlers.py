@@ -76,11 +76,10 @@ async def handle_computer_task(params: dict, llm_response: str, bridge=None,
             from .. import llm as _da_llm
             from ..llm.contracts import ask_for_synthesis
 
-            try:
-                from ..automation.browser import cdp as _bcdp
-                await _bcdp.cdp_health_probe(use_cache=False)
-            except Exception as _probe_err:
-                logger.debug(f"[ACTIONS] CDP refresh probe failed: {_probe_err}")
+            # A forced CDP re-probe stood here, bypassing the cache so a
+            # browser opened since startup would be noticed. The extension tier
+            # has no cache to bypass: it registers itself the moment it
+            # connects, so `latch_state_snapshot()` is already current.
 
             da_can, da_backend = await desktop_automation.can_handle(goal)
             if da_can:

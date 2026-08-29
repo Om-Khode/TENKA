@@ -361,13 +361,23 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
                listener_policies: dict[int, str] | None = None,
                ui_bundle: UiBundle | None = None,
                pair_store: PairCodeStore | None = None,
-               raises: RaiseStore | None = None) -> FastAPI:
+               raises: RaiseStore | None = None,
+               extension_digest: str | None = None) -> FastAPI:
     # Eager, once: instance_secret() is uncached on the environment-override
     # path, and a wrong-length TENKA_SECRET raises ValueError. Resolving it
     # here means a misconfigured override fails when the app is built, not
     # as a 500 on the first authenticated request. The ValueError's own
     # message names TENKA_SECRET, so the operator knows what to fix.
     vault.instance_secret()
+
+    # The SHA-256 of the vendored `dom_query.js`, compared against the copy the
+    # browser extension shipped. Passed IN rather than imported: this module is
+    # `io/api`, which may reach `core/` and `config` and nothing else, and the
+    # vendored file lives under `automation/`. `main.py` supplies it — the one
+    # place allowed to see both tiers. `None` means the check has nothing to
+    # compare against, and `evaluate_handshake` refuses on a digest mismatch, so
+    # an unsupplied digest fails closed rather than skipping the comparison.
+    app_extension_digest = extension_digest
 
     @asynccontextmanager
     async def lifespan(instance: FastAPI):
@@ -634,6 +644,100 @@ def create_app(runtime: StudioRuntime, vault: TokenVault, *,
     # ─── the event socket ───────────────────────────────────────────────
     # Not a route module like the ones above: `test_every_registered_route_
     # rejects_an_anonymous_call` in test_api_auth.py walks app.openapi(), and
+
+    # ─── the browser extension's socket ──────────────────────────────────
+    # A different door from `/v1/events` and deliberately so: this one carries
+    # no capability at all. Its listener's ceiling is empty (`policy.py`), so
+    # every HTTP route on this port already refuses; what is left is one socket
+    # that speaks a vocabulary with no intents in it.
+    #
+    # It authenticates in the protocol's own `hello` frame rather than through
+    # `authenticate()`. That is not a shortcut around the API's auth: the
+    # extension is a target, not a principal — it never asks TENKA to run
+    # anything — so it holds no device credential and there is nothing for the
+    # capability machinery to decide. Two auth systems that never touch beat one
+    # that half-shares a door.
+    @app.websocket("/latch")
+    async def latch(websocket: WebSocket) -> None:
+        import json
+
+        from .extension_ws import (
+            LatchConnection, evaluate_handshake, is_occupied, read_token,
+            register, unregister,
+        )
+        from ...core import latch_protocol as latch_proto
+
+        policy = policy_for_scope(websocket.scope, app.state.listener_policies)
+        if policy is None or policy.name != "extension":
+            # Refused before `accept()`. Serving this socket on any other
+            # listener would put a driver for the user's browser on a port whose
+            # policy was written for something else — including, on `local`, one
+            # that grants EXECUTE.
+            await websocket.close(code=1008)
+            return
+
+        # Accept first, then decide: the verdict is a `reject` frame carrying a
+        # code, and a client that is told PROTOCOL_MISMATCH stops retrying
+        # forever. A bare TCP close cannot say which of the four checks failed,
+        # so the extension would back off and retry an unfixable state until
+        # someone reads a log.
+        await websocket.accept()
+        try:
+            first = json.loads(await websocket.receive_text())
+        except Exception:
+            await websocket.close(code=1008)
+            return
+
+        verdict = evaluate_handshake(
+            first,
+            origin=websocket.headers.get("origin"),
+            expected_token=read_token(),
+            expected_digest=app_extension_digest or "",
+            occupied=is_occupied(),
+        )
+        if not verdict.ok:
+            logger.info(
+                f"[LATCH] refused: {verdict.reason} (code={verdict.code})"
+            )
+            await websocket.send_text(json.dumps({
+                "type": latch_proto.Frame.REJECT,
+                "code": verdict.code,
+                "reason": verdict.reason,
+            }))
+            await websocket.close(code=1008)
+            return
+
+        connection = LatchConnection(
+            send_json=lambda frame: websocket.send_text(json.dumps(frame)),
+            browser_name=str(first.get("browser", "other")),
+            protocol_version=int(first.get("protocolVersion", 0)),
+            extension_version=str(first.get("extensionVersion", "")),
+        )
+        register(connection)
+        await websocket.send_text(json.dumps({"type": latch_proto.Frame.WELCOME}))
+        logger.info(
+            f"[LATCH] connected: browser={connection.browser_name!r} "
+            f"version={connection.extension_version!r}"
+        )
+
+        try:
+            while True:
+                frame = json.loads(await websocket.receive_text())
+                connection.handle_frame(frame)
+        except WebSocketDisconnect:
+            reason = "disconnected"
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+        else:
+            reason = "closed"
+        finally:
+            # Unregister in `finally` so every exit path frees the slot. A
+            # connection left registered after its socket died makes
+            # `is_occupied()` refuse the extension's own reconnect, and nothing
+            # ever clears it.
+            unregister(connection, reason)
+            logger.info(f"[LATCH] disconnected: {reason}")
+
     # FastAPI's schema builder has no representation for a WebSocketRoute --
     # it is skipped entirely, sweep and all. test_api_events.py's own
     # unauthenticated-connect and invalid-token tests are what actually guard

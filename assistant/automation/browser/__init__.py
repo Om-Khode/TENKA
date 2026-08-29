@@ -1,1 +1,1 @@
-"""Browser automation stack — Playwright, CDP, and DOM-mode orchestration."""
+"""Browser automation stack — the extension driver, Playwright, and DOM-mode."""

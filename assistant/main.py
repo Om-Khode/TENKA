@@ -3539,16 +3539,11 @@ async def async_main():
     except Exception as _e:
         logger.debug(f"[main] Playwright warmup skipped: {_e}")
 
-    # Non-blocking CDP probe. We DO NOT gate startup on CDP being
-    # live — TENKA must boot when Chrome is closed too. The probe just warms
-    # the cache so the first browser task knows whether to attach or use
-    # bundled. Cost: ~5ms when port is closed, ~30ms when Chrome answers.
-    # Schedule as a fire-and-forget task; we don't await it here.
-    try:
-        from .automation.browser import cdp as browser_cdp
-        asyncio.create_task(browser_cdp.cdp_health_probe(timeout=0.5))
-    except Exception as _e:
-        logger.debug(f"[main] CDP probe schedule skipped: {_e}")
+    # There was a non-blocking CDP probe here, warming a cache so the first
+    # browser task knew whether to attach or fall back. The extension tier
+    # needs none: it dials in on its own and registers itself, so there is no
+    # port to poll and no attachment to warm. `latch_state_snapshot()` answers
+    # "is a browser drivable?" from a dict, at any moment, with no I/O.
 
     # Auto-start whisper.cpp server if needed
     _start_whisper_cpp_server()

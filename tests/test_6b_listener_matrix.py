@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from assistant.io.api.app import create_app
-from assistant.io.api.policy import POLICIES
+from assistant.io.api.policy import POLICIES, effective
 from assistant.io.api.security import COOKIE_NAME, CSRF_HEADER
 from assistant.io.api.vault import Capability, TokenVault
 from tests.fakes.api_client import ApiTestClient
@@ -43,6 +43,13 @@ LISTENER_PORTS: dict[str, int] = {
     "local": 8787,
     "tailnet": 8788,
     "funnel": 8789,
+    # The browser extension's WebSocket. It appears here for the same reason
+    # every other listener does: this file is the reachability table, and a
+    # socket the daemon binds but the table omits is a socket nobody audits.
+    # Its ceiling is empty, so every capability-gated row below is REFUSED --
+    # which is the point. What it does still answer (the rows gated on
+    # nothing) is now written down rather than assumed.
+    "extension": 8790,
 }
 
 # The registry every app in this file is built with -- all three listeners
@@ -66,7 +73,13 @@ REFUSED = 403
 # that a *second* socket route added later fails
 # `test_the_event_socket_is_still_the_only_websocket_route` and has to be
 # classified by whoever adds it.
-WEBSOCKET_ROUTES = frozenset({"/v1/events"})
+# `/latch` is the browser extension's socket, added by the Latch tier. Its
+# per-listener behaviour is decided and pinned in
+# `tests/test_extension_ws.py::test_the_socket_is_refused_on_every_other_listener`:
+# it answers only on the `extension` listener and closes on every other one
+# before accepting. It is not in MATRIX because a socket has no HTTP status,
+# which is the same reason `/v1/events` is not.
+WEBSOCKET_ROUTES = frozenset({"/v1/events", "/latch"})
 
 # The Studio front-end's catch-all (`ui.py`'s `mount_ui`), recorded rather
 # than covered, because it is absent from every app in this file: these apps
@@ -119,6 +132,14 @@ class Row:
     # with `UNAUTHORIZED`, not a 403: the route is gated on no capability, so
     # "capability not granted" would be a lie.
     bearer_only: bool = False
+    # A fourth axis, and the extension listener is what found it: a route that
+    # consults no credential at all. Until a listener existed whose ceiling
+    # narrows every device to nothing, "gated on no capability" and "reached
+    # without authenticating" behaved identically, so nothing distinguished
+    # them. On such a listener they diverge: the authenticated-but-ungated
+    # rows are refused with 401 at authentication, and only the genuinely
+    # credential-free route still answers.
+    unauthenticated: bool = False
 
 
 MATRIX: tuple[Row, ...] = (
@@ -135,8 +156,15 @@ MATRIX: tuple[Row, ...] = (
         body={"code": "AAAA-BBBB"}),
     # `GET /v1/listener` needs no credential at all -- it is what a caller
     # consults *before* it has one -- so no ceiling can withhold it either;
-    # it answers 200 on all three listeners.
-    Row("GET", "/v1/listener", "/v1/listener", None),
+    # it answers 200 on every listener.
+    #
+    # `unauthenticated=True` is what separates it from a row like
+    # `GET /v1/session`, which also carries no capability but does run through
+    # `authenticate`. Until the extension listener arrived nothing distinguished
+    # the two, because every listener authenticated somebody; a listener whose
+    # ceiling narrows to nothing refuses even the capability-free authenticated
+    # rows, and only a route that never authenticates at all still answers.
+    Row("GET", "/v1/listener", "/v1/listener", None, unauthenticated=True),
 
     # ── OBSERVE: watching her work ──────────────────────────────────────
     Row("GET", "/v1/status", "/v1/status", Capability.OBSERVE),
@@ -257,6 +285,25 @@ def expected_status(row: Row, policy_name: str) -> int:
     capability gate had its say.
     """
     policy = POLICIES[policy_name]
+
+    # A listener whose ceiling narrows a maximal device to nothing refuses at
+    # authentication, with 401, before any capability gate is consulted --
+    # `security.py`'s `if not grants` and the comment above it. That is not an
+    # implementation detail to route around here: a device that authenticated
+    # with an empty grant set would still reach every route gated on
+    # `authenticate` alone, and the 404-vs-403 split in `run_command` would
+    # become an oracle for which command ids exist.
+    #
+    # Derived from `effective()` rather than restated as `not policy.ceiling`,
+    # so a future policy that carries something only under a raise is judged by
+    # the same arithmetic the request is.
+    if row.unauthenticated:
+        # No credential is consulted, so no ceiling can withhold it.
+        return row.allowed
+
+    if not effective(frozenset(Capability), policy):
+        return 401
+
     if row.capability is not None and row.capability not in policy.ceiling:
         return REFUSED
     if row.admin and not policy.admin:
@@ -271,7 +318,7 @@ def expected_status(row: Row, policy_name: str) -> int:
 def _client_on(vault: TokenVault, token: str, policy_name: str) -> ApiTestClient:
     """A client whose requests really do arrive on that listener's port.
 
-    A **fresh app per policy**, sharing only the vault. The four apps would
+    A **fresh app per policy**, sharing only the vault. The apps would
     otherwise share one `FakeFileRuntime`/`FakeMemoryRuntime`, and the
     mutating rows (rename, delete, forget) would then answer 200 on the first
     listener that carries them and 404 on the next -- an ordering artefact
@@ -473,12 +520,18 @@ def test_the_port_table_matches_the_one_the_daemon_actually_uses():
 def test_the_matrix_is_not_all_permitted():
     """A guard on the guard. If every cell said "allowed", this file would be
     a large, green, expensive assertion that routing works -- and the ceilings
-    it exists to hold could all be deleted without a single failure."""
+    it exists to hold could all be deleted without a single failure.
+
+    "Refused" means any status other than the row's allowed one, not 403
+    specifically: a listener that narrows to nothing refuses at authentication
+    with 401, and counting only 403s would read that as refusing nothing at
+    all -- the most closed listener in the table scoring as the most open.
+    """
     for policy_name, policy in POLICIES.items():
         if policy_name == "local":
             continue
         refused = [row for row in MATRIX
-                   if expected_status(row, policy_name) == REFUSED]
+                   if expected_status(row, policy_name) != row.allowed]
         assert refused, f"the {policy_name} listener refuses nothing in MATRIX"
 
 
