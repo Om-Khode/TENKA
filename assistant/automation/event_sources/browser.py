@@ -30,7 +30,7 @@ written against, and the test asserts an end-to-end match through the real
 
 ## Names are prefixed here, not on the wire
 
-The extension speaks `navigated`; the bus sees `browser_navigated`. Latch is
+The extension speaks `navigated`; the bus sees `browser_navigated`. Drover is
 host-agnostic and its event names say nothing about a host or a subsystem;
 prefixing is this side's business, and doing it at the boundary keeps the
 protocol neutral without making monitor names ambiguous.

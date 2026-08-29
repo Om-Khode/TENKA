@@ -1,5 +1,5 @@
 """
-test_browser_handle.py — Latch Task 13: which browser, and whether anyone can tell.
+test_browser_handle.py — Drover Task 13: which browser, and whether anyone can tell.
 
 The interesting property is not "does it pick the extension when the extension
 is there". It is what happens when it *isn't*, because that failure is silent:
@@ -36,7 +36,7 @@ def _run(coro):
 
 
 class _FakeConnection:
-    """Enough of a `LatchConnection` to be handed to `ExtensionPage`."""
+    """Enough of a `DroverConnection` to be handed to `ExtensionPage`."""
 
     async def call(self, method, params=None, *, timeout=30.0):
         return {}
@@ -81,21 +81,21 @@ class _FakePage:
 
 
 def test_a_connected_extension_is_used(bundled_never_launches):
-    ews.register(ews.LatchConnection(send_json=_noop, browser_name="firefox"))
+    ews.register(ews.DroverConnection(send_json=_noop, browser_name="firefox"))
     handle = _run(bh.get_browser_handle())
-    assert handle.kind == "latch"
+    assert handle.kind == "drover"
     assert handle.connection is not None
     assert bundled_never_launches == [], "it fell back with an extension connected"
 
 
 def test_the_handle_carries_a_page_adapter(bundled_never_launches):
-    ews.register(ews.LatchConnection(send_json=_noop))
+    ews.register(ews.DroverConnection(send_json=_noop))
     handle = _run(bh.get_browser_handle())
     assert isinstance(handle.page, PageAdapter)
 
 
 def test_is_user_browser_distinguishes_the_two(bundled_never_launches):
-    ews.register(ews.LatchConnection(send_json=_noop))
+    ews.register(ews.DroverConnection(send_json=_noop))
     assert _run(bh.get_browser_handle()).is_user_browser is True
     ews.reset_state_for_test()
     assert _run(bh.get_browser_handle()).is_user_browser is False
@@ -160,10 +160,10 @@ def test_every_downgrade_is_logged_not_just_the_first(monkeypatch, caplog):
     )
 
 
-# ─── prefer_latch=False ──────────────────────────────────────────────────
+# ─── prefer_drover=False ──────────────────────────────────────────────────
 
 
-def test_prefer_latch_false_never_touches_the_connection(monkeypatch, bundled_never_launches):
+def test_prefer_drover_false_never_touches_the_connection(monkeypatch, bundled_never_launches):
     """Not merely 'loses the race' — never asks.
 
     A caller that asked for the bundled browser wants a clean profile. Handing
@@ -171,18 +171,18 @@ def test_prefer_latch_false_never_touches_the_connection(monkeypatch, bundled_ne
     different task than the one it asked for, and it would carry the user's
     cookies into it.
     """
-    ews.register(ews.LatchConnection(send_json=_noop))
+    ews.register(ews.DroverConnection(send_json=_noop))
     asked = []
     monkeypatch.setattr(ews, "current_connection",
                         lambda: asked.append(True) or None)
 
-    handle = _run(bh.get_browser_handle(prefer_latch=False))
+    handle = _run(bh.get_browser_handle(prefer_drover=False))
     assert handle.kind == "bundled"
     assert asked == [], "it consulted the extension after being told not to"
 
 
 def test_the_config_flag_off_also_never_touches_the_connection(monkeypatch, bundled_never_launches):
-    ews.register(ews.LatchConnection(send_json=_noop))
+    ews.register(ews.DroverConnection(send_json=_noop))
     asked = []
     monkeypatch.setattr(ews, "current_connection",
                         lambda: asked.append(True) or None)
@@ -204,7 +204,7 @@ def test_the_reasons_are_distinguishable(monkeypatch):
 
     monkeypatch.setattr(bh, "_bundled", capture)
 
-    _run(bh.get_browser_handle(prefer_latch=False))
+    _run(bh.get_browser_handle(prefer_drover=False))
     monkeypatch.setattr(config, "BROWSER_PREFER_EXTENSION", False)
     _run(bh.get_browser_handle())
     monkeypatch.setattr(config, "BROWSER_PREFER_EXTENSION", True)
@@ -219,7 +219,7 @@ def test_the_reasons_are_distinguishable(monkeypatch):
 def test_a_closed_connection_is_not_offered(bundled_never_launches):
     """A connection that died between check and use must surface as a
     downgrade, not as a handle whose every call raises."""
-    conn = ews.LatchConnection(send_json=_noop)
+    conn = ews.DroverConnection(send_json=_noop)
     ews.register(conn)
     conn.close("socket dropped")
 

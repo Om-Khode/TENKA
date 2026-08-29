@@ -19,8 +19,8 @@ Ref scheme (load-bearing):
   two elements with identical role+name+placeholder+8px-bucketed bounds).
 
 Locator strategy:
-  JS marks each captured element with `data-latch-idx` (0,1,2,...). Python
-  builds a Playwright Locator via `[data-latch-idx="N"]`. Indices are
+  JS marks each captured element with `data-drover-idx` (0,1,2,...). Python
+  builds a Playwright Locator via `[data-drover-idx="N"]`. Indices are
   per-perception (not stable across reads); refs ARE stable across reads
   when content is unchanged.
 
@@ -224,13 +224,13 @@ FilterMode = Literal["all", "interactive", "form"]
 # ─── The DOM-side query (one big evaluate) ────────────────────────────────────
 
 # Single JS function. Returns a list of dict objects, one per captured element.
-# Each captured element also gets `data-latch-idx="N"` set so Python can build
+# Each captured element also gets `data-drover-idx="N"` set so Python can build
 # a Playwright Locator without needing CSS-path generation.
 #
 # The function takes one parameter `cfg` which carries the filter mode and
 # whether to enumerate combobox options eagerly.
 # The JS itself lives in `vendor/dom_query.js` -- one artifact, byte-shared with
-# the Latch browser extension, which cannot be handed JS over the wire (MV3 CSP)
+# the Drover browser extension, which cannot be handed JS over the wire (MV3 CSP)
 # and must ship its own copy. `dom_query_vendor` verifies it against a recorded
 # SHA-256 at import; the extension reports the same digest at handshake.
 _DOM_QUERY_JS = _dom_query_vendor.DOM_QUERY_JS
@@ -506,9 +506,9 @@ async def read_page_dom(
         base_ref = _build_ref(role, name, placeholder, bounds)
         ref = _disambiguate_ref(base_ref, used_refs)
 
-        # Locator via the data-latch-idx attribute the JS just set.
+        # Locator via the data-drover-idx attribute the JS just set.
         try:
-            locator = page.locator(f"[data-latch-idx='{idx}']")
+            locator = page.locator(f"[data-drover-idx='{idx}']")
         except Exception as e:
             logger.debug(f"[DOM] failed to build Locator for idx={idx}: {e}")
             continue

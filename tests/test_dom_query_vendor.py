@@ -1,8 +1,8 @@
 """
-test_dom_query_vendor.py — Latch Task 2: the DOM query JS as a shared artifact.
+test_dom_query_vendor.py — Drover Task 2: the DOM query JS as a shared artifact.
 
 MV3's content-script CSP forbids evaluating JS that arrives over the wire, so
-the Latch extension cannot be handed `_DOM_QUERY_JS` at call time — it has to
+the Drover extension cannot be handed `_DOM_QUERY_JS` at call time — it has to
 ship its own copy. Two copies of the same file is a drift hazard, so the copies
 are compared by SHA-256 at the WS handshake and a mismatch refuses the
 connection.
@@ -63,7 +63,7 @@ class TestVendoredFileOnDisk(unittest.TestCase):
         self.assertNotIn(
             b"\r\n", raw,
             "CRLF found in dom_query.js. git's autocrlf rewrote it on checkout, "
-            "which changes the SHA-256 and breaks the Latch handshake with no "
+            "which changes the SHA-256 and breaks the Drover handshake with no "
             "code change involved. .gitattributes must mark this file binary.",
         )
 
@@ -127,17 +127,17 @@ class TestLoader(unittest.TestCase):
 class TestHostAgnosticAttribute(unittest.TestCase):
     """The stamped index attribute is part of the wire protocol (SPEC 6.4).
 
-    It is named `data-latch-idx`, not after this host: the extension is
+    It is named `data-drover-idx`, not after this host: the extension is
     host-agnostic and its content script writes the same attribute this module
     then selects on. A rename on one side alone leaves the query stamping one
     name and the locator selecting another -- every element resolves to nothing
     and the tier reports an empty page rather than an error.
     """
 
-    def test_js_stamps_the_latch_attribute(self):
+    def test_js_stamps_the_drover_attribute(self):
         text = _JS_PATH.read_bytes().decode("utf-8")
-        self.assertIn("dataset.latchIdx", text)
-        self.assertIn("[data-latch-idx]", text)
+        self.assertIn("dataset.droverIdx", text)
+        self.assertIn("[data-drover-idx]", text)
 
     def test_no_host_name_survives_in_the_shared_artifact(self):
         text = _JS_PATH.read_bytes().decode("utf-8").lower()
@@ -153,8 +153,8 @@ class TestHostAgnosticAttribute(unittest.TestCase):
         # side passes two separate literal checks and still resolves nothing.
         js = _JS_PATH.read_bytes().decode("utf-8")
         source = Path(bdom.__file__).read_text(encoding="utf-8")
-        self.assertIn("dataset.latchIdx", js)
-        self.assertIn("[data-latch-idx='{idx}']", source)
+        self.assertIn("dataset.droverIdx", js)
+        self.assertIn("[data-drover-idx='{idx}']", source)
 
 
 class TestDomUsesTheVendoredCopy(unittest.TestCase):
@@ -176,7 +176,7 @@ class TestDomUsesTheVendoredCopy(unittest.TestCase):
         # mirrored there silently disables the extension tier.
         self.assertEqual(
             vendor.DOM_QUERY_SHA256,
-            "efa84f142c64ac56cf245fa6e78890b67a7cbb67c19329fe2a331fafe26eed94",
+            "5ee77f4c1404c0db27c13c0b2025eb57a8e7c25e9579925729b3ed11409bf67c",
             "the query JS changed. That is allowed, but the extension's copy "
             "must change identically or the handshake refuses the connection. "
             "Update both, then re-pin this digest.",

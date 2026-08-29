@@ -1,7 +1,7 @@
 """
 dom_query_vendor.py — the DOM extraction JS, loaded from disk and integrity-checked.
 
-The query JS is one artifact with two copies. The source of truth lives in the Latch
+The query JS is one artifact with two copies. The source of truth lives in the Drover
 extension repo (`src/shared/dom_query.js`); this package vendors a byte copy at
 `vendor/dom_query.js` next to `vendor/dom_query.sha256`.
 

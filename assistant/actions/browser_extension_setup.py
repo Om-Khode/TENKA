@@ -24,7 +24,7 @@ from .registry import tool_registry
 logger = logging.getLogger("actions")
 
 _INSTALL_STEPS = (
-    "1. Open your browser's extensions page and load the Latch extension.\n"
+    "1. Open your browser's extensions page and load the Drover extension.\n"
     "2. Click its toolbar icon.\n"
     "3. Paste the token below and press Connect."
 )
@@ -51,7 +51,7 @@ async def handle_browser_extension_setup(
         return msg
 
     if mode == "status":
-        snap = _ews.latch_state_snapshot()
+        snap = _ews.drover_state_snapshot()
         if snap.connected:
             msg = f"The browser extension is connected from {snap.browser_name}."
         else:

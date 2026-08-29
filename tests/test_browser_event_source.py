@@ -1,5 +1,5 @@
 """
-test_browser_event_source.py — Latch Task 14: browser events reach the bus.
+test_browser_event_source.py — Drover Task 14: browser events reach the bus.
 
 The failure this file is written against is documented in
 `event_sources/base.py`'s `normalize_process_name` docstring, and it is the

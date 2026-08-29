@@ -83,7 +83,7 @@ class TestSetupPhrasings(_Base):
 
     def test_the_short_noun_alone(self):
         self._assert_setup("set up the extension")
-        self._assert_setup("configure latch")
+        self._assert_setup("configure drover")
 
     def test_words_between_verb_and_noun(self):
         self._assert_setup("set up that browser extension for me")

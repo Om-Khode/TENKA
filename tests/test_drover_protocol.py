@@ -1,7 +1,7 @@
 """
-test_latch_protocol.py — the two halves of the Latch protocol must agree.
+test_drover_protocol.py — the two halves of the Drover protocol must agree.
 
-The protocol is declared twice: `assistant/core/latch_protocol.py` here,
+The protocol is declared twice: `assistant/core/drover_protocol.py` here,
 and `src/shared/protocol.js` in the extension repo. Two declarations is the
 price of two runtimes, and the cost of that price is drift — a method renamed on
 one side, an error code reused on the other, an element key added here and never
@@ -17,7 +17,7 @@ clone of this repo alone must still pass. When it is absent these tests SKIP,
 loudly, rather than passing quietly. A skip is visible in the run; a vacuous
 pass is not.
 
-Run: py -3.11 -m pytest tests/test_latch_protocol.py -v
+Run: py -3.11 -m pytest tests/test_drover_protocol.py -v
 """
 
 from __future__ import annotations
@@ -30,12 +30,21 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest  # noqa: E402
 
-from assistant.core import latch_protocol as py_protocol  # noqa: E402
+from assistant.core import drover_protocol as py_protocol  # noqa: E402
 from assistant.automation.browser.dom_query_vendor import DOM_QUERY_SHA256  # noqa: E402
 
 #: Sibling checkout. Not a dependency and not required — see the module
 #: docstring for why absence is a skip and not a pass.
-_EXTENSION_REPO = Path(__file__).resolve().parent.parent.parent / "TENKA-extension"
+#:
+#: Two names are tried because the directory was created before the extension
+#: had its own, and a checkout made either way must still be found. Whichever
+#: exists wins; neither existing is a skip, not a failure.
+_SIBLING_NAMES = ("drover", "TENKA-extension")
+_CODE_ROOT = Path(__file__).resolve().parent.parent.parent
+_EXTENSION_REPO = next(
+    (_CODE_ROOT / name for name in _SIBLING_NAMES if (_CODE_ROOT / name).is_dir()),
+    _CODE_ROOT / _SIBLING_NAMES[0],
+)
 _PROTOCOL_JS = _EXTENSION_REPO / "src" / "shared" / "protocol.js"
 _QUERY_JS = _EXTENSION_REPO / "src" / "shared" / "dom_query.js"
 
@@ -43,7 +52,7 @@ _QUERY_JS = _EXTENSION_REPO / "src" / "shared" / "dom_query.js"
 def _js() -> str:
     if not _PROTOCOL_JS.is_file():
         pytest.skip(
-            f"the Latch extension repo is not checked out at {_EXTENSION_REPO}. "
+            f"the Drover extension repo is not checked out at {_EXTENSION_REPO}. "
             f"The protocol halves cannot be compared, so drift between them is "
             f"UNCHECKED in this run."
         )
@@ -154,7 +163,7 @@ def test_the_tables_are_not_empty():
 
 def test_the_vendored_query_matches_the_extensions_copy():
     if not _QUERY_JS.is_file():
-        pytest.skip(f"the Latch extension repo is not checked out at {_EXTENSION_REPO}")
+        pytest.skip(f"the Drover extension repo is not checked out at {_EXTENSION_REPO}")
     import hashlib
 
     theirs = hashlib.sha256(_QUERY_JS.read_bytes()).hexdigest()

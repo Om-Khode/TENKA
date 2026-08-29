@@ -1,13 +1,13 @@
 """
-latch_protocol.py — the Latch wire protocol, mirrored from the extension's `protocol.js`.
+drover_protocol.py — the Drover wire protocol, mirrored from the extension's `protocol.js`.
 
-Latch is a browser driver: it exposes primitives over a loopback WebSocket and
+Drover is a browser driver: it exposes primitives over a loopback WebSocket and
 holds no model, no planner and no task loop. This module is the Python half of
 its contract. The JavaScript half is `src/shared/protocol.js` in the extension
 repo, and the two are changed together with `PROTOCOL_VERSION` bumped.
 
 Constants only. No transport, no state — so that a reader checking whether the
-two halves agree has one short file to compare, and so that `test_latch_protocol`
+two halves agree has one short file to compare, and so that `test_drover_protocol`
 can assert the mirroring without importing anything that opens a socket.
 
 **It lives in `core/` because both sides of the layering need it.** The
@@ -28,9 +28,9 @@ from typing import Final
 PROTOCOL_VERSION: Final[int] = 1
 
 #: The attribute the query stamps on every captured element, and the only way a
-#: client addresses one afterwards. `dom.py` builds `[data-latch-idx='N']`
-#: selectors from it; the shared JS writes it via `dataset.latchIdx`.
-IDX_ATTR: Final[str] = "data-latch-idx"
+#: client addresses one afterwards. `dom.py` builds `[data-drover-idx='N']`
+#: selectors from it; the shared JS writes it via `dataset.droverIdx`.
+IDX_ATTR: Final[str] = "data-drover-idx"
 
 
 class Frame:

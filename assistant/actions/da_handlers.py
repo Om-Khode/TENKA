@@ -79,7 +79,7 @@ async def handle_computer_task(params: dict, llm_response: str, bridge=None,
             # A forced CDP re-probe stood here, bypassing the cache so a
             # browser opened since startup would be noticed. The extension tier
             # has no cache to bypass: it registers itself the moment it
-            # connects, so `latch_state_snapshot()` is already current.
+            # connects, so `drover_state_snapshot()` is already current.
 
             da_can, da_backend = await desktop_automation.can_handle(goal)
             if da_can:

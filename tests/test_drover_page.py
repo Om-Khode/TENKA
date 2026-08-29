@@ -1,5 +1,5 @@
 """
-test_latch_page.py — Latch Task 12: the DOM tier driven through the extension.
+test_drover_page.py — Drover Task 12: the DOM tier driven through the extension.
 
 The properties here are mostly about **refusing rather than returning nothing**.
 This driver genuinely cannot do some of what a Playwright page can — MV3's CSP
@@ -17,7 +17,7 @@ invisible when you do: indices are assigned **per query**, so a read-back issued
 with different query params re-stamps the page and index N becomes a different
 element. The value read is real, from a real element, and from the wrong one.
 
-Run: py -3.11 -m pytest tests/test_latch_page.py -v
+Run: py -3.11 -m pytest tests/test_drover_page.py -v
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest  # noqa: E402
 
 from assistant.automation.browser.dom_query_vendor import DOM_QUERY_JS  # noqa: E402
-from assistant.automation.browser.latch import (  # noqa: E402
+from assistant.automation.browser.drover import (  # noqa: E402
     ExtensionLocator,
     ExtensionPage,
     UnsupportedByExtension,
@@ -40,8 +40,8 @@ from assistant.automation.browser.page_adapter import (  # noqa: E402
     LocatorAdapter,
     PageAdapter,
 )
-from assistant.core import latch_protocol as proto  # noqa: E402
-from assistant.io.api.extension_ws import LatchCallError  # noqa: E402
+from assistant.core import drover_protocol as proto  # noqa: E402
+from assistant.io.api.extension_ws import DroverCallError  # noqa: E402
 
 
 def _run(coro):
@@ -54,7 +54,7 @@ class FakeConnection:
     def __init__(self, replies: dict | None = None):
         self.calls: list[tuple[str, dict]] = []
         self.replies = replies or {}
-        self.error: LatchCallError | None = None
+        self.error: DroverCallError | None = None
 
     async def call(self, method, params=None, *, timeout=30.0):
         self.calls.append((method, dict(params or {}), timeout))
@@ -268,7 +268,7 @@ def test_a_read_back_uses_the_params_that_stamped_the_index():
 def test_a_read_back_for_a_vanished_element_raises():
     conn, page = _page({proto.Rpc.QUERY: _tree([{"idx": 0, "value": "x"}])})
     _run(page.evaluate(DOM_QUERY_JS))
-    with pytest.raises(LatchCallError) as excinfo:
+    with pytest.raises(DroverCallError) as excinfo:
         _run(page.locator(f"[{proto.IDX_ATTR}='9']").input_value(timeout=10_000))
     assert excinfo.value.code == proto.Err.BAD_SELECTOR
 
@@ -299,9 +299,9 @@ def test_locator_evaluate_raises_rather_than_reading_back_nothing():
 
 def test_an_error_frame_propagates_with_its_code_and_is_not_a_sentinel():
     conn, page = _page({proto.Rpc.ACT: {"ok": True}})
-    conn.error = LatchCallError(proto.Err.INJECTION_BLOCKED, "page CSP refused")
+    conn.error = DroverCallError(proto.Err.INJECTION_BLOCKED, "page CSP refused")
 
-    with pytest.raises(LatchCallError) as excinfo:
+    with pytest.raises(DroverCallError) as excinfo:
         _run(page.locator(f"[{proto.IDX_ATTR}='0']").click(timeout=10_000))
     assert excinfo.value.code == proto.Err.INJECTION_BLOCKED
 
@@ -314,6 +314,6 @@ def test_an_error_during_evaluate_propagates_rather_than_becoming_an_empty_tree(
     "there is nothing to click" instead of a failure.
     """
     conn, page = _page()
-    conn.error = LatchCallError(proto.Err.TIMEOUT, "no reply")
-    with pytest.raises(LatchCallError):
+    conn.error = DroverCallError(proto.Err.TIMEOUT, "no reply")
+    with pytest.raises(DroverCallError):
         _run(page.evaluate(DOM_QUERY_JS))

@@ -110,7 +110,7 @@ _EXT_SETUP_VERBS = (r"set\s*(?:it\s+|that\s+|them\s+)?up|setup|configure|enable"
 # No brand name. The old pattern matched "chrome" and "cdp" because the
 # mechanism was Chrome-only; this one drives whatever browser is open, so
 # naming one would be both wrong and a THE-rule violation.
-_EXT_NOUNS = r"browser\s+extension|extension|latch|browser\s+control"
+_EXT_NOUNS = r"browser\s+extension|extension|drover|browser\s+control"
 _EXT_SETUP_RE = re.compile(
     rf"\b(?:{_EXT_SETUP_VERBS})\b[\w\s,'\"-]{{0,40}}\b(?:{_EXT_NOUNS})\b"
     rf"|"
@@ -121,7 +121,7 @@ _EXT_SETUP_RE = re.compile(
 # Undo requires an unambiguous noun (not a bare browser name — that
 # would catch "remove chrome" meaning uninstall the browser).
 _EXT_UNDO_VERBS = r"undo|reverse|unset|revert|restore|deactivate|disconnect"
-_EXT_UNDO_NOUNS = r"browser\s+extension|extension|latch|browser\s+control"
+_EXT_UNDO_NOUNS = r"browser\s+extension|extension|drover|browser\s+control"
 _EXT_UNDO_RE = re.compile(
     rf"\b(?:{_EXT_UNDO_VERBS})\b[\w\s,'\"-]{{0,40}}\b(?:{_EXT_UNDO_NOUNS})\b"
     rf"|"

@@ -599,7 +599,7 @@ def _choose_browser_mode(
                                browser; used when goal needs a browser we
                                control end-to-end, not the user's session)
 
-    `driver_state` is a `LatchState` from `extension_ws.latch_state_snapshot()`:
+    `driver_state` is a `DroverState` from `extension_ws.drover_state_snapshot()`:
     whether a browser extension is connected right now.
     `user_preference` overrides the heuristics — if set, returns that mode
     immediately. Loaded from preferences at the call site.
@@ -667,8 +667,8 @@ def _route_browser_content(goal: str, running_window: str) -> Tuple[str, Dict[st
     driver_state = None
     user_pref = None
     try:
-        from ..io.api.extension_ws import latch_state_snapshot
-        driver_state = latch_state_snapshot()
+        from ..io.api.extension_ws import drover_state_snapshot
+        driver_state = drover_state_snapshot()
     except Exception:
         driver_state = None
     # User can persist a preference for "always vision" or "always dom"
@@ -2011,13 +2011,13 @@ async def _execute_dom_task(
 
     # 1. Resolve a browser.
     try:
-        handle = await browser_handle.get_browser_handle(prefer_latch=True)
+        handle = await browser_handle.get_browser_handle(prefer_drover=True)
     except Exception as e:
         _reraise_if_user_aborted(e)
         logger.warning(f"[DA] DOM-mode resolve raised: {type(e).__name__}: {e}")
         return "__FALLBACK__"
 
-    if handle.kind != "latch":
+    if handle.kind != "drover":
         # The router said "dom" but no extension is connected. Most likely a
         # race: the snapshot said connected and the browser closed in between.
         logger.info(

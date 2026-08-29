@@ -34,7 +34,7 @@ import assistant.config as cfg
 
 
 class _FakeDriverState:
-    """Minimal stand-in for `extension_ws.LatchState`.
+    """Minimal stand-in for `extension_ws.DroverState`.
 
     The field is `connected`, not `available`: an extension either has a live
     socket or it has not, and there is no probe whose cached answer could be
@@ -246,7 +246,7 @@ class TestRouteBrowserContent(unittest.TestCase):
         # own browser open at the page), "playwright_bundled" doesn't
         # make sense. _route_browser_content translates it to "vision"
         # and tags meta with translated_from for telemetry.
-        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+        with patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(False)), \
              patch("assistant.preferences.get_preference", return_value=None):
             mode, meta = da._route_browser_content(
@@ -258,7 +258,7 @@ class TestRouteBrowserContent(unittest.TestCase):
         self.assertEqual(meta["translated_from"], "playwright_bundled")
 
     def test_a_connected_extension_with_a_form_intent_returns_dom(self):
-        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+        with patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             mode, meta = da._route_browser_content(
@@ -274,7 +274,7 @@ class TestRouteBrowserContent(unittest.TestCase):
         # harmless the moment the consumer began consulting provenance
         # (D2, §10.3): a row with no source is refused, correctly, and the
         # test then failed for a reason unrelated to what it checks.
-        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+        with patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference",
                    return_value={"key": "automation_browser_mode",
@@ -293,7 +293,7 @@ class TestRouteBrowserContent(unittest.TestCase):
         silently take over browser routing, so the value has to be one a
         person actually stated.
         """
-        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+        with patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference",
                    return_value={"key": "automation_browser_mode",
@@ -307,7 +307,7 @@ class TestRouteBrowserContent(unittest.TestCase):
     def test_a_preference_with_no_provenance_is_refused(self):
         """Fail closed. A row that cannot say where it came from is not a
         user statement, and this consumer accepts nothing less."""
-        with patch("assistant.io.api.extension_ws.latch_state_snapshot",
+        with patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference",
                    return_value={"key": "automation_browser_mode",
@@ -347,7 +347,7 @@ class TestDetectBackendFallback(unittest.TestCase):
         # Mock screen.get_open_windows to include a Chrome window
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["Truein - Google Chrome", "Notepad"]), \
-             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+             patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("fill this form with testing values")
@@ -359,7 +359,7 @@ class TestDetectBackendFallback(unittest.TestCase):
     def test_fill_form_falls_to_vision_when_cdp_down(self):
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["Truein - Google Chrome"]), \
-             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+             patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(False)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("fill this form with testing values")
@@ -381,7 +381,7 @@ class TestDetectBackendFallback(unittest.TestCase):
         browser-content because the form-fill is the actual task."""
         with patch("assistant.automation.router._detect_running_app",
                    return_value="Truein - Google Chrome"), \
-             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+             patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend(
@@ -450,7 +450,7 @@ class TestAppContextPatternFormGuard(unittest.TestCase):
     def test_fill_with_maths_not_treated_as_app(self):
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["demosite - Google Chrome"]), \
-             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+             patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("Fill the subjects field with Maths")
@@ -465,7 +465,7 @@ class TestAppContextPatternFormGuard(unittest.TestCase):
     def test_fill_form_with_value_routes_dom(self):
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["App - Google Chrome"]), \
-             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+             patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("fill this form with testing values")
@@ -492,7 +492,7 @@ class TestFormIntentExpandedKeywords(unittest.TestCase):
     def test_set_routes_to_dom_with_browser_open(self):
         with patch("assistant.io.screen.get_open_windows",
                    return_value=["demosite - Google Chrome"]), \
-             patch("assistant.io.api.extension_ws.latch_state_snapshot",
+             patch("assistant.io.api.extension_ws.drover_state_snapshot",
                    return_value=_FakeDriverState(True)), \
              patch("assistant.preferences.get_preference", return_value=None):
             backend, meta = da.detect_backend("Set State to NCR in this form")
@@ -533,7 +533,7 @@ class TestDomFormFillRouting(unittest.TestCase):
     @patch("assistant.automation.browser.dom_orchestrator.run_dom_task", new_callable=AsyncMock)
     @patch("assistant.automation.browser.handle.get_browser_handle", new_callable=AsyncMock)
     def test_form_intent_uses_form_fill(self, mock_handle, mock_old, mock_new):
-        mock_handle.return_value = MagicMock(kind="latch", page=MagicMock())
+        mock_handle.return_value = MagicMock(kind="drover", page=MagicMock())
         mock_new.return_value = MagicMock(
             success=True, final_summary="Form submitted.", reason="completed",
         )
@@ -545,7 +545,7 @@ class TestDomFormFillRouting(unittest.TestCase):
     @patch("assistant.automation.browser.dom_orchestrator.run_dom_task", new_callable=AsyncMock)
     @patch("assistant.automation.browser.handle.get_browser_handle", new_callable=AsyncMock)
     def test_non_form_uses_old_loop(self, mock_handle, mock_old, mock_new):
-        mock_handle.return_value = MagicMock(kind="latch", page=MagicMock())
+        mock_handle.return_value = MagicMock(kind="drover", page=MagicMock())
         mock_old.return_value = MagicMock(
             success=True, final_summary="Done.", reason="completed",
         )
