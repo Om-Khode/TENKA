@@ -261,7 +261,7 @@ def _check_routing_preference(goal: str) -> Optional[str]:
         "please", "can", "you", config.ASSISTANT_NAME_LOWER, "hey", "i", "want", "need", "use",
         "with", "from", "this", "that", "it", "is", "at", "of", "do",
     })
-    words = [w.lower().strip(".,!?") for w in goal.split() if len(w) > 2]
+    words = [w.lower().strip(_WORD_PUNCT) for w in goal.split() if len(w) > 2]
     candidates = [w for w in words if w not in _SKIP_WORDS]
     
     # Provenance, not just confidence. This is routing **priority 1** -- it
@@ -536,6 +536,17 @@ def _strip_generic_category_suffix(goal: str) -> str:
     return _GENERIC_SUFFIX_RE.sub("", goal).rstrip() if goal else goal
 
 
+# KI-39. `.strip(".,!?")` left quotes and apostrophes attached, so a goal
+# naming a window in quotes -- which the planner's recovery prompt produces --
+# yielded the candidate `notepad'`, and `"notepad'" in "notepad"` is False.
+# The target was lost and the caller fell back to the foreground window.
+#
+# One constant for every site that splits a goal into candidate words, because
+# four copies of a punctuation list is four chances for the next character to
+# be added to three of them.
+_WORD_PUNCT = ".,!?'\"`;:()[]{}"
+
+
 def _detect_running_app(goal: str) -> Optional[str]:
     """
     Check if the goal references a currently running application.
@@ -550,7 +561,7 @@ def _detect_running_app(goal: str) -> Optional[str]:
     except Exception:
         return None
 
-    goal_words = [w.lower().strip(".,!?") for w in goal.split()]
+    goal_words = [w.lower().strip(_WORD_PUNCT) for w in goal.split()]
     candidates = [w for w in goal_words if w not in _DETECT_STOP_WORDS and len(w) > 2]
 
     if not candidates:
@@ -1060,7 +1071,7 @@ def _is_locality_query(text: str) -> bool:
     low = (text or "").lower()
     if any(p in low for p in _LOCALITY_PHRASES):
         return True
-    return bool({w.strip(".,!?") for w in low.split()} & _LOCALITY_CUES)
+    return bool({w.strip(_WORD_PUNCT) for w in low.split()} & _LOCALITY_CUES)
 
 
 def _host_specificity(host: str) -> int:
@@ -1166,9 +1177,9 @@ async def _url_recon(goal: str, *, planner_goal: str = "") -> str | None:
 
     # Domain hints come from the STEP goal (has site name like "BookMyShow")
     hints = [
-        w.lower().strip(".,!?")
+        w.lower().strip(_WORD_PUNCT)
         for w in goal.split()
-        if len(w) > 2 and w.lower().strip(".,!?") not in _DETECT_STOP_WORDS
+        if len(w) > 2 and w.lower().strip(_WORD_PUNCT) not in _DETECT_STOP_WORDS
     ]
 
     url, reason = _choose_recon_url(results, hints)
@@ -1425,9 +1436,29 @@ async def _execute_browser_task(goal: str, llm_func, *, _from_planner: bool = Fa
         logger.error(f"[DA] run_browser_steps failed: {e}")
         return "__FALLBACK__"
 
+# KI-39. Window titles arrive quoted, and the planner's own recovery prompt is
+# what quotes them: a step that failed verification comes back as
+#
+#     type "hello world" in the 'hunter2.txt - Notepad' window
+#
+# The old pattern -- `(?:the\s+)?(\w+)\s*$` -- matched neither the quoted title
+# nor the trailing noun, so it reported *no explicit target*. That skipped the
+# guard in `_execute_native_task` which exists precisely to refuse the
+# active-window fallback when a target was named, and the recovery step typed
+# "hello world" into the user's editor.
+#
+# Two alternatives, quoted first so a title containing spaces is taken whole,
+# plus an optional trailing noun because "in the X window" is how both the
+# planner and ordinary speech name one.
 _APP_TARGET_SUFFIX_RE = re.compile(
-    r'\b(?:on|in|with|using)\s+(?:the\s+)?(\w+)\s*$',
-    re.IGNORECASE,
+    r"""\b(?:on|in|with|using)\s+(?:the\s+)?
+        (?:
+            ['"]([^'"]+)['"]                # a quoted window title
+          | (\w+)                           # or a bare app name
+        )
+        (?:\s+(?:window|app|application))?  # "... in the X window"
+        \s*$""",
+    re.IGNORECASE | re.VERBOSE,
 )
 _APP_TARGET_STOP_WORDS = frozenset({
     "it", "that", "this", "now", "here", "them", "all", "mode",
@@ -1452,10 +1483,17 @@ def _extract_target_app(goal: str) -> tuple[Optional[str], str]:
     m = _APP_TARGET_SUFFIX_RE.search(goal)
     if not m:
         return None, goal
-    candidate = m.group(1).lower()
-    if (len(candidate) <= 2
-            or candidate in _APP_TARGET_STOP_WORDS
-            or candidate in _GENERIC_CATEGORY_WORDS):
+    # Group 1 is the quoted form, group 2 the bare word; exactly one matches.
+    quoted, bare = m.group(1), m.group(2)
+    candidate = (quoted or bare).lower().strip()
+    if len(candidate) <= 2:
+        return None, goal
+    # The stop-word and category guards apply to a *bare* word only. Someone
+    # who wrote quotes around it named a specific window, and "in the 'Form'
+    # window" is a title, not the generic noun `_APP_TARGET_STOP_WORDS` is
+    # there to reject.
+    if quoted is None and (candidate in _APP_TARGET_STOP_WORDS
+                           or candidate in _GENERIC_CATEGORY_WORDS):
         return None, goal
     return candidate, goal[:m.start()].rstrip()
 
