@@ -64,6 +64,13 @@ class CdpProbeResult:
     ws_endpoint: str = ""       # webSocketDebuggerUrl from /json/version
     error: str = ""             # short reason when not available
     probed_at: float = 0.0      # time.monotonic() when this probe ran
+    # Which port this result describes. Not always the configured one: when no
+    # port is named, `cdp_health_probe` scans (see `find_browser_port`), and
+    # every caller that acts on a probe needs to act on the same socket the
+    # probe passed. `_choose_browser_mode` reads a cached snapshot and
+    # `connect_to_existing_chrome` opens a connection; those disagreeing about
+    # the port is the whole shape of KI-37's second round.
+    port: int = 0
     # KI-37. `/json/version` reports the endpoint's own User-Agent, and a
     # browser's is a `Mozilla/5.0 ...` string while an embedded webview often
     # carries its host's name. The live case answered
@@ -125,7 +132,7 @@ def cdp_state_snapshot() -> Optional[CdpProbeResult]:
 # ─── HTTP probe ───────────────────────────────────────────────────────────────
 
 
-async def cdp_health_probe(
+async def probe_one_port(
     port: Optional[int] = None,
     timeout: float = 0.5,
     *,
@@ -149,7 +156,15 @@ async def cdp_health_probe(
     ttl = float(getattr(config, "BROWSER_CDP_PROBE_TTL", 30.0))
 
     # Cache hit: return without probing.
-    if use_cache and _cdp_state is not None:
+    #
+    # **The cached result has to be about the same port.** It used to be
+    # returned on age alone, so once scanning existed a probe of 9333 could be
+    # answered with a cached 9222 result -- the same class of mistake as
+    # KI-37's second round, where the check and the connection disagreed about
+    # which socket they meant. Older results carry `port=0` and are treated as
+    # not matching, so a stale cache from before this field expires rather than
+    # answering for a port it never saw.
+    if use_cache and _cdp_state is not None and _cdp_state.port == p:
         age = time.monotonic() - _cdp_state.probed_at
         if age < ttl:
             return _cdp_state
@@ -198,6 +213,7 @@ async def cdp_health_probe(
         error=error,
         probed_at=now,
         user_agent=user_agent,
+        port=p,
     )
     _cdp_state = result
 
@@ -375,6 +391,98 @@ def cdp_owner_is_a_browser(port: int) -> tuple[Optional[bool], str]:
         return None, f"the check itself failed: {type(e).__name__}: {e}"
 
 
+def _endpoint_is_a_browser(probe: CdpProbeResult) -> tuple[bool, str]:
+    """Should this endpoint be driven? Ownership first, User-Agent as backup.
+
+    One place, so the scanner and the attach agree. `None` from the ownership
+    check means "could not tell", and only then does the endpoint's own
+    User-Agent get a say — a browser launched with `--user-agent` must not be
+    locked out on that alone.
+    """
+    owned, why = cdp_owner_is_a_browser(probe.port)
+    if owned is True:
+        return True, why
+    if owned is False:
+        return False, why
+
+    ua = (probe.user_agent or "").strip()
+    if ua and not ua.lower().startswith("mozilla/"):
+        return False, (f"the ownership check was blind ({why}) and the "
+                       f"endpoint's User-Agent is {ua!r}, which is not a "
+                       f"browser's")
+    return True, f"the ownership check was blind ({why}) — proceeding anyway"
+
+
+async def cdp_health_probe(
+    port: Optional[int] = None,
+    timeout: float = 0.5,
+    *,
+    use_cache: bool = True,
+) -> CdpProbeResult:
+    """Find a usable CDP endpoint. Never raises.
+
+    **With an explicit `port`, this probes exactly that port** and is the
+    function it has always been. With `port=None` it *searches*, starting at
+    `BROWSER_CDP_PORT` and walking `BROWSER_CDP_PORT_SCAN` further, returning
+    the first endpoint that is both available and a browser.
+
+    Scanning exists because 9222 is two conventions at once: Chrome's debug
+    port and the WebView2 default. On the machine KI-37 was found on, a
+    preinstalled utility's embedded webview held it, so the user's own Chrome
+    could not have the port even when they asked for it — and the answer
+    "reconfigure around the squatter" is one the user has to discover, then
+    apply in two places that did not agree. A few loopback connects find the
+    real browser a port or two along instead.
+
+    The result carries the `port` it describes. Callers must use *that* rather
+    than the configured one; a probe and a connection disagreeing about which
+    socket they mean is exactly how the first attempt at KI-37 passed its own
+    check and drove the wrong application anyway.
+    """
+    if port is not None:
+        return await probe_one_port(port, timeout, use_cache=use_cache)
+
+    global _cdp_state
+
+    base = int(getattr(config, "BROWSER_CDP_PORT", 9222))
+    span = max(0, int(getattr(config, "BROWSER_CDP_PORT_SCAN", 4)))
+    ttl = float(getattr(config, "BROWSER_CDP_PROBE_TTL", 30.0))
+
+    # A previous search's winner still counts, so the steady state costs one
+    # cached read rather than a walk.
+    if (use_cache and _cdp_state is not None and _cdp_state.available
+            and time.monotonic() - _cdp_state.probed_at < ttl):
+        return _cdp_state
+
+    first: Optional[CdpProbeResult] = None
+    for candidate in range(base, base + span + 1):
+        result = await probe_one_port(candidate, timeout, use_cache=use_cache)
+        if first is None:
+            first = result
+        if not result.available:
+            continue
+
+        ok, why = _endpoint_is_a_browser(result)
+        if ok:
+            if candidate != base:
+                logger.info(
+                    f"[CDP] using port {candidate} instead of the configured "
+                    f"{base}: {why}")
+            _cdp_state = result
+            return result
+
+        logger.info(f"[CDP] port {candidate} answers but is not a browser: {why}")
+
+    # Nothing usable. Report the configured port's own result rather than the
+    # last one tried, so the error a caller logs is about the port the user
+    # actually set.
+    fallback = first or CdpProbeResult(
+        available=False, error="no ports probed", probed_at=time.monotonic(),
+        port=base)
+    _cdp_state = fallback
+    return fallback
+
+
 async def connect_to_existing_chrome(
     port: Optional[int] = None,
     *,
@@ -396,29 +504,28 @@ async def connect_to_existing_chrome(
     """
     global _cdp_attachment
 
-    p = port if port is not None else int(getattr(config, "BROWSER_CDP_PORT", 9222))
+    # `port=None` means "wherever the browser is": the probe searches and
+    # reports which socket it settled on, and everything below uses *that*.
+    # Reading `BROWSER_CDP_PORT` again here would reintroduce KI-37's second
+    # round, where the check and the connection meant different ports.
+    probe = await cdp_health_probe(port=port)
+    p = probe.port or (port if port is not None
+                       else int(getattr(config, "BROWSER_CDP_PORT", 9222)))
 
-    # Cheap pre-flight: don't even try to import Playwright if probe says no.
-    probe = await cdp_health_probe(port=p)
     if not probe.available:
         logger.info(f"[CDP] attach skipped — probe says unavailable ({probe.error!r})")
         return None
 
-    # KI-37. The probe established that *something* Chromium answers here. This
-    # establishes that it is a browser the user can see, which is a different
-    # question and the one that matters before driving clicks into it.
+    # KI-37. The probe established that *something* Chromium answers here.
+    # `_endpoint_is_a_browser` establishes that it is a browser the user can
+    # see, which is a different question and the one that matters before
+    # driving clicks into it.
     #
-    # Three outcomes, and the middle one is why this is not a boolean:
-    #   True   a visible browser window belongs to the listening process
-    #   False  it does not -- refuse, and say what was found instead
-    #   None   the check could not run at all
-    #
-    # `None` attaches, loudly. Refusing on inability-to-check would disable
-    # DOM-mode wherever process enumeration is restricted, and "I could not
-    # tell" is not a finding. Fail-closed belongs on a definite answer;
-    # this one carries a warning instead so the log shows the check was blind.
-    owned, why = cdp_owner_is_a_browser(p)
-    if owned is False:
+    # Re-asked here even though the scanning path has already asked: an
+    # explicit `port=` skips the scan entirely, and a caller naming a port is
+    # exactly the caller most likely to have named the wrong one.
+    ok, why = _endpoint_is_a_browser(probe)
+    if not ok:
         logger.warning(
             f"[CDP] attach REFUSED on port {p}: {why}. The endpoint reports "
             f"{probe.browser!r}, but an embedded webview reports that too — "
@@ -426,26 +533,7 @@ async def connect_to_existing_chrome(
             f"at, and read its contents into a model prompt. Falling back."
         )
         return None
-    if owned is None:
-        # A second, independent signal, consulted **only here**. The endpoint
-        # reports its own User-Agent and a browser's is a `Mozilla/5.0 ...`
-        # string; the live webview answered `LenovoVantage/3.0.0.197`, saying
-        # plainly what it was while nothing read it.
-        #
-        # Never used to refuse when the process check gave a positive answer:
-        # a browser launched with a custom `--user-agent` must not be locked
-        # out on this alone. It only decides the blind case, where the
-        # alternative is attaching on no evidence at all.
-        ua = (probe.user_agent or "").strip()
-        if ua and not ua.lower().startswith("mozilla/"):
-            logger.warning(
-                f"[CDP] attach REFUSED on port {p}: the ownership check was "
-                f"blind ({why}) and the endpoint's User-Agent is {ua!r}, which "
-                f"is not a browser's. Falling back.")
-            return None
-        logger.warning(f"[CDP] browser-ownership check was blind ({why}) — attaching anyway")
-    else:
-        logger.info(f"[CDP] port {p} owner check: {why}")
+    logger.info(f"[CDP] port {p} owner check: {why}")
 
     try:
         # Defer import so non-CDP code paths don't pay the cost.

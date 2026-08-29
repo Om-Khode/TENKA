@@ -793,6 +793,19 @@ BROWSER_CDP_PORT = _runtime_setting(
                 "the Chrome convention. Change only if you launch Chrome "
                 "with a non-default --remote-debugging-port.",
 )
+BROWSER_CDP_PORT_SCAN = _runtime_setting(
+    "browser_cdp_port_scan", 4, cast=int,
+    description="How many ports past BROWSER_CDP_PORT to try when the "
+                "configured one is not a usable browser. 9222 is both the "
+                "Chrome convention and the WebView2 default, so an embedded "
+                "webview from some other application can be sitting on it "
+                "(KI-37) -- scanning finds the real browser a port or two "
+                "along instead of making the user reconfigure around a "
+                "squatter. 0 disables scanning and uses the configured port "
+                "only. Each extra port costs one loopback TCP connect (~5ms "
+                "when closed), and the result is cached for "
+                "BROWSER_CDP_PROBE_TTL.",
+)
 BROWSER_CDP_PROBE_TTL = _runtime_setting(
     "browser_cdp_probe_ttl", 30.0, cast=float,
     description="How long (seconds) the CDP availability probe result is "
@@ -920,7 +933,7 @@ def reload_runtime_settings() -> None:
     global VERIFY_VISION_FALLBACK, VERIFY_STRICT_TEXT_MATCH
     global VERIFY_MIN_CONFIDENCE, VERIFY_MAX_RETRIES
     global STUDIO_API_ENABLED, STUDIO_API_PORT, STUDIO_API_ORIGINS, STUDIO_UI_PATH
-    global BROWSER_CDP_PORT, BROWSER_CDP_PROBE_TTL, BROWSER_DOM_CACHE_TTL
+    global BROWSER_CDP_PORT, BROWSER_CDP_PORT_SCAN, BROWSER_CDP_PROBE_TTL, BROWSER_DOM_CACHE_TTL
     global BROWSER_DOM_MODE_ENABLED, BROWSER_DOM_TREE_TOKEN_BUDGET, BROWSER_PREFER_CDP
     global DETERMINISTIC_MATCHING_ENABLED, DIALOG_ENGAGEMENT_GATE_ENABLED
     global DROPDOWN_COMMIT_GUARD_ENABLED, DYNAMIC_BUDGET_ENABLED
@@ -965,6 +978,7 @@ def reload_runtime_settings() -> None:
     STUDIO_UI_PATH = new_values.get("studio_ui_path", STUDIO_UI_PATH)
 
     BROWSER_CDP_PORT = new_values.get("browser_cdp_port", BROWSER_CDP_PORT)
+    BROWSER_CDP_PORT_SCAN = new_values.get("browser_cdp_port_scan", BROWSER_CDP_PORT_SCAN)
     BROWSER_CDP_PROBE_TTL = new_values.get("browser_cdp_probe_ttl", BROWSER_CDP_PROBE_TTL)
     BROWSER_DOM_CACHE_TTL = new_values.get("browser_dom_cache_ttl", BROWSER_DOM_CACHE_TTL)
     BROWSER_DOM_MODE_ENABLED = new_values.get("browser_dom_mode_enabled", BROWSER_DOM_MODE_ENABLED)

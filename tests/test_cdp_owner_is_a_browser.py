@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
+import urllib.error
 import types
 import unittest
 from pathlib import Path
@@ -398,6 +400,177 @@ class TestTheEndpointsOwnUserAgent(unittest.TestCase):
         _, reached = self._attach("SomethingCustom/1.0", True)
         self.assertEqual(reached, [1],
                          "a UA check overrode a positive ownership answer")
+
+
+class TestScanningFindsTheBrowsersPort(unittest.TestCase):
+    """9222 is two conventions at once: Chrome's debug port and the WebView2
+    default. When something else holds it, TENKA walks a few ports along rather
+    than making the user discover and reconfigure around a squatter.
+
+    `probe_one_port` and `cdp_owner_is_a_browser` are both stubbed, so nothing
+    opens a socket or enumerates a window.
+    """
+
+    def setUp(self):
+        cdp.reset_state_for_test()
+
+    def tearDown(self):
+        cdp.reset_state_for_test()
+
+    def _scan(self, *, available: set, browsers: set, base=9222, span=4):
+        """available: ports that answer. browsers: ports that are a browser."""
+        self.probed: list[int] = []
+
+        async def _probe(port, timeout=0.5, use_cache=True):
+            self.probed.append(port)
+            return cdp.CdpProbeResult(
+                available=port in available, port=port,
+                browser="Chrome/1" if port in available else "",
+                error="" if port in available else "closed",
+                probed_at=999999.0)
+
+        return (patch.object(cdp, "probe_one_port", new=_probe),
+                patch.object(cdp, "cdp_owner_is_a_browser",
+                             side_effect=lambda p: (p in browsers, f"port {p}")),
+                patch.object(cdp.config, "BROWSER_CDP_PORT", base),
+                patch.object(cdp.config, "BROWSER_CDP_PORT_SCAN", span))
+
+    def _run_scan(self, **kw):
+        patches = self._scan(**kw)
+        for p in patches:
+            p.start()
+        try:
+            return asyncio.run(cdp.cdp_health_probe())
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_the_configured_port_is_used_when_it_is_a_browser(self):
+        r = self._run_scan(available={9222}, browsers={9222})
+        self.assertTrue(r.available)
+        self.assertEqual(r.port, 9222)
+        self.assertEqual(self.probed, [9222], "it kept scanning after a hit")
+
+    def test_it_walks_past_a_squatter_to_the_real_browser(self):
+        # The live shape: a webview answers on 9222, Chrome is on 9223.
+        r = self._run_scan(available={9222, 9223}, browsers={9223})
+        self.assertTrue(r.available)
+        self.assertEqual(r.port, 9223)
+
+    def test_it_walks_past_closed_ports(self):
+        r = self._run_scan(available={9225}, browsers={9225})
+        self.assertEqual(r.port, 9225)
+
+    def test_the_span_counts_ports_past_the_configured_one(self):
+        # span=4 means four *past* 9222, so 9222..9226 inclusive are probed.
+        # Stated as an assertion because "how many ports" is exactly the kind
+        # of off-by-one a reader assumes rather than checks -- the first draft
+        # of this test assumed the other one.
+        self._run_scan(available=set(), browsers=set())
+        self.assertEqual(self.probed, [9222, 9223, 9224, 9225, 9226])
+
+    def test_it_stops_at_the_configured_span(self):
+        # 9227 is one past base+span and must not be probed, however tempting.
+        r = self._run_scan(available={9227}, browsers={9227})
+        self.assertFalse(r.available)
+        self.assertNotIn(9227, self.probed)
+
+    def test_a_span_of_zero_probes_only_the_configured_port(self):
+        r = self._run_scan(available={9223}, browsers={9223}, span=0)
+        self.assertEqual(self.probed, [9222])
+        self.assertFalse(r.available)
+
+    def test_nothing_usable_reports_the_configured_port(self):
+        # The error a caller logs should be about the port the user set, not
+        # about the last one tried.
+        r = self._run_scan(available=set(), browsers=set())
+        self.assertFalse(r.available)
+        self.assertEqual(r.port, 9222)
+
+    def test_a_port_that_answers_but_is_not_a_browser_is_skipped(self):
+        r = self._run_scan(available={9222, 9224}, browsers={9224})
+        self.assertEqual(r.port, 9224)
+
+    def test_an_explicit_port_is_never_scanned_past(self):
+        """`port=` means that port. A caller naming one is not asking to
+        search, and searching on their behalf would drive a browser they did
+        not mean."""
+        patches = self._scan(available={9223}, browsers={9223})
+        for p in patches:
+            p.start()
+        try:
+            r = asyncio.run(cdp.cdp_health_probe(port=9222))
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        self.assertEqual(self.probed, [9222])
+        self.assertFalse(r.available)
+
+
+class TestTheProbeAndTheConnectionAgreeOnThePort(unittest.TestCase):
+    """The invariant KI-37's second round was about.
+
+    A probe that passes for one socket while the connection opens another is
+    how a green check ended up above the same wrong behaviour. The result
+    carries the port it describes, and the attach uses that.
+    """
+
+    def setUp(self):
+        cdp.reset_state_for_test()
+
+    def tearDown(self):
+        cdp.reset_state_for_test()
+
+    def test_the_attach_uses_the_port_the_scan_settled_on(self):
+        opened: list[str] = []
+
+        async def _probe(port, timeout=0.5, use_cache=True):
+            return cdp.CdpProbeResult(
+                available=(port == 9224), port=port, browser="Chrome/1",
+                ws_endpoint="ws://x", probed_at=999999.0)
+
+        class _FakePw:
+            async def start(self):
+                return self
+
+            class chromium:
+                @staticmethod
+                async def connect_over_cdp(url):
+                    opened.append(url)
+                    raise RuntimeError("stop here — the URL is the assertion")
+
+            async def stop(self):
+                pass
+
+        fake_async = types.ModuleType("playwright.async_api")
+        fake_async.async_playwright = lambda: _FakePw()
+        with patch.object(cdp, "probe_one_port", new=_probe),              patch.object(cdp, "cdp_owner_is_a_browser",
+                          return_value=(True, "a browser")),              patch.object(cdp.config, "BROWSER_CDP_PORT", 9222),              patch.object(cdp.config, "BROWSER_CDP_PORT_SCAN", 4),              patch.dict(sys.modules, {"playwright.async_api": fake_async}):
+            asyncio.run(cdp.connect_to_existing_chrome())
+
+        self.assertEqual(
+            opened, ["http://127.0.0.1:9224"],
+            "the attach opened a different port from the one the probe passed")
+
+    def test_a_cached_result_for_another_port_is_not_reused(self):
+        """The cache is keyed on the port, not on age alone.
+
+        Without this, a probe of 9333 could be answered by a cached 9222
+        result -- the same shape of mistake one level down.
+        """
+        cdp._cdp_state = cdp.CdpProbeResult(
+            available=True, port=9222, browser="Chrome/1",
+            probed_at=time.monotonic())
+
+        calls: list[int] = []
+
+        def _urlopen(req, timeout=None):
+            calls.append(int(req.full_url.rsplit(":", 1)[1].split("/")[0]))
+            raise urllib.error.URLError("refused")
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            asyncio.run(cdp.probe_one_port(port=9333))
+        self.assertEqual(calls, [9333], "a cached 9222 result answered for 9333")
 
 
 if __name__ == "__main__":
