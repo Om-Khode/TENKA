@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import dom as browser_dom
+from .page_adapter import LocatorAdapter
 from .dom_mapper import FillInstruction, FormMapping
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ def _values_match(observed: str, expected: str) -> bool:
 
 
 async def fill_textbox(
-    locator: Any,
+    locator: LocatorAdapter,
     elem: browser_dom.ElementInfo,
     value: str,
     *,
@@ -118,7 +119,7 @@ async def fill_textbox(
 
 
 async def fill_radio(
-    locator: Any,
+    locator: LocatorAdapter,
     elem: browser_dom.ElementInfo,
     value: str,
     *,
@@ -141,7 +142,7 @@ async def fill_radio(
 
 
 async def fill_checkbox(
-    locator: Any,
+    locator: LocatorAdapter,
     elem: browser_dom.ElementInfo,
     value: str,
     *,
@@ -182,7 +183,7 @@ async def fill_checkbox(
 
 
 async def fill_native_select(
-    locator: Any,
+    locator: LocatorAdapter,
     elem: browser_dom.ElementInfo,
     value: str,
     *,
@@ -261,7 +262,7 @@ def _find_matching_option(
 
 
 async def fill_combobox(
-    locator: Any,
+    locator: LocatorAdapter,
     elem: browser_dom.ElementInfo,
     value: str,
     *,
@@ -330,7 +331,7 @@ async def fill_combobox(
 
 
 async def fill_combobox_multi(
-    locator: Any,
+    locator: LocatorAdapter,
     elem: browser_dom.ElementInfo,
     values: list[str],
     *,

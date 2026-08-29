@@ -52,6 +52,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, Literal, Optional
 
 from ... import config
+from .page_adapter import LocatorAdapter, PageAdapter
 
 logger = logging.getLogger("browser_dom")
 
@@ -182,7 +183,7 @@ class PageDomTree:
                           completed BEFORE the next perception ran.
     """
     elements: list[ElementInfo]
-    ref_to_locator: dict[str, Any]  # str ref → Playwright Locator
+    ref_to_locator: dict[str, LocatorAdapter]  # str ref → LocatorAdapter
     truncated: int = 0
     read_at: float = 0.0
     viewport: tuple[int, int] = (0, 0)
@@ -199,7 +200,7 @@ class PageDomTree:
 _tree_cache: dict[int, PageDomTree] = {}
 
 
-def invalidate_tree_cache(page: Any) -> None:
+def invalidate_tree_cache(page: PageAdapter) -> None:
     """
     Drop the cached tree for a specific page. Called by the executor after
     click/press/navigation actions that may mutate the DOM.
@@ -932,7 +933,7 @@ def _apply_token_budget(
 
 
 async def read_page_dom(
-    page: Any,
+    page: PageAdapter,
     filter: FilterMode = "interactive",
     *,
     open_comboboxes: bool = False,
@@ -942,8 +943,9 @@ async def read_page_dom(
     Perceive the page's interactive element tree.
 
     Args:
-      page                — Playwright `Page` (or any object exposing
-                            `.evaluate(js, arg)` and `.locator(selector)`).
+      page                — any `PageAdapter`: `.url`, `.evaluate(js, arg)` and
+                            `.locator(selector)`. A Playwright `Page` satisfies it
+                            structurally; so does the extension-backed driver.
       filter              — "interactive" (default), "all", or "form".
       open_comboboxes     — reserved for the orchestrator's open-then-reperceive
                             flow; this perceiver returns combobox options ONLY
@@ -1005,7 +1007,7 @@ async def read_page_dom(
 
     used_refs: dict[str, int] = {}
     elements: list[ElementInfo] = []
-    ref_to_locator: dict[str, Any] = {}
+    ref_to_locator: dict[str, LocatorAdapter] = {}
     idx_to_ref: dict[int, str] = {}  # map JS idx → ref for error anchoring
 
     for raw_el in raw_list:
