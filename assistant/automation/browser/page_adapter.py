@@ -8,7 +8,7 @@ places:
 
     dom.py:972   getattr(page, "url", "")
     dom.py:979   await page.evaluate(_DOM_QUERY_JS, {...})
-    dom.py:1055  page.locator(f"[data-tenka-idx='{idx}']")
+    dom.py:1055  page.locator(f"[data-latch-idx='{idx}']")
 
 Everything downstream consumes plain dicts produced by that one `evaluate`, and acts
 through locators handed out by that one `locator` call and stored in

@@ -16,7 +16,7 @@ we test:
     crash, malformed top-level return
   - cache TTL behavior (within TTL returns cached; manual invalidation
     forces re-read)
-  - ref_to_locator built via page.locator() with the data-tenka-idx
+  - ref_to_locator built via page.locator() with the data-latch-idx
     selector
   - Pruned elements DROP from ref_to_locator (executor can't try to act
     on a ref the planner never saw)
@@ -257,9 +257,9 @@ class TestReadPageDomHappy(unittest.TestCase):
         self.assertEqual(len(set(e.ref for e in tree.elements)), 5)
         # ref_to_locator built for every element
         self.assertEqual(len(tree.ref_to_locator), 5)
-        # Locators built via data-tenka-idx selectors
+        # Locators built via data-latch-idx selectors
         for idx, sel in enumerate(page.locator_calls):
-            self.assertEqual(sel, f"[data-tenka-idx='{idx}']")
+            self.assertEqual(sel, f"[data-latch-idx='{idx}']")
 
     def test_evaluate_called_with_filter_and_options_args(self):
         page = _FakePage(evaluate_return=_evaluate_return([]))
@@ -422,7 +422,7 @@ class TestSerializeForPlanner(unittest.TestCase):
     def test_basic_serialization_shape(self):
         e = _make_element(0)
         tree = bdom.PageDomTree(
-            elements=[e], ref_to_locator={e.ref: _FakeLocator("[data-tenka-idx='0']")},
+            elements=[e], ref_to_locator={e.ref: _FakeLocator("[data-latch-idx='0']")},
             truncated=0, read_at=time.monotonic(), viewport=(800, 600),
         )
         s = bdom.serialize_for_planner(tree)

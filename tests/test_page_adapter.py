@@ -208,7 +208,7 @@ class TestPageForwarding(unittest.TestCase):
     def test_locator_forwards_selector_verbatim(self):
         rec = _Recorder()
         page = PlaywrightPage(_FakePage(rec))
-        sel = "[data-tenka-idx='7']"
+        sel = "[data-latch-idx='7']"
         page.locator(sel)
         name, args, _ = rec.only()
         self.assertEqual(name, "locator")
@@ -216,7 +216,7 @@ class TestPageForwarding(unittest.TestCase):
 
     def test_locator_returns_a_locator_adapter(self):
         page = PlaywrightPage(_FakePage(_Recorder()))
-        self.assertIsInstance(page.locator("[data-tenka-idx='0']"), LocatorAdapter)
+        self.assertIsInstance(page.locator("[data-latch-idx='0']"), LocatorAdapter)
 
     def test_url_reads_through_to_the_wrapped_page_live(self):
         inner = _FakePage(_Recorder())
