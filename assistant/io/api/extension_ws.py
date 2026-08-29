@@ -333,6 +333,28 @@ class LatchCallError(RuntimeError):
 
 _connection: LatchConnection | None = None
 
+#: Called whenever an extension connects. Push, not poll: a consumer that had
+#: to check periodically would miss events for up to its polling interval every
+#: time the browser restarted, and would spend the rest of the time asking a
+#: question whose answer had not changed.
+_on_connect: list[Callable[[LatchConnection], None]] = []
+
+
+def on_connect(callback: Callable[[LatchConnection], None]) -> None:
+    """Subscribe to connections. Idempotent -- the same callable registers once.
+
+    Idempotent because the natural caller is an event source's `start()`, and
+    `start()` runs again on every reload. A list that accepted duplicates would
+    dispatch each browser event once per reload.
+    """
+    if callback not in _on_connect:
+        _on_connect.append(callback)
+
+
+def remove_connect_callback(callback: Callable[[LatchConnection], None]) -> None:
+    if callback in _on_connect:
+        _on_connect.remove(callback)
+
 
 def current_connection() -> LatchConnection | None:
     return _connection if (_connection is not None and _connection.connected) else None
@@ -345,6 +367,15 @@ def is_occupied() -> bool:
 def register(connection: LatchConnection) -> None:
     global _connection
     _connection = connection
+    for callback in list(_on_connect):
+        try:
+            callback(connection)
+        except Exception as e:
+            # A subscriber that throws must not refuse the connection. The
+            # socket is already up; what fails here is one consumer's wiring.
+            logger.warning(
+                f"[LATCH] on-connect callback raised: {type(e).__name__}: {e}"
+            )
 
 
 def unregister(connection: LatchConnection, reason: str = "closed") -> None:
@@ -387,3 +418,4 @@ def reset_state_for_test() -> None:
     if _connection is not None:
         _connection.close("test reset")
     _connection = None
+    _on_connect.clear()

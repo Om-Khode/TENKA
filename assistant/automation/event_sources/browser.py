@@ -61,11 +61,19 @@ class BrowserEventSource:
     name = "browser"
     event_types = frozenset(_EVENT_TYPES.values())
 
-    def __init__(self, connection_getter: Callable[[], object | None]) -> None:
+    def __init__(
+        self,
+        connection_getter: Callable[[], object | None],
+        *,
+        subscribe: Callable[[Callable], None] | None = None,
+        unsubscribe: Callable[[Callable], None] | None = None,
+    ) -> None:
         # A getter, not a connection: the extension disconnects and reconnects
         # on its own schedule, and a source holding one instance would keep
         # feeding from a socket that closed an hour ago.
         self._get_connection = connection_getter
+        self._subscribe = subscribe
+        self._unsubscribe = unsubscribe
         self._dispatch: Callable[[dict], None] | None = None
         self._subscribed_to: object | None = None
 
@@ -74,11 +82,23 @@ class BrowserEventSource:
     def start(self, dispatch_fn: Callable[[dict], None] | None = None, **kwargs) -> None:
         if dispatch_fn is not None:
             self._dispatch = dispatch_fn
+        # Attach now for a connection that is already up, and subscribe so a
+        # later one attaches the moment it arrives. Both halves are needed: the
+        # extension may connect before or after the bus starts, and which it is
+        # depends on how fast a browser launches.
         self._attach()
+        if self._subscribe is not None:
+            self._subscribe(self._on_connection)
 
     def stop(self) -> None:
+        if self._unsubscribe is not None:
+            self._unsubscribe(self._on_connection)
         self._detach()
         self._dispatch = None
+
+    def _on_connection(self, _connection) -> None:
+        """A new extension connected. Move the subscription onto it."""
+        self._attach()
 
     # ─── Wiring ──────────────────────────────────────────────────────────
 

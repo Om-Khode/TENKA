@@ -277,3 +277,81 @@ def test_starting_with_no_connection_is_not_an_error():
     source = BrowserEventSource(lambda: None)
     source.start(lambda _e: None)
     source.stop()
+
+
+# ─── The source is actually started ──────────────────────────────────────
+#
+# Everything above this line passed while `EventBus` never instantiated this
+# class. The source was written, registered in the source registry, and tested
+# — and no browser event ever reached a monitor, because nothing constructed it.
+#
+# Same shape as the extension listener that was never bound: the mechanism was
+# right and the plug was missing. A unit test cannot see that gap, so it is
+# asserted structurally here.
+
+
+def test_the_event_bus_constructs_the_browser_source():
+    import ast
+    import inspect
+
+    from assistant.automation.event_bus import EventBus
+
+    tree = ast.parse(inspect.getsource(EventBus.start).lstrip())
+    constructed = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "BrowserEventSource"
+    ]
+    assert constructed, (
+        "EventBus.start() never constructs BrowserEventSource. The class can be "
+        "correct, registered and fully tested while no browser event ever "
+        "reaches a monitor."
+    )
+
+
+def test_the_bus_subscribes_rather_than_polls():
+    """The extension connects and reconnects on its own schedule.
+
+    A source attached only at startup listens to whatever was connected then --
+    which, on a machine where the browser starts after the assistant, is
+    nothing at all, forever.
+    """
+    import inspect
+
+    from assistant.automation.event_bus import EventBus
+
+    source = inspect.getsource(EventBus.start)
+    assert "on_connect" in source, (
+        "the bus does not subscribe to connections, so a browser that starts "
+        "after the assistant is never heard"
+    )
+
+
+def test_a_failing_browser_source_does_not_stop_the_bus():
+    """The browser is one source of three.
+
+    A browser that is not running, or an import that fails, must not take
+    window and media monitors down with it.
+    """
+    import inspect
+
+    from assistant.automation.event_bus import EventBus
+
+    source = inspect.getsource(EventBus.start)
+    head = source[: source.index("BrowserEventSource")]
+    assert "try:" in head[-500:], (
+        "the browser source is constructed outside a try block; an import "
+        "failure there would stop the whole event bus from starting"
+    )
+
+
+def test_the_bus_stops_the_browser_source():
+    import inspect
+
+    from assistant.automation.event_bus import EventBus
+
+    source = inspect.getsource(EventBus.stop)
+    assert "browser_source" in source and ".stop()" in source, (
+        "EventBus.stop() leaves the browser source attached, so a stopped bus "
+        "keeps dispatching events into a dispatcher it no longer owns"
+    )

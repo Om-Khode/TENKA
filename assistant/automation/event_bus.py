@@ -154,6 +154,29 @@ class EventBus:
 
         self._load_monitors(MonitorRepo(db))
 
+        # Browser events, from the extension. Started here rather than in the
+        # message pump because it needs no Win32 pump: its events arrive on the
+        # asyncio loop through the WebSocket, and `_dispatch_event` is already
+        # called off-thread by the media source.
+        #
+        # Failure is one warning, not a dead bus: the browser is one source of
+        # events among three, and a browser that is not running must not stop
+        # window and media monitors from working.
+        self._browser_source = None
+        try:
+            from .event_sources.browser import BrowserEventSource
+            from ..io.api.extension_ws import (
+                current_connection, on_connect, remove_connect_callback,
+            )
+            self._browser_source = BrowserEventSource(
+                current_connection,
+                subscribe=on_connect,
+                unsubscribe=remove_connect_callback,
+            )
+            self._browser_source.start(self._dispatch_event)
+        except Exception as e:
+            logger.warning("[event-monitor] Browser source unavailable: %s", e)
+
         self._thread = threading.Thread(
             target=self._run_message_pump,
             name="em1-event-bus",
@@ -169,6 +192,13 @@ class EventBus:
         # or never-started pump therefore left armed timers behind, free to
         # dispatch a monitor action after the bus was told to stop.
         self._stop_requested = True
+        browser_source = getattr(self, "_browser_source", None)
+        if browser_source is not None:
+            try:
+                browser_source.stop()
+            except Exception as e:
+                logger.debug("[event-monitor] Browser source stop: %s", e)
+            self._browser_source = None
         for timer in self._debounce_timers.values():
             timer.cancel()
         self._debounce_timers.clear()
