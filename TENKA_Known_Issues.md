@@ -1553,3 +1553,18 @@ Two things this adds to the entry above:
 
 Raises the practical priority of the foreground-window check proposed above,
 whichever of the three options is chosen.
+
+---
+
+<!-- Log-integrity note, 2026-08-29 -->
+
+**KI-39's fix landed on `main` as `734e7f9`, titled
+`chore: baseline row for the window-target tests`.** The title is wrong; the
+contents are the full fix. `git commit -C <branch>` was run after a trailing
+`chore` commit had been added to the branch, so it took the message from the
+new tip rather than from the fix. `main` was already pushed and the pre-commit
+hook refuses an amend there, both correctly.
+
+The full reasoning is on `fix/window-target-resolution` at `a2fc481`, which is
+not deleted — branches never are here, and this is one of the reasons why. Read
+that commit, not `734e7f9`'s title.
