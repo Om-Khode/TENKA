@@ -1724,9 +1724,10 @@ that commit, not `734e7f9`'s title.
 
 ---
 
-## KI-40: The handler-resolution sweep is red on `main`
+## KI-40: ~~The handler-resolution sweep is red on `main`~~ FIXED
 
-**Severity:** Low. **Status:** open, and not caused by the change that found it.
+**Severity:** Low. **Status:** FIXED 2026-08-31. Was not caused by the change
+that found it.
 
 `tests/test_6a5_api_fixes.py` asserts, from the AST, that exactly one site in
 the tree calls `tool_registry.get` — the premise being that `actions/__init__.py`
@@ -1750,9 +1751,35 @@ Two ways out, and it needs a decision rather than a quiet re-number:
 2. Exempt `selfknowledge` by name, with the argument written down — cheaper, and
    it decays the first time someone adds a third reader.
 
-`tests/BASELINE.md` still records that file GREEN, so the ledger is stale for it
-too. Found while removing the CDP tier; the sweep was already failing before
-that work began, which is exactly what the ledger exists to let one prove.
+Found while removing the CDP tier; the sweep was already failing before that
+work began, which is exactly what the ledger exists to let one prove.
+
+**Fixed by option 1.** Resolution is not the boundary, dispatch is, so the
+sweep now walks each `tool_registry.get` call, binds the name it is assigned
+to, and reds if that name is invoked, escapes into a non-introspecting call, is
+returned, or is stored. Resolve-and-`inspect.getdoc` passes; resolve-and-run
+does not. Option 2 -- exempting `selfknowledge` by name -- was rejected because
+that module was already the *second* legitimate reader, so the exemption would
+decay on the third, and it would re-red the sweep at exactly the moment someone
+is adding new code.
+
+Two things the old spelling was holding up incidentally, both now explicit:
+
+- `len(sites) == 1` also proved the *gated* site still exists. Counting
+  dispatch does not, so the site's path and reason are asserted separately --
+  making the gate's own resolution introspection-only takes the count to zero
+  and reds.
+- The allowlist is fail-closed: a call shape the sweep has not seen counts as a
+  possible invocation. Adding a name to `_INTROSPECTION_ONLY` that can in fact
+  run a handler reds `escapes_as_argument`.
+
+The sweep is itself a control, so its branches are pinned by
+`test_the_handler_dispatch_sweep_fails_closed_on_every_shape` against synthetic
+modules -- seven dispatching shapes and the three introspecting ones
+`brain/selfknowledge.py` actually uses. The tree contains exactly one of the
+ten, so without that test six branches would be unexercised.
+
+`tests/BASELINE.md` is corrected to GREEN, 33 tests.
 
 ---
 
