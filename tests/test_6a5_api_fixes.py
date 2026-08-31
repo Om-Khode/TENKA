@@ -28,6 +28,145 @@ from __future__ import annotations
 
 import pytest
 
+import ast
+from pathlib import Path
+
+
+# ─── Handler-dispatch sweep (KI-40) ──────────────────────────────────────────
+# Resolution is not the boundary; dispatch is. The first version of this sweep
+# counted every `tool_registry.get` call and demanded there be exactly one --
+# and went red when `brain/selfknowledge.py` began resolving handlers to read
+# `inspect.getdoc(handler)` so TENKA could describe what she can do. Nothing
+# dispatched around `actions.capability_refusal()`; the premise was wrong.
+#
+# A structural security test that reds on a case that was never a risk is one
+# nobody reads, which is what KI-40 recorded. So the sweep now asks the
+# property that matters: a resolved handler must not be *invoked*, and must not
+# *escape* to somewhere that could invoke it, outside the one gated site.
+#
+# What the old `len(sites) == 1` was incidentally holding up: it also proved
+# the gated site still exists. Dropping the count without replacing that would
+# let the gate's own resolution vanish silently, so it is asserted separately
+# below.
+
+# Reading a handler is not calling one. Anything not on this list is treated as
+# a possible invocation, because the sweep must fail closed on a form it has
+# not seen before.
+_INTROSPECTION_ONLY = frozenset({
+    "getdoc", "getsource", "getsourcefile", "getsourcelines", "signature",
+    "getmembers", "unwrap", "iscoroutinefunction", "isfunction", "ismethod",
+    "getmodule", "getfile", "get_type_hints", "repr", "id", "type", "bool",
+})
+
+
+def _resolution_calls(tree):
+    """Every `tool_registry.get(...)` call node in one module."""
+    return [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "tool_registry"
+    ]
+
+
+def _is_introspection_call(node) -> bool:
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+    return name in _INTROSPECTION_ONLY
+
+
+def handler_dispatch_sites(root: str = "assistant"):
+    """`[(path, lineno, reason)]` for every site that resolves a handler and
+    could then run it. A site that only introspects the handler is absent."""
+    sites = []
+    for path in sorted(Path(root).rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
+        except SyntaxError:                      # not ours to police here
+            continue
+
+        resolutions = _resolution_calls(tree)
+        if not resolutions:
+            continue
+
+        parents = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+
+        def enclosing_scope(node):
+            cur = parents.get(node)
+            while cur is not None and not isinstance(
+                    cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+                cur = parents.get(cur)
+            return cur or tree
+
+        for call in resolutions:
+            # Where does the resolved handler go?
+            names, reason = set(), ""
+            cur, node = parents.get(call), call
+            # `tool_registry.get(i) or fallback` still binds a handler.
+            while isinstance(cur, ast.BoolOp):
+                node, cur = cur, parents.get(cur)
+
+            if isinstance(cur, ast.Assign):
+                for target in cur.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+                    else:                        # stored on an object or in a
+                        reason = "resolved handler is stored, not bound"
+            elif isinstance(cur, (ast.AnnAssign, ast.NamedExpr)):
+                target = cur.target
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+                else:
+                    reason = "resolved handler is stored, not bound"
+            elif _is_introspection_call(cur) and node in getattr(cur, "args", []):
+                continue                         # read, never run
+            elif isinstance(cur, ast.Call) and node is cur.func:
+                reason = "resolved handler is called immediately"
+            else:
+                reason = f"resolved handler flows into {type(cur).__name__}"
+
+            if reason:
+                sites.append((str(path), call.lineno, reason))
+                continue
+
+            # Bound to a name. Red if that name is invoked, or handed to
+            # anything that is not pure introspection.
+            scope = enclosing_scope(call)
+            for node2 in ast.walk(scope):
+                if not isinstance(node2, ast.Call):
+                    continue
+                if isinstance(node2.func, ast.Name) and node2.func.id in names:
+                    sites.append((str(path), node2.lineno,
+                                  f"`{node2.func.id}` is invoked"))
+                    break
+                if _is_introspection_call(node2):
+                    continue
+                escaped = [a for a in node2.args
+                           if isinstance(a, ast.Name) and a.id in names]
+                escaped += [kw.value for kw in node2.keywords
+                            if isinstance(kw.value, ast.Name) and kw.value.id in names]
+                if escaped:
+                    sites.append((str(path), node2.lineno,
+                                  f"`{escaped[0].id}` escapes into a call"))
+                    break
+            else:
+                for node2 in ast.walk(scope):
+                    if (isinstance(node2, (ast.Return, ast.Yield))
+                            and isinstance(node2.value, ast.Name)
+                            and node2.value.id in names):
+                        sites.append((str(path), node2.lineno,
+                                      f"`{node2.value.id}` is returned"))
+                        break
+    return sites
+
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # PART 1c -- CONTROLS. These PASS. They are the things that stopped me,
@@ -76,30 +215,97 @@ def test_control_actions_execute_is_fail_closed_on_an_unset_grant_set():
     unlisted = asyncio.run(actions.execute("some_intent_nobody_classified", {}, ""))
     assert "permission" in unlisted.lower()
 
-    # The one structural claim worth keeping: there is still exactly one site
-    # that resolves a handler, so there is one place the gate has to sit.
-    # Counted from the AST, not from the text. A plain substring count reads
-    # two, because `registry.py`'s module docstring describes the dispatch it
-    # provides -- prose, not a call. A structural check that a comment can
-    # trip gets muted the first time someone documents something.
-    import ast
-    from pathlib import Path
+    # The one structural claim worth keeping: exactly one site both resolves a
+    # handler and can run it, so there is one place the gate has to sit. See
+    # `handler_dispatch_sites` above for why this counts dispatch rather than
+    # resolution (KI-40).
+    sites = handler_dispatch_sites()
+    assert len(sites) == 1, f"handler dispatch is no longer a single site: {sites}"
 
-    sites = []
-    for path in Path("assistant").rglob("*.py"):
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
-        except SyntaxError:                      # not ours to police here
-            continue
-        for node in ast.walk(tree):
-            if (isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "get"
-                    and isinstance(node.func.value, ast.Name)
-                    and node.func.value.id == "tool_registry"):
-                sites.append(f"{path}:{node.lineno}")
+    # And it is still the gated one. The previous spelling of this check
+    # counted resolutions and got this guarantee for free; counting dispatch
+    # does not, so it is asserted rather than assumed.
+    path, _lineno, reason = sites[0]
+    assert path.replace("\\", "/") == "assistant/actions/__init__.py", sites
+    assert "invoked" in reason, sites
 
-    assert len(sites) == 1, f"handler resolution is no longer a single site: {sites}"
+
+def test_the_handler_dispatch_sweep_fails_closed_on_every_shape(tmp_path):
+    """The sweep above is itself a security control, so its own branches are
+    pinned rather than trusted. Written against synthetic modules because the
+    tree contains exactly one dispatching shape and none of the escaping ones
+    -- an untested branch in a sweep is how the sweep stops sweeping.
+
+    KI-40's cause was a premise nobody re-derived. This is the test that would
+    have caught it: `introspecting` holds the two shapes
+    `brain/selfknowledge.py` actually uses, so the day one of them starts
+    reading as dispatch, this reds instead of the sweep going quietly red on
+    `main` for two days."""
+    dispatching = {
+        "called_via_name": """
+def f(i):
+    handler = tool_registry.get(i)
+    return handler(i)
+""",
+        "called_immediately": """
+def f(i):
+    return tool_registry.get(i)(i)
+""",
+        "escapes_as_argument": """
+def f(i):
+    handler = tool_registry.get(i)
+    run_it(handler, i)
+""",
+        "escapes_as_keyword": """
+def f(i):
+    handler = tool_registry.get(i)
+    run_it(fn=handler)
+""",
+        "returned_to_a_caller": """
+def f(i):
+    return tool_registry.get(i)
+""",
+        "returned_after_binding": """
+def f(i):
+    handler = tool_registry.get(i)
+    return handler
+""",
+        "stored_on_an_object": """
+def f(i, box):
+    box.handler = tool_registry.get(i)
+""",
+    }
+    introspecting = {
+        "read_inline": """
+import inspect
+def f(i):
+    return inspect.getdoc(tool_registry.get(i))
+""",
+        "read_after_binding": """
+import inspect
+def f(i):
+    handler = tool_registry.get(i)
+    if handler is None:
+        return ""
+    return inspect.getdoc(handler)
+""",
+        "read_after_a_fallback": """
+import inspect
+def f(i):
+    handler = tool_registry.get(i) or fallback
+    return (inspect.getdoc(handler) or "").strip()
+""",
+    }
+
+    for name, source in {**dispatching, **introspecting}.items():
+        root = tmp_path / name
+        root.mkdir()
+        (root / "m.py").write_text(source, encoding="utf-8")
+        found = handler_dispatch_sites(str(root))
+        if name in dispatching:
+            assert found, f"{name}: a dispatching shape was not flagged"
+        else:
+            assert not found, f"{name}: introspection read as dispatch: {found}"
 
 
 def test_control_a_studio_item_with_a_lost_grant_set_gets_nothing():

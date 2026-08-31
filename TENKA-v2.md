@@ -1,6 +1,13 @@
 # TENKA v2 — Brain Consolidation Specification
 
-**Status:** draft, awaiting operator approval
+**Status:** approved and executed. Every phase shipped by `ea9f9a3` except
+**P15**, which correctly did not ship — its own exit criterion deletes the
+Protocol when no consumer of the *absence* exists, and there is none.
+Three items are deferred by decision rather than done: `main.py`'s trim
+(§19 Architecture), a Task created per turn (`brain/authority.py:create_task`
+has no production caller, so P14 left five Task-keyed telemetry columns out
+rather than ship them always-NULL), and one-loop unification (P13 put three
+of six loops on one verdict vocabulary, which was the phase's deliverable).
 **Date:** 2026-08-22
 **Supersedes (does not replace on disk):** `TENKA_Final_Brain_Architecture.md`, `TENKA_Brain_Refactor_Final_Claude_Code_Implementation_Specification.md`
 **Predecessor milestones:** 6a.5 (`b48e3e4`, the `EXECUTE` capability model), 6b (transports, `f390e31`)

@@ -18,8 +18,8 @@ revert-and-rerun to attribute; this answers it in a second.
 
 | status | files |
 | --- | --- |
-| GREEN | 264 |
-| RED | 32 |
+| GREEN | 265 |
+| RED | 31 |
 | EMPTY | 6 |
 | SKIPPED | 1 |
 | UNKNOWN | 1 |
@@ -91,7 +91,7 @@ has looked at, and it blocks the next phase.
 | `test_4a_whatsapp.py` | GREEN | 18 | 0 | 0 | 0 | 10.9 |
 | `test_4b_computer_task_polish.py` | GREEN | 14 | 0 | 0 | 0 | 0.6 |
 | `test_4c_app_not_running.py` | GREEN | 22 | 0 | 0 | 0 | 0.6 |
-| `test_6a5_api_fixes.py` | RED | 32 | 1 | 0 | 0 | 6.1 |
+| `test_6a5_api_fixes.py` | GREEN | 33 | 0 | 0 | 0 | 2.7 |
 | `test_6a5_fence_leaks.py` | GREEN | 54 | 0 | 0 | 0 | 9.8 |
 | `test_6a5_predispatch_gate.py` | GREEN | 37 | 0 | 0 | 0 | 12.3 |
 | `test_6b_host_scoping.py` | GREEN | 16 | 0 | 0 | 0 | 2.2 |
